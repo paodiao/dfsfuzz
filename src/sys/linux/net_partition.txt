@@ -1,0 +1,5 @@
+syz_failure_net_down(cmd ptr[in, filename])
+syz_failure_net_up()
+
+syz_net_delay_add(cmd ptr[in, filename])
+syz_net_delay_del()

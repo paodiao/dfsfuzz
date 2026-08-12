@@ -1,0 +1,2282 @@
+package prog
+
+import (
+	"fmt"
+	"math/rand"
+	"monarch/pkg/log"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+)
+
+const (
+	MergeViewPrefix = "merge_view/"
+)
+
+const (
+	FileOpReqMagicInDCT  uint32 = 0x46524F50 // "FROP"
+	FileOpRespMagicInDCT uint32 = 0x46524553 // "FRES"
+)
+
+var (
+	DirOnlyCalls = []string{
+		"mkdir",
+		"rmdir",
+		"getdents64",
+	}
+
+	FileOnlyCalls = []string{
+		"creat",
+		"truncate",
+		"pread64",
+		"pwrite64",
+		"read",
+		"write",
+		"fsync",
+		"fdatasync",
+	}
+
+	FileOrDirCalls = []string{
+		"open",
+		"stat",
+		"chmod",
+		"unlink",
+		"rename",
+	}
+
+	FdRequiredCalls = []string{
+		"read",
+		"write",
+		"pread64",
+		"pwrite64",
+		"fsync",
+		"fdatasync",
+		"getdents64",
+		"close",
+		"fstat",
+		"fchmod",
+	}
+)
+
+var FileopsSubCalls = []string{
+	"open", "read", "write", "pread64", "pwrite64",
+	"fsync", "fdatasync", "truncate",
+}
+
+var InodeopsSubCalls = []string{
+	"mkdir", "rmdir", "creat", "unlink", "rename",
+	"chmod", "truncate", "stat",
+}
+
+func IsDirOnlyCall(callName string) bool {
+	for _, name := range DirOnlyCalls {
+		if strings.Contains(callName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsFileOnlyCall(callName string) bool {
+	for _, name := range FileOnlyCalls {
+		if strings.Contains(callName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsFileOrDirCall(callName string) bool {
+	for _, name := range FileOrDirCalls {
+		if strings.Contains(callName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsFdRequiredCall(callName string) bool {
+	for _, name := range FdRequiredCalls {
+		if strings.Contains(callName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+type PathRelation int
+
+const (
+	PathSelf PathRelation = iota
+	PathSelfTwo
+	PathSame
+	PathParent
+	PathChild
+	PathSibling
+	PathNoRel
+)
+
+func (pr PathRelation) String() string {
+	switch pr {
+	case PathSelf:
+		return "self"
+	case PathSelfTwo:
+		return "selftwo"
+	case PathSame:
+		return "same"
+	case PathParent:
+		return "parent"
+	case PathChild:
+		return "child"
+	case PathSibling:
+		return "sibling"
+	case PathNoRel:
+		return "norel"
+	default:
+		return "unknown"
+	}
+}
+
+type OffsetRelationType int
+
+const (
+	OffsetUnspecified OffsetRelationType = iota
+	OffsetSame
+	OffsetDifferent
+)
+
+type CallVariant struct {
+	CallName     string
+	PathRelation PathRelation
+}
+
+func (cv CallVariant) String() string {
+	return fmt.Sprintf("%s(%s)", cv.CallName, cv.PathRelation)
+}
+
+type FileNodeType int
+
+const (
+	NodeTypeFile FileNodeType = iota
+	NodeTypeDir
+	NodeTypeEmptyDir
+	NodeTypeTmpDir
+)
+
+type FileNode struct {
+	Name       string
+	FullPath   string
+	Type       FileNodeType
+	OwnerCid   string
+	Size       uint64
+	PathLength int
+	Children   map[string]*FileNode
+	Parent     *FileNode
+}
+
+type FileTree struct {
+	Root       *FileNode
+	NodesByCid map[string][]*FileNode
+	FilesByCid map[string][]*FileNode
+	DirsByCid  map[string][]*FileNode
+	mu         sync.RWMutex
+}
+
+func NewFileTree() *FileTree {
+	return &FileTree{
+		Root: &FileNode{
+			Name:     "merge_view",
+			FullPath: "merge_view",
+			Type:     NodeTypeDir,
+			Children: make(map[string]*FileNode),
+		},
+		NodesByCid: make(map[string][]*FileNode),
+		FilesByCid: make(map[string][]*FileNode),
+		DirsByCid:  make(map[string][]*FileNode),
+	}
+}
+
+func (ft *FileTree) InitFromHmdfsConfig(hmcfg *Hmdfs_config) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	for cid, files := range hmcfg.Init_file {
+		for _, f := range files {
+			node := ft.addNodeLocked(f, NodeTypeFile, cid)
+			if node != nil && hmcfg.FileSize != nil {
+				if sizes, ok := hmcfg.FileSize[cid]; ok {
+					if sz, ok := sizes[f]; ok {
+						node.Size = sz
+					}
+				}
+			}
+		}
+	}
+
+	for cid, dirs := range hmcfg.Init_dir {
+		for _, d := range dirs {
+			ft.addNodeLocked(d, NodeTypeDir, cid)
+		}
+	}
+
+	for cid, dirs := range hmcfg.Init_tmpdir {
+		for _, d := range dirs {
+			ft.addNodeLocked(d, NodeTypeTmpDir, cid)
+		}
+	}
+
+	for cid, dirs := range hmcfg.Init_empty_dir {
+		for _, d := range dirs {
+			ft.addNodeLocked(d, NodeTypeEmptyDir, cid)
+		}
+	}
+
+	for cid, files := range hmcfg.File_in_persistence_dir {
+		for _, f := range files {
+			node := ft.addNodeLocked(f, NodeTypeFile, cid)
+			if node != nil && hmcfg.FileSize != nil {
+				if sizes, ok := hmcfg.FileSize[cid]; ok {
+					if sz, ok := sizes[f]; ok {
+						node.Size = sz
+					}
+				}
+			}
+		}
+	}
+}
+
+func (ft *FileTree) addNodeLocked(path string, nodeType FileNodeType, ownerCid string) *FileNode {
+	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
+	if cleanPath == "" {
+		return nil
+	}
+
+	parts := strings.Split(cleanPath, "/")
+	current := ft.Root
+
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+
+		isLast := i == len(parts)-1
+
+		if child, exists := current.Children[part]; exists {
+			current = child
+			if isLast {
+				current.Type = nodeType
+				current.OwnerCid = ownerCid
+			}
+		} else {
+			newNode := &FileNode{
+				Name:     part,
+				FullPath: current.FullPath + "/" + part,
+				Parent:   current,
+				Children: make(map[string]*FileNode),
+			}
+
+			if isLast {
+				newNode.Type = nodeType
+				newNode.OwnerCid = ownerCid
+			} else {
+				newNode.Type = NodeTypeTmpDir
+				// TODO: add Tmp Dir Cid?
+			}
+
+			current.Children[part] = newNode
+			current = newNode
+		}
+	}
+
+	ft.NodesByCid[ownerCid] = append(ft.NodesByCid[ownerCid], current)
+	current.PathLength = len(current.FullPath)
+	if nodeType == NodeTypeFile {
+		ft.FilesByCid[ownerCid] = append(ft.FilesByCid[ownerCid], current)
+	} else {
+		ft.DirsByCid[ownerCid] = append(ft.DirsByCid[ownerCid], current)
+	}
+
+	return current
+}
+
+func (ft *FileTree) AddNode(path string, nodeType FileNodeType, ownerCid string) *FileNode {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	return ft.addNodeLocked(path, nodeType, ownerCid)
+}
+
+func (ft *FileTree) UpdateNodeSize(path string, size uint64) {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	node := ft.FindNode(path)
+	if node != nil && node.Type == NodeTypeFile {
+		node.Size = size
+	}
+}
+
+func (ft *FileTree) RemoveNode(path string) bool {
+	// TODO: for dir, does it delete children?
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
+	if cleanPath == "" {
+		return false
+	}
+
+	parts := strings.Split(cleanPath, "/")
+	current := ft.Root
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if child, exists := current.Children[part]; exists {
+			current = child
+		} else {
+			return false
+		}
+	}
+
+	if current.Parent != nil {
+		delete(current.Parent.Children, current.Name)
+	}
+
+	ft.removeNodeFromCidLists(current)
+	return true
+}
+
+func (ft *FileTree) removeNodeFromCidLists(node *FileNode) {
+	cid := node.OwnerCid
+
+	if list, ok := ft.NodesByCid[cid]; ok {
+		for i, n := range list {
+			if n == node {
+				ft.NodesByCid[cid] = append(list[:i], list[i+1:]...)
+				break
+			}
+		}
+	}
+
+	if node.Type == NodeTypeFile {
+		if list, ok := ft.FilesByCid[cid]; ok {
+			for i, n := range list {
+				if n == node {
+					ft.FilesByCid[cid] = append(list[:i], list[i+1:]...)
+					break
+				}
+			}
+		}
+	} else {
+		if list, ok := ft.DirsByCid[cid]; ok {
+			for i, n := range list {
+				if n == node {
+					ft.DirsByCid[cid] = append(list[:i], list[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+}
+
+func (ft *FileTree) RenameNode(oldPath, newPath string) bool {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+
+	cleanOldPath := strings.TrimPrefix(oldPath, MergeViewPrefix)
+	cleanNewPath := strings.TrimPrefix(newPath, MergeViewPrefix)
+
+	if cleanOldPath == "" || cleanNewPath == "" {
+		return false
+	}
+
+	oldParts := strings.Split(cleanOldPath, "/")
+	current := ft.Root
+
+	for _, part := range oldParts {
+		if part == "" {
+			continue
+		}
+		if child, exists := current.Children[part]; exists {
+			current = child
+		} else {
+			return false
+		}
+	}
+
+	if current.Parent != nil {
+		delete(current.Parent.Children, current.Name)
+	}
+
+	newParts := strings.Split(cleanNewPath, "/")
+	newParent := ft.Root
+	for i := 0; i < len(newParts)-1; i++ {
+		part := newParts[i]
+		if part == "" {
+			continue
+		}
+		if child, exists := newParent.Children[part]; exists {
+			newParent = child
+		} else {
+			return false
+		}
+	}
+
+	newName := newParts[len(newParts)-1]
+	current.Name = newName
+	current.FullPath = newParent.FullPath + "/" + newName
+	current.PathLength = len(current.FullPath)
+	current.Parent = newParent
+	newParent.Children[newName] = current
+
+	ft.updateChildPaths(current)
+
+	return true
+}
+
+func (ft *FileTree) updateChildPaths(node *FileNode) {
+	for _, child := range node.Children {
+		child.FullPath = node.FullPath + "/" + child.Name
+		child.PathLength = len(child.FullPath)
+		ft.updateChildPaths(child)
+	}
+}
+
+func (ft *FileTree) FindNode(path string) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
+	if cleanPath == "" {
+		return ft.Root
+	}
+
+	parts := strings.Split(cleanPath, "/")
+	current := ft.Root
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if child, exists := current.Children[part]; exists {
+			current = child
+		} else {
+			return nil
+		}
+	}
+
+	return current
+}
+
+func (ft *FileTree) GetParent(node *FileNode) *FileNode {
+	if node == nil || node.Parent == nil {
+		return nil
+	}
+	return node.Parent
+}
+
+func (ft *FileTree) GetChildren(node *FileNode) []*FileNode {
+	if node == nil {
+		return nil
+	}
+	children := make([]*FileNode, 0, len(node.Children))
+	for _, child := range node.Children {
+		children = append(children, child)
+	}
+	return children
+}
+
+func (ft *FileTree) GetEntriesUnderDir(dirPath string) []string {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+	node := ft.FindNode(dirPath)
+	if node == nil {
+		return nil
+	}
+	entries := make([]string, 0, len(node.Children))
+	for _, child := range node.Children {
+		entries = append(entries, child.FullPath)
+	}
+	return entries
+}
+
+func (ft *FileTree) GetFileEntriesUnderDir(dirPath string) []string {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+	node := ft.FindNode(dirPath)
+	if node == nil {
+		return nil
+	}
+	var entries []string
+	for _, child := range node.Children {
+		if child.Type == NodeTypeFile {
+			entries = append(entries, child.FullPath)
+		}
+	}
+	return entries
+}
+
+func (ft *FileTree) GetNonTmpDirEntriesUnderDir(dirPath string) []string {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+	node := ft.FindNode(dirPath)
+	if node == nil {
+		return nil
+	}
+	var entries []string
+	for _, child := range node.Children {
+		if child.Type == NodeTypeDir || child.Type == NodeTypeEmptyDir {
+			entries = append(entries, child.FullPath)
+		}
+	}
+	return entries
+}
+
+func (ft *FileTree) GetSibling(node *FileNode) []*FileNode {
+	if node == nil || node.Parent == nil {
+		return nil
+	}
+	siblings := make([]*FileNode, 0)
+	for _, child := range node.Parent.Children {
+		if child != node {
+			siblings = append(siblings, child)
+		}
+	}
+	return siblings
+}
+
+func (ft *FileTree) GetRandomFile(r *rand.Rand, cid string) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	files, ok := ft.FilesByCid[cid]
+	if !ok || len(files) == 0 {
+		return nil
+	}
+	return files[r.Intn(len(files))]
+}
+
+func (ft *FileTree) GetRandomFileExcluding(r *rand.Rand, excludeCid string) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	var candidates []*FileNode
+	for cid, files := range ft.FilesByCid {
+		if cid != excludeCid {
+			candidates = append(candidates, files...)
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[r.Intn(len(candidates))]
+}
+
+func (ft *FileTree) GetRandomDir(r *rand.Rand, cid string, allowEmpty bool) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	dirs, ok := ft.DirsByCid[cid]
+	if !ok || len(dirs) == 0 {
+		return nil
+	}
+	CandidatesDirs := make([]*FileNode, 0)
+	if allowEmpty {
+		for _, d := range dirs {
+			if d.Type != NodeTypeTmpDir {
+				CandidatesDirs = append(CandidatesDirs, d)
+			}
+		}
+		//return dirs[r.Intn(len(dirs))]
+	} else {
+		for _, d := range dirs {
+			if d.Type != NodeTypeEmptyDir && d.Type != NodeTypeTmpDir {
+				CandidatesDirs = append(CandidatesDirs, d)
+			}
+		}
+	}
+
+	if len(CandidatesDirs) == 0 {
+		return nil
+	}
+	return CandidatesDirs[r.Intn(len(CandidatesDirs))]
+}
+
+func (ft *FileTree) GetRandomDirExcluding(r *rand.Rand, excludeCid string) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	var candidates []*FileNode
+	for cid, dirs := range ft.DirsByCid {
+		if cid == excludeCid {
+			continue
+		}
+		for _, d := range dirs {
+			if d.Type != NodeTypeEmptyDir && d.Type != NodeTypeTmpDir {
+				candidates = append(candidates, d)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[r.Intn(len(candidates))]
+}
+
+func (ft *FileTree) GetAllFileNodesExcluding(excludeCid string) []*FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	var nodes []*FileNode
+	for cid, files := range ft.FilesByCid {
+		if cid == excludeCid {
+			continue
+		}
+		nodes = append(nodes, files...)
+	}
+	return nodes
+}
+
+func (ft *FileTree) GetAllNonTmpDirNodesExcluding(excludeCid string) []*FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	var nodes []*FileNode
+	for cid, dirs := range ft.DirsByCid {
+		if cid == excludeCid {
+			continue
+		}
+		for _, d := range dirs {
+			if d.Type == NodeTypeDir || d.Type == NodeTypeEmptyDir {
+				nodes = append(nodes, d)
+			}
+		}
+	}
+	return nodes
+}
+
+func (ft *FileTree) GetRandomEmptyDir(r *rand.Rand, cid string) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	dirs, ok := ft.DirsByCid[cid]
+	if !ok {
+		return nil
+	}
+
+	emptyDirs := make([]*FileNode, 0)
+	for _, d := range dirs {
+		if d.Type == NodeTypeEmptyDir {
+			emptyDirs = append(emptyDirs, d)
+		}
+	}
+
+	if len(emptyDirs) == 0 {
+		return nil
+	}
+	return emptyDirs[r.Intn(len(emptyDirs))]
+}
+
+func (ft *FileTree) GetRandomNode(r *rand.Rand, cid string) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	nodes, ok := ft.NodesByCid[cid]
+	if !ok || len(nodes) == 0 {
+		return nil
+	}
+	return nodes[r.Intn(len(nodes))]
+}
+
+func (ft *FileTree) GetPathByRelation(basePath string, basePath2 string, relation PathRelation, r *rand.Rand, cid string, isTwoPath bool) string {
+	var baseNode *FileNode = nil
+	//传入两条路径时，我们默认这两个路径权重相同，随机选取一个来基于relation获取路径，当然这只是基于从rename调用的两个路径来基于relation获取路径考虑的，还没考虑link和symlink
+	if isTwoPath {
+		if r.Intn(2) == 0 {
+			baseNode = ft.FindNode(basePath)
+		} else {
+			baseNode = ft.FindNode(basePath2)
+		}
+	} else {
+		baseNode = ft.FindNode(basePath)
+	}
+
+	if baseNode == nil {
+		return ""
+	}
+
+	switch relation {
+	case PathSelf, PathSelfTwo, PathSame:
+		return basePath
+
+	case PathParent:
+		parent := ft.GetParent(baseNode)
+		if parent == nil {
+			return ""
+		}
+		return parent.FullPath
+	case PathChild:
+		children := ft.GetChildren(baseNode)
+		if len(children) == 0 {
+			return ""
+		}
+		return children[r.Intn(len(children))].FullPath
+	case PathSibling:
+		siblings := ft.GetSibling(baseNode)
+		if len(siblings) == 0 {
+			return ""
+		}
+		return siblings[r.Intn(len(siblings))].FullPath
+	case PathNoRel:
+		return ft.getRandomUnrelatedPath(basePath, r, cid)
+	default:
+		return ""
+	}
+}
+
+func (ft *FileTree) getRandomUnrelatedPath(excludePath string, r *rand.Rand, cid string) string {
+	//TODO: get random path without cid
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	nodes, ok := ft.NodesByCid[cid]
+	if !ok || len(nodes) == 0 {
+		return ""
+	}
+
+	candidates := make([]*FileNode, 0)
+	for _, node := range nodes {
+		if node.FullPath != excludePath &&
+			!strings.HasPrefix(excludePath, node.FullPath+"/") &&
+			!strings.HasPrefix(node.FullPath, excludePath+"/") {
+			candidates = append(candidates, node)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[r.Intn(len(candidates))].FullPath
+}
+
+func (ft *FileTree) GetFilesForCid(cid string) []string {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	files, ok := ft.FilesByCid[cid]
+	if !ok {
+		return nil
+	}
+	paths := make([]string, len(files))
+	for i, f := range files {
+		paths[i] = f.FullPath
+	}
+	return paths
+}
+
+func (ft *FileTree) GetDirsForCid(cid string) []string {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	dirs, ok := ft.DirsByCid[cid]
+	if !ok {
+		return nil
+	}
+	paths := make([]string, len(dirs))
+	for i, d := range dirs {
+		paths[i] = d.FullPath
+	}
+	return paths
+}
+
+func (ft *FileTree) UpdateHmdfsConfig(hmcfg *Hmdfs_config) {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	hmcfg.Init_file = make(map[string][]string)
+	hmcfg.Init_dir = make(map[string][]string)
+	hmcfg.Init_tmpdir = make(map[string][]string)
+	hmcfg.Init_empty_dir = make(map[string][]string)
+	hmcfg.File_in_persistence_dir = make(map[string][]string)
+
+	hmcfg.FileSize = make(map[string]map[string]uint64)
+
+	for cid, nodes := range ft.NodesByCid {
+		for _, node := range nodes {
+			switch node.Type {
+			case NodeTypeFile:
+				hmcfg.Init_file[cid] = append(hmcfg.Init_file[cid], node.FullPath)
+				if node.Size > 0 {
+					if hmcfg.FileSize[cid] == nil {
+						hmcfg.FileSize[cid] = make(map[string]uint64)
+					}
+					hmcfg.FileSize[cid][node.FullPath] = node.Size
+				}
+			case NodeTypeDir:
+				hmcfg.Init_dir[cid] = append(hmcfg.Init_dir[cid], node.FullPath)
+			case NodeTypeEmptyDir:
+				hmcfg.Init_empty_dir[cid] = append(hmcfg.Init_empty_dir[cid], node.FullPath)
+			case NodeTypeTmpDir:
+				hmcfg.Init_tmpdir[cid] = append(hmcfg.Init_tmpdir[cid], node.FullPath)
+			}
+		}
+	}
+}
+
+type ConcurrentOp struct {
+	CallName string
+	PathArgs []PathArgSpec
+}
+
+type PathArgSpec struct {
+	Relation PathRelation
+}
+
+type ConcurrentPattern struct {
+	Name        string
+	ClientCount int
+	SharedRes   string
+	Operations  [][]ConcurrentOp
+	TestPoint   string
+	SeedType    string
+	OffsetRel   OffsetRelationType
+	LengthRel   OffsetRelationType
+}
+
+type PredefinedPatterns struct {
+	FileopsPatterns  []ConcurrentPattern
+	InodeopsPatterns []ConcurrentPattern
+}
+
+func NewPredefinedPatterns() *PredefinedPatterns {
+	pp := &PredefinedPatterns{
+		FileopsPatterns:  make([]ConcurrentPattern, 0),
+		InodeopsPatterns: make([]ConcurrentPattern, 0),
+	}
+
+	pp.initFileopsPatterns()
+	pp.initInodeopsPatterns()
+
+	return pp
+}
+
+func (pp *PredefinedPatterns) initFileopsPatterns() {
+	pp.FileopsPatterns = []ConcurrentPattern{
+		{
+			Name:        "write_write_diff_offset",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"write", []PathArgSpec{{PathSelf}}}},
+				{{"write", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "async_writeback_merge",
+			SeedType:  "fileops",
+			OffsetRel: OffsetDifferent,
+			LengthRel: OffsetDifferent,
+		},
+		{
+			Name:        "write_write_same_offset",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"write", []PathArgSpec{{PathSelf}}}},
+				{{"write", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "write_conflict_resolution",
+			SeedType:  "fileops",
+			OffsetRel: OffsetSame,
+			LengthRel: OffsetSame,
+		},
+		{
+			Name:        "write_read_concurrent",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"write", []PathArgSpec{{PathSelf}}}},
+				{{"read", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "read_visibility",
+			SeedType:  "fileops",
+			OffsetRel: OffsetSame,
+			LengthRel: OffsetSame,
+		},
+		{
+			Name:        "truncate_read_write_concurrent",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"truncate", []PathArgSpec{{PathSelf}}}},
+				{{"read", []PathArgSpec{{PathSame}}}},
+				{{"write", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "truncate_during_read",
+			SeedType:  "fileops",
+			OffsetRel: OffsetUnspecified,
+			LengthRel: OffsetUnspecified,
+		},
+	}
+
+	pp.FileopsPatterns = append(pp.FileopsPatterns,
+		ConcurrentPattern{
+			Name:        "fsync_concurrent",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"write", []PathArgSpec{{PathSelf}}},
+					{"fsync", []PathArgSpec{}}},
+				{{"read", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "fsync_visibility",
+			SeedType:  "fileops",
+			OffsetRel: OffsetUnspecified,
+			LengthRel: OffsetUnspecified,
+		},
+	)
+}
+
+func (pp *PredefinedPatterns) initInodeopsPatterns() {
+	pp.InodeopsPatterns = []ConcurrentPattern{
+		{
+			Name:        "concurrent_mkdir_same",
+			ClientCount: 3,
+			SharedRes:   "same_dir",
+			Operations: [][]ConcurrentOp{
+				{{"mkdir", []PathArgSpec{{PathSelf}}}},
+				{{"mkdir", []PathArgSpec{{PathSame}}}},
+				{{"mkdir", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "mkdir_atomicity",
+			SeedType:  "inodeops",
+		},
+		{
+			Name:        "create_unlink_same",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"creat", []PathArgSpec{{PathSelf}}}},
+				{{"unlink", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "create_unlink_consistency",
+			SeedType:  "inodeops",
+		},
+		{
+			Name:        "mkdir_stat_concurrent",
+			ClientCount: 2,
+			SharedRes:   "same_dir",
+			Operations: [][]ConcurrentOp{
+				{{"mkdir", []PathArgSpec{{PathSelf}}}},
+				{{"stat", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "mkdir_stat_consistency",
+			SeedType:  "inodeops",
+		},
+		{
+			Name:        "rename_open_concurrent",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"rename", []PathArgSpec{{PathSelfTwo}, {PathSelfTwo}}}},
+				{{"open", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "rename_open_atomicity",
+			SeedType:  "inodeops",
+		},
+		{
+			Name:        "rename_rename_concurrent",
+			ClientCount: 2,
+			SharedRes:   "two_files",
+			Operations: [][]ConcurrentOp{
+				{{"rename", []PathArgSpec{{PathSelfTwo}, {PathSelfTwo}}}},
+				{{"rename", []PathArgSpec{{PathSame}, {PathSibling}}}},
+			},
+			TestPoint: "rename_rename_conflict",
+			SeedType:  "inodeops",
+		},
+		{
+			Name:        "readdir_creat_concurrent",
+			ClientCount: 2,
+			SharedRes:   "same_dir",
+			Operations: [][]ConcurrentOp{
+				{{"getdents64", []PathArgSpec{{PathSelf}}}},
+				{{"creat", []PathArgSpec{{PathChild}}}},
+			},
+			TestPoint: "readdir_creat_consistency",
+			SeedType:  "inodeops",
+		},
+		{
+			Name:        "chmod_getattr_concurrent",
+			ClientCount: 2,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"chmod", []PathArgSpec{{PathSelf}}}},
+				{{"stat", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "chmod_stat_consistency",
+			SeedType:  "inodeops",
+		},
+		{
+			Name:        "rmdir_mkdir_child_concurrent",
+			ClientCount: 2,
+			SharedRes:   "parent_child",
+			Operations: [][]ConcurrentOp{
+				{{"rmdir", []PathArgSpec{{PathSelf}}}},
+				{{"mkdir", []PathArgSpec{{PathChild}}}},
+			},
+			TestPoint: "rmdir_mkdir_child_conflict",
+			SeedType:  "inodeops",
+		},
+	}
+
+	pp.InodeopsPatterns = append(pp.InodeopsPatterns,
+		ConcurrentPattern{
+			Name:        "multi_rename_same_file",
+			ClientCount: 3,
+			SharedRes:   "same_file",
+			Operations: [][]ConcurrentOp{
+				{{"rename", []PathArgSpec{{PathSelfTwo}, {PathSelfTwo}}}},
+				{{"rename", []PathArgSpec{{PathSame}, {PathSibling}}}},
+				{{"rename", []PathArgSpec{{PathSame}, {PathSibling}}}},
+			},
+			TestPoint: "multi_rename_conflict",
+			SeedType:  "inodeops",
+		},
+	)
+}
+
+func (pp *PredefinedPatterns) GetRandomPattern(seedType string, r *rand.Rand) *ConcurrentPattern {
+	var patterns []ConcurrentPattern
+	switch seedType {
+	case "fileops":
+		patterns = pp.FileopsPatterns
+	case "inodeops":
+		patterns = pp.InodeopsPatterns
+	default:
+		return nil
+	}
+
+	if len(patterns) == 0 {
+		return nil
+	}
+	return &patterns[r.Intn(len(patterns))]
+}
+
+func (pp *PredefinedPatterns) GetPatternsForNodeCount(seedType string, nodeCount int) []ConcurrentPattern {
+	var patterns []ConcurrentPattern
+	switch seedType {
+	case "fileops":
+		patterns = pp.FileopsPatterns
+	case "inodeops":
+		patterns = pp.InodeopsPatterns
+	default:
+		return nil
+	}
+
+	result := make([]ConcurrentPattern, 0)
+	for _, p := range patterns {
+		if p.ClientCount <= nodeCount {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+type DistributedChoiceTable struct {
+	mu sync.RWMutex
+
+	RootCalls map[string]bool
+
+	Variants map[string][]CallVariant
+
+	Weights map[string]map[CallVariant]int
+
+	TotalWeights map[string]int
+
+	seedType string
+}
+
+func NewDistributedChoiceTable(seedType string) *DistributedChoiceTable {
+	dct := &DistributedChoiceTable{
+		RootCalls:    make(map[string]bool),
+		Variants:     make(map[string][]CallVariant),
+		Weights:      make(map[string]map[CallVariant]int),
+		TotalWeights: make(map[string]int),
+		seedType:     seedType,
+	}
+
+	dct.initDefaultConfig()
+	return dct
+}
+
+func (dct *DistributedChoiceTable) initDefaultConfig() {
+	var rootCallNames []string
+	var variantCallNames []string
+
+	if dct.seedType == "fileops" {
+		rootCallNames = []string{"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate"}
+		variantCallNames = []string{"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate", "stat"}
+	} else {
+		rootCallNames = []string{"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "truncate", "stat"}
+		variantCallNames = []string{"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "truncate", "stat", "open", "getdents64", "write", "read", "pwrite64", "pread64"}
+	}
+	//TODO: root and variant call may need optimization
+	for _, callName := range rootCallNames {
+		dct.RootCalls[callName] = true
+	}
+
+	relations := []PathRelation{PathSame, PathParent, PathChild, PathSibling, PathNoRel}
+
+	for _, rootCall := range rootCallNames {
+		variants := make([]CallVariant, 0)
+		weights := make(map[CallVariant]int)
+
+		for _, variantCall := range variantCallNames {
+			if variantCall == "rename" {
+				for _, srcRel := range relations {
+					for _, tgtRel := range relations {
+						if srcRel == tgtRel {
+							cv := CallVariant{
+								CallName:     variantCall,
+								PathRelation: srcRel,
+							}
+							variants = append(variants, cv)
+							weights[cv] = dct.getInitialWeight(rootCall, cv)
+						}
+					}
+				}
+			} else {
+				for _, rel := range relations {
+					cv := CallVariant{
+						CallName:     variantCall,
+						PathRelation: rel,
+					}
+					variants = append(variants, cv)
+					weights[cv] = dct.getInitialWeight(rootCall, cv)
+				}
+			}
+		}
+
+		dct.Variants[rootCall] = variants
+		dct.Weights[rootCall] = weights
+
+		total := 0
+		for _, w := range weights {
+			total += w
+		}
+		dct.TotalWeights[rootCall] = total
+	}
+}
+
+func (dct *DistributedChoiceTable) getInitialWeight(rootCall string, variant CallVariant) int {
+	baseWeight := 10
+
+	if variant.PathRelation == PathSame {
+		baseWeight = 30
+	} else if variant.PathRelation == PathSibling {
+		baseWeight = 20
+	} else if variant.PathRelation == PathParent || variant.PathRelation == PathChild {
+		baseWeight = 15
+	} else if variant.PathRelation == PathNoRel {
+		baseWeight = 5
+	}
+
+	conflictPairs := map[string]map[string]int{
+		"mkdir":    {"rmdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15},
+		"rmdir":    {"mkdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15},
+		"creat":    {"unlink": 30, "rmdir": 20, "mkdir": 20, "write": 25, "read": 25},
+		"unlink":   {"creat": 30, "mkdir": 15, "rmdir": 15, "write": 30, "read": 20},
+		"rename":   {"rename": 35, "unlink": 25, "creat": 20, "write": 20, "read": 20},
+		"chmod":    {"read": 15, "write": 15, "truncate": 20},
+		"truncate": {"write": 25, "read": 20, "chmod": 20},
+		"stat":     {"write": 10, "read": 10},
+		"open":     {"read": 25, "write": 25, "truncate": 20},
+		"write":    {"read": 30, "write": 25, "truncate": 20, "unlink": 30, "creat": 25, "mkdir": 15, "rmdir": 15},
+		"read":     {"write": 30, "truncate": 15, "unlink": 20, "creat": 25, "mkdir": 15, "rmdir": 15},
+	}
+
+	if conflictGroup, ok := conflictPairs[rootCall]; ok {
+		if w, ok := conflictGroup[variant.CallName]; ok {
+			baseWeight = w
+		}
+	}
+
+	return baseWeight
+}
+
+func (dct *DistributedChoiceTable) ChooseVariant(rootCall string, r *rand.Rand) *CallVariant {
+	dct.mu.RLock()
+	defer dct.mu.RUnlock()
+
+	return dct.chooseVariant(rootCall, r, false)
+}
+
+func (dct *DistributedChoiceTable) ChooseVariantFiltered(rootCall string, r *rand.Rand, baseIsFile bool) *CallVariant {
+	dct.mu.RLock()
+	defer dct.mu.RUnlock()
+
+	return dct.chooseVariant(rootCall, r, baseIsFile)
+}
+
+func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, baseIsFile bool) *CallVariant {
+	variants, ok := dct.Variants[rootCall]
+	if !ok || len(variants) == 0 {
+		return nil
+	}
+
+	weights := dct.Weights[rootCall]
+	total := 0
+	for _, cv := range variants {
+		if baseIsFile && isDirOnlyCall(cv.CallName) {
+			continue
+		}
+		if baseIsFile && (cv.PathRelation == PathChild || cv.PathRelation == PathSibling) {
+			continue
+		}
+		if !baseIsFile && isFileOnlyVariantRel(cv) {
+			continue
+		}
+		total += weights[cv]
+	}
+
+	if total == 0 {
+		for i := 0; i < len(variants); i++ {
+			cv := variants[r.Intn(len(variants))]
+			if baseIsFile && isDirOnlyCall(cv.CallName) {
+				continue
+			}
+			if baseIsFile && (cv.PathRelation == PathChild || cv.PathRelation == PathSibling) {
+				continue
+			}
+			if !baseIsFile && isFileOnlyVariantRel(cv) {
+				continue
+			}
+			return &cv
+		}
+		cv := variants[0]
+		return &cv
+	}
+
+	x := r.Intn(total)
+	cumSum := 0
+	for _, cv := range variants {
+		if baseIsFile && isDirOnlyCall(cv.CallName) {
+			continue
+		}
+		if baseIsFile && (cv.PathRelation == PathChild || cv.PathRelation == PathSibling) {
+			continue
+		}
+		if !baseIsFile && isFileOnlyVariantRel(cv) {
+			continue
+		}
+		cumSum += weights[cv]
+		if x < cumSum {
+			return &cv
+		}
+	}
+
+	cv := variants[len(variants)-1]
+	return &cv
+}
+
+func isDirOnlyCall(callName string) bool {
+	for _, name := range DirOnlyCalls {
+		if strings.Contains(callName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFileOnlyCallByName(callName string) bool {
+	for _, name := range FileOnlyCalls {
+		if strings.Contains(callName, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFileOnlyVariantRel(cv CallVariant) bool {
+	return isFileOnlyCallByName(cv.CallName) &&
+		(cv.PathRelation == PathSelf || cv.PathRelation == PathSame || cv.PathRelation == PathParent)
+}
+
+func isDirPath(ft *FileTree, path string) bool {
+	node := ft.FindNode(path)
+	return node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir)
+}
+
+func (dct *DistributedChoiceTable) UpdateWeight(rootCall string, variant CallVariant, delta int) {
+	dct.mu.Lock()
+	defer dct.mu.Unlock()
+
+	if weights, ok := dct.Weights[rootCall]; ok {
+		if _, ok := weights[variant]; ok {
+			weights[variant] += delta
+			if weights[variant] < 1 {
+				weights[variant] = 1
+			}
+
+			total := 0
+			for _, w := range weights {
+				total += w
+			}
+			dct.TotalWeights[rootCall] = total
+		}
+	}
+}
+
+func (dct *DistributedChoiceTable) ChoosePathRelation(rootCall, variantCallName string, r *rand.Rand) PathRelation {
+	dct.mu.RLock()
+	defer dct.mu.RUnlock()
+
+	variants, ok := dct.Variants[rootCall]
+	if !ok || len(variants) == 0 {
+		return PathSelf
+	}
+
+	weights := dct.Weights[rootCall]
+	total := 0
+	for _, cv := range variants {
+		if cv.CallName == variantCallName {
+			total += weights[cv]
+		}
+	}
+	if total == 0 {
+		return PathSelf
+	}
+
+	x := r.Intn(total)
+	cumSum := 0
+	for _, cv := range variants {
+		if cv.CallName != variantCallName {
+			continue
+		}
+		cumSum += weights[cv]
+		if x < cumSum {
+			return cv.PathRelation
+		}
+	}
+	return PathSelf
+}
+
+type GroupSourceType int
+
+const (
+	GroupSourceDCT GroupSourceType = iota
+	GroupSourcePattern
+	GroupSourceStash
+	GroupSourceDcache
+	GroupSourceFileops
+	GroupSourceInodeops
+)
+
+type GroupMeta struct {
+	Source       GroupSourceType
+	BasePath     string
+	SeedType     string
+	RootCallName string
+}
+
+func isLengthSensitiveCall(callName string) bool {
+	return isOffsetSensitiveCall(callName)
+}
+
+func getRootLengthRel(rootCallName string) OffsetRelationType {
+	if isLengthSensitiveCall(rootCallName) {
+		return OffsetSame
+	}
+	return OffsetUnspecified
+}
+
+func (dct *DistributedChoiceTable) ChooseLengthRel(rootCall, variantCall string, r *rand.Rand) OffsetRelationType {
+	if !isLengthSensitiveCall(variantCall) {
+		return OffsetUnspecified
+	}
+	if !isLengthSensitiveCall(rootCall) {
+		if r.Intn(2) == 0 {
+			return OffsetDifferent
+		}
+		return OffsetUnspecified
+	}
+
+	w, ok := dctOffsetWeights[rootCall]
+	if !ok {
+		return OffsetUnspecified
+	}
+	vw, ok := w[variantCall]
+	if !ok {
+		vw = offsetWeight{30, 30, 40}
+	}
+	total := vw.same + vw.diff + vw.unspec
+	if total == 0 {
+		return OffsetUnspecified
+	}
+	x := r.Intn(total)
+	if x < vw.same {
+		return OffsetSame
+	}
+	x -= vw.same
+	if x < vw.diff {
+		return OffsetDifferent
+	}
+	return OffsetUnspecified
+}
+
+func isOffsetSensitiveCall(callName string) bool {
+	return strings.Contains(callName, "write") || strings.Contains(callName, "pwrite64") ||
+		strings.Contains(callName, "read") || strings.Contains(callName, "pread64")
+}
+
+func getRootOffsetRel(rootCallName string) OffsetRelationType {
+	if isOffsetSensitiveCall(rootCallName) {
+		return OffsetSame
+	}
+	return OffsetUnspecified
+}
+
+type offsetWeight struct{ same, diff, unspec int }
+
+var dctOffsetWeights = map[string]map[string]offsetWeight{
+	"write": {
+		"write": {20, 50, 30},
+		"read":  {50, 30, 20},
+	},
+	"read": {
+		"write": {40, 40, 20},
+		"read":  {50, 30, 20},
+	},
+	"pread64": {
+		"pwrite64": {20, 50, 30},
+		"pread64":  {50, 30, 20},
+	},
+	"pwrite64": {
+		"pwrite64": {20, 50, 30},
+		"pread64":  {50, 30, 20},
+	},
+}
+
+func (dct *DistributedChoiceTable) ChooseOffsetRel(rootCall, variantCall string, r *rand.Rand) OffsetRelationType {
+	if !isOffsetSensitiveCall(variantCall) {
+		return OffsetUnspecified
+	}
+	if !isOffsetSensitiveCall(rootCall) {
+		if r.Intn(2) == 0 {
+			return OffsetDifferent
+		}
+		return OffsetUnspecified
+	}
+
+	w, ok := dctOffsetWeights[rootCall]
+	if !ok {
+		return OffsetUnspecified
+	}
+	vw, ok := w[variantCall]
+	if !ok {
+		vw = offsetWeight{30, 30, 40}
+	}
+	total := vw.same + vw.diff + vw.unspec
+	if total == 0 {
+		return OffsetUnspecified
+	}
+	x := r.Intn(total)
+	if x < vw.same {
+		return OffsetSame
+	}
+	x -= vw.same
+	if x < vw.diff {
+		return OffsetDifferent
+	}
+	return OffsetUnspecified
+}
+
+func (dct *DistributedChoiceTable) IsRootCall(callName string) bool {
+	dct.mu.RLock()
+	defer dct.mu.RUnlock()
+	return dct.RootCalls[callName]
+}
+
+func (dct *DistributedChoiceTable) GetVariants(rootCall string) []CallVariant {
+	dct.mu.RLock()
+	defer dct.mu.RUnlock()
+
+	if variants, ok := dct.Variants[rootCall]; ok {
+		result := make([]CallVariant, len(variants))
+		copy(result, variants)
+		return result
+	}
+	return nil
+}
+
+type DistributedChoiceInfo struct {
+	IsFromDCT       bool
+	RootCallIdx     int
+	RootCallName    string
+	RootCallPath    string
+	RootCallPath2   string
+	ConcurrentCalls []ConcurrentCallInfo
+}
+
+type ConcurrentCallInfo struct {
+	ProgIdx  int
+	CallIdx  int
+	CallName string
+	Variant  CallVariant
+	PathArg  string
+	PathArg2 string
+}
+
+type LayeredChoiceStrategy struct {
+	PredefinedPatterns  *PredefinedPatterns
+	DCTInodeops         *DistributedChoiceTable
+	DCTFileops          *DistributedChoiceTable
+	FileTree            *FileTree
+	SeedType            string
+	FileopsChoiceTable  *ChoiceTable
+	InodeopsChoiceTable *ChoiceTable
+
+	patternProbability float64
+}
+
+func NewLayeredChoiceStrategy(seedType string, hmcfg *Hmdfs_config, target *Target) *LayeredChoiceStrategy {
+	lcs := &LayeredChoiceStrategy{
+		PredefinedPatterns:  NewPredefinedPatterns(),
+		DCTInodeops:         NewDistributedChoiceTable("inodeops"),
+		DCTFileops:          NewDistributedChoiceTable("fileops"),
+		FileTree:            nil,
+		SeedType:            seedType,
+		FileopsChoiceTable:  nil,
+		InodeopsChoiceTable: nil,
+		patternProbability:  0.3,
+	}
+
+	if hmcfg != nil && hmcfg.FileTree != nil {
+		lcs.FileTree = hmcfg.FileTree
+	} else if hmcfg != nil {
+		lcs.FileTree = NewFileTree()
+		lcs.FileTree.InitFromHmdfsConfig(hmcfg)
+	}
+
+	if target != nil {
+		lcs.FileopsChoiceTable = buildSubChoiceTable(target, FileopsSubCalls)
+		lcs.InodeopsChoiceTable = buildSubChoiceTable(target, InodeopsSubCalls)
+	}
+
+	return lcs
+}
+
+func buildSubChoiceTable(target *Target, callNames []string) *ChoiceTable {
+	enabled := make(map[*Syscall]bool)
+	for _, meta := range target.Syscalls {
+		for _, name := range callNames {
+			if meta.Name == name {
+				enabled[meta] = true
+				break
+			}
+		}
+	}
+	return target.BuildChoiceTable(nil, enabled)
+}
+
+func (lcs *LayeredChoiceStrategy) ShouldUsePattern(r *rand.Rand) bool {
+	return r.Float64() < lcs.patternProbability
+}
+
+func (lcs *LayeredChoiceStrategy) GetDCT() *DistributedChoiceTable {
+	if lcs.SeedType == "fileops" {
+		return lcs.DCTFileops
+	}
+	return lcs.DCTInodeops
+}
+
+func (lcs *LayeredChoiceStrategy) ChooseConcurrentCall(rootCallName string, r *rand.Rand) *CallVariant {
+	dct := lcs.GetDCT()
+	return dct.ChooseVariant(rootCallName, r)
+}
+
+func (lcs *LayeredChoiceStrategy) ChooseConcurrentCallFiltered(rootCallName string, r *rand.Rand, baseIsFile bool) *CallVariant {
+	dct := lcs.GetDCT()
+	return dct.ChooseVariantFiltered(rootCallName, r, baseIsFile)
+}
+
+func (lcs *LayeredChoiceStrategy) UpdateWeight(rootCallName string, variant CallVariant) {
+	dct := lcs.GetDCT()
+	dct.UpdateWeight(rootCallName, variant, 1)
+}
+
+func (lcs *LayeredChoiceStrategy) GetPathForVariant(basePath string, basePath2 string, variant CallVariant, r *rand.Rand, cid string, isTwoPath bool) string {
+	return lcs.FileTree.GetPathByRelation(basePath, basePath2, variant.PathRelation, r, cid, isTwoPath)
+}
+
+func (lcs *LayeredChoiceStrategy) GetPathsForRenameVariant(basePath string, basePath2 string, pathRelation PathRelation, r *rand.Rand, cid string, isTwoPath bool) (string, string) {
+	srcPath := lcs.FileTree.GetPathByRelation(basePath, basePath2, pathRelation, r, cid, isTwoPath)
+	siblingPath := ""
+	if srcPath == "" {
+		siblingPath = basePath + "._renamed_" + randomSuffix(r)
+	}
+	srcPathExt := filepath.Ext(srcPath)
+	if strings.Contains(srcPathExt, "._renamed_") {
+		siblingPath = srcPathExt[:len(srcPath)-len(srcPathExt)]
+		siblingPath = siblingPath + "._renamed_" + randomSuffix(r)
+	} else {
+		//退化为PathSame了
+		siblingPath = srcPath + "._renamed_" + randomSuffix(r)
+	}
+
+	return srcPath, siblingPath
+}
+
+func randomSuffix(r *rand.Rand) string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = charset[r.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+func (lcs *LayeredChoiceStrategy) AddCreatedFile(path string, cid string) {
+	lcs.FileTree.AddNode(path, NodeTypeFile, cid)
+}
+
+func (lcs *LayeredChoiceStrategy) AddCreatedDir(path string, cid string, isEmpty bool) {
+	nodeType := NodeTypeDir
+	if isEmpty {
+		//TODO: 不应该是空就是tmp，而是为了创建目标文件而中途创建的目录才是tmp
+		nodeType = NodeTypeEmptyDir
+	}
+	lcs.FileTree.AddNode(path, nodeType, cid)
+}
+
+func (lcs *LayeredChoiceStrategy) RemoveFile(path string) {
+	lcs.FileTree.RemoveNode(path)
+}
+
+func (lcs *LayeredChoiceStrategy) RenameFile(oldPath, newPath string) {
+	lcs.FileTree.RenameNode(oldPath, newPath)
+}
+
+func (lcs *LayeredChoiceStrategy) UpdateHmdfsConfig(hmcfg *Hmdfs_config) {
+	lcs.FileTree.UpdateHmdfsConfig(hmcfg)
+}
+
+func GetParentDir(path string) string {
+	return filepath.Dir(path)
+}
+
+func GetFileName(path string) string {
+	return filepath.Base(path)
+}
+
+func JoinPath(dir, name string) string {
+	return filepath.Join(dir, name)
+}
+
+func IsPathInMergeView(path string) bool {
+	return strings.HasPrefix(path, MergeViewPrefix)
+}
+
+func NormalizeMergeViewPath(path string) string {
+	if !strings.HasPrefix(path, MergeViewPrefix) {
+		return MergeViewPrefix + strings.TrimPrefix(path, "/")
+		// 碰到两道斜杠开头的是不是就炸了
+	}
+	return path
+}
+
+func SortCallVariants(variants []CallVariant) {
+	sort.Slice(variants, func(i, j int) bool {
+		if variants[i].CallName != variants[j].CallName {
+			return variants[i].CallName < variants[j].CallName
+		}
+		return variants[i].PathRelation < variants[j].PathRelation
+	})
+}
+
+/******************************* File Operation Tracking ************************************/
+
+type FileOpType int
+
+const (
+	FileOpNone FileOpType = iota
+	FileOpCreate
+	FileOpDelete
+	FileOpRename
+	FileOpSizeChanged
+)
+
+type FileOpInfo struct {
+	OpType      FileOpType
+	Path        string
+	Path2       string
+	OwnerCid    string
+	IsDir       bool
+	IsEmptyDir  bool
+	IsInPersist bool
+	ProgIdx     int
+	CallIdx     int
+}
+
+type FileOpsTracker struct {
+	Operations []FileOpInfo
+}
+
+func NewFileOpsTracker() *FileOpsTracker {
+	return &FileOpsTracker{
+		Operations: make([]FileOpInfo, 0),
+	}
+}
+
+func (ft *FileOpsTracker) AddCreateOp(path string, isDir bool, ownerCid string, progIdx, callIdx int) {
+	ft.Operations = append(ft.Operations, FileOpInfo{
+		OpType:   FileOpCreate,
+		Path:     path,
+		OwnerCid: ownerCid,
+		IsDir:    isDir,
+		ProgIdx:  progIdx,
+		CallIdx:  callIdx,
+	})
+}
+
+func (ft *FileOpsTracker) AddDeleteOp(path string, isDir bool, isEmptyDir bool, ownerCid string, progIdx, callIdx int) {
+	ft.Operations = append(ft.Operations, FileOpInfo{
+		OpType:     FileOpDelete,
+		Path:       path,
+		OwnerCid:   ownerCid,
+		IsDir:      isDir,
+		IsEmptyDir: isEmptyDir,
+		ProgIdx:    progIdx,
+		CallIdx:    callIdx,
+	})
+}
+
+func (ft *FileOpsTracker) AddRenameOp(oldPath, newPath string, ownerCid string, progIdx, callIdx int) {
+	ft.Operations = append(ft.Operations, FileOpInfo{
+		OpType:   FileOpRename,
+		Path:     oldPath,
+		Path2:    newPath,
+		OwnerCid: ownerCid,
+		ProgIdx:  progIdx,
+		CallIdx:  callIdx,
+	})
+}
+
+func (ft *FileOpsTracker) AddSizeChangedOp(path string, ownerCid string, progIdx, callIdx int) {
+	ft.Operations = append(ft.Operations, FileOpInfo{
+		OpType:   FileOpSizeChanged,
+		Path:     path,
+		OwnerCid: ownerCid,
+		ProgIdx:  progIdx,
+		CallIdx:  callIdx,
+	})
+}
+
+func (ft *FileOpsTracker) Clear() {
+	ft.Operations = ft.Operations[:0]
+}
+
+type FileOpResult struct {
+	Path       string
+	Exists     bool
+	FileSize   uint64
+	Path2      string
+	Exists2    bool
+	FileSize2  uint64
+	IsDir      bool
+	OwnerCid   string
+	ErrorCode  int
+	ErrorCode2 int
+}
+
+type FileOpsResult struct {
+	Results []FileOpResult
+}
+
+func NewFileOpsResult() *FileOpsResult {
+	return &FileOpsResult{
+		Results: make([]FileOpResult, 0),
+	}
+}
+
+func AnalyzeProgForFileOps(ps []*Prog, hmcfg *Hmdfs_config) *FileOpsTracker {
+	tracker := NewFileOpsTracker()
+
+	for progIdx, p := range ps {
+		cid := ""
+		if progIdx < len(hmcfg.Cids) {
+			cid = hmcfg.Cids[progIdx]
+		}
+
+		for callIdx, call := range p.Calls {
+			callName := call.Meta.Name
+
+			switch {
+			case strings.Contains(callName, "mkdir"):
+				path := extractPathFromCall(call)
+				if path != "" {
+					tracker.AddCreateOp(path, true, cid, progIdx, callIdx)
+				}
+
+			case strings.Contains(callName, "creat"):
+				path := extractPathFromCall(call)
+				if path != "" {
+					tracker.AddCreateOp(path, false, cid, progIdx, callIdx)
+				}
+
+			case strings.Contains(callName, "open"):
+				flags := extractOpenFlags(call)
+				if flags&0x40 != 0 { //绝大部分架构下的O_CREAT都是这个值
+					path := extractPathFromCall(call)
+					if path != "" {
+						tracker.AddCreateOp(path, false, cid, progIdx, callIdx)
+					}
+				}
+
+			case strings.Contains(callName, "rmdir"):
+				path := extractPathFromCall(call)
+				if path != "" {
+					isEmpty := isPathInEmptyDirList(path, hmcfg)
+					tracker.AddDeleteOp(path, true, isEmpty, cid, progIdx, callIdx)
+				}
+
+			case strings.Contains(callName, "unlink"):
+				path := extractPathFromCall(call)
+				if path != "" {
+					isInPersist := isPathInPersistenceDir(path, hmcfg)
+					tracker.Operations = append(tracker.Operations, FileOpInfo{
+						OpType:      FileOpDelete,
+						Path:        path,
+						OwnerCid:    cid,
+						IsDir:       false,
+						IsInPersist: isInPersist,
+						ProgIdx:     progIdx,
+						CallIdx:     callIdx,
+					})
+				}
+
+			case strings.Contains(callName, "rename"):
+				oldPath, newPath := extractRenamePaths(call)
+				if oldPath != "" && newPath != "" {
+					tracker.AddRenameOp(oldPath, newPath, cid, progIdx, callIdx)
+				}
+
+			case strings.Contains(callName, "write"),
+				strings.Contains(callName, "pwrite64"):
+				path := resolveFdToPath(p, call)
+				if path != "" {
+					tracker.AddSizeChangedOp(path, cid, progIdx, callIdx)
+				}
+
+			case strings.Contains(callName, "truncate"):
+				path := extractPathFromCall(call)
+				if path != "" {
+					tracker.AddSizeChangedOp(path, cid, progIdx, callIdx)
+				}
+			}
+		}
+	}
+
+	return tracker
+}
+
+func extractOpenFlags(call *Call) uint64 {
+	if len(call.Args) < 2 {
+		return 0
+	}
+	if flagsArg, ok := call.Args[1].(*ConstArg); ok {
+		return flagsArg.Val
+	}
+	return 0
+}
+
+func extractRenamePaths(call *Call) (string, string) {
+	if len(call.Args) < 2 {
+		return "", ""
+	}
+
+	oldPath := extractPathFromCallByArgIdx(call, 0)
+	newPath := extractPathFromCallByArgIdx(call, 1)
+
+	return oldPath, newPath
+}
+
+func resolveFdToPath(p *Prog, fdCall *Call) string {
+	if len(fdCall.Args) < 1 {
+		return ""
+	}
+	fdArg, ok := fdCall.Args[0].(*ResultArg)
+	if !ok || fdArg.Res == nil {
+		return ""
+	}
+	for _, call := range p.Calls {
+		if !strings.Contains(call.Meta.Name, "open") && !strings.Contains(call.Meta.Name, "creat") {
+			continue
+		}
+		if call.Ret == nil {
+			continue
+		}
+		if usesFdCheck(call.Ret, fdArg.Res) {
+			return extractPathFromCall(call)
+		}
+	}
+	return ""
+}
+
+func usesFdCheck(openRet *ResultArg, fdRes *ResultArg) bool {
+	return fdRes.Res == openRet
+}
+
+func isPathInEmptyDirList(path string, hmcfg *Hmdfs_config) bool {
+	for _, dirs := range hmcfg.Init_empty_dir {
+		for _, dir := range dirs {
+			if dir == path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isPathInPersistenceDir(path string, hmcfg *Hmdfs_config) bool {
+	if hmcfg.Persistence_dir == "" {
+		return false
+	}
+	return strings.HasPrefix(path, hmcfg.Persistence_dir)
+}
+
+func ApplyFileOpsResults(tracker *FileOpsTracker, results *FileOpsResult, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config) {
+	if tracker == nil || results == nil {
+		return
+	}
+
+	for i, op := range tracker.Operations {
+		if i >= len(results.Results) {
+			break
+		}
+		result := results.Results[i]
+
+		switch op.OpType {
+		case FileOpCreate:
+			if result.Exists {
+				lcs.AddCreatedFile(op.Path, op.OwnerCid)
+				if op.IsDir {
+					lcs.AddCreatedDir(op.Path, op.OwnerCid, true)
+				}
+				if result.FileSize > 0 {
+					lcs.FileTree.UpdateNodeSize(op.Path, result.FileSize)
+					updateFileSizeInHmdfsConfig(op.Path, op.OwnerCid, result.FileSize, hmcfg)
+				}
+			}
+
+		case FileOpDelete:
+			if !result.Exists {
+				lcs.RemoveFile(op.Path)
+				removeFromHmdfsConfig(op.Path, op.IsDir, op.OwnerCid, hmcfg)
+			}
+
+		case FileOpRename:
+			if result.Exists2 && !result.Exists {
+				lcs.RenameFile(op.Path, op.Path2)
+				renameInHmdfsConfig(op.Path, op.Path2, op.OwnerCid, hmcfg)
+				if result.FileSize2 > 0 {
+					lcs.FileTree.UpdateNodeSize(op.Path2, result.FileSize2)
+					updateFileSizeInHmdfsConfig(op.Path2, op.OwnerCid, result.FileSize2, hmcfg)
+				}
+			} else if !result.Exists2 && result.Exists {
+				// rename failed. do nothing
+			} else {
+				//WRONG!
+				log.Logf(0, "consisitency bug of rename! old: %s new: %s", result.Path, result.Path2)
+			}
+
+		case FileOpSizeChanged:
+			if result.Exists {
+				lcs.FileTree.UpdateNodeSize(op.Path, result.FileSize)
+				updateFileSizeInHmdfsConfig(op.Path, op.OwnerCid, result.FileSize, hmcfg)
+			}
+		}
+	}
+}
+
+func updateFileSizeInHmdfsConfig(path string, cid string, size uint64, hmcfg *Hmdfs_config) {
+	if hmcfg.FileSize == nil {
+		hmcfg.FileSize = make(map[string]map[string]uint64)
+	}
+	if hmcfg.FileSize[cid] == nil {
+		hmcfg.FileSize[cid] = make(map[string]uint64)
+	}
+	hmcfg.FileSize[cid][path] = size
+}
+
+func removeFromHmdfsConfig(path string, isDir bool, cid string, hmcfg *Hmdfs_config) {
+	//是不是有可能操作到tmpdir上？
+	if isDir {
+		if dirs, ok := hmcfg.Init_dir[cid]; ok {
+			for i, d := range dirs {
+				if d == path {
+					hmcfg.Init_dir[cid] = append(dirs[:i], dirs[i+1:]...)
+					break
+				}
+			}
+		}
+		if dirs, ok := hmcfg.Init_empty_dir[cid]; ok {
+			for i, d := range dirs {
+				if d == path {
+					hmcfg.Init_empty_dir[cid] = append(dirs[:i], dirs[i+1:]...)
+					break
+				}
+			}
+		}
+	} else {
+		if files, ok := hmcfg.Init_file[cid]; ok {
+			for i, f := range files {
+				if f == path {
+					hmcfg.Init_file[cid] = append(files[:i], files[i+1:]...)
+					break
+				}
+			}
+		}
+		if files, ok := hmcfg.File_in_persistence_dir[cid]; ok {
+			for i, f := range files {
+				if f == path {
+					hmcfg.File_in_persistence_dir[cid] = append(files[:i], files[i+1:]...)
+					break
+				}
+			}
+		}
+		if sizes, ok := hmcfg.FileSize[cid]; ok {
+			delete(sizes, path)
+		}
+	}
+}
+
+func renameInHmdfsConfig(oldPath, newPath, cid string, hmcfg *Hmdfs_config) {
+	if files, ok := hmcfg.Init_file[cid]; ok {
+		for i, f := range files {
+			if f == oldPath {
+				hmcfg.Init_file[cid][i] = newPath
+				break
+			}
+		}
+	}
+	if files, ok := hmcfg.File_in_persistence_dir[cid]; ok {
+		for i, f := range files {
+			if f == oldPath {
+				hmcfg.File_in_persistence_dir[cid][i] = newPath
+				break
+			}
+		}
+	}
+	if dirs, ok := hmcfg.Init_dir[cid]; ok {
+		for i, d := range dirs {
+			if d == oldPath {
+				hmcfg.Init_dir[cid][i] = newPath
+				break
+			}
+		}
+	}
+	if dirs, ok := hmcfg.Init_empty_dir[cid]; ok {
+		for i, d := range dirs {
+			if d == oldPath {
+				hmcfg.Init_empty_dir[cid][i] = newPath
+				break
+			}
+		}
+	}
+	if sizes, ok := hmcfg.FileSize[cid]; ok {
+		if sz, ok := sizes[oldPath]; ok {
+			sizes[newPath] = sz
+			delete(sizes, oldPath)
+		}
+	}
+	//empty dir和普通dir的处理，可能还会有其它地方做得不对
+}
+
+func (ft *FileOpsTracker) Serialize() []byte {
+	size := 8
+	for _, op := range ft.Operations {
+		size += 1 + 2 + len(op.Path) + 2 + len(op.Path2) + 2 + len(op.OwnerCid) + 1 + 1 + 1 + 4 + 4
+	}
+
+	buf := make([]byte, size)
+	offset := 0
+	//TODO: 写了count，没写magic，应该可以在这里把magic补上
+	writeUint32(buf, &offset, FileOpReqMagicInDCT)
+	writeUint32(buf, &offset, uint32(len(ft.Operations)))
+
+	for _, op := range ft.Operations {
+		buf[offset] = byte(op.OpType)
+		offset++
+
+		writeUint16(buf, &offset, uint16(len(op.Path)))
+		copy(buf[offset:], op.Path)
+		offset += len(op.Path)
+
+		writeUint16(buf, &offset, uint16(len(op.Path2)))
+		copy(buf[offset:], op.Path2)
+		offset += len(op.Path2)
+
+		writeUint16(buf, &offset, uint16(len(op.OwnerCid)))
+		copy(buf[offset:], op.OwnerCid)
+		offset += len(op.OwnerCid)
+
+		if op.IsDir {
+			buf[offset] = 1
+		} else {
+			buf[offset] = 0
+		}
+		offset++
+
+		if op.IsEmptyDir {
+			buf[offset] = 1
+		} else {
+			buf[offset] = 0
+		}
+		offset++
+
+		if op.IsInPersist {
+			buf[offset] = 1
+		} else {
+			buf[offset] = 0
+		}
+		offset++
+
+		writeUint32(buf, &offset, uint32(op.ProgIdx))
+		writeUint32(buf, &offset, uint32(op.CallIdx))
+	}
+
+	return buf[:offset]
+}
+
+func DeserializeFileOpsResult(data []byte) *FileOpsResult {
+	result := NewFileOpsResult()
+	if len(data) < 4 {
+		return result
+	}
+
+	offset := 0
+	count := readUint32(data, &offset)
+
+	for i := 0; i < int(count); i++ {
+		if offset+4 > len(data) {
+			break
+		}
+
+		fr := FileOpResult{}
+
+		pathLen := int(readUint16(data, &offset))
+		if offset+pathLen > len(data) {
+			break
+		}
+		fr.Path = string(data[offset : offset+pathLen])
+		offset += pathLen
+
+		if offset >= len(data) {
+			break
+		}
+		fr.Exists = data[offset] != 0
+		offset++
+
+		if offset+8 > len(data) {
+			break
+		}
+		fr.FileSize = readUint64(data, &offset)
+
+		if offset >= len(data) {
+			break
+		}
+
+		path2Len := int(readUint16(data, &offset))
+		if offset+path2Len > len(data) {
+			break
+		}
+		if path2Len > 0 {
+			fr.Path2 = string(data[offset : offset+path2Len])
+			offset += path2Len
+			if offset >= len(data) {
+				break
+			}
+			fr.Exists2 = data[offset] != 0
+			offset++
+
+			if offset+8 > len(data) {
+				break
+			}
+			fr.FileSize2 = readUint64(data, &offset)
+
+			if offset >= len(data) {
+				break
+			}
+		}
+
+		fr.IsDir = data[offset] != 0
+		offset++
+
+		ownerLen := int(readUint16(data, &offset))
+		if offset+ownerLen > len(data) {
+			break
+		}
+		fr.OwnerCid = string(data[offset : offset+ownerLen])
+		offset += ownerLen
+
+		if offset+4 > len(data) {
+			break
+		}
+		fr.ErrorCode = int(readUint32(data, &offset))
+		if path2Len > 0 {
+			fr.ErrorCode2 = int(readUint32(data, &offset))
+		}
+
+		result.Results = append(result.Results, fr)
+	}
+
+	return result
+}
+
+func writeUint16(buf []byte, offset *int, val uint16) {
+	buf[*offset] = byte(val >> 8)
+	buf[*offset+1] = byte(val)
+	*offset += 2
+}
+
+func writeUint32(buf []byte, offset *int, val uint32) {
+	buf[*offset] = byte(val >> 24)
+	buf[*offset+1] = byte(val >> 16)
+	buf[*offset+2] = byte(val >> 8)
+	buf[*offset+3] = byte(val)
+	*offset += 4
+}
+
+func readUint16(buf []byte, offset *int) uint16 {
+	val := uint16(buf[*offset])<<8 | uint16(buf[*offset+1])
+	*offset += 2
+	return val
+}
+
+func readUint32(buf []byte, offset *int) uint32 {
+	val := uint32(buf[*offset])<<24 | uint32(buf[*offset+1])<<16 | uint32(buf[*offset+2])<<8 | uint32(buf[*offset+3])
+	*offset += 4
+	return val
+}
+
+func writeUint64(buf []byte, offset *int, val uint64) {
+	buf[*offset] = byte(val >> 56)
+	buf[*offset+1] = byte(val >> 48)
+	buf[*offset+2] = byte(val >> 40)
+	buf[*offset+3] = byte(val >> 32)
+	buf[*offset+4] = byte(val >> 24)
+	buf[*offset+5] = byte(val >> 16)
+	buf[*offset+6] = byte(val >> 8)
+	buf[*offset+7] = byte(val)
+	*offset += 8
+}
+
+func readUint64(buf []byte, offset *int) uint64 {
+	val := uint64(buf[*offset])<<56 | uint64(buf[*offset+1])<<48 |
+		uint64(buf[*offset+2])<<40 | uint64(buf[*offset+3])<<32 |
+		uint64(buf[*offset+4])<<24 | uint64(buf[*offset+5])<<16 |
+		uint64(buf[*offset+6])<<8 | uint64(buf[*offset+7])
+	*offset += 8
+	return val
+}

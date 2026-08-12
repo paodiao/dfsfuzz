@@ -1,0 +1,91 @@
+{"commands": [
+    {
+        "name": "create",
+        "description":"create a file",
+        "weight": 1.0,
+        "argument_num" : 1,
+        "arguments":["NEW_FILE_NAME"],
+        "pre_command": []
+    },
+    {
+        "name": "delete",
+        "description":"delete a file",
+        "weight": 0.2,
+        "argument_num" : 1,
+        "arguments":["EXISTING_FILE_NAME"],
+        "pre_command": ["create"]
+    },
+    {
+        "name": "symlink",
+        "description":"link a file to another one",
+        "weight": 1,
+        "argument_num" : 2,
+        "arguments":["EXISTING_FILE_NAME","NEW_FILE_NAME"],
+        "pre_command": ["create"]
+    },
+    {
+        "name": "hardlink",
+        "description":"hard link a file to another one",
+        "weight": 1,
+        "argument_num" : 2,
+        "arguments":["EXISTING_FILE_NAME","NEW_FILE_NAME"],
+        "pre_command": ["create"]
+    },
+    {
+        "name": "mkdir",
+        "description":"create a directory",
+        "weight": 1.0,
+        "argument_num" : 1,
+        "arguments":["NEW_FILE_NAME"],
+        "pre_command": []
+    },
+    {
+        "name": "rmdir",
+        "description":"delete a directory",
+        "weight": 0.1,
+        "argument_num" : 1,
+        "arguments":["EXISTING_FILE_NAME"],
+        "pre_command": ["mkdir"]
+    },
+    {
+        "name": "chmod",
+        "description":"change the mode of a file or a directory",
+        "weight": 1.0,
+        "argument_num" : 1,
+        "arguments":["EXISTING_FILE_NAME"],
+        "pre_command": ["create"]
+    },
+    {
+        "name": "append",
+        "description":"append some content to a file",
+        "weight": 1.0,
+        "argument_num" : 1,
+        "arguments":["EXISTING_FILE_NAME"],
+        "pre_command": []
+    },
+    {
+        "name": "overwrite",
+        "description":"overwrite a file",
+        "weight": 1.0,
+        "argument_num" : 1,
+        "arguments":["EXISTING_FILE_NAME"],
+        "pre_command": ["create"]
+    },
+    {
+        "name": "truncate-overwrite",
+        "description":"",
+        "weight": 1.0,
+        "argument_num" : 1,
+        "arguments":["EXISTING_FILE_NAME"],
+        "pre_command": ["create"]
+    },
+    {
+        "name": "rename",
+        "description":"rename a file",
+        "weight": 1.0,
+        "argument_num" : 2,
+        "arguments":["EXISTING_FILE_NAME","NEW_FILE_NAME"],
+        "pre_command": ["create"]
+    }
+    ]
+}

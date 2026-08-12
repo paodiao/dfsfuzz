@@ -1,0 +1,85 @@
+# HMDFS Agent Configuration File
+# This is a template configuration file for hmdfs_agent
+# Copy this file to a new location and edit it according to your needs
+
+# 本地配置选项
+# 本地监听端口，0表示不启用本地监听
+local_port = 12345
+
+# 本机IP地址
+local_ip = 127.0.0.1
+
+# 本地CID（设备标识）
+local_cid = HMDFS-local-12345
+
+# 日志文件路径（可选，留空则输出到控制台）
+log_file =
+
+# 远程节点配置示例
+# 节点1配置
+remote_ip_0 = 192.168.1.100
+remote_port_0 = 12345
+remote_cid_0 = HMDFS-remote-100
+remote_sl_0 = 100  # 设备序列号
+
+# 节点2配置（可选）
+# remote_ip_1 = 192.168.1.101
+# remote_port_1 = 12345
+# remote_cid_1 = HMDFS-remote-101
+# remote_sl_1 = 101  # 设备序列号
+
+# 节点3配置（可选）
+# remote_ip_2 = 192.168.1.102
+# remote_port_2 = 12345
+# remote_cid_2 = HMDFS-remote-102
+# remote_sl_2 = 102  # 设备序列号
+
+# 节点4配置（可选）
+# remote_ip_3 = 192.168.1.103
+# remote_port_3 = 12345
+# remote_cid_3 = HMDFS-remote-103
+# remote_sl_3 = 103  # 设备序列号
+
+# 节点5配置（可选）
+# remote_ip_4 = 192.168.1.104
+# remote_port_4 = 12345
+# remote_cid_4 = HMDFS-remote-104
+# remote_sl_4 = 104  # 设备序列号
+
+# 节点6配置（可选）
+# remote_ip_5 = 192.168.1.105
+# remote_port_5 = 12345
+# remote_cid_5 = HMDFS-remote-105
+# remote_sl_5 = 105  # 设备序列号
+
+# 节点7配置（可选）
+# remote_ip_6 = 192.168.1.106
+# remote_port_6 = 12345
+# remote_cid_6 = HMDFS-remote-106
+# remote_sl_6 = 106  # 设备序列号
+
+# 节点8配置（可选）
+# remote_ip_7 = 192.168.1.107
+# remote_port_7 = 12345
+# remote_cid_7 = HMDFS-remote-107
+# remote_sl_7 = 107  # 设备序列号
+
+# 节点9配置（可选）
+# remote_ip_8 = 192.168.1.108
+# remote_port_8 = 12345
+# remote_cid_8 = HMDFS-remote-108
+# remote_sl_8 = 108  # 设备序列号
+
+# 节点10配置（可选）
+# remote_ip_9 = 192.168.1.109
+# remote_port_9 = 12345
+# remote_cid_9 = HMDFS-remote-109
+# remote_sl_9 = 109  # 设备序列号
+
+# 配置说明：
+# 1. local_port为0时，表示不启用本地监听，仅作为客户端主动连接远程节点
+# 2. 可以配置多个远程节点，索引从0开始，连续递增
+# 3. 每个远程节点需要配置ip、port、cid和sl四个参数
+# 4. remote_sl为设备序列号，用于标识不同的设备
+# 5. 日志文件路径留空则输出到控制台
+# 6. 配置文件支持注释，以#开头的行将被忽略
