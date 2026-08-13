@@ -104,9 +104,9 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		for i, id := range cids {
 			cids[i] = strings.TrimSpace(id)
 		}
-	hc.Cids = cids
-	hc.Serv_num = fuzzer.config.ServNum
-	hc.InitIp = fuzzer.config.InitIp
+		hc.Cids = cids
+		hc.Serv_num = fuzzer.config.ServNum
+		hc.InitIp = fuzzer.config.InitIp
 
 		// Load initial files and directories from InitDir
 		hc.Init_file = make(map[string][]string)
@@ -332,16 +332,16 @@ func (proc *Proc) loop() {
 			rand.Seed(time.Now().UnixNano())
 			if proc.fuzzer.config.DFSName == "hmdfs" {
 				// 按概率选择种子类型
-				seedType := rand.Intn(4)
+				seedType := rand.Intn(3)
 				switch seedType {
 				case 0:
 					ps = proc.fuzzer.target.GenerateProgsForHmdfsStash(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
 				case 1:
-					ps = proc.fuzzer.target.GenerateProgsForHmdfsDcache(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
-				case 2:
 					ps = proc.fuzzer.target.GenerateProgsForHmdfsFileops(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
-				case 3:
+				case 2:
 					ps = proc.fuzzer.target.GenerateProgsForHmdfsInodeops(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
+				//case 3:
+				//ps = proc.fuzzer.target.GenerateProgsForHmdfsDcache(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
 				default:
 					//ps = r.Generate(...)  // 原有的随机生成
 				}
