@@ -598,7 +598,22 @@ func (inst *instance) boot(index int) error {
 			"-device", "virtio-9p-pci,fsdev=fsdev0,mount_tag=/dev/root",
 		)
 	} else if inst.image != "" {
-		if inst.archConfig.UseNewQemuImageOptions {
+		if inst.cfg.DFSName == "hmdfs" {
+			// cfg 的 image 是模板名——按 VM index 补全：hmdfs.img → hmdfs<index>.img
+			dir, base := filepath.Split(inst.image)
+			ext := filepath.Ext(base)
+			stem := strings.TrimSuffix(base, ext)
+			image := filepath.Join(dir, fmt.Sprintf("%s%d%s", stem, index, ext))
+			// 只有主镜像：image_device 模板（默认 "-hda <镜像>"——root=/dev/sda 匹配）
+			imgline := strings.Split(inst.cfg.ImageDevice, " ")
+			imgline[0] = "-" + imgline[0]
+			if strings.HasSuffix(imgline[len(imgline)-1], "file=") {
+				imgline[len(imgline)-1] = imgline[len(imgline)-1] + image
+			} else {
+				imgline = append(imgline, image)
+			}
+			args = append(args, imgline...)
+		} else if inst.archConfig.UseNewQemuImageOptions {
 
 			images := strings.Split(inst.image, ";")
 			images = images[:len(images)-1]

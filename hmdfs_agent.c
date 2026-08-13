@@ -375,7 +375,7 @@ void generate_cid(char *cid) {
     uint32_t r8 = rand();
     
     // 生成64字节的连续16进制字符串 (64个字符 + 1个结束符)
-    snprintf(cid, HMDFS_CID_SIZE, "%08x%08x%08x%08x%08x%08x%08x%08x",
+    snprintf(cid, HMDFS_CID_SIZE + 1, "%08x%08x%08x%08x%08x%08x%08x%08x",
              r1, r2, r3, r4, r5, r6, r7, r8);
     cid[HMDFS_CID_SIZE] = '\0';
 }
@@ -1481,8 +1481,7 @@ int parse_config_cmd(const char *cmd_line) {
     g_config.local_port = port;
     
     if (strlen(log_file) > 0) {
-        strncpy(g_config.log_file, log_file, sizeof(g_config.log_file) - 1);
-        g_config.log_file[sizeof(g_config.log_file) - 1] = '\0';
+        snprintf(g_config.log_file, sizeof(g_config.log_file), "%s", log_file);
     }
     
     unsigned char init_ip_bytes[4];
