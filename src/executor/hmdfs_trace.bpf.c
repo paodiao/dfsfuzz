@@ -20,6 +20,11 @@
 #define ATTR_SIZE (1 << 10)
 #endif
 
+/* bpf_tracing.h defines PT_REGS_PARM1..5 only; x86_64's 6th arg is r9. */
+#ifndef PT_REGS_PARM6
+#define PT_REGS_PARM6(x) ((__u64)(x)->r9)
+#endif
+
 /* ── Event structure (80 bytes) ──────────────────────────────── */
 struct merge_trace_event {
 	u64 timestamp;    /* bpf_ktime_get_ns() — TSC nanoseconds  */
