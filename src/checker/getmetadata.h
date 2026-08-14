@@ -118,7 +118,7 @@ int file_xattr(int file_type, char *fn) {
       break;
     cur_len +=
         snprintf(xattr_buf + cur_len, XATTR_BUF_LEN - cur_len, "%s:", name);
-    if (copy_len > XATTR_BUF_LEN - 1 - cur_len)
+    if ((int)copy_len > XATTR_BUF_LEN - 1 - cur_len)
       copy_len = XATTR_BUF_LEN - 1 - cur_len; // never overflow xattr_buf
     memcpy(xattr_buf + cur_len, value_buf, copy_len);
     cur_len += copy_len;

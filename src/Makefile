@@ -389,7 +389,8 @@ test: descriptions
 	$(GO) test -short -coverprofile=.coverage.txt ./...
 
 clean:
-	rm -rf ./bin .descriptions executor/defs.h executor/syscalls.h
+	rm -rf ./bin .descriptions executor/defs.h executor/syscalls.h \
+		executor/hmdfs_trace.skel.h executor/hmdfs_trace.bpf.o
 	find sys/*/gen -type f -not -name empty.go -delete
 
 # For a tupical Ubuntu/Debian distribution.

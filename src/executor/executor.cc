@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string>
 #include <string.h>
 #include <sys/ipc.h>
 #include <sys/mount.h>
@@ -580,7 +581,7 @@ int main(int argc, char **argv) {
 
   snprintf(mnt_dir, 100, "/root/%s-client", dfs_name);
   if(!strcmp(dfs_name, "hmdfs")) {
-    snprintf(mnt_dir, 100, "/mnt/hmdfs/100/non_account", dfs_name);
+    snprintf(mnt_dir, 100, "/mnt/hmdfs/100/non_account");
   }
 
   if (!strcmp(dfs_name, "nfs") || !strcmp(dfs_name, "hmdfs") ||
@@ -609,7 +610,7 @@ int main(int argc, char **argv) {
   // kInFd, 0) != &input_data[0])
   input_data =
       (char *)mmap(0, kMaxInput, PROT_READ | PROT_WRITE, MAP_SHARED, kInFd, 0);
-  if (input_data < 0) {
+  if (input_data == MAP_FAILED) {
     fail("mmap of input file failed");
   }
   execCtl = ((struct executeControl *)input_data);
@@ -618,7 +619,7 @@ int main(int argc, char **argv) {
   kOrderFd = open("/sys/bus/pci/devices/0000:00:11.0/resource2", O_RDWR);
   uint8 *callOrderCtlOrg = (uint8 *)mmap(0, 1024 * 4, PROT_READ | PROT_WRITE,
                                          MAP_SHARED, kOrderFd, 0);
-  if (callOrderCtlOrg < 0)
+  if (callOrderCtlOrg == MAP_FAILED)
     fail("mmap of lock control file failed");
   callOrderCtl = (struct callOrderControl *)callOrderCtlOrg;
   callOrders = callOrderCtlOrg + sizeof(struct callOrderControl);
@@ -638,7 +639,7 @@ int main(int argc, char **argv) {
   // kOutFd, 0); if (output_data != preferred)
   output_data_org = (uint8 *)mmap(0, kMaxOutput, PROT_READ | PROT_WRITE,
                                   MAP_SHARED, kOutFd, 0);
-  if (output_data_org < 0) {
+  if (output_data_org == MAP_FAILED) {
     fail("mmap of output file failed");
   }
   output_ctl_pos = (struct outputControl *)output_data_org;
@@ -809,6 +810,7 @@ numbers
 }
 */
 
+static bool is_valid_path(const char *path) __attribute__((unused));
 static bool is_valid_path(const char *path) {
     // 检查路径是否有效
     if (!path) return false;
@@ -2237,7 +2239,7 @@ void write_call_output(thread_t *th, bool finished, cover_t *usp_covers) {
   // fprintf(stderr, "th->call_num: %d, th->args: %p, call1->call: %p\n",
   //        syscalls[th->call_num].sys_nr, th->args, call1->call);
   // Not pseudo syscall and not the last coverage collection from servers
-  if (call1->call == NULL && th->args != NULL) {
+  if (call1->call == NULL) {
     switch (syscalls[th->call_num].sys_nr) {
     case 0:  // read     (0)
     case 17: // pread64  (17)

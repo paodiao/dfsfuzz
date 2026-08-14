@@ -4782,6 +4782,7 @@ retry:
   return true;
 }
 
+static bool empty_dir(const char *dir) __attribute__((unused));
 static bool empty_dir(const char *dir) {
   DIR *dp = opendir(dir);
   if (dp == NULL) {

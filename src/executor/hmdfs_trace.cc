@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <cstdint>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,6 +63,8 @@ struct perf_state {
 static struct perf_state wb_perf;
 /* ── Executor output helpers (provided by executor.cc) ──────── */
 
+typedef unsigned int uint32;
+
 extern uint32 *write_output(uint32 v);
 extern uint32 *write_output_64(uint64 v);
 extern uint64_t tsc_ns_to_global(uint64_t ns);
@@ -72,6 +75,7 @@ static struct hmdfs_event collected[MAX_HMDFS_TRACE_EVENTS];
 static int collected_count;
 
 /* ── Ring buffer callback (BPF kretprobe events) ─────────────── */
+static int handle_event(void *ctx, void *data, size_t data_sz) __attribute__((unused));
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	if (collected_count >= MAX_HMDFS_TRACE_EVENTS)
@@ -195,6 +199,7 @@ static int open_wb_tracepoint(struct perf_state *ps)
 	return 0;
 }
 
+static void close_wb_tracepoint(struct perf_state *ps) __attribute__((unused));
 static void close_wb_tracepoint(struct perf_state *ps)
 {
 	/* reserved for executor shutdown cleanup — not currently called;
