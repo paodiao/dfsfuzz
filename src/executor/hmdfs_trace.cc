@@ -64,6 +64,7 @@ static struct perf_state wb_perf;
 /* ── Executor output helpers (provided by executor.cc) ──────── */
 
 typedef unsigned int uint32;
+typedef unsigned long long uint64;
 
 extern uint32 *write_output(uint32 v);
 extern uint32 *write_output_64(uint64 v);
