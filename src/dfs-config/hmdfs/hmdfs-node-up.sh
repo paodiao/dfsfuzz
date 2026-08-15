@@ -15,7 +15,6 @@ CACHE_DIR="/data/service/el2/100/cache"
 # 检查是否已挂载
 if ! mount | grep -q "$MOUNT_POINT "; then
     echo "need mount"
-    mkdir -p "$CACHE_DIR"
     mount -t hmdfs -o merge,local_dst="$MOUNT_POINT",cache_dir="$CACHE_DIR" "$SOURCE_DIR" "$MOUNT_POINT"
     
     # 再次检查挂载是否成功

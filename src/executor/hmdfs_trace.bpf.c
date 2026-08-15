@@ -162,12 +162,12 @@ DEFINE_MERGE_KRETPROBE(unlink_merge, FUNC_UNLINK_MERGE, ({
 }));
 
 /*
- * Rename — inode from the renamed file itself (old_dentry).
- * PTR2 = old_dentry*  →  d_inode  →  i_ino
+ * Rename — inode from the old parent directory (idmap occupies PARM1,
+ * so PARM2 is old_dir* — the parent inode, not the renamed entry).
  */
 DEFINE_MERGE_KRETPROBE(rename_merge, FUNC_RENAME_MERGE, ({
-	struct dentry *de = (struct dentry *)PT_REGS_PARM2(ctx);
-	BPF_CORE_READ(de, d_inode, i_ino);
+	struct inode *d = (struct inode *)PT_REGS_PARM2(ctx);
+	BPF_CORE_READ(d, i_ino);
 }));
 
 /*
