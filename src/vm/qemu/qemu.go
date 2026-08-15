@@ -600,10 +600,12 @@ func (inst *instance) boot(index int) error {
 	} else if inst.image != "" {
 		if inst.cfg.DFSName == "hmdfs" {
 			// cfg 的 image 是模板名——按 VM index 补全：hmdfs.img → hmdfs<index>.img
-			dir, base := filepath.Split(inst.image)
+			// mgrconfig 重拼后 image 带尾分号（多镜像约定）——模板名场景去掉
+			image := strings.TrimSuffix(inst.image, ";")
+			dir, base := filepath.Split(image)
 			ext := filepath.Ext(base)
 			stem := strings.TrimSuffix(base, ext)
-			image := filepath.Join(dir, fmt.Sprintf("%s%d%s", stem, index, ext))
+			image = filepath.Join(dir, fmt.Sprintf("%s%d%s", stem, index, ext))
 			// 只有主镜像：image_device 模板（默认 "-hda <镜像>"——root=/dev/sda 匹配）
 			imgline := strings.Split(inst.cfg.ImageDevice, " ")
 			imgline[0] = "-" + imgline[0]
