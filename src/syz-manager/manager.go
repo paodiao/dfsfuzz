@@ -244,8 +244,9 @@ func RunManager(cfg *mgrconfig.Config) {
 			f.Sync()
 			times += 1
 
-			log.Logf(0, "executed %v, cliCover %v, srvCover %v, cliSignal %v, srvSignal %v/%v, failSignal %v, crashes %v, http://%v",
+			log.Logf(0, "executed %v, cliCover %v, srvCover %v, cliSignal %v, srvSignal %v/%v, failSignal %v, dagPairs %v, dagSched %v, dagCorpus %v, crashes %v, http://%v",
 				executed, corpusCliCover, corpusSrvCover, corpusCliSignal, corpusSrvSignal, maxSignal, corpusFailSignal,
+				mgr.stats.getNamed("dag pair signal"), mgr.stats.getNamed("dag schedule signal"), mgr.stats.getNamed("dag corpus"),
 				crashes, cfg.HTTP)
 		}
 	}()

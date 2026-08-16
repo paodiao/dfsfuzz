@@ -127,3 +127,11 @@ func (s *Stat) add(v int) {
 func (s *Stat) set(v int) {
 	atomic.StoreUint64((*uint64)(s), uint64(v))
 }
+
+// getNamed returns the accumulated value of a fuzzer-reported named stat
+// (e.g. "dag pair signal"), 0 when the fuzzer never reported it.
+func (stats *Stats) getNamed(key string) uint64 {
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	return stats.namedStats[key]
+}
