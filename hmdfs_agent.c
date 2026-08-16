@@ -1489,6 +1489,7 @@ int parse_config_cmd(const char *cmd_line) {
     
     unsigned char local_ip_bytes[4];
     memcpy(local_ip_bytes, init_ip_bytes, 4);
+    local_ip_bytes[3] += local_idx;
     
     struct in_addr local_addr;
     memcpy(&local_addr.s_addr, local_ip_bytes, 4);
@@ -1530,7 +1531,7 @@ int parse_config_cmd(const char *cmd_line) {
         
         unsigned char remote_ip_bytes[4];
         memcpy(remote_ip_bytes, init_ip_bytes, 4);
-        remote_ip_bytes[3] += (i - local_idx);
+        remote_ip_bytes[3] += i;
         
         struct in_addr remote_addr;
         memcpy(&remote_addr.s_addr, remote_ip_bytes, 4);

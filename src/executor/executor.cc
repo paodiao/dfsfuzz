@@ -572,7 +572,7 @@ int main(int argc, char **argv) {
   enable_csan = !strcmp(argv[13], "true") ? 1 : 0;
   enable_c2san = !strcmp(argv[14], "true") ? 1 : 0;
   tsc_offset = atoll(argv[15]);
-  metadata_delay_ms = atoi(argv[16]);
+  metadata_delay_ms = argv[16] ? atoi(argv[16]) : 0;
   fprintf(stderr, "executor %lld tsc_offset %lld", executor_index, tsc_offset);
 
   calibrate_tsc();

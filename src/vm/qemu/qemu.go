@@ -884,6 +884,11 @@ func (inst *instance) GenExecutorCmd(command string) (string, string, error) {
 				if err != nil {
 					return "", "", err
 				}
+				// The sysfs file ends with a newline; strip it, otherwise the
+				// TSCOFF value leaks a newline into the executor command line
+				// and bash splits argv[16] (metadata_delay_ms) off as a
+				// separate command.
+				tscOffset = []byte(strings.TrimSpace(string(tscOffset)))
 				//
 				return executorCmd, string(tscOffset), nil
 			}
