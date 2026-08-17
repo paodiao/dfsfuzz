@@ -584,7 +584,7 @@ TRACE_EVENT(hmdfs_do_readpages_cloud_end,
 		__entry->ret = ret;
 	),
 
-	TP_printk("cnt:%d, pos:%llx",
+	TP_printk("cnt:%d, pos:%llx, ret:%d",
 		  __entry->cnt, __entry->pos, __entry->ret)
 );
 
