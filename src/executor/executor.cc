@@ -959,6 +959,40 @@ void *trace_dmesg_log(void *arg) {
   }
 }
 
+// Wait until the hmdfs agent has finished starting up (hmdfs-specific).
+// The agent runs in the background (nohup ... & in hmdfs-node-up.sh /
+// hmdfs-config.sh), so we poll its log file for the startup-complete marker
+// "open cmd file success" (printed by sysfs_checker_thread_func, the last
+// agent thread to initialize). The scripts rm -f the log first, so every
+// line in the file belongs to the current agent start; reading from the
+// beginning never skips fresh output and cannot match a stale marker.
+static void wait_hmdfs_agent_ready() {
+  if (strcmp(dfs_name, "hmdfs"))
+    return;
+  const char *agent_log = "/home/hmdfs_agent/hmdfs_agent.log";
+  bool ready = false;
+  for (int i = 0; i < 300; i++) { // up to 30s
+    FILE *lf = fopen(agent_log, "r");
+    if (lf) {
+      char line[512];
+      while (fgets(line, sizeof(line), lf)) {
+        if (strstr(line, "open cmd file success")) {
+          ready = true;
+          break;
+        }
+      }
+      fclose(lf);
+      if (ready)
+        break;
+    }
+    usleep(100000);
+  }
+#if MDEBUG
+  fprintf(stderr, "executor %lld hmdfs agent ready: %d\n", executor_index,
+          ready);
+#endif
+}
+
 void reconfigure_dfs() {
 
 // wait servers before current node are already setupped
@@ -1000,6 +1034,10 @@ void reconfigure_dfs() {
 #endif
       pclose(cmd);
     }
+
+    // Agent (hmdfs) was started in the background by the script; wait for it
+    // to finish starting before telling other nodes we are reconfigured.
+    wait_hmdfs_agent_ready();
 
     // Tell other nodes we finished reconfiguration.
     uint64_t mask = ~(((uint64_t)1) << executor_index);
@@ -1186,6 +1224,10 @@ void receive_handshake() {
       pclose(cmd);
     }
   }
+
+  // Agent (hmdfs) was started in the background by the config script; wait
+  // for it to finish starting before the fuzzer begins executing programs.
+  wait_hmdfs_agent_ready();
 
   // change to work dir
   // server:/root, client:/root/dfs-client

@@ -28,4 +28,8 @@ else
     echo "already mounted"
 fi
 
-/home/hmdfs_agent/hmdfs_agent node_num="$node_cnt" init_ip="$start_ip" local_idx="$cur_idx" cids="$cids" port=12345 mount_point="$MOUNT_POINT" log_file=/home/hmdfs_agent/hmdfs_agent.log
+# 清空旧日志：确保 executor 的就绪轮询只看到本次启动的输出
+rm -f /home/hmdfs_agent/hmdfs_agent.log
+# 后台启动 agent（常驻服务）：脚本必须立即返回，否则 executor 的
+# popen/pclose 会永久阻塞（见 executor.cc receive_handshake）
+nohup /home/hmdfs_agent/hmdfs_agent node_num="$node_cnt" init_ip="$start_ip" local_idx="$cur_idx" cids="$cids" port=12345 mount_point="$MOUNT_POINT" log_file=/home/hmdfs_agent/hmdfs_agent.log > /dev/null 2>&1 &
