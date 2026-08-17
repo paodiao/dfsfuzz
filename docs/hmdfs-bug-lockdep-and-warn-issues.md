@@ -131,12 +131,18 @@ hmdfs_server_readdir → hmdfs_server_rebuild_dents → iterate_dir（持 i_mute
 
 ### 改动点（已实施）
 
-`hmdfs_server_rebuild_dents`（hmdfs_server.c:1487-1544）在 `iterate_dir`（:1521）前获取 `mnt_want_write(dentry_file->f_path.mnt)`，`iterate_dir` 返回后 `mnt_drop_write`：
+`hmdfs_server_rebuild_dents`（hmdfs_server.c:1487-1560）在 `iterate_dir`（:1537）前获取 `mnt_want_write(dentry_file->f_path.mnt)`，`iterate_dir` 返回后 `mnt_drop_write`：
 
 - 锁序变为 `sb_writers → i_mutex_dir`，与 openat 同向 → **环消除**
 - `mnt_want_write` 可嵌套（per-cpu 计数）→ filldir 内 `vfs_truncate` 的嵌套 `mnt_want_write` 安全
 - 错误路径：`mnt_want_write` 失败 → `goto out`；`iterate_dir` 失败 → drop 后 `goto out`
 - `write_header` 在 drop 后执行（`kernel_write` 不取 sb_writers，与原行为一致）
+
+### 补充（2026-08-17 fuzz 实测）：recursive sb_writers → novalidate
+
+外层 `mnt_want_write` 使 `vfs_truncate` 内再次获取**同一把** sb_writers → lockdep 报 `possible recursive locking detected`（非 circular——**环已消除**，转为同线程嵌套误报），`panic_on_warn` 下 panic，fuzz 仍每 ~30s 重启。
+
+lockdep 无"sb_writers 合法嵌套"概念，但嵌套 per-cpu 读锁**运行时无害**。处理：`hmdfs_fill_super`（main.c）挂载时对该 sb 的 `SB_FREEZE_WRITE` 层执行 `lockdep_set_novalidate_class`——**仅关闭该 sb 该层锁的 lockdep 校验**（冻结计数语义不变），功能修复（外层 want_write）保留，运行时锁序 `sb_writers → i_mutex_dir` 与 openat 同向，无实际死锁。
 
 ---
 
@@ -175,6 +181,62 @@ iptables DROP（静默丢包，TCP 连接不快速断开——无 RST/FIN）
 
 ---
 
+## 问题 ⑤：merge_view lookup 竞态/UAF（ENOENT + merge_lookup mutex WARN）
+
+**状态：✅ 已修复**（`hmdfs/inode_merge.c` + `hmdfs/hmdfs_merge_view.h`，待编译验证）
+
+### 现象（2026-08-17 20:36 运行，两个独立表现）
+
+```
+A. SYZFAIL: executor 0: opendir /mnt/hmdfs/100/non_account/merge_view
+   failed No such file or directory (errno 2)          ← merge_view 根 lookup 失败
+B. DEBUG_LOCKS_WARN_ON(__owner_task(owner) != get_current())
+   WARNING: CPU: 1 PID: 5153 at kernel/locking/mutex.c:918
+   __mutex_unlock_slowpath ... merge_lookup_work_func+0x1ef
+```
+
+### 根因（hmdfs 原生缺陷，被 lookup_merge_root 异步化放大）
+
+`merge_lookup_async`（inode_merge.c）两处设计缺陷：
+
+1. **`++work_count` 在 `schedule_work` 之后**：work 可能在另一 CPU 立即运行并 `--work_count`（work_lock 内），先于调用者的 `++` → 计数提前归零/变负 → `is_merge_lookup_end`（`work_count==0 || list_empty`）立即为真 → `wait_event` 提前返回 → comrade_list 尚未 link → `lookup_merge_root` 返回 **-ENOENT** → merge_view 根目录创建失败 → 所有 merge_view 操作 ENOENT → SYZFAIL（现象 A）。
+2. **work 无 dentry/mdi 引用保护**：work 只持 `&mdi->wait_queue` 指针；mdi 挂于 `dentry->d_fsdata`，dentry 释放时 `d_release_merge` 直接 `kmem_cache_free(mdi)`（dentry.c:338）。fuzz 高频 create/rmdir/unlink + 断网 → dentry 快速消亡 → work 仍运行在已释放 mdi 上 → `work_lock` 状态错乱 → `mutex_unlock` owner 不符 → WARN + 崩溃（现象 B）。
+
+### 改动点（已实施）
+
+- `merge_lookup_async`：**`++work_count` 移到 `schedule_work` 之前**（++/-- 均在 work_lock 下互斥，配对成立）→ wait_event 不再提前返回 → ENOENT 消失
+- `merge_lookup_work` 增加 `struct dentry *dentry` 字段；async 内 `dget(dentry)`，work 结束 `dput(dentry)` → **mdi 生命周期与 work 绑定** → UAF 消除
+- `merge_lookup_work_func`：**`mutex_unlock(work_lock)` 移到 `wake_up_all` 之前** → 唤醒者重入（新 lookup/create）时锁已释放，减少竞争窗口
+- 4 个调用点（lookup_merge_normal ×2、lookup_merge_root ×2）传目标 dentry
+
+---
+
+## 问题 ⑥：`held lock freed`（connection_put 持锁释放 conn）
+
+**状态：✅ 已修复**（`hmdfs/comm/connection.c`，待编译验证）
+
+### 现象（2026-08-17 20:38 运行）
+
+```
+WARNING: held lock freed!
+dfs_rcv1_1_5/9599 is freeing memory ffff88801d2f4400-ffff88801d2f45ff,
+with a lock still held there!
+&tcp_conn->ref_lock at refcount_dec_and_mutex_lock+0x51
+connection_put → __kmem_cache_free → tcp_recv_thread+0x1c9
+```
+
+### 根因
+
+`connection_put`（connection.c:820）用 `kref_put_mutex(&conn->ref_cnt, connection_release, &conn->ref_lock)`——**持 ref_lock 调用 release** 且 `kref_put_mutex` 自身**从不解锁**（release 负责解锁）。而 `connection_release`（:744-786）直接 `kfree(conn)` → **释放包含仍被持有 mutex（ref_lock）的内存** → `debug_check_no_locks_freed` WARN。锁本身随内存释放**永久泄漏**。
+
+触发路径：`tcp_recv_thread` 退出（transport.c:642）——连接 RST 后（`tcp recv error -104`；由 `syz_failure_net_down` iptables DROP / agent 重连制造）。此前 fuzz 每 ~30s 崩于 ③ 掩盖了此路径。
+
+### 改动点（已实施）
+
+`connection_release` 在 `kfree(conn)` 前 **`mutex_unlock(&conn->ref_lock)`**（kref_put_mutex 标准配套）。已验证安全性：`conn->close`(=tcp_stop_connect) 为空函数、list 操作用独立锁 `node->conn_impl_list_lock`、`kfree(tcp)` 独立分配。
+
+---
+
 ## 附录：挂载配置分析
 
 ### `local_dst` 语义（代码证据）
@@ -205,9 +267,14 @@ mount -t hmdfs -o merge,local_dst="/mnt/hmdfs/100/non_account" \
 
 | 文件 | 行号 | 说明 |
 | --- | --- | --- |
-| `hmdfs/inode_merge.c` | :588-638 | `lookup_merge_root`（① 已异步化） |
+| `hmdfs/inode_merge.c` | :606-654 | `lookup_merge_root`（① 已异步化） |
 | `hmdfs/hmdfs_merge_view.h` | :167-190 | `has_merge_lookup_work`/`is_merge_lookup_end`（② 已无锁化） |
-| `hmdfs/hmdfs_server.c` | :1487-1544 | `hmdfs_server_rebuild_dents`（③ 锁序环位置） |
+| `hmdfs/hmdfs_server.c` | :1487-1560 | `hmdfs_server_rebuild_dents`（③ 锁序环位置） |
+| `hmdfs/main.c` | :902-903 | ③ novalidate sb_writers（fill_super） |
+| `hmdfs/inode_merge.c` | :444-481 | `merge_lookup_async`（⑤ ++/schedule 顺序 + dget） |
+| `hmdfs/inode_merge.c` | :395-442 | `merge_lookup_work_func`（⑤ wake 后置 + dput） |
+| `hmdfs/hmdfs_merge_view.h` | :24-39 | `struct merge_lookup_work`（⑤ 加 dentry 字段） |
+| `hmdfs/comm/connection.c` | :744-790 | `connection_release`（⑥ unlock ref_lock） |
 | `hmdfs/hmdfs_client.c` | :341-346 | `WARN_ON(ret == -ETIME)`（④ 位置） |
 | `hmdfs/comm/socket_adapter.c` | :480-493 | 请求超时 → -ETIME |
 | `hmdfs/main.c` | :689 | F_WRITEPAGE 超时 = TIMEOUT_COMMON = 4s |

@@ -775,6 +775,13 @@ static void connection_release(struct kref *ref)
 	}
 
 	kfree(tcp);
+	/*
+	 * kref_put_mutex() calls this release with &conn->ref_lock held and
+	 * never releases it itself. Unlock before freeing conn, otherwise
+	 * the lock (embedded in conn) is still reported as held when the
+	 * slab is released -> "held lock freed" warning (DEBUG_LOCK_ALLOC).
+	 */
+	mutex_unlock(&conn->ref_lock);
 	kfree(conn);
 }
 

@@ -398,6 +398,7 @@ static void merge_lookup_work_func(struct work_struct *work)
 	struct hmdfs_dentry_comrade *comrade;
 	struct hmdfs_dentry_info_merge *mdi;
 	int found = false;
+	bool wake = false;
 	
 	ml_work = container_of(work, struct merge_lookup_work, work);
 	mdi = container_of(ml_work->wait_queue,	struct hmdfs_dentry_info_merge,
@@ -424,17 +425,25 @@ static void merge_lookup_work_func(struct work_struct *work)
 
 out:
 	if (--mdi->work_count == 0 || found)
-		wake_up_all(ml_work->wait_queue);
+		wake = true;
+	/*
+	 * Unlock before waking: the waiter re-enters the lookup path on the
+	 * same mdi (new merge_lookup_async / create paths), so it must not
+	 * wake up while work_lock is still held.
+	 */
 	mutex_unlock(&mdi->work_lock);
+	if (wake)
+		wake_up_all(ml_work->wait_queue);
 
 	trace_hmdfs_merge_lookup_work_exit(ml_work, found);
 	kfree(ml_work->name);
+	dput(ml_work->dentry);
 	kfree(ml_work);
 }
 
 int merge_lookup_async(struct hmdfs_dentry_info_merge *mdi,
 	struct hmdfs_sb_info *sbi, int devid, const char *name,
-	unsigned int flags)
+	unsigned int flags, struct dentry *dentry)
 {
 	int err = -ENOMEM;
 	struct merge_lookup_work *ml_work;
@@ -453,10 +462,19 @@ int merge_lookup_async(struct hmdfs_dentry_info_merge *mdi,
 	ml_work->flags = flags;
 	ml_work->sbi = sbi;
 	ml_work->wait_queue = &mdi->wait_queue;
+	/*
+	 * Increment work_count before scheduling: the worker decrements it
+	 * under work_lock, while the callers (lookup_merge_root/normal) do
+	 * the increment while holding work_lock. Scheduling first would let
+	 * the worker run and decrement before the increment, making the
+	 * count hit zero early and wake wait_event() before the lookup
+	 * results are linked -> spurious -ENOENT on merge_view.
+	 */
+	++mdi->work_count;
+	ml_work->dentry = dget(dentry);
 	INIT_WORK(&ml_work->work, merge_lookup_work_func);
 
 	schedule_work(&ml_work->work);
-	++mdi->work_count;
 	err = 0;
 out:
 	return err;
@@ -510,7 +528,7 @@ static int lookup_merge_normal(struct dentry *dentry, unsigned int flags)
 	if (mdi->type != DT_REG || devid == 0) {
 		snprintf(cpath, PATH_MAX, "device_view/local%s/%s", ppath,
 			rname);
-		err = merge_lookup_async(mdi, sbi, 0, cpath, flags);
+		err = merge_lookup_async(mdi, sbi, 0, cpath, flags, dentry);
 		if (err)
 			hmdfs_err("failed to create local lookup work");
 	}
@@ -521,7 +539,7 @@ static int lookup_merge_normal(struct dentry *dentry, unsigned int flags)
 		snprintf(cpath, PATH_MAX, "device_view/%s%s/%s", peer->cid,
 			ppath, rname);
 		err = merge_lookup_async(mdi, sbi, peer->device_id, cpath,
-			flags);
+			flags, dentry);
 		if (err)
 			hmdfs_err("failed to create remote lookup work");
 	}
@@ -613,7 +631,8 @@ static int lookup_merge_root(struct inode *root_inode __maybe_unused,
 
 	/* lookup real_dst/device_view/local */
 	snprintf(cpath, PATH_MAX, DEVICE_VIEW_ROOT "/" DEVICE_VIEW_LOCAL);
-	err = merge_lookup_async(mdi, sbi, HMDFS_DEVID_LOCAL, cpath, flags);
+	err = merge_lookup_async(mdi, sbi, HMDFS_DEVID_LOCAL, cpath, flags,
+		child_dentry);
 	if (err)
 		hmdfs_err("failed to create local lookup work");
 
@@ -621,7 +640,7 @@ static int lookup_merge_root(struct inode *root_inode __maybe_unused,
 	list_for_each_entry(peer, &sbi->connections.node_list, list) {
 		snprintf(cpath, PATH_MAX, DEVICE_VIEW_ROOT "/%s", peer->cid);
 		err = merge_lookup_async(mdi, sbi, peer->device_id, cpath,
-			flags);
+			flags, child_dentry);
 		if (err)
 			hmdfs_err("failed to create remote lookup work");
 	}

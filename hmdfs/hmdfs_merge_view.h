@@ -27,6 +27,13 @@ struct merge_lookup_work {
 	unsigned int flags;
 	struct hmdfs_sb_info *sbi;
 	wait_queue_head_t *wait_queue;
+	/*
+	 * Reference on the dentry whose hmdfs_dentry_info_merge owns
+	 * wait_queue: the work may outlive the lookup context (it runs on
+	 * the system workqueue), so holding this reference keeps the mdi
+	 * alive until the work finishes.
+	 */
+	struct dentry *dentry;
 	struct work_struct work;
 };
 
@@ -119,7 +126,8 @@ struct hmdfs_dentry_comrade *lookup_comrade(struct path lower_path,
 bool is_valid_comrade(struct hmdfs_dentry_info_merge *mdi, umode_t mode);
 int merge_lookup_async(struct hmdfs_dentry_info_merge *mdi,
 		       struct hmdfs_sb_info *sbi, int devid,
-		       const char *name, unsigned int flags);
+		       const char *name, unsigned int flags,
+		       struct dentry *dentry);
 char *hmdfs_get_real_dname(struct dentry *dentry, int *devid, int *type);
 void lock_root_inode_shared(struct inode *root, bool *locked, bool *down);
 void restore_root_inode_sem(struct inode *root, bool locked, bool down);

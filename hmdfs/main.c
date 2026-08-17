@@ -9,6 +9,7 @@
 #include "hmdfs.h"
 
 #include <linux/ctype.h>
+#include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/statfs.h>
 #include <linux/xattr.h>
@@ -886,6 +887,20 @@ static int hmdfs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_magic = HMDFS_SUPER_MAGIC;
 	sb->s_xattr = hmdfs_xattr_handlers;
 	sb->s_op = &hmdfs_sops;
+
+	/*
+	 * hmdfs_server_rebuild_dents() takes mnt_want_write() before
+	 * iterate_dir() so that the filldir callback (create_dentry ->
+	 * cache_file_truncate -> vfs_truncate) nests mnt_wait_write on the
+	 * same sb_writers. That ordering is intentional and lock-safe
+	 * (mnt_want_write is a nestable per-cpu read lock), but lockdep has
+	 * no notion of legal nesting for sb_writers and reports a "possible
+	 * recursive locking" warning. Exclude this sb's SB_FREEZE_WRITE
+	 * rwsem from lockdep validation; the freeze counter semantics are
+	 * unchanged.
+	 */
+	lockdep_set_novalidate_class(
+		&sb->s_writers.rw_sem[SB_FREEZE_WRITE].dep_map);
 
 	sbi->boot_cookie = hmdfs_gen_boot_cookie();
 
