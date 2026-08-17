@@ -1059,13 +1059,17 @@ void HandleAllNotify(int fd) {
                     for (int i = 0; i < g_config.node_count; i++) {
                         remote_node *node = &g_config.nodes[i];
                         pthread_mutex_lock(&g_device_mutex);
-					if (node->status == DEVICE_STATUS_ONLINE || node->status == DEVICE_STATUS_CONNECTED) { // 只连接在线节点
-						if (node->fd != -1) { // 已有连接则跳过，避免重复连接
-							pthread_mutex_unlock(&g_device_mutex);
-							continue;
-						}
-						// 建立到远程节点的连接
-						int remote_fd = connect_to_remote_node(node);
+                        // 连接真实存活则跳过；stale fd 先清理再重连
+                        if (node->fd != -1 && socketConnected(node->fd) == 1) {
+                            pthread_mutex_unlock(&g_device_mutex);
+                            continue;
+                        }
+                        if (node->fd != -1) { // stale fd, 清理后重连
+                            close(node->fd);
+                            node->fd = -1;
+                        }
+                        // 建立到远程节点的连接
+                        int remote_fd = connect_to_remote_node(node);
                             if (remote_fd >= 0) {
                                 // 准备更新套接字命令
                                 memset(&cmd, 0, sizeof(cmd));
@@ -1086,7 +1090,6 @@ void HandleAllNotify(int fd) {
                                     update_device_status(node, DEVICE_STATUS_CONNECTED);
                                 }
                             }
-                        }
                         pthread_mutex_unlock(&g_device_mutex);
                     }
                 } else {
@@ -1094,10 +1097,16 @@ void HandleAllNotify(int fd) {
                     remote_node *node = find_remote_node(cid_str);
                 
                     if (node) {
-                        if (node->fd != -1) { // 已有连接则跳过，避免重复连接
+                        pthread_mutex_lock(&g_device_mutex);
+                        // 连接真实存活则跳过；stale fd 先清理再重连
+                        if (node->fd != -1 && socketConnected(node->fd) == 1) {
+                            pthread_mutex_unlock(&g_device_mutex);
                             log_message(LOG_LEVEL_INFO, "Node %s already connected, skip", node->cid);
                         } else {
-                            pthread_mutex_lock(&g_device_mutex);
+                            if (node->fd != -1) { // stale fd, 清理后重连
+                                close(node->fd);
+                                node->fd = -1;
+                            }
                             // 建立到远程节点的连接
                             int remote_fd = connect_to_remote_node(node);
                             if (remote_fd >= 0) {
@@ -1182,13 +1191,17 @@ void handle_hmdfs_notify(void) {
                 for (int i = 0; i < g_config.node_count; i++) {
                     remote_node *node = &g_config.nodes[i];
                     pthread_mutex_lock(&g_device_mutex);
-			if (node->status == DEVICE_STATUS_ONLINE || node->status == DEVICE_STATUS_CONNECTED) { // 只连接在线节点
-				if (node->fd != -1) { // 已有连接则跳过，避免重复连接
-					pthread_mutex_unlock(&g_device_mutex);
-					continue;
-				}
-				// 建立到远程节点的连接
-				int remote_fd = connect_to_remote_node(node);
+                    // 连接真实存活则跳过；stale fd 先清理再重连
+                    if (node->fd != -1 && socketConnected(node->fd) == 1) {
+                        pthread_mutex_unlock(&g_device_mutex);
+                        continue;
+                    }
+                    if (node->fd != -1) { // stale fd, 清理后重连
+                        close(node->fd);
+                        node->fd = -1;
+                    }
+                    // 建立到远程节点的连接
+                    int remote_fd = connect_to_remote_node(node);
                         if (remote_fd >= 0) {
                             // 准备更新套接字命令
                             memset(&cmd, 0, sizeof(cmd));
@@ -1209,7 +1222,6 @@ void handle_hmdfs_notify(void) {
                                 update_device_status(node, DEVICE_STATUS_CONNECTED);
                             }
                         }
-                    }
                     pthread_mutex_unlock(&g_device_mutex);
                 }
             } else {
@@ -1217,10 +1229,16 @@ void handle_hmdfs_notify(void) {
                 remote_node *node = find_remote_node(cid_str);
                 
                 if (node) {
-                    if (node->fd != -1) { // 已有连接则跳过，避免重复连接
+                    pthread_mutex_lock(&g_device_mutex);
+                    // 连接真实存活则跳过；stale fd 先清理再重连
+                    if (node->fd != -1 && socketConnected(node->fd) == 1) {
+                        pthread_mutex_unlock(&g_device_mutex);
                         log_message(LOG_LEVEL_INFO, "Node %s already connected, skip", node->cid);
                     } else {
-                        pthread_mutex_lock(&g_device_mutex);
+                        if (node->fd != -1) { // stale fd, 清理后重连
+                            close(node->fd);
+                            node->fd = -1;
+                        }
                         // 建立到远程节点的连接
                         int remote_fd = connect_to_remote_node(node);
                         if (remote_fd >= 0) {
@@ -1840,6 +1858,11 @@ void *connector_thread_func(void *arg) {
 }
 
 // 定期检查连接状态并下线设备
+// DISABLED: 该线程在 main() 中未创建。原因：socket fd 已通过 UPDATE_SOCKET 移交给
+// HMDFS 内核模块，agent 与内核共享同一 socket；此处基于 TCP_INFO 的轮询会在连接
+// 建立/竞态下误判离线，并主动发送 CMD_OFF_LINE 给内核，引发断开-重连风暴并反复
+// 触发内核 connection_put 的 held lock freed（UAF）。断开检测由内核 recv 线程
+// 退出后的 NOTIFY_GET_SESSION 通知驱动（见 HandleAllNotify）。
 void *connect_checker_thread_func(void *arg) {
     while(g_running) {
         for (int i = 0; i < g_config.node_count; i++) {
@@ -2000,10 +2023,14 @@ int main(int argc, char *argv[]) {
     }
     
     // 启动连接检查线程
-    if (pthread_create(&g_connect_checker_thread, NULL, connect_checker_thread_func, NULL) != 0) {
+    // DISABLED: connect_checker_thread_func 会对已移交内核的 fd 做 TCP_INFO 轮询，
+    // 在连接建立/竞态下误判离线并主动发 CMD_OFF_LINE 给内核，引发断开-重连风暴
+    // 并反复触发内核 connection_put 的 held lock freed。断开检测由内核 recv 线程
+    // 退出后的 NOTIFY_GET_SESSION 通知驱动（见 HandleAllNotify），无需用户态轮询。
+    /* if (pthread_create(&g_connect_checker_thread, NULL, connect_checker_thread_func, NULL) != 0) {
         log_message(LOG_LEVEL_ERROR, "Failed to create connect checker thread");
         return 1;
-    }
+    } */
 
     // 启动sysfs监听线程
     if (pthread_create(&g_sysfs_checker_thread, NULL, sysfs_checker_thread_func, NULL) != 0) {
@@ -2015,7 +2042,7 @@ int main(int argc, char *argv[]) {
     pthread_join(g_listener_thread, NULL);
     //pthread_join(g_notify_handler_thread, NULL);
     pthread_join(g_connector_thread, NULL);
-    pthread_join(g_connect_checker_thread, NULL);
+    //pthread_join(g_connect_checker_thread, NULL); // DISABLED: 见上方线程创建处注释
     pthread_join(g_sysfs_checker_thread, NULL);
     
     log_message(LOG_LEVEL_INFO, "HMDFS Agent stopped");
