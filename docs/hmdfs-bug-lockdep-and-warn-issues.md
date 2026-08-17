@@ -102,7 +102,7 @@ __mutex_lock → hmdfs_lookup_merge+0xa22 → lookup_open
 
 ## 问题 ③：`hmdfs_server_rebuild_dents` 锁序环（circular locking）
 
-**状态：✅ 已修复**（`hmdfs/hmdfs_server.c`，待编译验证）
+**状态：✅ 已修复（最终方案，`hmdfs/hmdfs_dentryfile.c`，待编译验证）**
 
 ### 现象
 
@@ -129,20 +129,33 @@ hmdfs_server_readdir → hmdfs_server_rebuild_dents → iterate_dir（持 i_mute
 
 **高频触发，阻塞 fuzz**：syz-manager 每 ~30 秒报 `vm-0: crash: possible deadlock in vfs_truncate`（18:40:48/18:41:28/18:41:57），fuzz 程序首轮 readdir 重建即触发，`executed 0`——**不修 fuzz 无法运行**。原"低概率"假设不成立。
 
-### 改动点（已实施）
+### 修复演进（勿再走回头路）
 
-`hmdfs_server_rebuild_dents`（hmdfs_server.c:1487-1560）在 `iterate_dir`（:1537）前获取 `mnt_want_write(dentry_file->f_path.mnt)`，`iterate_dir` 返回后 `mnt_drop_write`：
+1. **第一轮（已回退）**：`rebuild_dents` 在 `iterate_dir` 前 `mnt_want_write`——环消除但引入**同线程递归获取 sb_writers** → lockdep `possible recursive locking`（实测 #3 内核 ~30s/次仍崩）。
+2. **第二轮（已回退）**：`hmdfs_fill_super` 对 `SB_FREEZE_WRITE` 层 `lockdep_set_novalidate_class`——**无效**：`lockdep_init_map_type` 拒绝覆盖已在 `alloc_super`（`percpu_init_rwsem`）初始化过的 key（只打印 "key is not as annotated" 警告）。实测 #4 内核 recursive 仍每 ~30s 触发。
+3. **最终方案（当前）**：**根因修复**——`cache_file_truncate` 不再用 `vfs_truncate()`（路径级 API，强制 `mnt_want_write`/sb_writers），改用 **`do_truncate()`**（`ftruncate(2)` 语义）：
 
-- 锁序变为 `sb_writers → i_mutex_dir`，与 openat 同向 → **环消除**
-- `mnt_want_write` 可嵌套（per-cpu 计数）→ filldir 内 `vfs_truncate` 的嵌套 `mnt_want_write` 安全
-- 错误路径：`mnt_want_write` 失败 → `goto out`；`iterate_dir` 失败 → drop 后 `goto out`
-- `write_header` 在 drop 后执行（`kernel_write` 不取 sb_writers，与原行为一致）
+```c
+long cache_file_truncate(struct hmdfs_sb_info *sbi, struct file *filp,
+			 loff_t length)
+{
+	const struct cred *old_cred = hmdfs_override_creds(sbi->system_cred);
+	long ret = do_truncate(file_mnt_idmap(filp), filp->f_path.dentry,
+				length, 0, filp);
 
-### 补充（2026-08-17 fuzz 实测）：recursive sb_writers → novalidate
+	hmdfs_revert_creds(old_cred);
+	return ret;
+}
+```
 
-外层 `mnt_want_write` 使 `vfs_truncate` 内再次获取**同一把** sb_writers → lockdep 报 `possible recursive locking detected`（非 circular——**环已消除**，转为同线程嵌套误报），`panic_on_warn` 下 panic，fuzz 仍每 ~30s 重启。
+- `dentry_file` 由调用者 **O_RDWR 打开**（`create_local_dentry_file_cache`）→ 写权限已在 open 时检查 → 与 `ftruncate(2)` 一致**不需要** sb_writers（openEuler 签名：`do_truncate(struct mnt_idmap *, struct dentry *, loff_t, unsigned int, struct file *)`，fs/open.c:40）
+- 修改后 iterate 路径**完全不获取 sb_writers**：`iterate_dir（目录 i_rwsem 读）→ do_truncate → notify_change → inode_lock（文件 i_rwsem 写）`——不同 inode 动态 key、与 openat 同向 → **circular 与 recursive 同时从根源消失，无需任何 lockdep 豁免**
+- 外层 `mnt_want_write` 补丁（hmdfs_server.c）与 novalidate 补丁（main.c）**全部回退**（git 参考：`44e776e` 与 `903c33a`/`f3e2088`/`5b60d3e`）
 
-lockdep 无"sb_writers 合法嵌套"概念，但嵌套 per-cpu 读锁**运行时无害**。处理：`hmdfs_fill_super`（main.c）挂载时对该 sb 的 `SB_FREEZE_WRITE` 层执行 `lockdep_set_novalidate_class`——**仅关闭该 sb 该层锁的 lockdep 校验**（冻结计数语义不变），功能修复（外层 want_write）保留，运行时锁序 `sb_writers → i_mutex_dir` 与 openat 同向，无实际死锁。
+### 残余风险（记录，未处理）
+
+- filldir 的 **DT_LNK 分支**（`hmdfs_lookup_symlink` → `hmdfs_open_link` → `filp_open(O_RDWR)`）仍在 iterate 内取 sb_writers——理论上存在同款环，但 fuzz 目录无 symlink、从未实测触发；若触发，将 `hmdfs_open_link` 改 `O_RDONLY`（读 symlink 内容不需写权限）
+- freeze 语义差异（ftruncate 语义，测试环境无 freeze，无影响）
 
 ---
 
@@ -269,8 +282,9 @@ mount -t hmdfs -o merge,local_dst="/mnt/hmdfs/100/non_account" \
 | --- | --- | --- |
 | `hmdfs/inode_merge.c` | :606-654 | `lookup_merge_root`（① 已异步化） |
 | `hmdfs/hmdfs_merge_view.h` | :167-190 | `has_merge_lookup_work`/`is_merge_lookup_end`（② 已无锁化） |
-| `hmdfs/hmdfs_server.c` | :1487-1560 | `hmdfs_server_rebuild_dents`（③ 锁序环位置） |
-| `hmdfs/main.c` | :902-903 | ③ novalidate sb_writers（fill_super） |
+| `hmdfs/hmdfs_server.c` | :1487-1540 | `hmdfs_server_rebuild_dents`（③ 已回退裸 iterate_dir） |
+| `hmdfs/hmdfs_dentryfile.c` | :1597-1614 | `cache_file_truncate`（③ 最终修复：do_truncate） |
+| `hmdfs/hmdfs_dentryfile.c` | :902-906 | ③ 调用点（传 filp） |
 | `hmdfs/inode_merge.c` | :444-481 | `merge_lookup_async`（⑤ ++/schedule 顺序 + dget） |
 | `hmdfs/inode_merge.c` | :395-442 | `merge_lookup_work_func`（⑤ wake 后置 + dput） |
 | `hmdfs/hmdfs_merge_view.h` | :24-39 | `struct merge_lookup_work`（⑤ 加 dentry 字段） |

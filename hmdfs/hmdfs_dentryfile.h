@@ -281,7 +281,7 @@ int hmdfs_get_path_in_sb(struct super_block *sb, const char *name,
 int hmdfs_wlock_file(struct file *filp, loff_t start, loff_t len);
 int hmdfs_rlock_file(struct file *filp, loff_t start, loff_t len);
 int hmdfs_unlock_file(struct file *filp, loff_t start, loff_t len);
-long cache_file_truncate(struct hmdfs_sb_info *sbi, const struct path *path,
+long cache_file_truncate(struct hmdfs_sb_info *sbi, struct file *filp,
 			 loff_t length);
 ssize_t cache_file_read(struct hmdfs_sb_info *sbi, struct file *filp, void *buf,
 			size_t count, loff_t *pos);
