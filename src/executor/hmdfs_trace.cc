@@ -124,10 +124,10 @@ static int parse_tp_format(const char *event_name, struct tp_field *fields,
 
 		int offset = 0, size = 0;
 		semi[0] = ';'; // restore
-		// sscanf against p (past any leading whitespace the format file
-		// lines start with a tab) and with a leading space in the format
-		// to tolerate any whitespace prefix.
-		if (sscanf(p, " field:%*[^;]; offset:%d; size:%d;",
+		// sscanf against line (it contains the "field:" prefix; p points
+		// past it) with a leading space in the format to skip the tab the
+		// format file lines start with.
+		if (sscanf(line, " field:%*[^;]; offset:%d; size:%d;",
 			   &offset, &size) != 2)
 			continue;
 

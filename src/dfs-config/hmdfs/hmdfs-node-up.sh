@@ -28,4 +28,4 @@ else
     echo "already mounted"
 fi
 
-/home/hmdfs_agent/hmdfs_agent node_num="$node_cnt" init_ip="$start_ip" local_idx="$cur_idx" cids="$cids" port=12345 log_file=/home/hmdfs_agent/hmdfs_agent.log
+/home/hmdfs_agent/hmdfs_agent node_num="$node_cnt" init_ip="$start_ip" local_idx="$cur_idx" cids="$cids" port=12345 mount_point="$MOUNT_POINT" log_file=/home/hmdfs_agent/hmdfs_agent.log

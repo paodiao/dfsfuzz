@@ -1418,6 +1418,7 @@ int parse_config_cmd(const char *cmd_line) {
     int port = 12345;
     char cids[2048] = {0};
     char log_file[256] = {0};
+    char mount_point[256] = {0};
     
     char *token = strtok(cmd_copy, " ");
     while (token != NULL) {
@@ -1433,6 +1434,9 @@ int parse_config_cmd(const char *cmd_line) {
         } else if (strncmp(token, "cids=", 5) == 0) {
             strncpy(cids, token + 5, sizeof(cids) - 1);
             cids[sizeof(cids) - 1] = '\0';
+        } else if (strncmp(token, "mount_point=", 12) == 0) {
+            strncpy(mount_point, token + 12, sizeof(mount_point) - 1);
+            mount_point[sizeof(mount_point) - 1] = '\0';
         } else if (strncmp(token, "log_file=", 9) == 0) {
             strncpy(log_file, token + 9, sizeof(log_file) - 1);
             log_file[sizeof(log_file) - 1] = '\0';
@@ -1482,6 +1486,10 @@ int parse_config_cmd(const char *cmd_line) {
     
     if (strlen(log_file) > 0) {
         snprintf(g_config.log_file, sizeof(g_config.log_file), "%s", log_file);
+    }
+    
+    if (strlen(mount_point) > 0) {
+        snprintf(g_config.mount_point, sizeof(g_config.mount_point), "%s", mount_point);
     }
     
     unsigned char init_ip_bytes[4];
