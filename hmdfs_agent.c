@@ -762,7 +762,7 @@ int set_and_send_offline(remote_node *node) {
     offline_param cmd;
     cmd.cmd = CMD_OFF_LINE;
     if (node && strlen(node->cid) > 0) {
-        strcpy((char *)cmd.remote_cid, node->cid);
+        memcpy(cmd.remote_cid, node->cid, HMDFS_CID_SIZE);
     } else {
         log_message(LOG_LEVEL_ERROR, "node without cid!");
         return -1;
@@ -796,7 +796,7 @@ int set_and_send_socket(int conn_fd, remote_node *node) {
     
     // 使用远程节点的CID
     if (node && strlen(node->cid) > 0) {
-        strcpy((char *)cmd.cid, node->cid);
+        memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
     } else {
         close(conn_fd);
         log_message(LOG_LEVEL_ERROR, "node without cid!");
@@ -1018,7 +1018,7 @@ remote_node *find_remote_node(const char *cid) {
     
     pthread_mutex_lock(&g_device_mutex);
     for (int i = 0; i < g_config.node_count; i++) {
-        if (strcmp(g_config.nodes[i].cid, cid) == 0) {
+        if (strncmp(g_config.nodes[i].cid, cid, HMDFS_CID_SIZE) == 0) {
             remote_node *node = &g_config.nodes[i];
             pthread_mutex_unlock(&g_device_mutex);
             return node;
@@ -1039,15 +1039,20 @@ void HandleAllNotify(int fd) {
         if ((readSize < (int)sizeof(notify_param)) || (param.notify == NOTIFY_NONE)) {
             return;
         }
+        // remote_cid is 64 bytes without NUL (kernel memcpy); make a
+        // NUL-terminated copy for string use (log/strlen/find_remote_node).
+        char cid_str[HMDFS_CID_SIZE + 1];
+        memcpy(cid_str, param.remote_cid, HMDFS_CID_SIZE);
+        cid_str[HMDFS_CID_SIZE] = '\0';
         log_message(LOG_LEVEL_INFO, "Received notify: type=%d, fd=%d, remote_cid=%s", 
-               param.notify, param.fd, param.remote_cid);
+               param.notify, param.fd, cid_str);
     
         switch (param.notify) {
             case NOTIFY_GET_SESSION: {
-                log_message(LOG_LEVEL_INFO, "Handling NOTIFY_GET_SESSION for CID %s", param.remote_cid);
+                log_message(LOG_LEVEL_INFO, "Handling NOTIFY_GET_SESSION for CID %s", cid_str);
             
                 // 检查是否为空CID请求（查找所有远程节点）
-                if (strlen((const char *)param.remote_cid) == 0) {
+                if (strlen(cid_str) == 0) {
                     log_message(LOG_LEVEL_INFO, "No specific CID provided, connecting to all configured remote nodes");
                 
                     // 遍历所有配置的远程节点
@@ -1069,7 +1074,7 @@ void HandleAllNotify(int fd) {
                                 cmd.devsl = 1;
                                 cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                                 memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
-                                strcpy((char *)cmd.cid, node->cid);
+                                memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
                             
                                 // 发送命令给HMDFS模块
                                 if (send_update_socket_cmd(&cmd) < 0) {
@@ -1086,7 +1091,7 @@ void HandleAllNotify(int fd) {
                     }
                 } else {
                     // 查找匹配的远程节点（特定CID请求）
-                    remote_node *node = find_remote_node((const char *)param.remote_cid);
+                    remote_node *node = find_remote_node(cid_str);
                 
                     if (node) {
                         if (node->fd != -1) { // 已有连接则跳过，避免重复连接
@@ -1103,7 +1108,7 @@ void HandleAllNotify(int fd) {
                                 cmd.devsl = 1;
                                 cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                                 memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
-                                strcpy((char *)cmd.cid, node->cid);
+                                memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
                             
                                 // 发送命令给HMDFS模块
                                 if (send_update_socket_cmd(&cmd) < 0) {
@@ -1118,16 +1123,16 @@ void HandleAllNotify(int fd) {
                             pthread_mutex_unlock(&g_device_mutex);
                         }
                     } else {
-                        log_message(LOG_LEVEL_ERROR, "No matching remote node found for CID %s", param.remote_cid);
+                        log_message(LOG_LEVEL_ERROR, "No matching remote node found for CID %s", cid_str);
                     }
                 }
                 break;
             }
         
             case NOTIFY_OFFLINE: {
-                log_message(LOG_LEVEL_INFO, "Handling NOTIFY_OFFLINE for CID %s", param.remote_cid);
+                log_message(LOG_LEVEL_INFO, "Handling NOTIFY_OFFLINE for CID %s", cid_str);
                 // 处理设备离线通知
-                remote_node *node = find_remote_node((const char *)param.remote_cid);
+                remote_node *node = find_remote_node(cid_str);
                 pthread_mutex_lock(&g_device_mutex);
                 if (node) {
                     update_device_status(node, DEVICE_STATUS_OFFLINE);
@@ -1157,15 +1162,20 @@ void handle_hmdfs_notify(void) {
         return;
     }
     
+    // remote_cid is 64 bytes without NUL (kernel memcpy); make a
+    // NUL-terminated copy for string use (log/strlen/find_remote_node).
+    char cid_str[HMDFS_CID_SIZE + 1];
+    memcpy(cid_str, param.remote_cid, HMDFS_CID_SIZE);
+    cid_str[HMDFS_CID_SIZE] = '\0';
     log_message(LOG_LEVEL_INFO, "Received notify: type=%d, fd=%d, remote_cid=%s", 
-               param.notify, param.fd, param.remote_cid);
+               param.notify, param.fd, cid_str);
     
     switch (param.notify) {
         case NOTIFY_GET_SESSION: {
-            log_message(LOG_LEVEL_INFO, "Handling NOTIFY_GET_SESSION for CID %s", param.remote_cid);
+            log_message(LOG_LEVEL_INFO, "Handling NOTIFY_GET_SESSION for CID %s", cid_str);
             
             // 检查是否为空CID请求（查找所有远程节点）
-            if (strlen((const char *)param.remote_cid) == 0) {
+            if (strlen(cid_str) == 0) {
                 log_message(LOG_LEVEL_INFO, "No specific CID provided, connecting to all configured remote nodes");
                 
                 // 遍历所有配置的远程节点
@@ -1187,7 +1197,7 @@ void handle_hmdfs_notify(void) {
                             cmd.devsl = 1;
                             cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                             memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
-                            strcpy((char *)cmd.cid, node->cid);
+                            memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
                             
                             // 发送命令给HMDFS模块
                             if (send_update_socket_cmd(&cmd) < 0) {
@@ -1204,7 +1214,7 @@ void handle_hmdfs_notify(void) {
                 }
             } else {
                 // 查找匹配的远程节点（特定CID请求）
-                remote_node *node = find_remote_node((const char *)param.remote_cid);
+                remote_node *node = find_remote_node(cid_str);
                 
                 if (node) {
                     if (node->fd != -1) { // 已有连接则跳过，避免重复连接
@@ -1221,7 +1231,7 @@ void handle_hmdfs_notify(void) {
                             cmd.devsl = 1;
                             cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                             memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
-                            strcpy((char *)cmd.cid, node->cid);
+                            memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
                             
                             // 发送命令给HMDFS模块
                             if (send_update_socket_cmd(&cmd) < 0) {
@@ -1236,16 +1246,16 @@ void handle_hmdfs_notify(void) {
                         pthread_mutex_unlock(&g_device_mutex);
                     }
                 } else {
-                    log_message(LOG_LEVEL_ERROR, "No matching remote node found for CID %s", param.remote_cid);
+                    log_message(LOG_LEVEL_ERROR, "No matching remote node found for CID %s", cid_str);
                 }
             }
             break;
         }
         
         case NOTIFY_OFFLINE: {
-            log_message(LOG_LEVEL_INFO, "Handling NOTIFY_OFFLINE for CID %s", param.remote_cid);
+            log_message(LOG_LEVEL_INFO, "Handling NOTIFY_OFFLINE for CID %s", cid_str);
             // 处理设备离线通知
-            remote_node *node = find_remote_node((const char *)param.remote_cid);
+            remote_node *node = find_remote_node(cid_str);
             pthread_mutex_lock(&g_device_mutex);
             if (node) {
                 update_device_status(node, DEVICE_STATUS_OFFLINE);
@@ -1332,7 +1342,8 @@ int parse_config_file(const char *filename) {
         } else if (strncmp(key, "remote_ip_", 10) == 0) {
             node_index = atoi(key + 10);
             if (node_index < MAX_REMOTE_NODES) {
-                strcpy(g_config.nodes[node_index].ip, value);
+                strncpy(g_config.nodes[node_index].ip, value, sizeof(g_config.nodes[node_index].ip) - 1);
+                g_config.nodes[node_index].ip[sizeof(g_config.nodes[node_index].ip) - 1] = '\0';
             }
         } else if (strncmp(key, "remote_port_", 12) == 0) {
             /* node_index = atoi(key + 12);
@@ -1798,7 +1809,7 @@ void *connector_thread_func(void *arg) {
                     cmd.devsl = 1;
                     cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                     memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
-                    strcpy((char *)cmd.cid, node->cid);
+                    memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
                             
                     // 发送命令给HMDFS模块
                     if (send_update_socket_cmd(&cmd) < 0) {
