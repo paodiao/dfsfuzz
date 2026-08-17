@@ -166,24 +166,27 @@ static inline bool is_comrade_list_empty(struct hmdfs_dentry_info_merge *mdi)
 
 static inline bool has_merge_lookup_work(struct hmdfs_dentry_info_merge *mdi)
 {
-	bool ret;
-
-	mutex_lock(&mdi->work_lock);
-	ret = (mdi->work_count != 0);
-	mutex_unlock(&mdi->work_lock);
-
-	return ret;
+	/*
+	 * Lock-free read of work_count: this predicate is evaluated inside
+	 * wait_event() conditions, where the task is in TASK_UNINTERRUPTIBLE
+	 * state and must not block (DEBUG_ATOMIC_SLEEP). wait_event() first
+	 * calls prepare_to_wait_event() and then re-checks the condition on
+	 * every wakeup, so a transiently stale read only causes one extra
+	 * iteration; wakeups issued under work_lock are never lost.
+	 */
+	return READ_ONCE(mdi->work_count) != 0;
 }
 
 static inline bool is_merge_lookup_end(struct hmdfs_dentry_info_merge *mdi)
 {
-	bool ret;
-
-	mutex_lock(&mdi->work_lock);
-	ret = mdi->work_count == 0 || !is_comrade_list_empty(mdi);
-	mutex_unlock(&mdi->work_lock);
-
-	return ret;
+	/*
+	 * Lock-free condition for the same reason as has_merge_lookup_work():
+	 * called from wait_event() while !TASK_RUNNING. list_empty() only
+	 * reads the head pointer and is safe; the wait_event() loop tolerates
+	 * transient inconsistency.
+	 */
+	return READ_ONCE(mdi->work_count) == 0 ||
+	       list_empty(&mdi->comrade_list);
 }
 
 void hmdfs_update_meta(struct inode *dir);

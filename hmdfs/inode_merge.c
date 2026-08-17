@@ -544,58 +544,6 @@ out:
 	return ret;
 }
 
-/**
- * do_lookup_merge_root - lookup the root of the merge view(root/merge_view)
- *
- * It's common for a network filesystem to incur various of faults, so we
- * intent to show mercy for faults here, except faults reported by the local.
- */
-static int do_lookup_merge_root(struct path path_dev,
-				struct dentry *child_dentry, unsigned int flags)
-{
-	struct hmdfs_sb_info *sbi = hmdfs_sb(child_dentry->d_sb);
-	struct hmdfs_dentry_comrade *comrade;
-	const int buf_len =
-		max((int)HMDFS_CID_SIZE + 1, (int)sizeof(DEVICE_VIEW_LOCAL));
-	char *buf = kzalloc(buf_len, GFP_KERNEL);
-	struct hmdfs_peer *peer;
-	LIST_HEAD(head);
-	int ret;
-
-	if (!buf)
-		return -ENOMEM;
-
-	// lookup real_dst/device_view/local
-	memcpy(buf, DEVICE_VIEW_LOCAL, sizeof(DEVICE_VIEW_LOCAL));
-	comrade = lookup_comrade(path_dev, buf, HMDFS_DEVID_LOCAL, flags);
-	if (IS_ERR(comrade)) {
-		ret = PTR_ERR(comrade);
-		goto out;
-	}
-	link_comrade(&head, comrade);
-
-	// lookup real_dst/device_view/cidxx
-	mutex_lock(&sbi->connections.node_lock);
-	list_for_each_entry(peer, &sbi->connections.node_list, list) {
-		mutex_unlock(&sbi->connections.node_lock);
-		memcpy(buf, peer->cid, HMDFS_CID_SIZE);
-		comrade = lookup_comrade(path_dev, buf, peer->device_id, flags);
-		if (IS_ERR(comrade))
-			continue;
-
-		link_comrade(&head, comrade);
-		mutex_lock(&sbi->connections.node_lock);
-	}
-	mutex_unlock(&sbi->connections.node_lock);
-
-	assign_comrades_unlocked(child_dentry, &head);
-	ret = 0;
-
-out:
-	kfree(buf);
-	return ret;
-}
-
 // mkdir -p
 void lock_root_inode_shared(struct inode *root, bool *locked, bool *down)
 {
@@ -637,38 +585,55 @@ void restore_root_inode_sem(struct inode *root, bool locked, bool down)
 		inode_lock(root);
 }
 
-static int lookup_merge_root(struct inode *root_inode,
+static int lookup_merge_root(struct inode *root_inode __maybe_unused,
 			     struct dentry *child_dentry, unsigned int flags)
 {
 	struct hmdfs_sb_info *sbi = hmdfs_sb(child_dentry->d_sb);
-	struct path path_dev;
+	struct hmdfs_dentry_info_merge *mdi = hmdfs_dm(child_dentry);
+	struct hmdfs_peer *peer;
+	char *cpath;
 	int ret = -ENOENT;
-	int buf_len;
-	char *buf = NULL;
-	bool locked, down;
+	int err;
 
-	// consider additional one slash and one '\0'
-	buf_len = strlen(sbi->real_dst) + 1 + sizeof(DEVICE_VIEW_ROOT);
-	if (buf_len > PATH_MAX)
-		return -ENAMETOOLONG;
-
-	buf = kmalloc(buf_len, GFP_KERNEL);
-	if (unlikely(!buf))
+	/*
+	 * Lookup device_view/local and device_view/<cid> asynchronously, in
+	 * the same way as lookup_merge_normal(). Doing the lookup
+	 * synchronously via kern_path() here re-enters the hmdfs mount
+	 * itself (real_dst points into the hmdfs superblock), re-acquiring
+	 * the directory rwsem that the VFS lookup already holds -> lockdep
+	 * "possible recursive locking" warning. The workqueue context does
+	 * not hold the VFS lookup lock, so the re-entry is safe there.
+	 */
+	cpath = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (unlikely(!cpath))
 		return -ENOMEM;
 
-	sprintf(buf, "%s/%s", sbi->real_dst, DEVICE_VIEW_ROOT);
-	lock_root_inode_shared(root_inode, &locked, &down);
-	ret = hmdfs_get_path_in_sb(child_dentry->d_sb, buf, LOOKUP_DIRECTORY,
-				   &path_dev);
-	if (ret)
-		goto free_buf;
+	mutex_lock(&mdi->work_lock);
+	mutex_lock(&sbi->connections.node_lock);
 
-	ret = do_lookup_merge_root(path_dev, child_dentry, flags);
-	path_put(&path_dev);
+	/* lookup real_dst/device_view/local */
+	snprintf(cpath, PATH_MAX, DEVICE_VIEW_ROOT "/" DEVICE_VIEW_LOCAL);
+	err = merge_lookup_async(mdi, sbi, HMDFS_DEVID_LOCAL, cpath, flags);
+	if (err)
+		hmdfs_err("failed to create local lookup work");
 
-free_buf:
-	kfree(buf);
-	restore_root_inode_sem(root_inode, locked, down);
+	/* lookup real_dst/device_view/cidxx */
+	list_for_each_entry(peer, &sbi->connections.node_list, list) {
+		snprintf(cpath, PATH_MAX, DEVICE_VIEW_ROOT "/%s", peer->cid);
+		err = merge_lookup_async(mdi, sbi, peer->device_id, cpath,
+			flags);
+		if (err)
+			hmdfs_err("failed to create remote lookup work");
+	}
+	mutex_unlock(&sbi->connections.node_lock);
+	mutex_unlock(&mdi->work_lock);
+
+	wait_event(mdi->wait_queue, is_merge_lookup_end(mdi));
+
+	if (!is_comrade_list_empty(mdi))
+		ret = 0;
+
+	kfree(cpath);
 	return ret;
 }
 
