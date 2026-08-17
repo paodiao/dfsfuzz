@@ -98814,19 +98814,19 @@ struct aegis_crypt_ops {
 };
 
 struct aegis_ctx {
-	union aegis_block___2 key;
-};
-
-struct aegis_ctx___2 {
 	struct aegis_block key;
 };
 
+struct aegis_ctx___2 {
+	union aegis_block___2 key;
+};
+
 struct aegis_state {
-	union aegis_block___2 blocks[5];
+	struct aegis_block blocks[5];
 };
 
 struct aegis_state___2 {
-	struct aegis_block blocks[5];
+	union aegis_block___2 blocks[5];
 };
 
 struct aer_header_log_regs {
@@ -173314,7 +173314,7 @@ struct e1000_option {
 		} r;
 		struct {
 			int nr;
-			const struct e1000_opt_list *p;
+			struct e1000_opt_list *p;
 		} l;
 	} arg;
 };
@@ -173335,7 +173335,7 @@ struct e1000_option___2 {
 		} r;
 		struct {
 			int nr;
-			struct e1000_opt_list *p;
+			const struct e1000_opt_list *p;
 		} l;
 	} arg;
 };
@@ -194063,7 +194063,7 @@ struct go7007_snd {
 struct go7007_usb_board;
 
 struct go7007_usb {
-	struct go7007_usb_board *board;
+	const struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -194072,7 +194072,7 @@ struct go7007_usb {
 };
 
 struct go7007_usb___2 {
-	const struct go7007_usb_board *board;
+	struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -202591,11 +202591,7 @@ struct hfs_bnode_desc___2 {
 	u16 reserved;
 } __attribute__((packed));
 
-union hfs_btree_key;
-
-typedef union hfs_btree_key btree_key;
-
-typedef int (*btree_keycmp)(const btree_key *, const btree_key *);
+typedef int (*btree_keycmp)(const hfsplus_btree_key *, const hfsplus_btree_key *);
 
 struct hfs_btree {
 	struct super_block *sb;
@@ -202620,7 +202616,11 @@ struct hfs_btree {
 	int node_hash_cnt;
 };
 
-typedef int (*btree_keycmp___2)(const hfsplus_btree_key *, const hfsplus_btree_key *);
+union hfs_btree_key;
+
+typedef union hfs_btree_key btree_key;
+
+typedef int (*btree_keycmp___2)(const btree_key *, const btree_key *);
 
 struct hfs_btree___2 {
 	struct super_block *sb;
@@ -202813,8 +202813,8 @@ typedef union hfs_cat_rec hfs_cat_rec;
 struct hfs_find_data {
 	hfsplus_btree_key *search_key;
 	hfsplus_btree_key *key;
-	struct hfs_btree___2 *tree;
-	struct hfs_bnode___2 *bnode;
+	struct hfs_btree *tree;
+	struct hfs_bnode *bnode;
 	int record;
 	int keyoffset;
 	int keylength;
@@ -202825,8 +202825,8 @@ struct hfs_find_data {
 struct hfs_find_data___2 {
 	btree_key *key;
 	btree_key *search_key;
-	struct hfs_btree *tree;
-	struct hfs_bnode *bnode;
+	struct hfs_btree___2 *tree;
+	struct hfs_bnode___2 *bnode;
 	int record;
 	int keyoffset;
 	int keylength;
@@ -202904,8 +202904,8 @@ struct hfs_sb_info {
 	struct buffer_head *alt_mdb_bh;
 	struct hfs_mdb *alt_mdb;
 	__be32 *bitmap;
-	struct hfs_btree *ext_tree;
-	struct hfs_btree *cat_tree;
+	struct hfs_btree___2 *ext_tree;
+	struct hfs_btree___2 *cat_tree;
 	u32 file_count;
 	u32 folder_count;
 	u32 next_id;
@@ -203050,9 +203050,9 @@ struct hfsplus_sb_info {
 	struct hfsplus_vh *s_vhdr;
 	void *s_backup_vhdr_buf;
 	struct hfsplus_vh *s_backup_vhdr;
-	struct hfs_btree___2 *ext_tree;
-	struct hfs_btree___2 *cat_tree;
-	struct hfs_btree___2 *attr_tree;
+	struct hfs_btree *ext_tree;
+	struct hfs_btree *cat_tree;
+	struct hfs_btree *attr_tree;
 	atomic_t attr_tree_state;
 	struct inode *alloc_file;
 	struct inode *hidden_dir;
@@ -381533,16 +381533,6 @@ struct wmi_neighbor_report_event {
 };
 
 struct wmi_network_type {
-	struct wmi_ssid ssid;
-	u32 authentication;
-	u32 encryption;
-	u32 bcast_nw_type;
-	u8 channel_count;
-	u16 channels[60];
-	s32 rssi_threshold;
-} __attribute__((packed));
-
-struct wmi_network_type___2 {
 	struct wmi_ssid___2 ssid;
 	u32 authentication;
 	u32 encryption;
@@ -381551,6 +381541,16 @@ struct wmi_network_type___2 {
 	u16 channels[60];
 	s32 rssi_threshold;
 };
+
+struct wmi_network_type___2 {
+	struct wmi_ssid ssid;
+	u32 authentication;
+	u32 encryption;
+	u32 bcast_nw_type;
+	u8 channel_count;
+	u16 channels[60];
+	s32 rssi_threshold;
+} __attribute__((packed));
 
 struct wmi_ns_offload_tuple {
 	u32 tlv_header;
@@ -382533,7 +382533,7 @@ struct wmi_pmkid_list_reply {
 	struct wmi_pmkid pmkid_list[1];
 } __attribute__((packed));
 
-struct wmi_pno_scan_req {
+struct wmi_pno_scan_req___2 {
 	u8 enable;
 	u8 vdev_id;
 	u8 uc_networks_count;
@@ -382550,9 +382550,9 @@ struct wmi_pno_scan_req {
 	u32 enable_pno_scan_randomization;
 	u8 mac_addr[6];
 	u8 mac_addr_mask[6];
-} __attribute__((packed));
+};
 
-struct wmi_pno_scan_req___2 {
+struct wmi_pno_scan_req {
 	u8 enable;
 	u8 vdev_id;
 	u8 uc_networks_count;
@@ -382569,7 +382569,7 @@ struct wmi_pno_scan_req___2 {
 	u32 enable_pno_scan_randomization;
 	u8 mac_addr[6];
 	u8 mac_addr_mask[6];
-};
+} __attribute__((packed));
 
 struct wmi_power_mode_cmd {
 	u8 pwr_mode;
@@ -401579,9 +401579,9 @@ typedef int (*initxattrs)(struct inode *, const struct xattr *, void *);
 
 typedef struct dentry *instantiate_t(struct dentry *, struct task_struct *, const void *);
 
-typedef int (*ioctl_fn)(struct file *, struct autofs_sb_info *, struct autofs_dev_ioctl *);
+typedef int (*ioctl_fn)(struct file *, struct dm_ioctl *, size_t);
 
-typedef int (*ioctl_fn___2)(struct file *, struct dm_ioctl *, size_t);
+typedef int (*ioctl_fn___2)(struct file *, struct autofs_sb_info *, struct autofs_dev_ioctl *);
 
 typedef int (*iomap_punch_t)(struct inode *, loff_t, loff_t);
 
@@ -401701,9 +401701,9 @@ typedef int (*quirk_func_t)(struct snd_usb_audio *, struct usb_interface *, stru
 
 typedef void (*rds_info_func)(struct socket *, unsigned int, struct rds_info_iterator *, struct rds_info_lengths *);
 
-typedef int (*read_block_fn)(void *, unsigned int, void *, size_t);
+typedef int read_block_fn(void *, u8 *, unsigned int, size_t);
 
-typedef int read_block_fn___2(void *, u8 *, unsigned int, size_t);
+typedef int (*read_block_fn___2)(void *, unsigned int, void *, size_t);
 
 typedef int recdir_func(struct dentry *, struct dentry *, struct nfsd_net *);
 
@@ -401731,7 +401731,7 @@ typedef int (*sctp_callback_t)(struct sctp_endpoint *, struct sctp_transport *, 
 
 typedef void sctp_timer_event_t(struct timer_list *);
 
-typedef int (*search_strategy_t)(struct hfs_bnode___2 *, struct hfs_find_data *, int *, int *, int *);
+typedef int (*search_strategy_t)(struct hfs_bnode *, struct hfs_find_data *, int *, int *, int *);
 
 typedef int (*sendmsg_func)(struct sock *, struct msghdr *);
 
