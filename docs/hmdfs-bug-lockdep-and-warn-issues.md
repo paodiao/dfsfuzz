@@ -102,7 +102,7 @@ __mutex_lock → hmdfs_lookup_merge+0xa22 → lookup_open
 
 ## 问题 ③：`hmdfs_server_rebuild_dents` 锁序环（circular locking）
 
-**状态：⏳ 保留实测**（**真实死锁风险**，留给 fuzz 触发）
+**状态：✅ 已修复**（`hmdfs/hmdfs_server.c`，待编译验证）
 
 ### 现象
 
@@ -125,14 +125,18 @@ hmdfs_server_readdir → hmdfs_server_rebuild_dents → iterate_dir（持 i_mute
 
 锁序：`i_mutex_dir → sb_writers`；而 openat 路径为 `sb_writers → i_mutex_dir`——**锁序相反 → 环形依赖**。
 
-### 性质
+### 实测结论（18:40 运行）
 
-**真实死锁风险**（lockdep 静态依赖检测证实）：kworker 持目录读锁等待 sb_writers，同时 openat 持 sb_writers 等待目录写锁时死锁。需特定并发时序（rebuild 触发 truncate 且 openat 同目录创建）才实际发生，概率低。生产内核不检测 lockdep，可能偶发未复现。
+**高频触发，阻塞 fuzz**：syz-manager 每 ~30 秒报 `vm-0: crash: possible deadlock in vfs_truncate`（18:40:48/18:41:28/18:41:57），fuzz 程序首轮 readdir 重建即触发，`executed 0`——**不修 fuzz 无法运行**。原"低概率"假设不成立。
 
-### 处理预案
+### 改动点（已实施）
 
-- **保留**：真实 bug，留给 fuzz 触发（lockdep WARNING 本身即可作为发现报告）
-- 若实测**高频阻塞 fuzz**：方案 A——在 cfg 加 syzkaller `suppressions` 正则净化报告（不 reproduce、不污染 bug 列表；注意 suppressions 不影响 VM 重启）；方案 B——代码修复：`iterate_dir` 前 `mnt_want_write(file->f_path.mnt)` 使锁序与 openat 同向（mnt_want_write 可重入）
+`hmdfs_server_rebuild_dents`（hmdfs_server.c:1487-1544）在 `iterate_dir`（:1521）前获取 `mnt_want_write(dentry_file->f_path.mnt)`，`iterate_dir` 返回后 `mnt_drop_write`：
+
+- 锁序变为 `sb_writers → i_mutex_dir`，与 openat 同向 → **环消除**
+- `mnt_want_write` 可嵌套（per-cpu 计数）→ filldir 内 `vfs_truncate` 的嵌套 `mnt_want_write` 安全
+- 错误路径：`mnt_want_write` 失败 → `goto out`；`iterate_dir` 失败 → drop 后 `goto out`
+- `write_header` 在 drop 后执行（`kernel_write` 不取 sb_writers，与原行为一致）
 
 ---
 

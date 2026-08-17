@@ -1518,7 +1518,24 @@ struct file *hmdfs_server_rebuild_dents(struct hmdfs_sb_info *sbi,
 	gc.parent_path = path;
 	gc.file = dentry_file;
 
+	/*
+	 * Take sb_writers before iterate_dir: the filldir callback
+	 * (hmdfs_filldir_real -> create_dentry -> cache_file_truncate ->
+	 * vfs_truncate) acquires mnt_want_write while the directory
+	 * i_rwsem read lock is held by iterate_dir. Acquiring sb_writers
+	 * first makes this path lock-ordered sb_writers -> i_mutex_dir,
+	 * same as openat(), breaking the circular dependency detected by
+	 * lockdep (possible circular locking: sb_writers <-> i_mutex_dir).
+	 * mnt_want_write is nestable (per-cpu counter), so the inner
+	 * mnt_want_write in vfs_truncate is safe.
+	 */
+	err = mnt_want_write(dentry_file->f_path.mnt);
+	if (err) {
+		hmdfs_err("mnt_want_write failed err=%d", err);
+		goto out;
+	}
 	err = iterate_dir(file, &(gc.ctx));
+	mnt_drop_write(dentry_file->f_path.mnt);
 	if (err) {
 		hmdfs_err("iterate_dir failed");
 		goto out;
