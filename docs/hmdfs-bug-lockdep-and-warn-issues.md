@@ -8,6 +8,23 @@ syzkaller 测试内核全量开启 `CONFIG_PROVE_LOCKING`（lockdep）与 `CONFI
 
 **复现环境**：3 节点 QEMU（192.168.0.5/.6/.7）、Linux 6.6.0-dirty、openEuler 官方挂载配置（`local_dst=挂载点`，见附录）。
 
+处理策略见下方"备选方案"章节与各问题"处理预案"。
+
+---
+
+## 备选方案：禁用内核检测选项（对比路线，未采用）
+
+**内容**：编译内核时关闭 `CONFIG_PROVE_LOCKING`（lockdep）+ `CONFIG_DEBUG_ATOMIC_SLEEP`，消除 ①②③ 的 WARNING——① 递归锁、③ 环形依赖由 lockdep 检测；② 由 DEBUG_ATOMIC_SLEEP 检测。
+
+**关键结论（经实验验证）**：
+
+- **④ 无法被该方案消除**：`WARN_ON(ret == -ETIME)`（hmdfs_client.c:345）是裸 `WARN_ON` 断言，与 lockdep/DEBUG_ATOMIC_SLEEP 无关——关选项后依旧触发 → 即使走禁用路线，④ 仍需代码处理（降级为 `hmdfs_err` 日志）
+- **③ 真死锁风险失去检测**：锁序环（sb_writers ↔ i_mutex_dir）是真实死锁风险，关 lockdep 后不再报警；若实际发生将无声卡死，必须保留 `CONFIG_DETECT_HUNG_TASK` 兜底
+- **fuzz 检测能力受损**：丢失全部锁序/原子违规检测——这正是 fuzz 的核心价值之一，会漏掉一大类 bug
+- **注意**：syzkaller 检测到内核 WARNING 输出即判 crash 重启 VM（与 panic_on_warn 无关），因此关闭选项是唯一能阻止"WARNING → 重启"循环的配置手段；但代价如上
+
+**结论**：该路线仅作为"快速验证 fuzz 全链路"的临时手段。本项目最终采用**代码修复路线**——问题 ①② 修代码 + **保留全部检测选项**（lockdep/KASAN/DEBUG_ATOMIC_SLEEP 全开），③④ 作为真实 bug 保留给 fuzz 触发。
+
 ---
 
 ## 问题 ①：`lookup_merge_root` 的 kern_path 重入（recursive locking）
