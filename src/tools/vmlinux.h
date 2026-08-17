@@ -204081,14 +204081,6 @@ struct hiface_chip {
 	struct pcm_runtime *pcm;
 };
 
-struct pcm_runtime___2;
-
-struct hiface_chip___2 {
-	struct usb_device *dev;
-	struct snd_card *card;
-	struct pcm_runtime___2 *pcm;
-};
-
 struct hiface_vendor_quirk {
 	const char *device_name;
 	u8 extra_freq;
@@ -220737,14 +220729,14 @@ struct insn {
 
 struct instance_attribute {
 	struct attribute attr;
-	ssize_t (*show)(struct edac_device_instance *, char *);
-	ssize_t (*store)(struct edac_device_instance *, const char *, size_t);
+	ssize_t (*show)(struct edac_pci_ctl_info *, char *);
+	ssize_t (*store)(struct edac_pci_ctl_info *, const char *, size_t);
 };
 
 struct instance_attribute___2 {
 	struct attribute attr;
-	ssize_t (*show)(struct edac_pci_ctl_info *, char *);
-	ssize_t (*store)(struct edac_pci_ctl_info *, const char *, size_t);
+	ssize_t (*show)(struct edac_device_instance *, char *);
+	ssize_t (*store)(struct edac_device_instance *, const char *, size_t);
 };
 
 struct instr_dual {
@@ -279720,14 +279712,14 @@ struct pcm_substream {
 };
 
 struct pcm_urb {
-	struct hiface_chip___2 *chip;
+	struct hiface_chip *chip;
 	struct urb instance;
 	struct usb_anchor submitted;
 	u8 *buffer;
 };
 
-struct pcm_runtime___2 {
-	struct hiface_chip___2 *chip;
+struct pcm_runtime {
+	struct hiface_chip *chip;
 	struct snd_pcm *instance;
 	struct pcm_substream playback;
 	bool panic;
@@ -279747,7 +279739,7 @@ struct pcm_urb___2 {
 	struct pcm_urb___2 *peer;
 };
 
-struct pcm_runtime {
+struct pcm_runtime___2 {
 	struct sfire_chip *chip;
 	struct snd_pcm *instance;
 	struct pcm_substream playback;
@@ -307270,7 +307262,7 @@ struct sfire_chip {
 	int regidx;
 	bool shutdown;
 	struct midi_runtime *midi;
-	struct pcm_runtime *pcm;
+	struct pcm_runtime___2 *pcm;
 	struct control_runtime *control;
 	struct comm_runtime *comm;
 };
