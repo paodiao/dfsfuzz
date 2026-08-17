@@ -173314,7 +173314,7 @@ struct e1000_option {
 		} r;
 		struct {
 			int nr;
-			const struct e1000_opt_list *p;
+			struct e1000_opt_list *p;
 		} l;
 	} arg;
 };
@@ -173335,7 +173335,7 @@ struct e1000_option___2 {
 		} r;
 		struct {
 			int nr;
-			struct e1000_opt_list *p;
+			const struct e1000_opt_list *p;
 		} l;
 	} arg;
 };
@@ -194063,7 +194063,7 @@ struct go7007_snd {
 struct go7007_usb_board;
 
 struct go7007_usb {
-	struct go7007_usb_board *board;
+	const struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -194072,7 +194072,7 @@ struct go7007_usb {
 };
 
 struct go7007_usb___2 {
-	const struct go7007_usb_board *board;
+	struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -204079,6 +204079,14 @@ struct hiface_chip {
 	struct usb_device *dev;
 	struct snd_card *card;
 	struct pcm_runtime *pcm;
+};
+
+struct pcm_runtime___2;
+
+struct hiface_chip___2 {
+	struct usb_device *dev;
+	struct snd_card *card;
+	struct pcm_runtime___2 *pcm;
 };
 
 struct hiface_vendor_quirk {
@@ -279712,14 +279720,14 @@ struct pcm_substream {
 };
 
 struct pcm_urb {
-	struct hiface_chip *chip;
+	struct hiface_chip___2 *chip;
 	struct urb instance;
 	struct usb_anchor submitted;
 	u8 *buffer;
 };
 
-struct pcm_runtime {
-	struct hiface_chip *chip;
+struct pcm_runtime___2 {
+	struct hiface_chip___2 *chip;
 	struct snd_pcm *instance;
 	struct pcm_substream playback;
 	bool panic;
@@ -279739,7 +279747,7 @@ struct pcm_urb___2 {
 	struct pcm_urb___2 *peer;
 };
 
-struct pcm_runtime___2 {
+struct pcm_runtime {
 	struct sfire_chip *chip;
 	struct snd_pcm *instance;
 	struct pcm_substream playback;
@@ -307262,7 +307270,7 @@ struct sfire_chip {
 	int regidx;
 	bool shutdown;
 	struct midi_runtime *midi;
-	struct pcm_runtime___2 *pcm;
+	struct pcm_runtime *pcm;
 	struct control_runtime *control;
 	struct comm_runtime *comm;
 };
@@ -401570,9 +401578,9 @@ typedef int (*initxattrs)(struct inode *, const struct xattr *, void *);
 
 typedef struct dentry *instantiate_t(struct dentry *, struct task_struct *, const void *);
 
-typedef int (*ioctl_fn)(struct file *, struct dm_ioctl *, size_t);
+typedef int (*ioctl_fn)(struct file *, struct autofs_sb_info *, struct autofs_dev_ioctl *);
 
-typedef int (*ioctl_fn___2)(struct file *, struct autofs_sb_info *, struct autofs_dev_ioctl *);
+typedef int (*ioctl_fn___2)(struct file *, struct dm_ioctl *, size_t);
 
 typedef int (*iomap_punch_t)(struct inode *, loff_t, loff_t);
 
@@ -401692,9 +401700,9 @@ typedef int (*quirk_func_t)(struct snd_usb_audio *, struct usb_interface *, stru
 
 typedef void (*rds_info_func)(struct socket *, unsigned int, struct rds_info_iterator *, struct rds_info_lengths *);
 
-typedef int (*read_block_fn)(void *, unsigned int, void *, size_t);
+typedef int read_block_fn(void *, u8 *, unsigned int, size_t);
 
-typedef int read_block_fn___2(void *, u8 *, unsigned int, size_t);
+typedef int (*read_block_fn___2)(void *, unsigned int, void *, size_t);
 
 typedef int recdir_func(struct dentry *, struct dentry *, struct nfsd_net *);
 
