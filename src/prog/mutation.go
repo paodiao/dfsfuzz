@@ -1021,7 +1021,7 @@ func (ctx *mutator) mutateFailPos() bool {
 func (ctx *mutator) genSrvFailCalls(startIdx *uint64, crashFailure bool, failInfo SrvFailInfo, ps []*Prog, idx int) {
 	calls := make([]*Call, 0)
 	calls = append(calls, ctx.genRecvCall(startIdx)...)
-	calls = append(calls, ctx.genDownCall(crashFailure, failInfo)...)
+	calls = append(calls, ctx.genDownCall(crashFailure, failInfo, ps, idx)...)
 	calls = append(calls, ctx.genSendCall(startIdx)...)
 	calls = append(calls, ctx.genRecvCall(startIdx)...)
 	calls = append(calls, ctx.genUpCall(crashFailure, failInfo)...)
@@ -1089,7 +1089,7 @@ func (ctx *mutator) genNetCmd(failInfo SrvFailInfo) []byte {
 	return []byte(genIptablesDropCmd(ctx.initIp, failInfo.PartNodes))
 }
 
-func (ctx *mutator) genDownCall(crashFailure bool, failInfo SrvFailInfo) []*Call {
+func (ctx *mutator) genDownCall(crashFailure bool, failInfo SrvFailInfo, ps []*Prog, idx int) []*Call {
 	if crashFailure {
 		meta := ctx.r.target.Syscalls[ctx.sCalls.DownId]
 		calls := ctx.r.generateParticularCall(nil, meta)
@@ -1099,7 +1099,9 @@ func (ctx *mutator) genDownCall(crashFailure bool, failInfo SrvFailInfo) []*Call
 		meta := ctx.r.target.Syscalls[ctx.sCalls.NetDownId]
 		c := MakeCall(meta, nil)
 		c.IsFCall = true
-		s := newState(ctx.r.target, ctx.ct, nil)
+		// 必须在插入目标 prog（ps[idx]）的 state 上分配数据地址，
+		// 否则独立 newState 从地址 0 分配，与目标 prog 数据重叠（L9）。
+		s := stateFromProg(ps[idx])
 		s.custData = append([]byte{}, ctx.genNetCmd(failInfo)...)
 		c.Args, _ = ctx.r.generateArgs(s, meta.Args, DirIn)
 		ctx.r.target.assignSizesCall(c)
@@ -1704,9 +1706,11 @@ func syncStashReadVerification(ps []*Prog, oldOff, oldLen, newOff, newLen uint64
 	}
 }
 
-// reassignDataArg 重分配 DataArg（改 data 后调用）——新地址按新长度分配，
-// 消除 copyin 越界覆盖（原分配区按旧长度——data 变长后越界，L7）。
-func reassignDataArg(call *Call, r *randGen, newData []byte) bool {
+// reassignDataArg 重分�?DataArg（改 data 后调用）——新地址按新长度分配�?
+// 消除 copyin 越界覆盖（原分配区按旧长度——data 变长后越界，L7）�?
+// 必须在主 prog �?state（stateFromProg）上分配，否则独�?newState 从地址 0
+// 重新分配，与�?prog 已有数据重叠（L9）�?
+func reassignDataArg(p *Prog, call *Call, r *randGen, newData []byte) bool {
 	if len(call.Args) < 2 {
 		return false
 	}
@@ -1718,7 +1722,7 @@ func reassignDataArg(call *Call, r *randGen, newData []byte) bool {
 	if !ok {
 		return false
 	}
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 	newDataArg := MakeDataArg(ptrType.Elem, DirIn, newData)
 	newPtr := r.allocAddr(s, ptrType, DirIn, newDataArg.Size(), newDataArg)
 	ptrArg.Res = newPtr
@@ -1794,7 +1798,7 @@ func mutateWriteLength(ps []*Prog, call *Call, r *randGen) bool {
 					newData[i] = byte(r.Intn(256))
 				}
 				dataArg.data = newData
-				reassignDataArg(call, r, newData) // 重分配——新地址新尺寸（L7）
+				reassignDataArg(ps[0], call, r, newData) // 重分配——新地址新尺寸（L7�?
 			}
 		}
 	}
@@ -1838,9 +1842,9 @@ func mutateWriteData(ps []*Prog, call *Call, r *randGen) bool {
 	data = mutateData(r, data, 1, 8192)
 	dataArg.data = data
 	countArg.Val = uint64(len(data))
-	reassignDataArg(call, r, data) // 重分配——新地址新尺寸（L7）
+	reassignDataArg(ps[0], call, r, data) // 重分配——新地址新尺寸（L7�?
 
-	syncStashReadVerification(ps, oldOff, oldLen, oldOff, countArg.Val) // 读验证同步（L7）
+	syncStashReadVerification(ps, oldOff, oldLen, oldOff, countArg.Val) // 读验证同步（L7�?
 	return true
 }
 
@@ -2054,9 +2058,9 @@ func insertStashCall(ps []*Prog, p *Prog, r *randGen, sCalls *SpecialCalls, ct *
 		return false
 	}
 
-	// 故障窗口区间（p0 的 recv/down/send/recv/up/send 6 调用块）——插入不得
-	// 落入窗口内部（窗口变长后 moveFailCalls 的 6 块移动会拆散 recv/send 配
-	// 对 → 死锁）；窗口前插入时同步更新表。
+	// 故障窗口区间（p0 �?recv/down/send/recv/up/send 6 调用块）——插入不�?
+	// 落入窗口内部（窗口变长后 moveFailCalls �?6 块移动会拆散 recv/send �?
+	// �?�?死锁）；窗口前插入时同步更新表�?
 	failStart, failEnd := -1, -1
 	if len(p.GeneralFailPos) > 0 && len(p.GeneralFailPos[0]) >= 4 {
 		failStart = p.GeneralFailPos[0][1]
@@ -2099,7 +2103,7 @@ func insertStashCall(ps []*Prog, p *Prog, r *randGen, sCalls *SpecialCalls, ct *
 }
 
 // shiftGeneralFailPos 偏移 GeneralFailPos 表中 progIdx 节点的条目：
-// 插入/删除位置 <= 记录位置时偏移 delta（与 updateBarrierPosTable 同模式）。
+// 插入/删除位置 <= 记录位置时偏�?delta（与 updateBarrierPosTable 同模式）�?
 func shiftGeneralFailPos(p *Prog, progIdx, shiftPos, delta int) {
 	if p == nil || len(p.GeneralFailPos) == 0 {
 		return
@@ -2204,7 +2208,7 @@ func genPreadCallWithFdAt(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultA
 	if meta == nil {
 		return nil
 	}
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 	bufPtrType := meta.Args[1].Type.(*PtrType)
 	countType := meta.Args[2].Type.(*LenType)
 	posType := meta.Args[3].Type.(*IntType)
@@ -2245,7 +2249,7 @@ func genPwriteCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultAr
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	bufSize := r.randBufLen()
 	bufData := make([]byte, bufSize)
@@ -2388,7 +2392,7 @@ func findConcurrentCalls(ps []*Prog, anchor GroupPosition, anchorPath string, ts
 // the counterpart of findConcurrentCalls on the causal side of the anchor's
 // timeline. Like findConcurrentCalls this is a timing approximation of
 // causality (DAG causality additionally requires path relevance and
-// modifier/observer conditions) — see DAG_KNOWN_ISSUES.md #18.
+// modifier/observer conditions) �?see DAG_KNOWN_ISSUES.md #18.
 func findHBCalls(ps []*Prog, anchor GroupPosition, anchorPath string, tscoffs []int64) []ConcurrentCall {
 	if len(ps) == 0 {
 		return nil
@@ -2563,7 +2567,7 @@ func RemoveOneInGroupDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 }
 
 // MutateGroupDataDynamic shares a random offset (and length for writes)
-// across all read/write calls of the anchor's dynamic concurrent set — the
+// across all read/write calls of the anchor's dynamic concurrent set �?the
 // deterministic counterpart of the probabilistic OffsetSame insertions. The
 // anchor itself must be a read/write call, so the set always contains
 // something to mutate.
@@ -2624,7 +2628,7 @@ func MutateGroupDataDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 		if isWriteCall(call) && len(call.Args) >= 3 {
 			if countArg, ok := call.Args[2].(*ConstArg); ok {
 				countArg.Val = sharedLength
-				updateWriteDataBuf(call, sharedLength, r)
+				updateWriteDataBuf(ps[pos.ProgIdx], call, sharedLength, r)
 			}
 		}
 		r.target.assignSizesCall(call)
@@ -2718,7 +2722,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 	}
 
 	if basePath == "" {
-		//TODO: 目前是种子本身有操作文件就使用已操作文件，否则就选一个新的
+		//TODO: 目前是种子本身有操作文件就使用已操作文件，否则就选一个新�?
 		if seedType == "fileops" {
 			fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
 			if fileNode == nil {
@@ -2727,7 +2731,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 			basePath = fileNode.FullPath
 		} else {
 			dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
-			//TODO: 对于inodeops其实不一定要是dir吧，只不过有一些操作只能对dir做
+			//TODO: 对于inodeops其实不一定要是dir吧，只不过有一些操作只能对dir�?
 			if dirNode == nil {
 				return false
 			}
@@ -2746,7 +2750,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 	}
 
 	referenceInsertPos := -1
-	refTime := int64(-1) // 参考时间（全局 TSC 域）；-1 表示尚无参考
+	refTime := int64(-1) // 参考时间（全局 TSC 域）�?1 表示尚无参�?
 
 	for nodeIdx, ops := range pattern.Operations {
 		if nodeIdx >= len(ps) {
@@ -2785,7 +2789,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 			}
 		}
 		for _, op := range ops {
-			calls, _, _ := r.generateCallFromPatternOp(newState(r.target, nil, nil), sCalls, op, basePath, cid, lcs, ExistingFd, useExistingFd, pattern.OffsetRel, sharedOffset)
+			calls, _, _ := r.generateCallFromPatternOp(stateFromProg(p), sCalls, op, basePath, cid, lcs, ExistingFd, useExistingFd, pattern.OffsetRel, sharedOffset)
 			for _, c := range calls {
 				if insertPos >= len(p.Calls) {
 					p.Calls = append(p.Calls, c)
@@ -2815,7 +2819,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 				flags = r.target.GetConst("O_DIRECTORY")
 			}
 		}
-		calls := r.generateVerificationCalls(newState(r.target, nil, nil), sCalls, basePath, cid, seedType, nil, flags)
+		calls := r.generateVerificationCalls(stateFromProg(p), sCalls, basePath, cid, seedType, nil, flags)
 		for _, c := range calls {
 			if verInsertPos >= len(p.Calls) {
 				p.Calls = append(p.Calls, c)
@@ -2987,7 +2991,7 @@ func updateCallPathInProg(p *Prog, callIdx int, newPath string, r *randGen) {
 	r.target.assignSizesCall(call)
 
 	// rename 的目标路径跟随源迁移（L25）：目标基于旧源派生
-	// （源._renamed_xxx）——源迁移后目标同步重新派生（对齐 L9 的 rename 处理）。
+	// （源._renamed_xxx）——源迁移后目标同步重新派生（对齐 L9 �?rename 处理）�?
 	if strings.Contains(call.Meta.Name, "rename") {
 		updateCallPathByArgIdx(call, 1, newPath+"._renamed_"+randomSuffix(r.Rand), r)
 	}
@@ -3047,7 +3051,7 @@ func pickMutationLength(r *randGen) uint64 {
 	return uint64(r.Intn(4096) + 1)
 }
 
-func updateWriteDataBuf(call *Call, newLen uint64, r *randGen) {
+func updateWriteDataBuf(p *Prog, call *Call, newLen uint64, r *randGen) {
 	if len(call.Args) < 2 {
 		return
 	}
@@ -3065,7 +3069,7 @@ func updateWriteDataBuf(call *Call, newLen uint64, r *randGen) {
 	for i := uint64(len(oldData)); i < newLen; i++ {
 		newData[i] = byte(r.Intn(256))
 	}
-	reassignDataArg(call, r, newData)
+	reassignDataArg(p, call, r, newData)
 }
 
 func getFdFilePathForCall(ps []*Prog, pos GroupPosition) string {
@@ -3248,7 +3252,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 			rootFlags = r.target.GetConst("O_DIRECTORY")
 		}
 	}
-	rootCalls := r.generateCallByName(newState(r.target, nil, nil), sCalls, rootCallName, basePath, basePath2, cid0, ExistingFd, useExistFd, rootFileSize, rootFlags)
+	rootCalls := r.generateCallByName(stateFromProg(p0), sCalls, rootCallName, basePath, basePath2, cid0, ExistingFd, useExistFd, rootFileSize, rootFlags)
 
 	if insertPos >= len(p0.Calls) {
 		p0.Calls = append(p0.Calls, rootCalls...)
@@ -3279,7 +3283,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, !isDirPath(lcs.FileTree, basePath))
 		if variant == nil {
 			continue
-			//TODO: continue对吗？
+			//TODO: continue对吗�?
 		}
 		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, *variant, r.Rand)
 
@@ -3302,7 +3306,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 		if variant.CallName == "rename" {
 			concurrentPath, concurrentPath2 = lcs.GetPathsForRenameVariant(basePath, "", variant.PathRelation, r.Rand, cid, false)
 			if concurrentPath == "" {
-				continue // 该关系无匹配——跳过此节点（S16）
+				continue // 该关系无匹配——跳过此节点（S16�?
 			}
 		} else {
 			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, cid, false)
@@ -3334,7 +3338,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 				}
 			}
 		}
-		concurrentCalls := r.generateCallByName(newState(r.target, nil, nil), sCalls, variant.CallName, concurrentPath, concurrentPath2, cid, ExistingFd, useExistFd, concurrentFileSize, concurrentFlags)
+		concurrentCalls := r.generateCallByName(stateFromProg(p), sCalls, variant.CallName, concurrentPath, concurrentPath2, cid, ExistingFd, useExistFd, concurrentFileSize, concurrentFlags)
 
 		if ConcurrentInsertPos >= len(p.Calls) {
 			p.Calls = append(p.Calls, concurrentCalls...)
@@ -3452,7 +3456,7 @@ func findInsertPosition(p *Prog, r *randGen, useFd int, sCalls *SpecialCalls, re
 	//useFd: 0 is false, 1 is file, 2 is dir
 	if useFd > 0 {
 		if len(p.Calls) == 0 {
-			return r.Intn(len(p.Calls) + 1), nil //没有适合的fd，无法插入
+			return r.Intn(len(p.Calls) + 1), nil //没有适合的fd，无法插�?
 		}
 
 		type fdRange struct {
@@ -3610,7 +3614,7 @@ func genPreadCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultArg
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	bufSize := r.randBufLen()
 
@@ -3759,7 +3763,7 @@ func genPwriteCall(p *Prog, r *randGen, sCalls *SpecialCalls) *Call {
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	bufSize := r.randBufLen()
 	bufData := make([]byte, bufSize)
@@ -3802,7 +3806,7 @@ func genPreadCall(p *Prog, r *randGen, sCalls *SpecialCalls) *Call {
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	bufSize := r.randBufLen()
 
@@ -3933,7 +3937,7 @@ func mutateDcacheOpType(ps []*Prog, r *randGen, sCalls *SpecialCalls, ct *Choice
 
 		opType := r.Intn(3)
 		switch opType {
-		//TODO: insert里getdents64的处理没有仔细检查，以及swap的重要性令人怀疑
+		//TODO: insert里getdents64的处理没有仔细检查，以及swap的重要性令人怀�?
 		case DcacheOpInsert:
 			return insertDcacheCall(ps, pidx, p, r, sCalls, hmcfg)
 		case DcacheOpRemove:
@@ -3989,7 +3993,7 @@ func insertGetdents64Call(ps []*Prog, pidx int, p *Prog, r *randGen, sCalls *Spe
 	// Self-contained insertion: open(O_DIRECTORY) + getdents64 + close on a
 	// directory path of the dcache seed, so the insertion does not depend on
 	// the seed carrying a directory fd (it never does; the old candidate
-	// filter made this a permanent no-op). getdents64 is a test call here —
+	// filter made this a permanent no-op). getdents64 is a test call here �?
 	// it exercises the dcache directory-read path; verification of directory
 	// contents is left to stat/symsc (see DAG_KNOWN_ISSUES.md #19).
 	// Directory operations (mkdir/rmdir) are preferred as candidates: opening
@@ -4045,7 +4049,7 @@ func genOpenDirCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, dirPath s
 	if meta == nil {
 		return nil, nil
 	}
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 	ptrType := meta.Args[0].Type.(*PtrType)
 	flagsType := meta.Args[1].Type.(*FlagsType)
 	modeType := meta.Args[2].Type.(*FlagsType)
@@ -4089,7 +4093,7 @@ func genGetdents64CallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *Resu
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	// Fixed page-size buffer and count: the count must exceed zero to
 	// trigger a real directory read, and a large value avoids the checker's
@@ -4104,7 +4108,7 @@ func genGetdents64CallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *Resu
 
 	args := make([]Arg, len(meta.Args))
 	fdType := meta.Args[0].Type.(*ResourceType)
-	args[0] = MakeResultArg(fdType, DirIn, fd, 0) // 类型 = fd_dir（参数类型）——Res = open.Ret——validate 通过（L14）
+	args[0] = MakeResultArg(fdType, DirIn, fd, 0) // 类型 = fd_dir（参数类型）——Res = open.Ret——validate 通过（L14�?
 	args[1] = bufPtr
 	args[2] = MakeConstArg(lenType, DirIn, bufSize)
 
@@ -4148,7 +4152,7 @@ func swapDcacheCalls(p *Prog, r *randGen) bool {
 	candidates := make([]int, 0)
 	for i, call := range p.Calls {
 		// open/close/getdents64 must not be swapped: moving them would break
-		// the fd chain (open.Ret referenced before produced → serialization
+		// the fd chain (open.Ret referenced before produced �?serialization
 		// panic "no copyout index"——L8) or the self-contained
 		// open+getdents64+close blocks.
 		if strings.Contains(call.Meta.Name, "syz_failure") ||
@@ -4221,7 +4225,7 @@ func mutateDcachePathName(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *H
 	} else {
 		newPath = extractFileFromTree(hmcfg, dcacheP, r)
 		if newPath == "" {
-			return false // 无文件目标——不替换为目录（语义错误，L9）
+			return false // 无文件目标——不替换为目录（语义错误，L9�?
 		}
 	}
 	if newPath == "" || newPath == oldPath {
@@ -4233,7 +4237,7 @@ func mutateDcachePathName(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *H
 			if extractPathFromCall(call) == oldPath {
 				updateCallPath(p, i, call, newPath, r)
 			}
-			// rename 的目标路径也检查（L9）
+			// rename 的目标路径也检查（L9�?
 			if strings.Contains(call.Meta.Name, "rename") {
 				if extractPathFromCallByArgIdx(call, 1) == oldPath {
 					updateCallPathByArgIdx(call, 1, newPath, r)
@@ -4447,7 +4451,7 @@ func genMkdirCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	parentDir := extractDirFromTree(hmcfg, p, r)
 	newDir := fmt.Sprintf("%s/mut_dir_%s", parentDir, randomSuffix(r.Rand))
@@ -4461,7 +4465,7 @@ func genRmdirCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	var targetDir string
 	if hmcfg.FileTree != nil && r.bin() {
@@ -4493,7 +4497,7 @@ func genCreatCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, filePath st
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	ptrType := meta.Args[0].Type.(*PtrType)
 	modeType := meta.Args[1].Type.(*FlagsType)
@@ -4537,7 +4541,7 @@ func genUnlinkCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, filePath s
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 	return genPathCall(meta, filePath, r, s)
 }
 
@@ -4547,7 +4551,7 @@ func genRenameCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_confi
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	var oldPath string
 	if hmcfg.FileTree != nil && r.bin() {
@@ -4638,7 +4642,7 @@ func genNanosleepCall(p *Prog, r *randGen, sCalls *SpecialCalls, useHmdfsTimeout
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	var sec int64
 	var nsec int64
@@ -4656,9 +4660,9 @@ func genNanosleepCall(p *Prog, r *randGen, sCalls *SpecialCalls, useHmdfsTimeout
 			if ptrArg, ok := args[0].(*PointerArg); ok {
 				if structArg, ok := ptrArg.Res.(*GroupArg); ok {
 					if len(structArg.Inner) >= 2 {
-						// timespec 的 time_sec/time_nsec 是 ResourceType——
-						// generateTimespec 产出 *ResultArg（Res=nil，Val 为值），
-						// 断言 *ConstArg 恒失败导致超时值写不进（S13）。
+						// timespec �?time_sec/time_nsec �?ResourceType—�?
+						// generateTimespec 产出 *ResultArg（Res=nil，Val 为值）�?
+						// 断言 *ConstArg 恒失败导致超时值写不进（S13）�?
 						if tvSec, ok := structArg.Inner[0].(*ResultArg); ok {
 							tvSec.Val = uint64(sec)
 						}
@@ -4828,7 +4832,7 @@ func MutateInodeOpsProg(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *Spe
 	case InodeOpsMutParams:
 		return mutateInodeOpsParams(ps, r, sCalls)
 	case InodeOpsMutSequence:
-		//TODO: 其实是swap，重要性存疑
+		//TODO: 其实是swap，重要性存�?
 		return mutateInodeOpsSequence(ps, r)
 	case InodeOpsMutAddRemove:
 		//TODO: 替换为基于distributed choice
@@ -5144,7 +5148,7 @@ func genChmodCallWithMode(p *Prog, r *randGen, sCalls *SpecialCalls, filePath st
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	ptrType := meta.Args[0].Type.(*PtrType)
 	modeType := meta.Args[1].Type.(*FlagsType)
@@ -5170,7 +5174,7 @@ func genChmodCallWithMode(p *Prog, r *randGen, sCalls *SpecialCalls, filePath st
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	ptrType := meta.Args[0].Type.(*PtrType)
 
@@ -5202,7 +5206,7 @@ func genTruncateCall(p *Prog, r *randGen, sCalls *SpecialCalls, filePath string,
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	ptrType := meta.Args[0].Type.(*PtrType)
 
@@ -5235,7 +5239,7 @@ func genRenameCallWithPaths(p *Prog, r *randGen, sCalls *SpecialCalls, oldPath, 
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	oldPtrType := meta.Args[0].Type.(*PtrType)
 	newPtrType := meta.Args[1].Type.(*PtrType)
@@ -5263,7 +5267,7 @@ func genMkdirCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, dirPath str
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 	return genPathCall(meta, dirPath, r, s)
 }
 
@@ -5273,7 +5277,7 @@ func genRmdirCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, dirPath str
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 	return genPathCall(meta, dirPath, r, s)
 }
 
@@ -5470,7 +5474,7 @@ func mutateFileopsConcurrent(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg
 
 		mutType := r.Intn(3)
 		switch mutType {
-		//TODO: 这里插入并发读和写的约束太松弛了，实际上并没有很并发，考虑替换为基于distributed choice。然后这里distributed choice是否要把offset、length等元数据也纳入考虑？
+		//TODO: 这里插入并发读和写的约束太松弛了，实际上并没有很并发，考虑替换为基于distributed choice。然后这里distributed choice是否要把offset、length等元数据也纳入考虑�?
 		case 0:
 			return insertConcurrentRead(ps, r, sCalls, hmcfg)
 		case 1:
@@ -5496,8 +5500,8 @@ func insertOverlappingWrite(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg 
 		srcCallIdx := pwriteCalls[r.Intn(len(pwriteCalls))]
 		srcCall := srcP.Calls[srcCallIdx]
 
-		// src 文件 = 该 pwrite 实际写的文件（多 open 时第一个 open 路径可能
-		// 不一致——overlap 相对错误文件计算，L24）。
+		// src 文件 = �?pwrite 实际写的文件（多 open 时第一�?open 路径可能
+		// 不一致——overlap 相对错误文件计算，L24）�?
 		srcFilePath := extractFilePath(srcP)
 		if p := resolveFdToPath(srcP, srcCall); p != "" {
 			srcFilePath = p
@@ -5532,7 +5536,7 @@ func insertOverlappingWrite(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg 
 			if overlapWrite == nil {
 				continue
 			}
-			//TODO: 这里没有让覆盖写尽可能并发
+			//TODO: 这里没有让覆盖写尽可能并�?
 			if insertPos >= len(dstP.Calls) {
 				dstP.Calls = append(dstP.Calls, overlapWrite)
 			} else {
@@ -5572,7 +5576,7 @@ func genPwriteCallWithOffsetAndLength(p *Prog, r *randGen, sCalls *SpecialCalls,
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	bufData := make([]byte, length)
 	for i := range bufData {
@@ -5709,7 +5713,7 @@ func mutateFileopsFsync(ps []*Prog, r *randGen, sCalls *SpecialCalls) bool {
 		if !p.IsFileOps {
 			continue
 		}
-		//TODO: 这里所有的fsync和fdatasync的问题都是一样的，只插入一个，也不突变位置，肯定不对
+		//TODO: 这里所有的fsync和fdatasync的问题都是一样的，只插入一个，也不突变位置，肯定不�?
 		fsyncCalls := findCallsByName(p, "fsync")
 		fdatasyncCalls := findCallsByName(p, "fdatasync")
 
@@ -5722,8 +5726,8 @@ func mutateFileopsFsync(ps []*Prog, r *randGen, sCalls *SpecialCalls) bool {
 			continue
 		}
 
-		// 插入位置约束在第一个 open 之后——fsync 的 fd（findAvailableFd 同款）
-		// 在 insertPos 前有效（防 use-before-produce，S14）。
+		// 插入位置约束在第一�?open 之后——fsync �?fd（findAvailableFd 同款�?
+		// �?insertPos 前有效（�?use-before-produce，S14）�?
 		openIdx := openCalls[0]
 		insertPos := openIdx + 1 + r.Intn(len(p.Calls)-openIdx)
 
@@ -5816,7 +5820,7 @@ func genPreadCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, filePath st
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	bufSize := r.randBufLen()
 
@@ -5856,7 +5860,7 @@ func genPwriteCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, filePath s
 		return nil
 	}
 
-	s := newState(r.target, nil, nil)
+	s := stateFromProg(p)
 
 	bufSize := r.randBufLen()
 	bufData := make([]byte, bufSize)

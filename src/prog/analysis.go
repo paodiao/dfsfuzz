@@ -37,6 +37,20 @@ func analyze(ct *ChoiceTable, corpus [][]*Prog, p *Prog, c *Call) *state {
 	return s
 }
 
+// stateFromProg builds a state whose memAllocator is aware of all data
+// already allocated in p, so that new data allocated for calls which are
+// going to be inserted/appended into p will not overlap existing data.
+// Use this instead of newState() whenever a generated call is merged into
+// an existing program: an independent allocator starts from address 0 and
+// collides with the target program's data region.
+func stateFromProg(p *Prog) *state {
+	s := newState(p.Target, nil, nil)
+	for _, c := range p.Calls {
+		s.analyze(c)
+	}
+	return s
+}
+
 func newState(target *Target, ct *ChoiceTable, corpus [][]*Prog) *state {
 	s := &state{
 		target:    target,

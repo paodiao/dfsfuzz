@@ -1127,11 +1127,10 @@ func findAvailableFdInCalls(calls []*Call) *ResultArg {
 	return nil
 }
 
-func (r *randGen) genNetDownCall(sCalls *SpecialCalls, targetNodes []int) *Call {
+func (r *randGen) genNetDownCall(s *state, sCalls *SpecialCalls, targetNodes []int) *Call {
 	meta := r.target.Syscalls[sCalls.NetDownId]
 	c := MakeCall(meta, nil)
 	c.IsFCall = true
-	s := newState(r.target, nil, nil)
 	var cmdBuilder strings.Builder
 	cmdBuilder.WriteString("iptables -F;iptables -X;")
 	cmdBuilder.WriteString(genIptablesDropCmd(r.hmcfg.InitIp, targetNodes))
@@ -1139,6 +1138,8 @@ func (r *randGen) genNetDownCall(sCalls *SpecialCalls, targetNodes []int) *Call 
 
 	// 显式构造：按 custData 实际长度分配——不依赖 generateArgs 的随机分配
 	// （原随机 filename 长度 < 命令长度——覆写后尺寸陈旧——copyin 越界覆盖，L6）。
+	// 必须复用调用方传入的 state（同一 memAllocator）分配数据地址，
+	// 否则独立 newState 从地址 0 重新分配，与主程序数据区重叠（L7/L9）。
 	ptrType := meta.Args[0].Type.(*PtrType)
 	dataArg := MakeDataArg(ptrType.Elem, DirIn, custData)
 	ptrArg := r.allocAddr(s, ptrType, DirIn, dataArg.Size(), dataArg)
@@ -1147,9 +1148,9 @@ func (r *randGen) genNetDownCall(sCalls *SpecialCalls, targetNodes []int) *Call 
 	return c
 }
 
-func (r *randGen) genNetUpCall(sCalls *SpecialCalls) *Call {
+func (r *randGen) genNetUpCall(s *state, sCalls *SpecialCalls) *Call {
 	meta := r.target.Syscalls[sCalls.NetUpId]
-	calls := r.generateParticularCall(nil, meta)
+	calls := r.generateParticularCall(s, meta)
 	calls[len(calls)-1].IsFCall = true
 	return calls[len(calls)-1]
 }
@@ -1160,11 +1161,10 @@ func genNetDelayCmd(r *randGen) []byte {
 	return []byte(fmt.Sprintf("tc qdisc add dev eth0 root netem delay %dms %dms", baseMs, jitterMs))
 }
 
-func (r *randGen) genNetDelayAddCall(sCalls *SpecialCalls) *Call {
+func (r *randGen) genNetDelayAddCall(s *state, sCalls *SpecialCalls) *Call {
 	meta := r.target.Syscalls[sCalls.NetDelayAddId]
 	c := MakeCall(meta, nil)
 	c.IsFCall = true
-	s := newState(r.target, nil, nil)
 	custData := genNetDelayCmd(r)
 	c.Args, _ = r.generateArgs(s, meta.Args, DirIn)
 	if len(c.Args) > 0 {
@@ -1440,10 +1440,10 @@ func (r *randGen) generateWriteCallsWithNetCallForHmdfsStash(s *state, p *Prog, 
 		if i == netInsertPos {
 			failStartIdx = len(calls)
 			calls = append(calls, r.genRecvCall(sCalls, *syncIdx))
-			calls = append(calls, r.genNetDownCall(sCalls, targetNodes))
+			calls = append(calls, r.genNetDownCall(s, sCalls, targetNodes))
 			calls = append(calls, r.genSendCall(sCalls, syncIdx))
 			calls = append(calls, r.genRecvCall(sCalls, *syncIdx))
-			calls = append(calls, r.genNetUpCall(sCalls))
+			calls = append(calls, r.genNetUpCall(s, sCalls))
 			calls = append(calls, r.genSendCall(sCalls, syncIdx))
 			failEndIdx = len(calls) - 1
 		}
@@ -3382,10 +3382,10 @@ func (r *randGen) generateMultiFileWriteCallsForStash(s *state, p *Prog, sCalls 
 			if currentPos == netInsertPos {
 				failStartIdx = len(calls)
 				calls = append(calls, r.genRecvCall(sCalls, *syncIdx))
-				calls = append(calls, r.genNetDownCall(sCalls, targetNodes))
+				calls = append(calls, r.genNetDownCall(s, sCalls, targetNodes))
 				calls = append(calls, r.genSendCall(sCalls, syncIdx))
 				calls = append(calls, r.genRecvCall(sCalls, *syncIdx))
-				calls = append(calls, r.genNetUpCall(sCalls))
+				calls = append(calls, r.genNetUpCall(s, sCalls))
 				calls = append(calls, r.genSendCall(sCalls, syncIdx))
 				failEndIdx = len(calls) - 1
 			}
