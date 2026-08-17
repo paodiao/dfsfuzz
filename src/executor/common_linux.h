@@ -351,8 +351,8 @@ static long syz_failure_down() {
 }
 
 static long syz_failure_up() {
-  char cmd[100];
-  snprintf(cmd, 100, "/root/%s-node-up.sh %s %s %lld 2>&1", dfs_name, init_ip,
+  char cmd[4096]; // dfs_setup_params (cids) can be long; quote it (spaces and ';')
+  snprintf(cmd, sizeof(cmd), "/root/%s-node-up.sh %s \"%s\" %lld 2>&1", dfs_name, init_ip,
            dfs_setup_params, executor_index);
   debug_cmd(cmd);
   // system(cmd);

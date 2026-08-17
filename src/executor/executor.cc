@@ -982,7 +982,9 @@ void reconfigure_dfs() {
     fprintf(stderr, "------ executor %lld reconfigure DFS\n", executor_index);
 #endif
     char cmdbuf[4096]; // hmdfs cids (64 hex chars per node) can be long
-    snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-node-up.sh %s %s %lld", dfs_name, init_ip,
+    // Quote dfs_setup_params: it contains spaces and ';' (cids separator)
+    // which bash would otherwise split into extra args / commands.
+    snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-node-up.sh %s \"%s\" %lld", dfs_name, init_ip,
              dfs_setup_params, executor_index);
     if (cmdbuf[0] != 0) {
 #if MDEBUG
@@ -1167,7 +1169,7 @@ void receive_handshake() {
   if (executor_index == 0 || !strcmp(dfs_name, "hmdfs")) {
     char cmdbuf[4096]; // hmdfs cids (64 hex chars per node) can be long
     if (!strcmp(dfs_name, "hmdfs")) {
-      snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-config.sh %s %s %lld 2>&1",
+      snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-config.sh %s \"%s\" %lld 2>&1",
                dfs_name, init_ip, dfs_setup_params, executor_index);
     } else {
       snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-config.sh %s %s 2>&1",
