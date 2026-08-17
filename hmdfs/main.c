@@ -900,7 +900,7 @@ static int hmdfs_fill_super(struct super_block *sb, void *data, int silent)
 	 * unchanged.
 	 */
 	lockdep_set_novalidate_class(
-		&sb->s_writers.rw_sem[SB_FREEZE_WRITE].dep_map);
+		&sb->s_writers.rw_sem[SB_FREEZE_WRITE].rw_sem);
 
 	sbi->boot_cookie = hmdfs_gen_boot_cookie();
 
