@@ -121,17 +121,16 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 	r.EnabledCalls = serv.cfg.Syscalls
 	r.GitRevision = prog.GitRevision
 	r.TargetRevision = serv.cfg.Target.Revision
-	if serv.mgr.rotateCorpus() && serv.rnd.Intn(5) == 0 {
-		// We do rotation every other time because there are no objective
-		// proofs regarding its efficiency either way.
-		// Also, rotation gives significantly skewed syscall selection
-		// (run prog.TestRotationCoverage), it may or may not be OK.
-		r.CheckResult = serv.rotateCorpus(f, corpus)
-	} else {
-		r.CheckResult = serv.checkResult
-		f.inputs = corpus
-		f.newMaxSignal = serv.maxSignal.Copy()
-	}
+	// NOTE: corpus rotation is disabled. The rotator randomly drops ~5%
+	// of syscalls per VM run (e.g. pread64/syz_failure_recv), while the
+	// hmdfs program generators emit fixed calls (pread64/pwrite64/...)
+	// without consulting the choice table, which panics the fuzzer with
+	// "executing disabled syscall". EnabledCalls above stays at the full
+	// cfg.Syscalls set, so generator output always matches the choice
+	// table. rotateCorpus()/Rotator/selectInputs below are dead code.
+	r.CheckResult = serv.checkResult
+	f.inputs = corpus
+	f.newMaxSignal = serv.maxSignal.Copy()
 	return nil
 }
 
