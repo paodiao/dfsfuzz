@@ -147846,6 +147846,18 @@ struct comm_runtime {
 	int (*write16)(struct comm_runtime *, u8, u8, u8, u8);
 };
 
+struct sfire_chip___2;
+
+struct comm_runtime___2 {
+	struct sfire_chip___2 *chip;
+	struct urb receiver;
+	u8 *receiver_buffer;
+	u8 serial;
+	void (*init_urb)(struct comm_runtime___2 *, struct urb *, u8 *, void *, void (*)(struct urb *));
+	int (*write8)(struct comm_runtime___2 *, u8, u8, u8);
+	int (*write16)(struct comm_runtime___2 *, u8, u8, u8, u8);
+};
+
 struct scsi_lun {
 	__u8 scsi_lun[8];
 };
@@ -150400,7 +150412,7 @@ struct control_runtime {
 	int (*update_streaming)(struct control_runtime *);
 	int (*set_rate)(struct control_runtime *, int);
 	int (*set_channels)(struct control_runtime *, int, int, bool, bool);
-	struct sfire_chip *chip;
+	struct sfire_chip___2 *chip;
 	struct snd_kcontrol *element[32];
 	bool opt_coax_switch;
 	bool line_phono_switch;
@@ -163208,14 +163220,14 @@ struct dma_heap_allocation_data {
 
 struct dma_heap_attachment {
 	struct device *dev;
-	struct sg_table table;
+	struct sg_table *table;
 	struct list_head list;
 	bool mapped;
 };
 
 struct dma_heap_attachment___2 {
 	struct device *dev;
-	struct sg_table *table;
+	struct sg_table table;
 	struct list_head list;
 	bool mapped;
 };
@@ -194063,7 +194075,7 @@ struct go7007_snd {
 struct go7007_usb_board;
 
 struct go7007_usb {
-	const struct go7007_usb_board *board;
+	struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -194072,7 +194084,7 @@ struct go7007_usb {
 };
 
 struct go7007_usb___2 {
-	struct go7007_usb_board *board;
+	const struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -204081,14 +204093,6 @@ struct hiface_chip {
 	struct pcm_runtime *pcm;
 };
 
-struct pcm_runtime___2;
-
-struct hiface_chip___2 {
-	struct usb_device *dev;
-	struct snd_card *card;
-	struct pcm_runtime___2 *pcm;
-};
-
 struct hiface_vendor_quirk {
 	const char *device_name;
 	u8 extra_freq;
@@ -205087,11 +205091,10 @@ struct hpd_input_report {
 struct hpd_status {
 	union {
 		struct {
-			u32 distance: 16;
+			u32 human_presence_report: 4;
+			u32 human_presence_actual: 4;
 			u32 probablity: 8;
-			u32 presence: 2;
-			u32 rsvd: 5;
-			u32 state: 1;
+			u32 object_distance: 16;
 		} shpd;
 		u32 val;
 	};
@@ -205100,10 +205103,11 @@ struct hpd_status {
 struct hpd_status___2 {
 	union {
 		struct {
-			u32 human_presence_report: 4;
-			u32 human_presence_actual: 4;
+			u32 distance: 16;
 			u32 probablity: 8;
-			u32 object_distance: 16;
+			u32 presence: 2;
+			u32 rsvd: 5;
+			u32 state: 1;
 		} shpd;
 		u32 val;
 	};
@@ -220737,14 +220741,14 @@ struct insn {
 
 struct instance_attribute {
 	struct attribute attr;
-	ssize_t (*show)(struct edac_pci_ctl_info *, char *);
-	ssize_t (*store)(struct edac_pci_ctl_info *, const char *, size_t);
+	ssize_t (*show)(struct edac_device_instance *, char *);
+	ssize_t (*store)(struct edac_device_instance *, const char *, size_t);
 };
 
 struct instance_attribute___2 {
 	struct attribute attr;
-	ssize_t (*show)(struct edac_device_instance *, char *);
-	ssize_t (*store)(struct edac_device_instance *, const char *, size_t);
+	ssize_t (*show)(struct edac_pci_ctl_info *, char *);
+	ssize_t (*store)(struct edac_pci_ctl_info *, const char *, size_t);
 };
 
 struct instr_dual {
@@ -248642,6 +248646,21 @@ struct midi_runtime {
 	u8 *out_buffer;
 	int buffer_offset;
 	void (*in_received)(struct midi_runtime *, u8 *, int);
+};
+
+struct midi_runtime___2 {
+	struct sfire_chip___2 *chip;
+	struct snd_rawmidi *instance;
+	struct snd_rawmidi_substream *in;
+	char in_active;
+	spinlock_t in_lock;
+	spinlock_t out_lock;
+	struct snd_rawmidi_substream *out;
+	struct urb out_urb;
+	u8 out_serial;
+	u8 *out_buffer;
+	int buffer_offset;
+	void (*in_received)(struct midi_runtime___2 *, u8 *, int);
 };
 
 struct mif6ctl {
@@ -279721,14 +279740,14 @@ struct pcm_substream {
 };
 
 struct pcm_urb {
-	struct hiface_chip___2 *chip;
+	struct hiface_chip *chip;
 	struct urb instance;
 	struct usb_anchor submitted;
 	u8 *buffer;
 };
 
-struct pcm_runtime___2 {
-	struct hiface_chip___2 *chip;
+struct pcm_runtime {
+	struct hiface_chip *chip;
 	struct snd_pcm *instance;
 	struct pcm_substream playback;
 	bool panic;
@@ -279741,15 +279760,15 @@ struct pcm_runtime___2 {
 };
 
 struct pcm_urb___2 {
-	struct sfire_chip *chip;
+	struct sfire_chip___2 *chip;
 	struct urb instance;
 	struct usb_iso_packet_descriptor packets[8];
 	u8 *buffer;
 	struct pcm_urb___2 *peer;
 };
 
-struct pcm_runtime {
-	struct sfire_chip *chip;
+struct pcm_runtime___2 {
+	struct sfire_chip___2 *chip;
 	struct snd_pcm *instance;
 	struct pcm_substream playback;
 	struct pcm_substream capture;
@@ -307274,6 +307293,18 @@ struct sfire_chip {
 	struct pcm_runtime *pcm;
 	struct control_runtime *control;
 	struct comm_runtime *comm;
+};
+
+struct sfire_chip___2 {
+	struct usb_device *dev;
+	struct snd_card *card;
+	int intf_count;
+	int regidx;
+	bool shutdown;
+	struct midi_runtime___2 *midi;
+	struct pcm_runtime___2 *pcm;
+	struct control_runtime *control;
+	struct comm_runtime___2 *comm;
 };
 
 struct sfp_eeprom_base {
@@ -381533,16 +381564,6 @@ struct wmi_neighbor_report_event {
 };
 
 struct wmi_network_type {
-	struct wmi_ssid___2 ssid;
-	u32 authentication;
-	u32 encryption;
-	u32 bcast_nw_type;
-	u8 channel_count;
-	u16 channels[60];
-	s32 rssi_threshold;
-};
-
-struct wmi_network_type___2 {
 	struct wmi_ssid ssid;
 	u32 authentication;
 	u32 encryption;
@@ -381551,6 +381572,16 @@ struct wmi_network_type___2 {
 	u16 channels[60];
 	s32 rssi_threshold;
 } __attribute__((packed));
+
+struct wmi_network_type___2 {
+	struct wmi_ssid___2 ssid;
+	u32 authentication;
+	u32 encryption;
+	u32 bcast_nw_type;
+	u8 channel_count;
+	u16 channels[60];
+	s32 rssi_threshold;
+};
 
 struct wmi_ns_offload_tuple {
 	u32 tlv_header;
@@ -382533,7 +382564,7 @@ struct wmi_pmkid_list_reply {
 	struct wmi_pmkid pmkid_list[1];
 } __attribute__((packed));
 
-struct wmi_pno_scan_req___2 {
+struct wmi_pno_scan_req {
 	u8 enable;
 	u8 vdev_id;
 	u8 uc_networks_count;
@@ -382550,9 +382581,9 @@ struct wmi_pno_scan_req___2 {
 	u32 enable_pno_scan_randomization;
 	u8 mac_addr[6];
 	u8 mac_addr_mask[6];
-};
+} __attribute__((packed));
 
-struct wmi_pno_scan_req {
+struct wmi_pno_scan_req___2 {
 	u8 enable;
 	u8 vdev_id;
 	u8 uc_networks_count;
@@ -382569,7 +382600,7 @@ struct wmi_pno_scan_req {
 	u32 enable_pno_scan_randomization;
 	u8 mac_addr[6];
 	u8 mac_addr_mask[6];
-} __attribute__((packed));
+};
 
 struct wmi_power_mode_cmd {
 	u8 pwr_mode;
