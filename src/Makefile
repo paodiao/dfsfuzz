@@ -151,7 +151,7 @@ else
 	$(MAKE) $(HMDFS_BPF_SKEL)
 	$(CXX) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) \
 		executor/executor.cc $(HMDFS_TRACE_SRC) \
-		$(ADDCFLAGS) $(CFLAGS) -lbpf -lz -lelf -g -O0 -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
+		$(ADDCFLAGS) $(CFLAGS) -L/usr/lib64 -lbpf -lz -lelf -g -O0 -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
 		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
 endif
 endif
