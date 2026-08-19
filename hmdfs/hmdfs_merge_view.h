@@ -189,12 +189,14 @@ static inline bool is_merge_lookup_end(struct hmdfs_dentry_info_merge *mdi)
 {
 	/*
 	 * Lock-free condition for the same reason as has_merge_lookup_work():
-	 * called from wait_event() while !TASK_RUNNING. list_empty() only
-	 * reads the head pointer and is safe; the wait_event() loop tolerates
-	 * transient inconsistency.
+	 * called from wait_event() while !TASK_RUNNING. Only work_count is
+	 * checked: wait_event() must wait until every scheduled merge lookup
+	 * work has finished (work_count == 0). Checking list_empty(&comrade_list)
+	 * here would terminate the wait as soon as the first work has not yet
+	 * linked its comrade, returning a spurious -ENOENT even though more
+	 * works are still running (every merge_view lookup raced this way).
 	 */
-	return READ_ONCE(mdi->work_count) == 0 ||
-	       list_empty(&mdi->comrade_list);
+	return READ_ONCE(mdi->work_count) == 0;
 }
 
 void hmdfs_update_meta(struct inode *dir);

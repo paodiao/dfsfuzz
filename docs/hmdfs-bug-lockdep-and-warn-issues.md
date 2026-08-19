@@ -137,27 +137,27 @@ hmdfs_server_readdir → hmdfs_server_rebuild_dents → iterate_dir（持 i_mute
 2. **第二轮（已回退）**：`hmdfs_fill_super` 用 `lockdep_set_novalidate_class` 宏——**无效**：宏内部 `lockdep_init_map_type` 拒绝覆盖已在 `alloc_super` 初始化过的 key（只打印 "key is not as annotated" 警告）。
 3. **第三轮（已回退）**：`cache_file_truncate` 改 `do_truncate()`（ftruncate 语义，setattr 不取 sb_writers）——**有效但半修**：truncate 路径不再取锁（#5 内核实证），但 **write 路径（kernel_write → ext4 write_iter → sb_start_write）无法绕过**（主线语义：任何写都取 sb_writers）→ 环仍在（触发点变为 `create_dentry` 的 kernel_write）。
 4. **第四轮（已回退）**：外层 `sb_start_write` 包 iterate + `hmdfs_fill_super` 直接赋值 `SB_FREEZE_WRITE` 层 `dep_map.key = &__lockdep_no_validate__`（绕过宏覆盖保护）——**外层锁生效**（#6 内核实证：`already holding sb_writers at hmdfs_server_readdir`），但 **novalidate 无法抑制 recursive**——机制（lockdep.c:5004）：`if (!prove_locking || lock->key == &__lockdep_no_validate__) check = 0;`——**novalidate 只关环检测（check=0），recursive 检测（同锁同 subclass 重复获取）独立于 check 仍执行** → recursive 照报（#6 仍崩）。
-5. **最终方案（当前）**：**配置层关闭 lockdep** + **保留外层锁（freeze 安全）**：
+5. **最终方案（当前）**：**配置层关闭 lockdep，hmdfs 代码完全回到生产原始**：
 
 ```
 CONFIG_LOCKDEP=n              # 连带 PROVE_LOCKING=n、DEBUG_LOCK_ALLOC=n
 CONFIG_DEBUG_ATOMIC_SLEEP=y   # 保留（问题② 检测）
 ```
 
-- **hmdfs 代码保持项目基线**（main.c 已还原：删除 novalidate 与 lockdep.h include——`CONFIG_LOCKDEP=n` 后 `dep_map` 成员不存在，必须删）
-- **server.c 外层 `sb_start_write` 保留**：运行时锁序 `sb_writers → i_mutex_dir`（与 openat 同向）→ **freeze 场景安全**；无 lockdep 下为纯 freeze 计数，无副作用
-- 关闭 lockdep 后 circular/recursive 均不再被检测——**华为生产内核（无 lockdep）即以原始代码运行**
+- **hmdfs 代码完全还原**（与 hmdfs-bak 真原始一致）：main.c 已删 novalidate 与 lockdep.h include；**server.c 外层 `sb_start_write` 也已清除**（LOCKDEP=n 后无检测意义，freeze 保护还原为生产原始语义）——`rebuild_dents` 为裸 `iterate_dir`
+- 关闭 lockdep 后 circular/recursive 均不再被检测——**华为生产内核（无 lockdep）即以原始代码运行**（实测 #7 内核实证：recursive/circular 崩溃全部消失）
 
 **关键论证**：
 - **读-读兼容（数学严格）**：filldir 与 openat 取 sb_writers 均为 `percpu_down_read`（读锁，不互斥）→ 非 freeze 场景 filldir 的 sb_writers 获取永不阻塞 → 无死锁
-- **freeze 场景**：外层 `sb_start_write` 使锁序与 openat 同向（外层读锁先持，freeze 等待外层释放，内层嵌套读无新增等待）→ 安全——**运行时正确性不依赖检测器**
+- **freeze 场景**：还原后与华为生产原始一致（filldir 持 i_mutex_dir 读 → 取 sb_writers 读）——freeze 并发存在理论三环死锁，但**生产同配置运行多年未触发、fuzz 无 freeze 调用**——记录为已知风险
 - **为何放弃代码级方案**：lockdep 语义（recursive 不受 novalidate/check 控制、无 sb_writers 嵌套 API、subclass 方案会暴露 circular）与 hmdfs"iterate 内写文件"的设计根本冲突——任何代码内表达都是 hack；**配置层关闭（华为生产同款）是唯一干净的出路**
 - **兜底**：DETECT_HUNG_TASK 仍在；② 的规范检测（DEBUG_ATOMIC_SLEEP）保留
 
 ### 残余风险（记录，未处理）
 
 - lockdep 全关 → 未来锁序/递归问题不再被 fuzz 自动发现（DETECT_HUNG_TASK + 人工 review 兜底）；所有已发现问题的代码级修复（①②⑤⑥）已在，不依赖 lockdep
-- filldir 的 **DT_LNK 分支**（`hmdfs_lookup_symlink` → `filp_open(O_RDWR)`）也在 iterate 内取 sb_writers——被外层锁覆盖（freeze 安全）；若需根治可将 `hmdfs_open_link` 改 `O_RDONLY`（读 symlink 内容不需写权限）
+- **freeze 并发**：外层锁已清除，freeze 场景回到生产原始理论死锁风险（fuzz 无 freeze 调用，不触发）
+- filldir 的 **DT_LNK 分支**（`hmdfs_lookup_symlink` → `filp_open(O_RDWR)`）也在 iterate 内取 sb_writers——同属生产原始行为；若需根治可将 `hmdfs_open_link` 改 `O_RDONLY`（读 symlink 内容不需写权限）
 
 ---
 
@@ -224,6 +224,14 @@ B. DEBUG_LOCKS_WARN_ON(__owner_task(owner) != get_current())
 - `merge_lookup_work_func`：**`mutex_unlock(work_lock)` 移到 `wake_up_all` 之前** → 唤醒者重入（新 lookup/create）时锁已释放，减少竞争窗口
 - 4 个调用点（lookup_merge_normal ×2、lookup_merge_root ×2）传目标 dentry
 
+### 补充（2026-08-19 实测，ENOENT 根因）：`is_merge_lookup_end` 提前返回
+
+LOCKDEP 关闭后（#7 内核）recursive/circular 崩溃消失，但 `opendir merge_view ENOENT` **独立高频出现**（每 ~40s）——**不是 crash 次生**。根因：
+
+`is_merge_lookup_end`（hmdfs_merge_view.h）条件 `work_count == 0 || list_empty(&comrade_list)`——**`|| list_empty` 让 wait_event 在任一 work 尚未 link comrade 时提前返回**（count>0 但 comrade_list 暂空 → 立即判结束 → -ENOENT 误报）。与现象完全吻合：时好时坏（取决于 work 是否恰在条件检查前 link）、跨节点不一致（不同 VM 调度时序）、readdir 显示名字但 stat 该路径 ENOENT（readdir 直接遍历底层、lookup 走异步 work 提前返回）。
+
+**修复**：`is_merge_lookup_end` 去掉 `|| list_empty(&mdi->comrade_list)`，仅保留 `work_count == 0`（wait 到所有 work 完成再判 comrade_list；无 work 场景 count=0 即结束）。
+
 ---
 
 ## 问题 ⑥：`held lock freed`（connection_put 持锁释放 conn）
@@ -283,8 +291,8 @@ mount -t hmdfs -o merge,local_dst="/mnt/hmdfs/100/non_account" \
 | 文件 | 行号 | 说明 |
 | --- | --- | --- |
 | `hmdfs/inode_merge.c` | :606-654 | `lookup_merge_root`（① 已异步化） |
-| `hmdfs/hmdfs_merge_view.h` | :167-190 | `has_merge_lookup_work`/`is_merge_lookup_end`（② 已无锁化） |
-| `hmdfs/hmdfs_server.c` | :1487-1550 | `hmdfs_server_rebuild_dents`（③ 保留 sb_start_write 包 iterate_dir） |
+| `hmdfs/hmdfs_merge_view.h` | :167-198 | `has_merge_lookup_work`/`is_merge_lookup_end`（② 已无锁化；⑤ `is_merge_lookup_end` 去掉 `\|\| list_empty` 修复 ENOENT） |
+| `hmdfs/hmdfs_server.c` | :1487-1540 | `hmdfs_server_rebuild_dents`（③ 已还原裸 iterate_dir，与真原始一致） |
 | `hmdfs/hmdfs_dentryfile.c` | :1597-1606 | `cache_file_truncate`（保持原始 vfs_truncate） |
 | `hmdfs/main.c` | — | ③ 已还原（无 novalidate/lockdep） |
 | `hmdfs/inode_merge.c` | :444-481 | `merge_lookup_async`（⑤ ++/schedule 顺序 + dget） |
