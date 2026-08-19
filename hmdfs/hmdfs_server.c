@@ -1518,7 +1518,22 @@ struct file *hmdfs_server_rebuild_dents(struct hmdfs_sb_info *sbi,
 	gc.parent_path = path;
 	gc.file = dentry_file;
 
+	/*
+	 * Take sb_writers before iterate_dir: the filldir callback writes
+	 * the dcache file (create_dentry -> cache_file_write/truncate), and
+	 * every write path takes sb_writers (freeze protection). Acquiring
+	 * it first makes this path lock-ordered sb_writers -> i_mutex_dir,
+	 * same as openat(), so freeze-time deadlock is impossible (the inner
+	 * acquisition is a nested read under the outer one). lockdep cannot
+	 * express this nesting; the SB_FREEZE_WRITE rwsem of this sb is
+	 * excluded from lockdep validation in hmdfs_fill_super() (main.c).
+	 * Note: this must be the same super_block as the one excluded in
+	 * main.c — with the current setup the dcache file lives inside the
+	 * hmdfs mount (lockdep shows one sb_writers instance), so it is.
+	 */
+	sb_start_write(dentry_file->f_path.mnt->mnt_sb);
 	err = iterate_dir(file, &(gc.ctx));
+	sb_end_write(dentry_file->f_path.mnt->mnt_sb);
 	if (err) {
 		hmdfs_err("iterate_dir failed");
 		goto out;

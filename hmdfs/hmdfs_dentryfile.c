@@ -899,7 +899,7 @@ find:
 	       get_bucketaddr(level, namehash % get_bucket_by_level(level));
 	end_block = bidx + BUCKET_BLOCKS;
 	if (end_block > get_dentry_group_cnt(file_inode(file))) {
-		if (cache_file_truncate(sbi, file,
+		if (cache_file_truncate(sbi, &(file->f_path),
 					get_dcache_file_size(level))) {
 			ret = -ENOSPC;
 			goto out;
@@ -1594,21 +1594,11 @@ int hmdfs_unlock_file(struct file *filp, loff_t start, loff_t len)
 	return hmdfs_do_lock_file(filp, F_UNLCK, start, len);
 }
 
-long cache_file_truncate(struct hmdfs_sb_info *sbi, struct file *filp,
+long cache_file_truncate(struct hmdfs_sb_info *sbi, const struct path *path,
 			 loff_t length)
 {
 	const struct cred *old_cred = hmdfs_override_creds(sbi->system_cred);
-	/*
-	 * filp is already opened O_RDWR by the caller, so its write
-	 * permission was checked at open time. Truncate it through
-	 * do_truncate() (ftruncate semantics) instead of vfs_truncate():
-	 * the latter takes mnt_want_write()/sb_writers, which inside
-	 * iterate_dir() created the i_mutex_dir <-> sb_writers circular
-	 * dependency reported by lockdep. Keeping rebuild_dents free of
-	 * sb_writers acquisitions removes that problem entirely.
-	 */
-	long ret = do_truncate(file_mnt_idmap(filp), filp->f_path.dentry,
-				length, 0, filp);
+	long ret = vfs_truncate(path, length);
 
 	hmdfs_revert_creds(old_cred);
 

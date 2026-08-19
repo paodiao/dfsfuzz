@@ -9,6 +9,7 @@
 #include "hmdfs.h"
 
 #include <linux/ctype.h>
+#include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/statfs.h>
 #include <linux/xattr.h>
@@ -886,6 +887,24 @@ static int hmdfs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_magic = HMDFS_SUPER_MAGIC;
 	sb->s_xattr = hmdfs_xattr_handlers;
 	sb->s_op = &hmdfs_sops;
+
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
+	/*
+	 * hmdfs_server_rebuild_dents() writes the dcache file inside
+	 * iterate_dir(): create_dentry -> cache_file_write -> kernel_write
+	 * -> ext4 write_iter -> sb_start_write(). Every write path takes
+	 * sb_writers, so filldir inherently acquires sb_writers while the
+	 * directory i_rwsem read lock is held. The rebuild path acquires
+	 * sb_writers first (sb_start_write around iterate_dir in
+	 * hmdfs_server.c), making its order sb_writers -> i_mutex_dir, same
+	 * as openat(), so freeze-time deadlock is impossible. lockdep cannot
+	 * express this nesting (no nested-acquire API for sb_writers), so
+	 * this sb's SB_FREEZE_WRITE rwsem is excluded from lockdep
+	 * validation; freeze counters are unaffected.
+	 */
+	sb->s_writers.rw_sem[SB_FREEZE_WRITE - 1].dep_map.key =
+		&__lockdep_no_validate__;
+#endif
 
 	sbi->boot_cookie = hmdfs_gen_boot_cookie();
 
