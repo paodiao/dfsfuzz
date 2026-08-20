@@ -790,7 +790,7 @@ int set_and_send_socket(int conn_fd, remote_node *node) {
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmd = CMD_UPDATE_SOCKET;
     cmd.newfd = conn_fd;
-    cmd.devsl = 1;
+    cmd.devsl = 3;
     cmd.status = SOCKET_STAT_ACCEPT; // 使用官方定义的状态值，服务器接受连接
     memset(cmd.masterkey, 0, HMDFS_KEY_SIZE); // 初始化为全0，后续由内核处理
     
@@ -1075,7 +1075,7 @@ void HandleAllNotify(int fd) {
                                 memset(&cmd, 0, sizeof(cmd));
                                 cmd.cmd = CMD_UPDATE_SOCKET;
                                 cmd.newfd = remote_fd;
-                                cmd.devsl = 1;
+                                cmd.devsl = 3;
                                 cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                                 memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
                                 memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
@@ -1114,7 +1114,7 @@ void HandleAllNotify(int fd) {
                                 memset(&cmd, 0, sizeof(cmd));
                                 cmd.cmd = CMD_UPDATE_SOCKET;
                                 cmd.newfd = remote_fd;
-                                cmd.devsl = 1;
+                                cmd.devsl = 3;
                                 cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                                 memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
                                 memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
@@ -1207,7 +1207,7 @@ void handle_hmdfs_notify(void) {
                             memset(&cmd, 0, sizeof(cmd));
                             cmd.cmd = CMD_UPDATE_SOCKET;
                             cmd.newfd = remote_fd;
-                            cmd.devsl = 1;
+                            cmd.devsl = 3;
                             cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                             memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
                             memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
@@ -1246,7 +1246,7 @@ void handle_hmdfs_notify(void) {
                             memset(&cmd, 0, sizeof(cmd));
                             cmd.cmd = CMD_UPDATE_SOCKET;
                             cmd.newfd = remote_fd;
-                            cmd.devsl = 1;
+                            cmd.devsl = 3;
                             cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                             memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
                             memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
@@ -1392,7 +1392,7 @@ int parse_config_file(const char *filename) {
             g_config.nodes[i].fd = -1;
             g_config.nodes[i].port = g_config.local_port;
             if (g_config.nodes[i].devsl == 0) {
-                g_config.nodes[i].devsl = 1; // 默认设备序列号为1
+                g_config.nodes[i].devsl = 3; // 默认设备序列号为3
             }
             g_config.node_count++;
         } else {
@@ -1575,7 +1575,7 @@ int parse_config_cmd(const char *cmd_line) {
         inet_ntop(AF_INET, &remote_addr, g_config.nodes[remote_idx].ip, INET_ADDRSTRLEN);
         
         g_config.nodes[remote_idx].port = port;
-        g_config.nodes[remote_idx].devsl = 1;
+        g_config.nodes[remote_idx].devsl = 3;
         g_config.nodes[remote_idx].status = DEVICE_STATUS_ONLINE;
         g_config.nodes[remote_idx].fd = -1;
         g_config.nodes[remote_idx].last_heartbeat = current_time;
@@ -1824,7 +1824,7 @@ void *connector_thread_func(void *arg) {
                     memset(&cmd, 0, sizeof(cmd));
                     cmd.cmd = CMD_UPDATE_SOCKET;
                     cmd.newfd = remote_fd;
-                    cmd.devsl = 1;
+                    cmd.devsl = 3;
                     cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
                     memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
                     memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);

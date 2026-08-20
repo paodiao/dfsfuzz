@@ -162,6 +162,15 @@
 **X2. stash 元数据"陈旧"导致 moveFailCalls 拆散其它节点 recv/send 配对**（代理推断）
 - 核实：配对按 sync 值跨 prog 汇合，6 块整体移动保持内部顺序——不会因只移动 ps[0] 而死锁——排除（但 C4/S6/S7 的窗口拆分路径仍真实存在）
 
+## 六、环境/配置问题（✅ 已修复）
+
+**E1. agent devsl=1 导致跨节点 F_OPEN 必拒（Permission denied）**
+- 位置：hmdfs_agent.c 793 / 1078 / 1117 / 1210 / 1249 / 1827（`cmd.devsl = 1`）+ 1395 / 1578（配置默认值）
+- 现象：metadata 收集期 `get_file_checksum open failed ... Permission denied (errno 13)` → SYZFAIL；内核日志 `hmdfs_open_file() devsl permission denied`（hmdfs_server.c:357）。仅跨节点打开 merge_view 下对端已有文件时出现；同节点文件、创建、stat、xattr 全部正常——表现为"时有时无"的偶发失败
+- 根因：内核 `check_sec_level()`（hmdfs_server.c:291-341）对**无 `user.security` xattr** 的文件要求 `node->devsl >= DATA_SEC_LEVEL3(3)` 才放行（有标签则 `devsl >= 标签级别`）；agent 将 devsl 写死为 1（真实 HarmonyOS 设备为 3）→ 无标签文件跨节点 F_OPEN 必被服务端拒绝。检查只存在于 F_OPEN 回调链（hmdfs_server_open → hmdfs_open_file），F_CREATE/F_GETATTR/F_READPAGE 等均不检查——故测试期跨节点 open 静默失败（executor 仅记录 errno，默认不打印），仅 write_metadata 的 checksum open（getmetadata.h:210-223 的 fail()）暴露为 SYZFAIL
+- 修复：8 处 devsl=1 → 3（与内核 DATA_SEC_LEVEL3 对齐，恢复真实设备语义——无标签文件跨节点可访问）
+- 状态：✅ 已修复（待 fuzz 回归验证：重跑 2 节点 hmdfs 用例，确认 `devsl permission denied` 与 checksum SYZFAIL 消失）
+
 ## 附：修复批次与优先级
 
 - **批1（崩溃级）**：C1 → C2 → C3 → C4 → C5（顺序：先两侧语义对齐项 C1，再空 ps 防护 C2，后 panic 类 C3/C4/C5）
