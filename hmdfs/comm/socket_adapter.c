@@ -485,9 +485,10 @@ int hmdfs_sendmessage_request(struct hmdfs_peer *con,
 		hmdfs_untrack_async_readdir(con, msg_wq);
 
 	if (time_left == -ERESTARTSYS || time_left == 0) {
-		hmdfs_err("timeout err sm->device_id %lld,  msg_id %d cmd %d",
+		hmdfs_err("timeout err sm->device_id %lld,  msg_id %d cmd %d, time_left=%d%s",
 			  con->device_id, head->msg_id,
-			  head->operations.command);
+			  head->operations.command, time_left,
+			  time_left == 0 ? " (real-timeout)" : " (signal-interrupted)");
 		if (sm->operations.command == F_ITERATE)
 			atomic_set(&msg_wq->recv_info.state, FILE_RECV_ERR_NET);
 		ret = -ETIME;
