@@ -3134,7 +3134,12 @@ void write_metadata(int iter) {
 
     stat_cnt = 0;
     mnt_path_len = strlen(cwdbuf) + 1;
+    fprintf(stderr, "MD start: exec=%lld pos=%ld val=%u\n", executor_index,
+            (long)((char *)output_pos - (char *)output_data),
+            *output_pos_value);
     write_dir_info(cwdbuf, NULL);
+    fprintf(stderr, "MD end: exec=%lld pos=%ld cnt=%u\n", executor_index,
+            (long)((char *)output_pos - (char *)output_data), stat_cnt);
 #ifdef MDEBUG
     fprintf(stderr,
             "executor %lld write_dir_info begins is_dfs_client:%lld %p %p %d "
@@ -3255,8 +3260,11 @@ uint32 *write_stat(struct stat *stat_buf, char *filepath, int xattr_len,
   write_output(filepath_size);
   write_output(xattr_len);
   write_output(link_len);
-  fprintf(stderr, "filepath_size %d xattr_len %d symlink_len %d\n",
-          filepath_size, xattr_len, link_len);
+  fprintf(stderr,
+          "MD: exec=%lld pos=%ld cnt=%u f=%d x=%d l=%d\n",
+          executor_index,
+          (long)((char *)output_pos - (char *)output_data),
+          stat_cnt, filepath_size, xattr_len, link_len);
 
   // filepath
   memcpy((void *)output_pos, (const void *)relative_filepath, filepath_size);
