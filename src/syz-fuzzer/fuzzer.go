@@ -222,7 +222,7 @@ func main() {
 		MaxDagCorpus         = flag.Int("MaxDagCorpus", 0, "Max DAG-driven corpus entries (0 = unlimited)")
 		Syzkaller            = flag.String("Syzkaller", "", "syzkaller location")
 		TSCOFF               = flag.String("TSCOFF", "0", "tsc offset")
-		MetadataDelayMs      = flag.Int("MetadataDelayMs", 10000, "metadata collection delay in ms for DFS conflict resolution")
+		MetadataDelayMs      = flag.Int("MetadataDelayMs", 60000, "metadata collection delay in ms for DFS conflict resolution")
 	)
 	defer tool.Init()()
 	outputType := parseOutputType(*flagOutput)
