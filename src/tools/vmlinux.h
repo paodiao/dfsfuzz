@@ -10931,19 +10931,6 @@ enum {
 };
 
 enum {
-	LOCKF_USED_IN_HARDIRQ = 1,
-	LOCKF_USED_IN_HARDIRQ_READ = 2,
-	LOCKF_ENABLED_HARDIRQ = 4,
-	LOCKF_ENABLED_HARDIRQ_READ = 8,
-	LOCKF_USED_IN_SOFTIRQ = 16,
-	LOCKF_USED_IN_SOFTIRQ_READ = 32,
-	LOCKF_ENABLED_SOFTIRQ = 64,
-	LOCKF_ENABLED_SOFTIRQ_READ = 128,
-	LOCKF_USED = 256,
-	LOCKF_USED_READ = 512,
-};
-
-enum {
 	LOGIC_PIO_INDIRECT = 0,
 	LOGIC_PIO_CPU_MMIO = 1,
 };
@@ -31688,13 +31675,6 @@ enum bfqq_state_flags {
 	BFQQF_split_coop = 11,
 };
 
-enum bfs_result {
-	BFS_EINVALIDNODE = -2,
-	BFS_EQUEUEFULL = -1,
-	BFS_RMATCH = 0,
-	BFS_RNOMATCH = 1,
-};
-
 enum bh_state_bits {
 	BH_Uptodate = 0,
 	BH_Dirty = 1,
@@ -51414,9 +51394,9 @@ enum lockdep_wait_type {
 	LD_WAIT_INV = 0,
 	LD_WAIT_FREE = 1,
 	LD_WAIT_SPIN = 2,
-	LD_WAIT_CONFIG = 3,
-	LD_WAIT_SLEEP = 4,
-	LD_WAIT_MAX = 5,
+	LD_WAIT_CONFIG = 2,
+	LD_WAIT_SLEEP = 3,
+	LD_WAIT_MAX = 4,
 };
 
 enum lockdown_reason {
@@ -144716,14 +144696,6 @@ struct circ_buf {
 	int tail;
 };
 
-struct lock_list;
-
-struct circular_queue {
-	struct lock_list *element[4096];
-	unsigned int front;
-	unsigned int rear;
-};
-
 struct drm_modeset_acquire_ctx;
 
 struct drm_mode_config_funcs;
@@ -147858,6 +147830,18 @@ struct comm_runtime___2 {
 	int (*write16)(struct comm_runtime___2 *, u8, u8, u8, u8);
 };
 
+struct sfire_chip___3;
+
+struct comm_runtime___3 {
+	struct sfire_chip___3 *chip;
+	struct urb receiver;
+	u8 *receiver_buffer;
+	u8 serial;
+	void (*init_urb)(struct comm_runtime___3 *, struct urb *, u8 *, void *, void (*)(struct urb *));
+	int (*write8)(struct comm_runtime___3 *, u8, u8, u8);
+	int (*write16)(struct comm_runtime___3 *, u8, u8, u8, u8);
+};
+
 struct scsi_lun {
 	__u8 scsi_lun[8];
 };
@@ -150412,7 +150396,41 @@ struct control_runtime {
 	int (*update_streaming)(struct control_runtime *);
 	int (*set_rate)(struct control_runtime *, int);
 	int (*set_channels)(struct control_runtime *, int, int, bool, bool);
+	struct sfire_chip *chip;
+	struct snd_kcontrol *element[32];
+	bool opt_coax_switch;
+	bool line_phono_switch;
+	bool digital_thru_switch;
+	bool usb_streaming;
+	u8 output_vol[6];
+	u8 ovol_updated;
+	u8 output_mute;
+	s8 input_vol[2];
+	u8 ivol_updated;
+};
+
+struct control_runtime___2 {
+	int (*update_streaming)(struct control_runtime___2 *);
+	int (*set_rate)(struct control_runtime___2 *, int);
+	int (*set_channels)(struct control_runtime___2 *, int, int, bool, bool);
 	struct sfire_chip___2 *chip;
+	struct snd_kcontrol *element[32];
+	bool opt_coax_switch;
+	bool line_phono_switch;
+	bool digital_thru_switch;
+	bool usb_streaming;
+	u8 output_vol[6];
+	u8 ovol_updated;
+	u8 output_mute;
+	s8 input_vol[2];
+	u8 ivol_updated;
+};
+
+struct control_runtime___3 {
+	int (*update_streaming)(struct control_runtime___3 *);
+	int (*set_rate)(struct control_runtime___3 *, int);
+	int (*set_channels)(struct control_runtime___3 *, int, int, bool, bool);
+	struct sfire_chip___3 *chip;
 	struct snd_kcontrol *element[32];
 	bool opt_coax_switch;
 	bool line_phono_switch;
@@ -173326,7 +173344,7 @@ struct e1000_option {
 		} r;
 		struct {
 			int nr;
-			struct e1000_opt_list *p;
+			const struct e1000_opt_list *p;
 		} l;
 	} arg;
 };
@@ -173347,7 +173365,7 @@ struct e1000_option___2 {
 		} r;
 		struct {
 			int nr;
-			const struct e1000_opt_list *p;
+			struct e1000_opt_list *p;
 		} l;
 	} arg;
 };
@@ -173544,10 +173562,6 @@ struct each_dev_arg {
 struct each_port_arg {
 	struct typec_port *port;
 	struct component_match *match;
-};
-
-struct early_boot_kfree_rcu {
-	struct callback_head rh;
 };
 
 struct uart_icount {
@@ -194075,7 +194089,7 @@ struct go7007_snd {
 struct go7007_usb_board;
 
 struct go7007_usb {
-	struct go7007_usb_board *board;
+	const struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -194084,7 +194098,7 @@ struct go7007_usb {
 };
 
 struct go7007_usb___2 {
-	const struct go7007_usb_board *board;
+	struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -220741,14 +220755,14 @@ struct insn {
 
 struct instance_attribute {
 	struct attribute attr;
-	ssize_t (*show)(struct edac_device_instance *, char *);
-	ssize_t (*store)(struct edac_device_instance *, const char *, size_t);
+	ssize_t (*show)(struct edac_pci_ctl_info *, char *);
+	ssize_t (*store)(struct edac_pci_ctl_info *, const char *, size_t);
 };
 
 struct instance_attribute___2 {
 	struct attribute attr;
-	ssize_t (*show)(struct edac_pci_ctl_info *, char *);
-	ssize_t (*store)(struct edac_pci_ctl_info *, const char *, size_t);
+	ssize_t (*show)(struct edac_device_instance *, char *);
+	ssize_t (*store)(struct edac_device_instance *, const char *, size_t);
 };
 
 struct instr_dual {
@@ -229383,18 +229397,6 @@ struct irqtime {
 	u64 tick_delta;
 	u64 irq_start_time;
 	struct u64_stats_sync sync;
-};
-
-struct irqtrace_events {
-	unsigned int irq_events;
-	long unsigned int hardirq_enable_ip;
-	long unsigned int hardirq_disable_ip;
-	unsigned int hardirq_enable_event;
-	unsigned int hardirq_disable_event;
-	long unsigned int softirq_disable_ip;
-	long unsigned int softirq_enable_ip;
-	unsigned int softirq_disable_event;
-	unsigned int softirq_enable_event;
 };
 
 struct irt_routing_table {
@@ -238878,7 +238880,6 @@ struct kvm_vcpu {
 	int vcpu_id;
 	int vcpu_idx;
 	int ____srcu_idx;
-	int srcu_depth;
 	int mode;
 	u64 requests;
 	long unsigned int guest_debug;
@@ -242211,13 +242212,6 @@ struct lock_to_push {
 	__u32 pid;
 	__u16 netfid;
 	__u8 type;
-};
-
-struct lock_trace {
-	struct hlist_node hash_entry;
-	u32 hash;
-	u32 nr_entries;
-	long unsigned int entries[0];
 };
 
 struct lockd_net {
@@ -248649,7 +248643,7 @@ struct midi_runtime {
 };
 
 struct midi_runtime___2 {
-	struct sfire_chip___2 *chip;
+	struct sfire_chip___3 *chip;
 	struct snd_rawmidi *instance;
 	struct snd_rawmidi_substream *in;
 	char in_active;
@@ -279786,6 +279780,33 @@ struct pcm_runtime___2 {
 	bool stream_wait_cond;
 };
 
+struct pcm_urb___3 {
+	struct sfire_chip___3 *chip;
+	struct urb instance;
+	struct usb_iso_packet_descriptor packets[8];
+	u8 *buffer;
+	struct pcm_urb___3 *peer;
+};
+
+struct pcm_runtime___3 {
+	struct sfire_chip___3 *chip;
+	struct snd_pcm *instance;
+	struct pcm_substream playback;
+	struct pcm_substream capture;
+	bool panic;
+	struct pcm_urb___3 in_urbs[16];
+	struct pcm_urb___3 out_urbs[16];
+	int in_packet_size;
+	int out_packet_size;
+	int in_n_analog;
+	int out_n_analog;
+	struct mutex stream_mutex;
+	u8 stream_state;
+	u8 rate;
+	wait_queue_head_t stream_wait_queue;
+	bool stream_wait_cond;
+};
+
 struct pcmad_board_struct {
 	const char *name;
 	unsigned int ai_maxdata;
@@ -291082,13 +291103,6 @@ struct rcu_tasks_percpu {
 	struct list_head rtp_blkd_tasks;
 	int cpu;
 	struct rcu_tasks *rtpp;
-};
-
-struct rcu_tasks_test_desc {
-	struct callback_head rh;
-	const char *name;
-	bool notrun;
-	long unsigned int runstart;
 };
 
 struct t10_wwn {
@@ -307301,10 +307315,22 @@ struct sfire_chip___2 {
 	int intf_count;
 	int regidx;
 	bool shutdown;
-	struct midi_runtime___2 *midi;
+	struct midi_runtime *midi;
 	struct pcm_runtime___2 *pcm;
-	struct control_runtime *control;
+	struct control_runtime___2 *control;
 	struct comm_runtime___2 *comm;
+};
+
+struct sfire_chip___3 {
+	struct usb_device *dev;
+	struct snd_card *card;
+	int intf_count;
+	int regidx;
+	bool shutdown;
+	struct midi_runtime___2 *midi;
+	struct pcm_runtime___3 *pcm;
+	struct control_runtime___3 *control;
+	struct comm_runtime___3 *comm;
 };
 
 struct sfp_eeprom_base {
@@ -324604,12 +324630,6 @@ struct task_struct {
 	struct rt_mutex_waiter *pi_blocked_on;
 	struct mutex_waiter *blocked_on;
 	int non_block_count;
-	struct irqtrace_events irqtrace;
-	unsigned int hardirq_threaded;
-	u64 hardirq_chain_key;
-	int softirqs_enabled;
-	int softirq_context;
-	int irq_config;
 	u64 curr_chain_key;
 	int lockdep_depth;
 	unsigned int lockdep_recursion;
@@ -324720,6 +324740,9 @@ struct task_struct {
 	struct llist_head kretprobe_instances;
 	struct llist_head rethooks;
 	struct callback_head l1d_flush_kill;
+	long: 64;
+	long: 64;
+	long: 64;
 	long: 64;
 	struct thread_struct thread;
 };
@@ -335684,8 +335707,6 @@ struct trace_event_data_offsets_power_domain {
 struct trace_event_data_offsets_powernv_throttle {
 	u32 reason;
 };
-
-struct trace_event_data_offsets_preemptirq_template {};
 
 struct trace_event_data_offsets_prq_report {
 	u32 iommu;
@@ -351166,13 +351187,6 @@ struct trace_event_raw_powernv_throttle {
 	int chip_id;
 	u32 __data_loc_reason;
 	int pmax;
-	char __data[0];
-};
-
-struct trace_event_raw_preemptirq_template {
-	struct trace_entry ent;
-	s32 caller_offs;
-	s32 parent_offs;
 	char __data[0];
 };
 
@@ -396365,10 +396379,6 @@ typedef void (*btf_trace_ipi_raise)(void *, const struct cpumask *, const char *
 typedef void (*btf_trace_ipi_send_cpu)(void *, const unsigned int, long unsigned int, void *);
 
 typedef void (*btf_trace_ipi_send_cpumask)(void *, const struct cpumask *, long unsigned int, void *);
-
-typedef void (*btf_trace_irq_disable)(void *, long unsigned int, long unsigned int);
-
-typedef void (*btf_trace_irq_enable)(void *, long unsigned int, long unsigned int);
 
 typedef void (*btf_trace_irq_handler_entry)(void *, int, struct irqaction *);
 
