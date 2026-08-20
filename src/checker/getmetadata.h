@@ -114,17 +114,33 @@ int file_xattr(int file_type, char *fn) {
       ssize_t got = lgetxattr(fn, name, value_buf, want);
       copy_len = got > 0 ? (size_t)got : 0; // ERANGE/errors leave the buffer untouched
     }
-    if (cur_len >= XATTR_BUF_LEN)
+    if (cur_len >= XATTR_BUF_LEN - 1)
       break;
-    cur_len +=
-        snprintf(xattr_buf + cur_len, XATTR_BUF_LEN - cur_len, "%s:", name);
+    int name_written =
+        snprintf(xattr_buf + cur_len, XATTR_BUF_LEN - 1 - cur_len, "%s:", name);
+    if (name_written < 0)
+      break;
+    if (name_written >= XATTR_BUF_LEN - 1 - cur_len) {
+      cur_len = XATTR_BUF_LEN - 1;
+      xattr_buf[cur_len] = '\0';
+      return cur_len + 1;
+    }
+    cur_len += name_written;
     if ((int)copy_len > XATTR_BUF_LEN - 1 - cur_len)
       copy_len = XATTR_BUF_LEN - 1 - cur_len; // never overflow xattr_buf
     memcpy(xattr_buf + cur_len, value_buf, copy_len);
     cur_len += copy_len;
     i = next_name(name_buf, i);
-    if (cur_len < XATTR_BUF_LEN - 1)
-      cur_len += snprintf(xattr_buf + cur_len, XATTR_BUF_LEN - cur_len, ";");
+    if (cur_len < XATTR_BUF_LEN - 1) {
+      int semi_written =
+          snprintf(xattr_buf + cur_len, XATTR_BUF_LEN - 1 - cur_len, ";");
+      if (semi_written >= XATTR_BUF_LEN - 1 - cur_len) {
+        cur_len = XATTR_BUF_LEN - 1;
+        xattr_buf[cur_len] = '\0';
+        return cur_len + 1;
+      }
+      cur_len += semi_written;
+    }
   }
   if (cur_len > 0 && xattr_buf[cur_len - 1] == ';')
     xattr_buf[cur_len - 1] = '\0';
@@ -136,7 +152,7 @@ void write_dir_info(char *dn, struct dirent *dent) {
 
   struct dirent *sub_ent = NULL;
   struct stat stat_buf;
-  char sub_fn[510];
+  char sub_fn[512];
   int xattr_len = 0;
 
   fprintf(stderr, "----- executor %lld write_dir_info %s\n", executor_index,
@@ -186,7 +202,13 @@ void write_dir_info(char *dn, struct dirent *dent) {
       continue;
 
     fprintf(stderr, "subfile: %s\n", sub_ent->d_name);
-    snprintf(sub_fn, 510, "%s/%s", dn, sub_ent->d_name);
+    int sub_len =
+        snprintf(sub_fn, sizeof(sub_fn), "%s/%s", dn, sub_ent->d_name);
+    if (sub_len >= (int)sizeof(sub_fn)) {
+      fprintf(stderr, "executor %lld: sub path truncated: %s\n",
+              executor_index, sub_fn);
+      continue;
+    }
     if (sub_ent->d_type == DT_DIR) {
       write_dir_info(sub_fn, sub_ent);
     } else {

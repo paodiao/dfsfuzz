@@ -3242,8 +3242,14 @@ uint32 *write_stat(struct stat *stat_buf, char *filepath, int xattr_len,
   }
 
   // relative path
-  char relative_filepath[100];
-  snprintf(relative_filepath, 100, "./%s", relative_path(filepath));
+  char relative_filepath[512];
+  int rp_len = snprintf(relative_filepath, sizeof(relative_filepath), "./%s",
+                        relative_path(filepath));
+  if (rp_len >= (int)sizeof(relative_filepath)) {
+    fprintf(stderr, "executor %lld: relative path truncated: %s\n",
+            executor_index, relative_filepath);
+    return output_pos;  // no output written yet, stat_cnt not incremented
+  }
   // Write the filepath size, xattr size, checksum size, symlink path size.
   int filepath_size = strlen(relative_filepath);
   write_output(filepath_size);

@@ -832,7 +832,11 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 		return nil, fmt.Errorf("failed to read number of stat_cnt")
 	}
 
-	log.Logf(0, "------ stat_cnt %d, %v", stat_cnt, out[:10])
+	if len(out) >= 10 {
+		log.Logf(0, "------ stat_cnt %d, %v", stat_cnt, out[:10])
+	} else {
+		log.Logf(0, "------ stat_cnt %d, out len %d", stat_cnt, len(out))
+	}
 
 	if stat_cnt_uint == 0xFFFFFFFF {
 		return nil, nil
