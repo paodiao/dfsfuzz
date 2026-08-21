@@ -219,6 +219,8 @@ static void close_wb_tracepoint(struct perf_state *ps)
 /* ── Perf: drain ring buffer into collected[] ────────────────── */
 static void drain_wb_events(struct perf_state *ps)
 {
+	fprintf(stderr, "TRACE3A0: pid=%d fd=%d buf=%p page_cnt=%d\n",
+		getpid(), ps->fd, ps->buf, ps->page_cnt);
 	if (ps->fd < 0)
 		return;
 
