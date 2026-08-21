@@ -254,6 +254,24 @@ static void drain_wb_events(struct perf_state *ps)
 	if (ps->fd < 0)
 		return;
 
+	/* The perf ring mmap is not inherited across fork() (the kernel
+	 * marks the VMA VM_DONTCOPY), so the loop process (a child of
+	 * do_sandbox_none) has no mapping for wb_perf.buf even though it
+	 * inherited the perf fd. Re-establish the mapping here when it is
+	 * gone; if that fails, skip writepage events for this round. */
+	if (ps->buf && ps->page_cnt > 0) {
+		unsigned char v;
+		if (mincore(ps->buf, 4096, &v) != 0) {
+			void *nb = mmap(NULL, (size_t)ps->page_cnt * 4096,
+					PROT_READ | PROT_WRITE, MAP_SHARED,
+					ps->fd, 0);
+			if (nb != MAP_FAILED)
+				ps->buf = nb;
+			else
+				return;
+		}
+	}
+
 	struct perf_event_mmap_page *mp = (struct perf_event_mmap_page *)ps->buf;
 	uint64_t head = __atomic_load_n(&mp->data_head, __ATOMIC_ACQUIRE);
 	uint64_t tail = mp->data_tail;
