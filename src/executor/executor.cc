@@ -1635,13 +1635,20 @@ void reply_execute(int status, int iter) {
 
   clt_finish();
   write_metadata(execution_index);
+  fprintf(stderr, "PHASE1_AFTER_WM: exec=%lld pos=%ld val=%u\n",
+          executor_index, (long)((char *)output_pos - (char *)output_data),
+          *output_pos_value);
   stop_collect_hmdfs_trace();
+  fprintf(stderr, "PHASE2_AFTER_TRACE: exec=%lld pos=%ld val=%u\n",
+          executor_index, (long)((char *)output_pos - (char *)output_data),
+          *output_pos_value);
 
   execute_reply reply = {};
   reply.magic = kOutMagic;
   reply.done = true;
   reply.status = status;
   memcpy(execute_reply_pos, &reply, sizeof(reply));
+  fprintf(stderr, "PHASE3_AFTER_REPLY: exec=%lld\n", executor_index);
 
   if (in_kernel(SERVER)) {
 #if MDEBUG
@@ -1656,6 +1663,7 @@ void reply_execute(int status, int iter) {
   // visible before the executionFinished flag (paired with atomic loads in ipc.go)
   __sync_synchronize();
   output_ctl_pos->executionFinished = 1;
+  fprintf(stderr, "PHASE4_DONE: exec=%lld\n", executor_index);
   // if (write(kOutPipeFd, &reply, sizeof(reply)) != sizeof(reply))
   //	fail("control pipe write failed");
 }
@@ -3148,6 +3156,9 @@ void write_metadata(int iter) {
     write_dir_info(cwdbuf, NULL);
     fprintf(stderr, "MD end: exec=%lld pos=%ld cnt=%u\n", executor_index,
             (long)((char *)output_pos - (char *)output_data), stat_cnt);
+    fprintf(stderr, "PHASE0_WM_TAIL: exec=%lld pos=%ld val=%u\n",
+            executor_index, (long)((char *)output_pos - (char *)output_data),
+            *output_pos_value);
 #ifdef MDEBUG
     fprintf(stderr,
             "executor %lld write_dir_info begins is_dfs_client:%lld %p %p %d "
