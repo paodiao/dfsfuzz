@@ -1727,6 +1727,9 @@ void execute_one() {
              sizeof(uint32 **));
   output_pos = output_data;
   *output_pos_value = 0;
+  fprintf(stderr, "RESET: exec=%lld pos=%ld val=%u\n", executor_index,
+          (long)((char *)output_pos - (char *)output_data),
+          *output_pos_value);
   write_output(0); // Number of executed syscalls (updated later).
   // Get the inode of test dir for CephFS concurrent semantic checker.
   if (is_dfs_client) {
