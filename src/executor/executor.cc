@@ -1727,6 +1727,7 @@ void execute_one() {
              sizeof(uint32 **));
   output_pos = output_data;
   *output_pos_value = 0;
+  *(uint32 *)(output_data_org + 32) = 0xA5A5A5A5;
   fprintf(stderr, "RESET: exec=%lld pos=%ld val=%u\n", executor_index,
           (long)((char *)output_pos - (char *)output_data),
           *output_pos_value);
@@ -3268,10 +3269,11 @@ uint32 *write_stat(struct stat *stat_buf, char *filepath, int xattr_len,
   write_output(xattr_len);
   write_output(link_len);
   fprintf(stderr,
-          "MD: exec=%lld pos=%ld cnt=%u f=%d x=%d l=%d\n",
+          "MD: exec=%lld pos=%ld cnt=%u f=%d x=%d l=%d magic=%x\n",
           executor_index,
           (long)((char *)output_pos - (char *)output_data),
-          stat_cnt, filepath_size, xattr_len, link_len);
+          stat_cnt, filepath_size, xattr_len, link_len,
+          *(uint32 *)(output_data_org + 32));
 
   // filepath
   memcpy((void *)output_pos, (const void *)relative_filepath, filepath_size);

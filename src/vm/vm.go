@@ -393,8 +393,8 @@ var (
 	executingProgram1 = []byte("executing program")  // syz-fuzzer output
 	executingProgram2 = []byte("executed programs:") // syz-execprog output
 
-	beforeContext = 1024 << 10
-	afterContext  = 128 << 10
+	beforeContext = 8192 << 10
+	afterContext  = 512 << 10
 
 	tickerPeriod         = 10 * time.Second
 	waitForOutputTimeout = 10 * time.Second
