@@ -221,9 +221,14 @@ static void drain_wb_events(struct perf_state *ps)
 {
 	unsigned char vec[8] = {0};
 	int mr = -1;
-	if (ps->buf && ps->page_cnt > 0)
+	int mr_errno = 0;
+	if (ps->buf && ps->page_cnt > 0) {
+		errno = 0;
 		mr = mincore(ps->buf, (size_t)ps->page_cnt * 4096, vec);
+		mr_errno = errno;
+	}
 	char fdinfo[256] = "n/a";
+	char fdlink[128] = "n/a";
 	if (ps->fd >= 0) {
 		char fdpath[64];
 		snprintf(fdpath, sizeof(fdpath), "/proc/self/fdinfo/%d", ps->fd);
@@ -235,11 +240,17 @@ static void drain_wb_events(struct perf_state *ps)
 		} else {
 			snprintf(fdinfo, sizeof(fdinfo), "open-fail");
 		}
+		snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", ps->fd);
+		ssize_t ll = readlink(fdpath, fdlink, sizeof(fdlink) - 1);
+		if (ll < 0)
+			snprintf(fdlink, sizeof(fdlink), "readlink-fail");
+		else
+			fdlink[ll] = 0;
 	}
 	fprintf(stderr,
-		"TRACE3A0: pid=%d fd=%d buf=%p page_cnt=%d mincore=%d vec=%02x%02x%02x%02x%02x fdinfo=%s\n",
-		getpid(), ps->fd, ps->buf, ps->page_cnt, mr, vec[0], vec[1],
-		vec[2], vec[3], vec[4], fdinfo);
+		"TRACE3A0: pid=%d fd=%d buf=%p page_cnt=%d mincore=%d merr=%d vec=%02x%02x%02x%02x%02x fdinfo=%s fdlink=%s\n",
+		getpid(), ps->fd, ps->buf, ps->page_cnt, mr, mr_errno, vec[0],
+		vec[1], vec[2], vec[3], vec[4], fdinfo, fdlink);
 	if (ps->fd < 0)
 		return;
 
