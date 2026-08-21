@@ -219,8 +219,27 @@ static void close_wb_tracepoint(struct perf_state *ps)
 /* ── Perf: drain ring buffer into collected[] ────────────────── */
 static void drain_wb_events(struct perf_state *ps)
 {
-	fprintf(stderr, "TRACE3A0: pid=%d fd=%d buf=%p page_cnt=%d\n",
-		getpid(), ps->fd, ps->buf, ps->page_cnt);
+	unsigned char vec[8] = {0};
+	int mr = -1;
+	if (ps->buf && ps->page_cnt > 0)
+		mr = mincore(ps->buf, (size_t)ps->page_cnt * 4096, vec);
+	char fdinfo[256] = "n/a";
+	if (ps->fd >= 0) {
+		char fdpath[64];
+		snprintf(fdpath, sizeof(fdpath), "/proc/self/fdinfo/%d", ps->fd);
+		FILE *ff = fopen(fdpath, "r");
+		if (ff) {
+			if (fgets(fdinfo, sizeof(fdinfo), ff))
+				fdinfo[strcspn(fdinfo, "\n")] = 0;
+			fclose(ff);
+		} else {
+			snprintf(fdinfo, sizeof(fdinfo), "open-fail");
+		}
+	}
+	fprintf(stderr,
+		"TRACE3A0: pid=%d fd=%d buf=%p page_cnt=%d mincore=%d vec=%02x%02x%02x%02x%02x fdinfo=%s\n",
+		getpid(), ps->fd, ps->buf, ps->page_cnt, mr, vec[0], vec[1],
+		vec[2], vec[3], vec[4], fdinfo);
 	if (ps->fd < 0)
 		return;
 
