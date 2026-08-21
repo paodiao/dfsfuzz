@@ -328,23 +328,32 @@ void start_hmdfs_trace(void)
 
 void stop_collect_hmdfs_trace(void)
 {
+	fprintf(stderr, "TRACE0_ENTER: pid=%d cnt=%d\n", getpid(), collected_count);
 	/* 1. drain BPF kretprobe events */
-	if (skel && rb)
+	if (skel && rb) {
+		fprintf(stderr, "TRACE1_BEFORE_CONSUME: pid=%d cnt=%d\n", getpid(), collected_count);
 		ring_buffer__consume(rb);
+		fprintf(stderr, "TRACE2_AFTER_CONSUME: pid=%d cnt=%d\n", getpid(), collected_count);
+	}
 
 	/* 2. drain perf writepage events */
 	if (wb_perf.fd >= 0)
 		ioctl(wb_perf.fd, PERF_EVENT_IOC_DISABLE, 0);
+	fprintf(stderr, "TRACE3_BEFORE_DRAIN: pid=%d cnt=%d\n", getpid(), collected_count);
 	drain_wb_events(&wb_perf);
+	fprintf(stderr, "TRACE4_AFTER_DRAIN: pid=%d cnt=%d\n", getpid(), collected_count);
 
 	/* 3. sort merged events by timestamp */
 	if (collected_count > 0) {
+		fprintf(stderr, "TRACE5_BEFORE_SORT: pid=%d cnt=%d\n", getpid(), collected_count);
 		std::sort(collected, collected + collected_count,
 			  event_before);
+		fprintf(stderr, "TRACE6_BEFORE_TSC: pid=%d cnt=%d\n", getpid(), collected_count);
 		/* convert bpf_ktime_get_ns() timestamps to the global
 		 * raw-TSC domain (shared with per-call windows) */
 		for (int i = 0; i < collected_count; i++)
 			collected[i].timestamp = tsc_ns_to_global(collected[i].timestamp);
+		fprintf(stderr, "TRACE7_BEFORE_WRITE: pid=%d cnt=%d\n", getpid(), collected_count);
 	}
 
 	/* 4. write to output */
@@ -358,6 +367,7 @@ void stop_collect_hmdfs_trace(void)
 			write_output_64(collected[i].args[j]);
 		write_output_64(collected[i].off);
 	}
+	fprintf(stderr, "TRACE8_DONE: pid=%d cnt=%d\n", getpid(), collected_count);
 
 	/* 5. reset for the next round: this runs in the parent (loop) process,
 	 * whose collected_count is never reset by the forked child's
