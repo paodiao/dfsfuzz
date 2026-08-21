@@ -194089,7 +194089,7 @@ struct go7007_snd {
 struct go7007_usb_board;
 
 struct go7007_usb {
-	const struct go7007_usb_board *board;
+	struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -194098,7 +194098,7 @@ struct go7007_usb {
 };
 
 struct go7007_usb___2 {
-	struct go7007_usb_board *board;
+	const struct go7007_usb_board *board;
 	struct mutex i2c_lock;
 	struct usb_device *usbdev;
 	struct urb *video_urbs[8];
@@ -202617,7 +202617,11 @@ struct hfs_bnode_desc___2 {
 	u16 reserved;
 } __attribute__((packed));
 
-typedef int (*btree_keycmp)(const hfsplus_btree_key *, const hfsplus_btree_key *);
+union hfs_btree_key;
+
+typedef union hfs_btree_key btree_key;
+
+typedef int (*btree_keycmp)(const btree_key *, const btree_key *);
 
 struct hfs_btree {
 	struct super_block *sb;
@@ -202642,11 +202646,7 @@ struct hfs_btree {
 	int node_hash_cnt;
 };
 
-union hfs_btree_key;
-
-typedef union hfs_btree_key btree_key;
-
-typedef int (*btree_keycmp___2)(const btree_key *, const btree_key *);
+typedef int (*btree_keycmp___2)(const hfsplus_btree_key *, const hfsplus_btree_key *);
 
 struct hfs_btree___2 {
 	struct super_block *sb;
@@ -202839,8 +202839,8 @@ typedef union hfs_cat_rec hfs_cat_rec;
 struct hfs_find_data {
 	hfsplus_btree_key *search_key;
 	hfsplus_btree_key *key;
-	struct hfs_btree *tree;
-	struct hfs_bnode *bnode;
+	struct hfs_btree___2 *tree;
+	struct hfs_bnode___2 *bnode;
 	int record;
 	int keyoffset;
 	int keylength;
@@ -202851,8 +202851,8 @@ struct hfs_find_data {
 struct hfs_find_data___2 {
 	btree_key *key;
 	btree_key *search_key;
-	struct hfs_btree___2 *tree;
-	struct hfs_bnode___2 *bnode;
+	struct hfs_btree *tree;
+	struct hfs_bnode *bnode;
 	int record;
 	int keyoffset;
 	int keylength;
@@ -202930,8 +202930,8 @@ struct hfs_sb_info {
 	struct buffer_head *alt_mdb_bh;
 	struct hfs_mdb *alt_mdb;
 	__be32 *bitmap;
-	struct hfs_btree___2 *ext_tree;
-	struct hfs_btree___2 *cat_tree;
+	struct hfs_btree *ext_tree;
+	struct hfs_btree *cat_tree;
 	u32 file_count;
 	u32 folder_count;
 	u32 next_id;
@@ -203076,9 +203076,9 @@ struct hfsplus_sb_info {
 	struct hfsplus_vh *s_vhdr;
 	void *s_backup_vhdr_buf;
 	struct hfsplus_vh *s_backup_vhdr;
-	struct hfs_btree *ext_tree;
-	struct hfs_btree *cat_tree;
-	struct hfs_btree *attr_tree;
+	struct hfs_btree___2 *ext_tree;
+	struct hfs_btree___2 *cat_tree;
+	struct hfs_btree___2 *attr_tree;
 	atomic_t attr_tree_state;
 	struct inode *alloc_file;
 	struct inode *hidden_dir;
@@ -205105,10 +205105,11 @@ struct hpd_input_report {
 struct hpd_status {
 	union {
 		struct {
-			u32 human_presence_report: 4;
-			u32 human_presence_actual: 4;
+			u32 distance: 16;
 			u32 probablity: 8;
-			u32 object_distance: 16;
+			u32 presence: 2;
+			u32 rsvd: 5;
+			u32 state: 1;
 		} shpd;
 		u32 val;
 	};
@@ -205117,11 +205118,10 @@ struct hpd_status {
 struct hpd_status___2 {
 	union {
 		struct {
-			u32 distance: 16;
+			u32 human_presence_report: 4;
+			u32 human_presence_actual: 4;
 			u32 probablity: 8;
-			u32 presence: 2;
-			u32 rsvd: 5;
-			u32 state: 1;
+			u32 object_distance: 16;
 		} shpd;
 		u32 val;
 	};
@@ -401620,9 +401620,9 @@ typedef int (*initxattrs)(struct inode *, const struct xattr *, void *);
 
 typedef struct dentry *instantiate_t(struct dentry *, struct task_struct *, const void *);
 
-typedef int (*ioctl_fn)(struct file *, struct dm_ioctl *, size_t);
+typedef int (*ioctl_fn)(struct file *, struct autofs_sb_info *, struct autofs_dev_ioctl *);
 
-typedef int (*ioctl_fn___2)(struct file *, struct autofs_sb_info *, struct autofs_dev_ioctl *);
+typedef int (*ioctl_fn___2)(struct file *, struct dm_ioctl *, size_t);
 
 typedef int (*iomap_punch_t)(struct inode *, loff_t, loff_t);
 
@@ -401772,7 +401772,7 @@ typedef int (*sctp_callback_t)(struct sctp_endpoint *, struct sctp_transport *, 
 
 typedef void sctp_timer_event_t(struct timer_list *);
 
-typedef int (*search_strategy_t)(struct hfs_bnode *, struct hfs_find_data *, int *, int *, int *);
+typedef int (*search_strategy_t)(struct hfs_bnode___2 *, struct hfs_find_data *, int *, int *, int *);
 
 typedef int (*sendmsg_func)(struct sock *, struct msghdr *);
 
