@@ -117,6 +117,8 @@ static void segv_handler(int sig, siginfo_t *info, void *ctx) {
     _longjmp(segv_env, 1);
 #endif
   }
+  fprintf(stderr, "SEGV: executor %lld addr=%p skip=%d valid=%d sig=%d\n",
+          executor_index, (void *)addr, skip, valid, sig);
   debug("executor %lld SIGSEGV on %p, exiting\n", executor_index, (void *)addr);
   doexit(sig);
 }
