@@ -1714,28 +1714,32 @@ void execute_one() {
   // } else {
   // output_pos = output_data + *output_pos_value;
   // }
-  if (!is_restarting) {
-    memset(output_data_org, 0,
-           sizeof(struct outputControl) + sizeof(execute_reply) +
-               sizeof(uint32 **));
-    output_pos = output_data;
-    *output_pos_value = 0;
-    write_output(0); // Number of executed syscalls (updated later).
-    // Get the inode of test dir for CephFS concurrent semantic checker.
-    if (is_dfs_client) {
-        struct stat tmp_stat;
-        char cwdbuf[256];
-        getcwd(cwdbuf, 256);
-        if (stat(cwdbuf, &tmp_stat) != 0) {
-            fail("failed to stat the test dir");
-        }
-        fprintf(stderr, "tmp.stat.st_ino: %lx\n", tmp_stat.st_ino);
-        write_output_64(tmp_stat.st_ino);
-    } else {
-        write_output_64(0);
+  // Every round (including crash-recovery rounds, is_restarting==1) restarts
+  // the output stream from output_data: the fuzzer parses outmems from the
+  // fixed outCtlSize+replySize offset each round, so an accumulating write
+  // position on recovery rounds leaves the round's replies/metadata
+  // unreachable (observed as stale metadata + bad symlink size on the last
+  // record). The crash point itself is only recorded via executionFinished
+  // and skipped syscalls in execute_one(); nothing consumes the pre-crash
+  // partial output, so resetting is safe.
+  memset(output_data_org, 0,
+         sizeof(struct outputControl) + sizeof(execute_reply) +
+             sizeof(uint32 **));
+  output_pos = output_data;
+  *output_pos_value = 0;
+  write_output(0); // Number of executed syscalls (updated later).
+  // Get the inode of test dir for CephFS concurrent semantic checker.
+  if (is_dfs_client) {
+    struct stat tmp_stat;
+    char cwdbuf[256];
+    getcwd(cwdbuf, 256);
+    if (stat(cwdbuf, &tmp_stat) != 0) {
+      fail("failed to stat the test dir");
     }
+    fprintf(stderr, "tmp.stat.st_ino: %lx\n", tmp_stat.st_ino);
+    write_output_64(tmp_stat.st_ino);
   } else {
-    output_pos = output_data + *output_pos_value;
+    write_output_64(0);
   }
 
   /*
