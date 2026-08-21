@@ -228,6 +228,10 @@ static void drain_wb_events(struct perf_state *ps)
 
 	uint64_t base = (uint64_t)ps->buf + mp->data_offset;
 	uint64_t size = mp->data_size;
+	fprintf(stderr, "TRACE3A: pid=%d fd=%d buf=%p head=%llu tail=%llu base=%llu size=%llu cnt=%d\n",
+		getpid(), ps->fd, ps->buf, (unsigned long long)head,
+		(unsigned long long)tail, (unsigned long long)base,
+		(unsigned long long)size, collected_count);
 
 	while (tail < head) {
 		if (collected_count >= MAX_HMDFS_TRACE_EVENTS)
@@ -239,6 +243,9 @@ static void drain_wb_events(struct perf_state *ps)
 
 		if (hdr->size == 0 || tail + hdr->size > head)
 			break;
+		fprintf(stderr, "TRACE3B: pid=%d pos=%llu hdr_size=%u cnt=%d\n",
+			getpid(), (unsigned long long)pos, hdr->size,
+			collected_count);
 
 		/* advance past header to sample data */
 		unsigned char *data = (unsigned char *)(pos + sizeof(*hdr));
@@ -248,6 +255,11 @@ static void drain_wb_events(struct perf_state *ps)
 		uint32_t raw_sz = *(uint32_t *)data;
 		data += 4;
 		(void)raw_sz;
+		fprintf(stderr,
+			"TRACE3C: pid=%d data=%p raw_sz=%u off_err=%d off_ino=%d off_remote=%d off_dev=%d off_page=%d cnt=%d\n",
+			getpid(), data, raw_sz, ps->off_err, ps->off_ino_raw,
+			ps->off_remote_ino, ps->off_device_id, ps->off_page_index,
+			collected_count);
 		/* data now points at raw trace buffer (common +
 		 * custom fields) — use format offsets */
 
@@ -274,6 +286,8 @@ static void drain_wb_events(struct perf_state *ps)
 		collected[collected_count].args[5] = 0;
 
 		collected_count++;
+		fprintf(stderr, "TRACE3D: pid=%d cnt=%d\n", getpid(),
+			collected_count);
 
 		tail += hdr->size;
 	}
