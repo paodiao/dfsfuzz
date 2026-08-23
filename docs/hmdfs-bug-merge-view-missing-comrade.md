@@ -208,9 +208,12 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 	fi_iter = get_hmdfs_file_info(fi_head, device_id);
 	if (!fi_iter)
 		fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-	if (!fi_iter && device_id != 0) {
-		/* 解码出的 device_id 无效（EOF 标记 LLONG_MAX 被错解为
-		 * ULONG_MAX 等）：从头开始遍历。已输出的条目由去重树
+	if (!fi_iter) {
+		/* get/get_next 都未命中：解码出的 device_id 在 comrade 链表中
+		 * 不存在（如单设备 merge 目录——大目录只在 peer 上有，链表无
+		 * local/dev 0——首访 pos=0 解码 device_id=0 找不到；
+		 * 或 EOF 标记 LLONG_MAX 被错解为 ULONG_MAX）。
+		 * 从头开始遍历，已输出的条目由去重树
 		 * （fi_head->root / insert_filename）跳过，不会重复输出。 */
 		mutex_lock(&fi_head->comrade_list_lock);
 		if (!list_empty(&fi_head->comrade_list))
@@ -223,6 +226,7 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 
 要点：
 - 插入位置：位于 `if (!fi_iter) { ... }` 块（:346-352，内含 `get_next` 与 `ctx_merge.ctx.pos = hmdfs_set_pos(...)` 设置）**之后**——此时 `ctx_merge.ctx.pos` 保持初始化值 0，被遍历设备从第 0 项开始（"从头"）；
+- **条件为 `!fi_iter`（不含 `device_id != 0` 限制）**：最初版本带 `device_id != 0`（假设"device_id=0 且都未命中 = 链表空"），但**单设备 peer merge 目录**（大目录只在 edd5a2a9 有，comrade 链表只有 dev 2、无 dev 0）在**首访 `pos=0` 解码出 `device_id=0`** 时同样未命中——带条件会跳过"从头"导致空输出（实测 `ls 大目录 | wc -l` = 0）。放宽后：链表空时 `list_empty` 兜底返回 NULL（无死循环，VFS 位置检查终止）；merge_view 根（链表含 dev 0）`get(0)` 命中不触发，无影响；
 - 取链表第一个节点（不依赖 device_id == 0 存在与否，比 `get(0)` 更健壮）；
 - 去重树兜底：`hmdfs_actor_merge` 对已输出条目返回旧类型（:249-250 目录 `goto done` 跳过），重复遍历无副作用；
 - 行为与原代码"缺陷 1 错误返回首节点"等效（原代码正是靠错误返回实现"从头"），修复后显式化，不再依赖 bug。

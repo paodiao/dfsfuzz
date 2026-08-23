@@ -359,9 +359,12 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 			ctx_merge.ctx.pos =
 				hmdfs_set_pos(fi_iter->device_id, 0, 0);
 	}
-	if (!fi_iter && device_id != 0) {
-		/* 解码出的 device_id 无效（EOF 标记 LLONG_MAX 被错解为
-		 * ULONG_MAX 等）：从头开始遍历，已输出的条目由去重树
+	if (!fi_iter) {
+		/* get/get_next 都未命中：解码出的 device_id 在 comrade 链表中
+		 * 不存在（如单设备 merge 目录——大目录只在 peer 上有，链表无
+		 * local/dev 0——首访 pos=0 解码 device_id=0 找不到；
+		 * 或 EOF 标记 LLONG_MAX 被错解为 ULONG_MAX）。
+		 * 从头开始遍历，已输出的条目由去重树
 		 * （fi_head->root / insert_filename）跳过，不会重复输出。 */
 		mutex_lock(&fi_head->comrade_list_lock);
 		if (!list_empty(&fi_head->comrade_list))
