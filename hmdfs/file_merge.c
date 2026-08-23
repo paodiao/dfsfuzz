@@ -354,6 +354,9 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 		ctx_merge.dev_id = fi_iter->device_id;
 		device_id = ctx_merge.dev_id;
 		lower_file_iter = fi_iter->lower_file;
+		hmdfs_info_ratelimited("iterate_merge: dentry=%s traverse devid=%llu",
+				       file->f_path.dentry->d_name.name,
+				       fi_iter->device_id);
 		lower_file_iter->f_pos = file->f_pos;
 		err = iterate_dir(lower_file_iter, &ctx_merge.ctx);
 		file->f_pos = lower_file_iter->f_pos;
@@ -395,6 +398,13 @@ int do_dir_open_merge(struct file *file, const struct cred *cred,
 	wait_event(dim->wait_queue, !has_merge_lookup_work(dim));
 
 	mutex_lock(&dim->comrade_list_lock);
+	{
+		int c_cnt = 0;
+		list_for_each_entry(comrade, &(dim->comrade_list), list)
+			c_cnt++;
+		hmdfs_info("dir_open_merge: dentry=%s total_comrades=%d",
+			   file->f_path.dentry->d_name.name, c_cnt);
+	}
 	list_for_each_entry(comrade, &(dim->comrade_list), list) {
 		fi = kzalloc(sizeof(*fi), GFP_KERNEL);
 		if (!fi) {
@@ -405,7 +415,8 @@ int do_dir_open_merge(struct file *file, const struct cred *cred,
 		// make sure that dentry will not be dentry_kill before open
 		dget(lo_p.dentry);
 		if (unlikely(d_is_negative(lo_p.dentry))) {
-			hmdfs_info("dentry is negative, try again");
+			hmdfs_info("dir_open_merge: devid=%llu skipped NEGATIVE",
+				   comrade->dev_id);
 			kfree(fi);
 			dput(lo_p.dentry);
 			continue;  // skip this device
@@ -413,9 +424,12 @@ int do_dir_open_merge(struct file *file, const struct cred *cred,
 		lower_file = dentry_open(&lo_p, file->f_flags, cred);
 		dput(lo_p.dentry);
 		if (IS_ERR(lower_file)) {
+			hmdfs_info("dir_open_merge: devid=%llu open FAILED err=%ld",
+				   comrade->dev_id, PTR_ERR(lower_file));
 			kfree(fi);
 			continue;
 		}
+		hmdfs_info("dir_open_merge: devid=%llu opened", comrade->dev_id);
 		ret = 0;
 		fi->device_id = comrade->dev_id;
 		fi->lower_file = lower_file;
