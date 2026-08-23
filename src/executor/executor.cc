@@ -1722,36 +1722,39 @@ void execute_one() {
   // } else {
   // output_pos = output_data + *output_pos_value;
   // }
-  // Every round (including crash-recovery rounds, is_restarting==1) restarts
-  // the output stream from output_data: the fuzzer parses outmems from the
-  // fixed outCtlSize+replySize offset each round, so an accumulating write
-  // position on recovery rounds leaves the round's replies/metadata
-  // unreachable (observed as stale metadata + bad symlink size on the last
-  // record). The crash point itself is only recorded via executionFinished
-  // and skipped syscalls in execute_one(); nothing consumes the pre-crash
-  // partial output, so resetting is safe.
-  memset(output_data_org, 0,
-         sizeof(struct outputControl) + sizeof(execute_reply) +
-             sizeof(uint32 **));
-  output_pos = output_data;
-  *output_pos_value = 0;
-  *(uint32 *)(output_data_org + 32) = 0xA5A5A5A5;
-  fprintf(stderr, "RESET: exec=%lld pos=%ld val=%u\n", executor_index,
-          (long)((char *)output_pos - (char *)output_data),
-          *output_pos_value);
-  write_output(0); // Number of executed syscalls (updated later).
-  // Get the inode of test dir for CephFS concurrent semantic checker.
-  if (is_dfs_client) {
-    struct stat tmp_stat;
-    char cwdbuf[256];
-    getcwd(cwdbuf, 256);
-    if (stat(cwdbuf, &tmp_stat) != 0) {
-      fail("failed to stat the test dir");
+  // Normal rounds restart the output stream from output_data: the fuzzer
+  // parses outmems from the fixed outCtlSize+replySize offset each round,
+  // so each round rewrites ncmd/replies/metadata from the beginning.
+  // Recovery rounds (is_restarting==1) continue the same testcase after a
+  // crash: replies/metadata are appended after the crashed round's partial
+  // output (whose start position survives in *output_pos_value), and the
+  // fuzzer re-reads the full stream after recovery completes.
+  if (!is_restarting) {
+    memset(output_data_org, 0,
+           sizeof(struct outputControl) + sizeof(execute_reply) +
+               sizeof(uint32 **));
+    output_pos = output_data;
+    *output_pos_value = 0;
+    *(uint32 *)(output_data_org + 32) = 0xA5A5A5A5;
+    fprintf(stderr, "RESET: exec=%lld pos=%ld val=%u\n", executor_index,
+            (long)((char *)output_pos - (char *)output_data),
+            *output_pos_value);
+    write_output(0); // Number of executed syscalls (updated later).
+    // Get the inode of test dir for CephFS concurrent semantic checker.
+    if (is_dfs_client) {
+      struct stat tmp_stat;
+      char cwdbuf[256];
+      getcwd(cwdbuf, 256);
+      if (stat(cwdbuf, &tmp_stat) != 0) {
+        fail("failed to stat the test dir");
+      }
+      fprintf(stderr, "tmp.stat.st_ino: %lx\n", tmp_stat.st_ino);
+      write_output_64(tmp_stat.st_ino);
+    } else {
+      write_output_64(0);
     }
-    fprintf(stderr, "tmp.stat.st_ino: %lx\n", tmp_stat.st_ino);
-    write_output_64(tmp_stat.st_ino);
   } else {
-    write_output_64(0);
+    output_pos = output_data + *output_pos_value;
   }
 
   /*
@@ -3308,6 +3311,14 @@ uint32 *write_stat(struct stat *stat_buf, char *filepath, int xattr_len,
   }
   memcpy((void *)output_pos, (const void *)stat_buf, sizeof(struct stat));
   output_pos = (uint32 *)((char *)output_pos + sizeof(struct stat));
+
+  // Keep the persistent write pointer in sync with the real position: the
+  // filepath/stat memcpy above bypasses write_output(), the only place
+  // *output_pos_value is normally updated. A crash after write_metadata()
+  // (e.g. perf drain) would otherwise make the recovery pass in
+  // reply_execute() start from the stale mid-record value, overwriting
+  // the last record's filepath/stat.
+  *output_pos_value = output_pos - output_data;
 
   fprintf(stderr, "print_dirent_stat\n");
   print_dirent_stat(stat_buf, relative_filepath, xattr_buf);
