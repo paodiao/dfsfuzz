@@ -227,47 +227,79 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 - 去重树兜底：`hmdfs_actor_merge` 对已输出条目返回旧类型（:249-250 目录 `goto done` 跳过），重复遍历无副作用；
 - 行为与原代码"缺陷 1 错误返回首节点"等效（原代码正是靠错误返回实现"从头"），修复后显式化，不再依赖 bug。
 
-### 修复 3：`hmdfs_iterate_merge` 遍历完所有设备时置 EOF 标记
+### 修复 3（曾尝试，已放弃）：`while` 正常退出时置 EOF 标记
+
+**尝试方案**：在 `while` 循环正常退出（`get_next` 返回 NULL）后执行 `ctx->pos = -1`，使下次调用命中函数入口的 `ctx->pos == -1` 检查而直接返回。
+
+**放弃原因（实测后推演确认）**：`while` 正常退出只发生在 `ctx_merge.result == false` 的路径上——即"设备遍历因缓冲满而中断"（最后一次 emit 返回 false）。此时**设备尚未遍历完**（大目录 1100 项 > getdents64 缓冲 ~32KB，必然分批），置 `-1` 会**切断续读、永久丢失剩余条目**（大目录统计将从 1501 掉到 ~1201）。而 merge_view 根场景（每设备 6/4/8 项，缓冲不满）的 `while` 正常退出**永不发生**（设备完成后 `result=true` 走修复 4 的提前 done 分支）——因此该方案"要么不触发、要么有害"，予以放弃。merge_view 根的 EOF 由修复 4 覆盖（`get_next` 无下一个设备时置 `-1`）。
+
+### 修复 4：设备遍历完成（提前退出）后推进到下一个设备
+
+**背景**：`ctx_merge.result` 记录的是**最后一次 actor（emit）的返回值**（file_merge.c:276）——设备正常遍历完（最后条目 emit 成功）时 `result=true`，原代码 391 行 `if (ctx_merge.result) goto done;` 将其当作"缓冲满"提前停止。**结果：每次调用只处理 1 个设备就提前 done**，且 done 后 `ctx->pos` 停在设备 f_pos（EOF 标记 `LLONG_MAX`）——与调用进入时相同 → **VFS 的 `ctx->pos == last_pos` 检查判定位置无进展 → readdir 提前 EOF** → 后续设备永不遍历（devid=2 缺失的直接原因）。
 
 ```c
-	while (fi_iter) {
-		...
-		fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-		if (fi_iter) {
-			file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
-			ctx->pos = file->f_pos;
+		if (err) {
+			/* 远程设备 readdir 返回 iterate_result（>0 表示输出中止/
+			 * 本次调用完成，<0 为真实错误）：推进到下一个设备 */
+			if (err < 0)
+				goto done;
+			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
+			if (fi_iter) {
+				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
+				ctx->pos = file->f_pos;
+			} else {
+				ctx->pos = -1;
+			}
+			goto done;
 		}
-	}
-	/* 全部 device 遍历完毕：置 EOF 标记（-1 = 0xFFFF...），
-	 * 与函数入口 ctx->pos == -1 的结束检查保持一致，
-	 * 避免 LLONG_MAX 再次被解码为 ULONG_MAX 走错误路径。 */
-	ctx->pos = -1;
-done:
-	...
+		if (ctx_merge.result) {
+			/* 当前设备已遍历完成（最后一次 emit 成功）：推进到
+			 * 下一个设备，避免 ctx->pos 停在设备 f_pos（EOF 标记）
+			 * 导致 VFS 判定位置无进展而提前结束 readdir。 */
+			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
+			if (fi_iter) {
+				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
+				ctx->pos = file->f_pos;
+			} else {
+				ctx->pos = -1;
+			}
+			goto done;
+		}
 ```
 
-要点：仅在 `while` 正常退出（`get_next` 返回 NULL，即全部设备遍历完）时设置；"提前退出"（`err` / `result` 分支 `goto done`）不设置（设备未遍历完，下次调用继续）。
+**修复后调用序列**（merge_view 根，每次调用推进一个设备）：
+
+```
+调用1: fi0(6项) → 推进 fi1 → ctx->pos = set_pos(1,0,0)（≠进入时 → VFS 继续）
+调用2: fi1(4项) → 推进 fi2 → ctx->pos = set_pos(2,0,0)
+调用3: fi2(8项) → get_next(2)=NULL → ctx->pos = -1
+调用4: ctx->pos == -1 → 函数入口直接返回 0 → EOF
+总输出 18 项 ✓
+```
+
+**大目录（单设备）"缓冲满"路径**（`result=false`）：不触发本分支，走 `get_next` 推进（单设备返回 NULL）→ `while` 正常退出 → 无 EOF 标记（修复 3 已放弃）→ `ctx->pos` 停在设备 f_pos → 下次调用从头续读（去重树跳过已输出条目）→ 剩余输出——恢复修复前的分批续读行为，大目录统计保持准确。
 
 ### 收敛性论证（无死循环、无重复输出）
 
-- 每次 `hmdfs_iterate_merge` 调用从有效 device 开始遍历，已输出条目由去重树跳过（目录 `:249-250`）；
-- 每次调用至少推进一个设备的遍历（或最终 `get_next` 返回 NULL）；提前退出时下次调用"从头"，但去重树保证不重复输出；
+- 每次 `hmdfs_iterate_merge` 调用从有效 device 开始遍历；设备完成后由修复 4 推进到下一个设备（`ctx->pos` 编码为 `set_pos(next, 0, 0)`，位置有进展）；
+- 已输出条目由去重树跳过（目录 `:249-250`）——正常推进路径每设备只遍历一次，不产生重复；
 - 全部设备遍历完 → `ctx->pos = -1` → 下次调用 `:342` 直接返回 0；
-- VFS 侧兜底：`vfs_getdents` 对每次 `iterate_dir` 调用检查 `ctx->pos == last_pos`（位置无进展即视为 EOF，`fs/readdir.c`）——`ctx->pos = -1` 后位置不再变化，VFS 必然终止（这也是当前代码在遍历错乱后 ls 仍能正常结束的机制），双保险保证无死循环。
+- VFS 侧兜底：`vfs_getdents` 对每次 `iterate_dir` 调用检查 `ctx->pos == last_pos`（位置无进展即视为 EOF，`fs/readdir.c`）——即使出现位置未编码等异常，VFS 也必然终止（这也是当前代码在遍历错乱后 ls 仍能正常结束的机制），保证无死循环。
 
 ## 验证方法
 
-1. 应用上述 3 处补丁，重新编译 hmdfs 内核模块，部署到 3 个节点 VM；
+1. 应用上述修复（修复 1/2/4），重新编译 hmdfs 内核模块，部署到 3 个节点 VM；
 2. 挂载 + 启动 agent，等待连接全部建立（peer online）；
 3. `ls merge_view/` → 预期 18 项全输出（含 edd5a2a9 的 8 个专属根、hisrrykxiv 大目录根）；
-4. `dmesg` 中 `traverse` 序列应为 `0 → 1 → 2`（不再有 devid=2 缺失）；
-5. 重跑 CSAN 分布式一致性测试 → 各 executor 文件数统计一致（三方互缺消失）。
+4. `dmesg` 中 `traverse` 序列应为 `0 → 1 → 2`（跨 2-3 次调用，每次推进一个设备）；
+5. 重跑 CSAN 分布式一致性测试 → 各 executor 文件数统计一致（三方互缺消失）；
+6. 重点确认大目录统计不受影响（exec 1 仍为 1501——验证"缓冲满"路径的续读未被子修复破坏）。
 
 ## 遗留问题（后续调查项）
 
-1. **"设备遍历后提前退出"的确切触发点未完全定位**：诊断日志显示本地设备（devid=0）遍历 6 项后调用提前结束（`result=true` 或 `err≠0`），静态分析未能确定具体触发分支（`hmdfs_actor_merge` 的 false 路径、`iterate_dir` 返回值语义等）。修复方案对该原因不敏感（去重树 + 从头兜底），但值得后续用 trace 进一步定位。
-2. **跨调用位置（pos）状态机脆弱**：设备层 EOF 标记（`LLONG_MAX`）与 merge 层结束检查（`-1`）不一致、提前退出时 `ctx->pos` 未按位域编码（`file_merge.c:362-363` 直接赋值设备 f_pos）——建议后续统一 EOF 语义并完善编码，从根本上消除状态损坏。
-3. **文件冲突改名行为**：`hmdfs_actor_merge` 对重复文件条目（`:259-266`）会改名后输出（`CONFLICTING_FILE_SUFFIX`）。在"从头重遍历"路径下同名文件可能被误判为冲突而改名重复输出（当前实测大目录统计未观察到，但存在理论风险），需在统一续读机制后复查。
+1. **"设备遍历后提前退出"的确切触发点**：已基本定位——`ctx_merge.result` 记录最后一次 emit 的返回值，设备正常遍历完（最后条目 emit 成功）时 `result=true`，原代码 391 行将其误当"缓冲满"提前停止（修复 4 已处理）；"缓冲满"（`result=false`，真实分批）路径仍依赖"从头续读"（去重树兜底），无设备内续读机制，值得后续统一。
+2. **跨调用位置（pos）状态机脆弱**：设备层 EOF 标记（`LLONG_MAX`）与 merge 层结束检查（`-1`）不一致、提前退出时 `ctx->pos` 未按位域编码（直接赋值设备 f_pos）——建议后续统一 EOF 语义并完善编码（设备内续读），从根本上消除状态损坏。
+3. **文件冲突改名行为**：`hmdfs_actor_merge` 对重复文件条目（`:259-266`）会改名后输出（`CONFLICTING_FILE_SUFFIX`）。在"从头重遍历"路径（大目录分批续读）下同名文件可能被误判为冲突而改名重复输出（当前实测大目录统计 1501 未观察到重复，但存在理论风险），需在统一续读机制后复查。
 
 ## 附录
 

@@ -393,24 +393,43 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 		file->f_pos = lower_file_iter->f_pos;
 		ctx->pos = file->f_pos;
 
-		if (err)
+		if (err) {
+			/* 远程设备 readdir 返回 iterate_result（>0 表示输出中止/
+			 * 本次调用完成，<0 为真实错误）：推进到下一个设备 */
+			if (err < 0)
+				goto done;
+			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
+			if (fi_iter) {
+				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
+				ctx->pos = file->f_pos;
+			} else {
+				ctx->pos = -1;
+			}
 			goto done;
+		}
 		/*
 		 * ctx->actor return nonzero means buffer is exhausted or
 		 * something is wrong, thus we should not continue.
 		 */
-		if (ctx_merge.result)
+		if (ctx_merge.result) {
+			/* 当前设备已遍历完成（最后一次 emit 成功）：推进到
+			 * 下一个设备，避免 ctx->pos 停在设备 f_pos（EOF 标记）
+			 * 导致 VFS 判定位置无进展而提前结束 readdir。 */
+			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
+			if (fi_iter) {
+				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
+				ctx->pos = file->f_pos;
+			} else {
+				ctx->pos = -1;
+			}
 			goto done;
+		}
 		fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
 		if (fi_iter) {
 			file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
 			ctx->pos = file->f_pos;
 		}
 	}
-	/* while 正常退出：全部 device 遍历完毕。置 EOF 标记（-1），
-	 * 与函数入口 ctx->pos == -1 的结束检查保持一致，
-	 * 避免 LLONG_MAX 再次被解码为 ULONG_MAX 走错误路径。 */
-	ctx->pos = -1;
 done:
 	trace_hmdfs_iterate_merge(file->f_path.dentry, start_pos, ctx->pos,
 				  err);
