@@ -624,6 +624,19 @@ void cleanup_heartbeat(void) {
     }
 }
 
+/* 为 socket 设置 TCP keepalive：对端无 FIN 的半开断线（umount/VM 断电）也能被内核 recv 检测到 */
+void setup_keepalive(int fd) {
+    if (fd < 0) {
+        return;
+    }
+    int keepalive = 1;
+    int keepidle = 10, keepintvl = 5, keepcnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+}
+
 /* 建立到远程节点的连接（非阻塞 + 超时，避免对端不可达时卡住线程） */
 int connect_to_remote_node(remote_node *node) {
     if (!node || strlen(node->ip) == 0 || node->port <= 0) {
@@ -687,6 +700,9 @@ int connect_to_remote_node(remote_node *node) {
     
     // 恢复原阻塞模式（socket 后续移交给 HMDFS 内核模块）
     fcntl(sockfd, F_SETFL, flags);
+    
+    // TCP keepalive：对端无 FIN 的半开断线（umount/VM 断电）也能被内核 recv 检测到
+    setup_keepalive(sockfd);
     
     log_message(LOG_LEVEL_INFO, "Connected to remote node %s:%d, fd=%d", 
                node->ip, node->port, sockfd);
@@ -877,6 +893,9 @@ void handle_new_connection(int client_fd, struct sockaddr_in *client_addr) {
     log_message(LOG_LEVEL_INFO, "New connection from %s:%d, fd=%d", 
                client_ip, ntohs(client_addr->sin_port), client_fd);
     
+    // 入向连接显式设置 TCP keepalive（不依赖 accept 对监听 socket 参数的继承）
+    setup_keepalive(client_fd);
+    
     // pthread_mutex_lock(&g_connection_mutex);
     
     // 检查是否超过最大客户端数量
@@ -1005,6 +1024,10 @@ int init_server_socket(void) {
         g_server_fd = -1;
         return -1;
     }
+    
+    // TCP keepalive：accept 的入向连接继承监听 socket 的 keepalive 设置，
+    // 配合出向端的 keepalive，使任意方向的半开断线都能被内核 recv 检测到
+    setup_keepalive(g_server_fd);
     
     log_message(LOG_LEVEL_INFO, "Listening on port %d", g_config.local_port);
     return 0;
@@ -1991,11 +2014,11 @@ int main(int argc, char *argv[]) {
     }
     
     // 初始化inotify
-    /* if (init_inotify() < 0) {
+    if (init_inotify() < 0) {
         log_message(LOG_LEVEL_ERROR, "Failed to initialize inotify");
         // free(g_connections);
         return -1;
-    } */
+    }
     
     // 设置信号处理
     signal(SIGINT, handle_signal);
@@ -2011,10 +2034,10 @@ int main(int argc, char *argv[]) {
     }
     
     // 启动NOTIFY监听线程
-    /* if (pthread_create(&g_notify_handler_thread, NULL, notify_handler_thread_func, NULL) != 0) {
+    if (pthread_create(&g_notify_handler_thread, NULL, notify_handler_thread_func, NULL) != 0) {
         log_message(LOG_LEVEL_ERROR, "Failed to create notify handler thread");
         return 1;
-    } */
+    }
 
     // 启动连接线程
     if (pthread_create(&g_connector_thread, NULL, connector_thread_func, NULL) != 0) {
