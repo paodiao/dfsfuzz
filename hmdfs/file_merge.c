@@ -300,6 +300,12 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 	}
 	mutex_unlock(&fi_head->comrade_list_lock);
 
+	/* 遍历完链表未找到匹配（list_for_each_entry_safe 结束后 fi_iter
+	 * 回落为链表头、fi_result == next(head) == 链表首节点）：
+	 * 必须返回 NULL，否则首节点被误当作"下一个"返回，破坏遍历序列。 */
+	if (&fi_iter->comrade_list == &fi_head->comrade_list)
+		return NULL;
+
 	hmdfs_info("get_next: in_devid=%d out_devid=%lld",
 		   device_id,
 		   fi_result != fi_head ? (long long)fi_result->device_id : -1LL);
@@ -353,6 +359,17 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 			ctx_merge.ctx.pos =
 				hmdfs_set_pos(fi_iter->device_id, 0, 0);
 	}
+	if (!fi_iter && device_id != 0) {
+		/* 解码出的 device_id 无效（EOF 标记 LLONG_MAX 被错解为
+		 * ULONG_MAX 等）：从头开始遍历，已输出的条目由去重树
+		 * （fi_head->root / insert_filename）跳过，不会重复输出。 */
+		mutex_lock(&fi_head->comrade_list_lock);
+		if (!list_empty(&fi_head->comrade_list))
+			fi_iter = list_first_entry(&fi_head->comrade_list,
+						   struct hmdfs_file_info,
+						   comrade_list);
+		mutex_unlock(&fi_head->comrade_list_lock);
+	}
 	{
 		struct hmdfs_file_info *fi_tmp;
 		hmdfs_info("iterate_merge: entry pos=%lld decoded_devid=%lu",
@@ -390,6 +407,10 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 			ctx->pos = file->f_pos;
 		}
 	}
+	/* while 正常退出：全部 device 遍历完毕。置 EOF 标记（-1），
+	 * 与函数入口 ctx->pos == -1 的结束检查保持一致，
+	 * 避免 LLONG_MAX 再次被解码为 ULONG_MAX 走错误路径。 */
+	ctx->pos = -1;
 done:
 	trace_hmdfs_iterate_merge(file->f_path.dentry, start_pos, ctx->pos,
 				  err);
