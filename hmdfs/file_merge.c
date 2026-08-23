@@ -300,6 +300,9 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 	}
 	mutex_unlock(&fi_head->comrade_list_lock);
 
+	hmdfs_info("get_next: in_devid=%d out_devid=%lld",
+		   device_id,
+		   fi_result != fi_head ? (long long)fi_result->device_id : -1LL);
 	return fi_result != fi_head ? fi_result : NULL;
 }
 
@@ -350,13 +353,24 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 			ctx_merge.ctx.pos =
 				hmdfs_set_pos(fi_iter->device_id, 0, 0);
 	}
+	{
+		struct hmdfs_file_info *fi_tmp;
+		hmdfs_info("iterate_merge: entry pos=%lld decoded_devid=%lu",
+			   ctx->pos, device_id);
+		mutex_lock(&fi_head->comrade_list_lock);
+		list_for_each_entry(fi_tmp, &(fi_head->comrade_list),
+				    comrade_list)
+			hmdfs_info("iterate_merge: list devid=%llu",
+				   fi_tmp->device_id);
+		mutex_unlock(&fi_head->comrade_list_lock);
+	}
 	while (fi_iter) {
 		ctx_merge.dev_id = fi_iter->device_id;
 		device_id = ctx_merge.dev_id;
 		lower_file_iter = fi_iter->lower_file;
-		hmdfs_info_ratelimited("iterate_merge: dentry=%s traverse devid=%llu",
-				       file->f_path.dentry->d_name.name,
-				       fi_iter->device_id);
+		hmdfs_info("iterate_merge: dentry=%s traverse devid=%llu",
+			   file->f_path.dentry->d_name.name,
+			   fi_iter->device_id);
 		lower_file_iter->f_pos = file->f_pos;
 		err = iterate_dir(lower_file_iter, &ctx_merge.ctx);
 		file->f_pos = lower_file_iter->f_pos;
