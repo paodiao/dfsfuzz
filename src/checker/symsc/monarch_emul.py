@@ -36,6 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("-d", "--showdata", action="store_true")
     parser.add_argument("-i", "--input", type=str, help="FileMetadata")
     parser.add_argument("-g", dest="seq_programs", required=True)
+    parser.add_argument("-l", dest="init_tree", help="initial file tree subset (temp file path)")
     parser.add_argument("-s", dest="srv_nodes_cnt", required=True)
     parser.add_argument("-f", dest="cfg_mode", required=True)
     parser.add_argument("-a", dest="init_ip", required=True)
@@ -45,9 +46,9 @@ if __name__ == "__main__":
     print("start parsing arguments\n")
     args = parser.parse_args()
 
-    # -p/-i/-g/-c may carry temp file paths instead of inline content when the
-    # payload is too large for the command line (ARG_MAX).
-    for name in ("prog", "input", "seq_programs", "crashed"):
+    # -p/-i/-g/-c/-l may carry temp file paths instead of inline content when
+    # the payload is too large for the command line (ARG_MAX).
+    for name in ("prog", "input", "seq_programs", "crashed", "init_tree"):
         val = getattr(args, name)
         if val and os.path.isfile(val):
             with open(val) as f:
@@ -104,7 +105,7 @@ if __name__ == "__main__":
 
     # Initialize emul_state
     node_cnt = len(seq_programs)
-    emul_state = utils.init_state(args.prog, node_cnt)
+    emul_state = utils.init_state(args.prog, node_cnt, args.init_tree)
 
     # Runtime state
     c.runtime_state = json.loads(args.input)

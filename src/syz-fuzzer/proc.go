@@ -1194,7 +1194,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	if proc.fuzzer.config.EnableCsan {
 		csanPassed, csanDiffs = checker.ConcFSCheck(ps, infos, fsMds, proc.fuzzer.config.ServNum,
 			proc.fuzzer.config.DFSName, proc.fuzzer.config.DfsSetupParams,
-			proc.fuzzer.config.InitIp, testdirIno)
+			proc.fuzzer.config.InitIp, testdirIno, proc.hmcfg.FileTree)
 		if !csanPassed {
 			log.Logf(0, "Concurrent semantic checker detects a bug")
 			proc.saveCsanBug(ps, output, csanDiffs, fsMds, stat)

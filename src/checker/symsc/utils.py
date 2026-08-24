@@ -6,7 +6,7 @@ import common as c
 import re
 
 
-def init_state(prog, node_cnt):
+def init_state(prog, node_cnt, init_tree=None):
     if c.verbose:
         print("Initialize file system state")
 
@@ -34,6 +34,46 @@ def init_state(prog, node_cnt):
     FT = c.FileTree()
     FT.add_node(c.ROOT)
     state["FT"] = FT
+
+    # Load the initial file tree subset (pre-existing files/dirs the programs
+    # operate on) so the emulation starts from the real tree instead of an
+    # empty one. Lines are "path\ttype\tsize" (type: file/dir).
+    # The actual file contents are unknown, so is_init marks these inodes and
+    # read-data comparison is skipped for them downstream.
+    if init_tree:
+        for line in init_tree.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 2:
+                continue
+            path, ftype = parts[0], parts[1]
+            fsize = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            fchildren = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+            mpath = "./" + path
+            if mpath in state["DENTRY"]:
+                continue
+            name = path.rstrip("/").rsplit("/", 1)[-1]
+            c.INODE_CNT += 1
+            if ftype == "file":
+                inode = c.Inode(id=c.INODE_CNT, name=name, type=c.FILE, mode=0o644,
+                                size=fsize, path=mpath, linkcnt=1, is_init=1)
+            else:
+                inode = c.Inode(id=c.INODE_CNT, name=name, type=c.DIR, mode=0o755,
+                                size=fsize, path=mpath, linkcnt=2, is_init=1)
+                # Real child count from the initial tree: children outside the
+                # subset are not materialized, so remember how many are unknown.
+                inode.dir_unknown = fchildren
+            state["DISK"][inode.id] = inode
+            state["DENTRY"][mpath] = inode.id
+            parent_path = "./" + path.rsplit("/", 1)[0] if "/" in path else "."
+            parent_id = state["DENTRY"].get(parent_path)
+            if parent_id is not None:
+                parent = state["DISK"].get(parent_id)
+                if parent is not None and inode not in parent.children:
+                    parent.children.append(inode)
+                    if parent.dir_unknown > 0:
+                        parent.dir_unknown -= 1
+                state["FT"].add_node((inode.id, name), (parent_id, parent.name[0]))
+        state["INODE_CNT"] = c.INODE_CNT
 
     program_lines = prog.split("\n")
     for line in program_lines:

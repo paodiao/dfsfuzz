@@ -264,7 +264,7 @@ class Inode:
     # pending_ops = None
     refs = None
 
-    def __init__(self, id, name, type, mode, size, path, linkcnt=1, refs=0, uid=0, gid=0, numblk=0):
+    def __init__(self, id, name, type, mode, size, path, linkcnt=1, refs=0, uid=0, gid=0, numblk=0, is_init=0):
         global INODE_CNT
         self.id = id
         self.name = [name]
@@ -290,6 +290,8 @@ class Inode:
         self.removed = 0
         self.offset = {}
         self.numblk = numblk
+        self.is_init = is_init
+        self.dir_unknown = 0
         if type == FILE:
             self.datablock = DataBlock("", "\x00"*65536)
             bs = size // BLKSIZE

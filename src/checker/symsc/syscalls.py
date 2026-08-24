@@ -854,7 +854,7 @@ def rmdir(argv):
 
     # 1. Get children nodes
     children = c.FT[tup][0].children
-    if children:
+    if children or getattr(inode, "dir_unknown", 0) > 0:
         if c.verbose:
             print("[-] EMUL-ERR cannot remove non-empty directory {0}".format(path))
         return 1
@@ -1344,7 +1344,7 @@ path_old, path_new))
         new_children = None
         if len(c.FT[tup_new_existing]) == 1: # meaning that it is a directory
             new_children = c.FT[tup_new_existing][0].children
-        if new_children:
+        if new_children or getattr(inode_new_existing, "dir_unknown", 0) > 0:
             if c.verbose:
                 print("[-] EMUL-ERR new path is not empty (has children)")
             return 1
@@ -2041,8 +2041,8 @@ nbyte, buf_var, inode.name))
     rear = inode.datablock.hole[cur_offset+nbyte:]
     inode.datablock.hole = front + newhole_filled + rear
 
-    inode.size = len(new_data)
-    inode.numblk = inode.size / 512
+    inode.size = max(inode.size, len(new_data))
+    inode.numblk = inode.size // 512
     if inode.size > inode.numblk * 512:
         inode.numblk += 1
     inode.offset[varname] += nbyte
@@ -2155,7 +2155,7 @@ buf_var))
     rear = inode.datablock.hole[offset+nbyte:]
     inode.datablock.hole = front + newhole_filled + rear
 
-    inode.size = len(new_data)
+    inode.size = max(inode.size, len(new_data))
 
     _unsync_inode_by_id(inode.id)
 

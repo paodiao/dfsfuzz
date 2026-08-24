@@ -3,6 +3,7 @@ package checker
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"syscall"
 
 	"monarch/pkg/ipc"
@@ -19,7 +20,8 @@ type Calls []*prog.Call
 
 func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	fsMds []map[string]prog.FileMetadata, srvNum int,
-	fsType string, cfg_mode string, initIP string, testdirIno uint64) (bool, []string) {
+	fsType string, cfg_mode string, initIP string, testdirIno uint64,
+	ft *prog.FileTree) (bool, []string) {
 
 	log.Logf(0, "ConcFSCheck fsMds:%v", fsMds)
 
@@ -172,17 +174,25 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	}
 	defer os.Remove(statFile)
 
+	initTree := initTreeSubset(progs, ft)
+	initFile, err := writeTemp("init", []byte(initTree))
+	if err != nil {
+		log.Logf(0, "write symsc init tree temp file error: %v\n", err)
+		return false, nil
+	}
+	defer os.Remove(initFile)
+
 	cmd := exec.Command("python3",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
 		"-v", "-t", fsType, "-p", progFile,
 		"-i", infosFile, "-c", statFile,
-		"-g", seqsFile, "-s", fmt.Sprintf("%v", srvNum),
+		"-g", seqsFile, "-l", initFile, "-s", fmt.Sprintf("%v", srvNum),
 		"-f", cfg_mode, "-a", initIP, "-n", fmt.Sprintf("%v", testdirIno))
 
-	log.Logf(0, "python3 %v -v -t %v -p %v -i %v -c %v -g %v -s %v -f \"%v\" -a \"%v\" -n %v",
+	log.Logf(0, "python3 %v -v -t %v -p %v -i %v -c %v -g %v -l %v -s %v -f \"%v\" -a \"%v\" -n %v",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
 		fsType, progFile, infosFile,
-		statFile, seqsFile,
+		statFile, seqsFile, initFile,
 		srvNum, cfg_mode, initIP, testdirIno)
 
 	cmd.Stdout = os.Stdout
@@ -333,4 +343,52 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata) []
 	}
 
 	return ics
+}
+
+// initTreeSubset serializes the subset of the initial file tree touched by
+// the test programs (plus all ancestor directories, up to and including the
+// merge_view root) for symsc. The initial tree can contain thousands of
+// files while a program only touches a few dozen, so passing the whole tree
+// would blow up the emulation's per-call state copies.
+func initTreeSubset(ps []*prog.Prog, ft *prog.FileTree) string {
+	if ft == nil {
+		return ""
+	}
+	seen := make(map[string]bool)
+	var lines []string
+	addPath := func(path string) {
+		path = strings.TrimPrefix(path, "./")
+		if node := ft.FindNode(path); node != nil {
+			for n := node; n != nil; n = n.Parent {
+				fp := n.FullPath
+				if seen[fp] {
+					continue
+				}
+				seen[fp] = true
+				t := "dir"
+				if n.Type == prog.NodeTypeFile {
+					t = "file"
+				}
+				lines = append(lines, fmt.Sprintf("%s\t%s\t%d\t%d", fp, t, n.Size, len(n.Children)))
+			}
+		}
+	}
+	for _, p := range ps {
+		for _, call := range p.Calls {
+			for _, arg := range call.Args {
+				switch a := arg.(type) {
+				case *prog.PointerArg:
+					if s, ok := a.Res.(*prog.StringArg); ok && strings.Contains(s.Value, "merge_view") {
+						addPath(s.Value)
+					}
+				case *prog.StringArg:
+					if strings.Contains(a.Value, "merge_view") {
+						addPath(a.Value)
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n")
 }

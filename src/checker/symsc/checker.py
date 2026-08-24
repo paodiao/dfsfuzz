@@ -700,19 +700,33 @@ def state_check(retval, emul_state, call_idx):
         return True
     
     elif syscall_name in ["SYS_read", "SYS_readlink", "SYS_pread64"]:
-        buf_var = syscall_argv[1].replace("(long)", "")
-        print("crc val:", c.BUF_DATA[buf_var][:retval])
-        crc_val = binascii.crc32(c.BUF_DATA[buf_var][:retval].encode()) & 0xFFFFFFFF
-        print("read returns ", retval, " crc ", crc_val, c.BUF_DATA[buf_var][:retval])
-        if (retval == -1 or retval == 0) and op_runtime_stat['Checksum'] == 0:
+        inode = None
+        try:
+            fd_inode = c.FD_STACK[syscall_argv[0].replace("(long)", "")]
+            if fd_inode != -1:
+                inode = c.MEM.get(fd_inode.id)
+                if inode is None:
+                    inode = c.DISK.get(fd_inode.id)
+        except (KeyError, AttributeError):
+            inode = None
+        if inode is not None and getattr(inode, "is_init", 0):
+            # Pre-existing file: the emulation has no initial content for it,
+            # so only its metadata is comparable, not the read data.
+            print("read pre-existing file, skip content compare")
+        elif (retval == -1 or retval == 0) and op_runtime_stat['Checksum'] == 0:
             print("read fails/nothing")
-        elif crc_val == op_runtime_stat['Checksum']:
-            print("read checksums equal",
-                c.BUF_DATA[buf_var], op_runtime_stat['Checksum'])
         else:
-            print("read checksums differ",
-                c.BUF_DATA[buf_var], op_runtime_stat['Checksum'])
-            return False
+            buf_var = syscall_argv[1].replace("(long)", "")
+            print("crc val:", c.BUF_DATA[buf_var][:retval])
+            crc_val = binascii.crc32(c.BUF_DATA[buf_var][:retval].encode()) & 0xFFFFFFFF
+            print("read returns ", retval, " crc ", crc_val, c.BUF_DATA[buf_var][:retval])
+            if crc_val == op_runtime_stat['Checksum']:
+                print("read checksums equal",
+                    c.BUF_DATA[buf_var], op_runtime_stat['Checksum'])
+            else:
+                print("read checksums differ",
+                    c.BUF_DATA[buf_var], op_runtime_stat['Checksum'])
+                return False
 
     elif syscall_name in ["SYS_stat", "SYS_fstat"]:
         if retval != -1:
@@ -778,11 +792,25 @@ def state_check(retval, emul_state, call_idx):
 
     elif syscall_name in ["SYS_getdents", "SYS_getdents64"]:
         if retval != -1:
-            buf_var = syscall_argv[1].replace("(long)", "")
-            emulate_dents = c.BUF_DATA[buf_var]
-            if emulate_dents != op_runtime_stat['Dents']:
-                print("dents differ", emulate_dents, op_runtime_stat['Dents'])
-                return False
+            inode = None
+            try:
+                fd_inode = c.FD_STACK[syscall_argv[0].replace("(long)", "")]
+                if fd_inode != -1:
+                    inode = c.MEM.get(fd_inode.id)
+                    if inode is None:
+                        inode = c.DISK.get(fd_inode.id)
+            except (KeyError, AttributeError):
+                inode = None
+            if inode is not None and getattr(inode, "is_init", 0):
+                # Pre-existing directory: only the subset's children are
+                # materialized, so the dents content is not comparable.
+                print("getdents pre-existing directory, skip content compare")
+            else:
+                buf_var = syscall_argv[1].replace("(long)", "")
+                emulate_dents = c.BUF_DATA[buf_var]
+                if emulate_dents != op_runtime_stat['Dents']:
+                    print("dents differ", emulate_dents, op_runtime_stat['Dents'])
+                    return False
         elif op_runtime_stat['Dents'] != "":
             print("dents differ, retval=-1 but runtime dents is {}".format(op_runtime_stat['Dents']))
             return False
