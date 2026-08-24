@@ -336,13 +336,12 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 	struct hmdfs_file_info *fi_iter = NULL;
 	struct file *lower_file_iter = NULL;
 	loff_t start_pos = ctx->pos;
-	unsigned long device_id = (unsigned long)((ctx->pos) << 1 >>
-				  (POS_BIT_NUM - DEV_ID_BIT_NUM));
+	int device_id = -1;
 	struct hmdfs_iterate_callback_merge ctx_merge = {
 		.ctx.actor = hmdfs_actor_merge,
 		.caller = ctx,
 		.root = &fi_head->root,
-		.dev_id = device_id
+		.dev_id = 0
 	};
 
 	/* pos = -1 indicates that all devices have been traversed
@@ -351,21 +350,13 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 	if (ctx->pos == -1)
 		return 0;
 
-	fi_iter = get_hmdfs_file_info(fi_head, device_id);
+	/*
+	 * 设备定位：从 fi_head 状态恢复，不再解析 ctx->pos 位域——
+	 * 原实现把设备 f_pos（遍历完为 LLONG_MAX 等 EOF 标记）直接赋给
+	 * ctx->pos（:396-397），下次调用解码出 ULONG_MAX 导致遍历错乱。
+	 */
+	fi_iter = get_hmdfs_file_info(fi_head, fi_head->cur_dev);
 	if (!fi_iter) {
-		fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-		// dev_id is changed, parameter is set 0 to get next file info
-		if (fi_iter)
-			ctx_merge.ctx.pos =
-				hmdfs_set_pos(fi_iter->device_id, 0, 0);
-	}
-	if (!fi_iter) {
-		/* get/get_next 都未命中：解码出的 device_id 在 comrade 链表中
-		 * 不存在（如单设备 merge 目录——大目录只在 peer 上有，链表无
-		 * local/dev 0——首访 pos=0 解码 device_id=0 找不到；
-		 * 或 EOF 标记 LLONG_MAX 被错解为 ULONG_MAX）。
-		 * 从头开始遍历，已输出的条目由去重树
-		 * （fi_head->root / insert_filename）跳过，不会重复输出。 */
 		mutex_lock(&fi_head->comrade_list_lock);
 		if (!list_empty(&fi_head->comrade_list))
 			fi_iter = list_first_entry(&fi_head->comrade_list,
@@ -373,17 +364,22 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 						   comrade_list);
 		mutex_unlock(&fi_head->comrade_list_lock);
 	}
+	if (!fi_iter)
+		return 0;
+	fi_head->cur_dev = fi_iter->device_id;
+
 	{
 		struct hmdfs_file_info *fi_tmp;
-		hmdfs_info("iterate_merge: entry pos=%lld decoded_devid=%lu",
-			   ctx->pos, device_id);
+		hmdfs_info("iterate_merge: entry pos=%lld cur_dev=%d",
+			   ctx->pos, fi_head->cur_dev);
 		mutex_lock(&fi_head->comrade_list_lock);
 		list_for_each_entry(fi_tmp, &(fi_head->comrade_list),
 				    comrade_list)
-			hmdfs_info("iterate_merge: list devid=%llu",
+			hmdfs_info("iterate_merge: list devid=%d",
 				   fi_tmp->device_id);
 		mutex_unlock(&fi_head->comrade_list_lock);
 	}
+
 	while (fi_iter) {
 		ctx_merge.dev_id = fi_iter->device_id;
 		device_id = ctx_merge.dev_id;
@@ -391,48 +387,40 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 		hmdfs_info("iterate_merge: dentry=%s traverse devid=%llu",
 			   file->f_path.dentry->d_name.name,
 			   fi_iter->device_id);
-		lower_file_iter->f_pos = file->f_pos;
+		ctx_merge.ctx.pos = fi_head->dev_pos;   /* 恢复设备内续读位置 */
 		err = iterate_dir(lower_file_iter, &ctx_merge.ctx);
-		file->f_pos = lower_file_iter->f_pos;
-		ctx->pos = file->f_pos;
+		fi_head->dev_pos = ctx_merge.ctx.pos;   /* 保存设备内位置（原样） */
 
-		if (err) {
-			/* 远程设备 readdir 返回 iterate_result（>0 表示输出中止/
-			 * 本次调用完成，<0 为真实错误）：推进到下一个设备 */
-			if (err < 0)
-				goto done;
-			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-			if (fi_iter) {
-				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
-				ctx->pos = file->f_pos;
-			} else {
-				ctx->pos = -1;
-			}
+		if (err < 0)
+			goto done;                          /* 真实错误 */
+
+		if (err > 0 || !ctx_merge.result) {
+			/* 缓冲满（远程 iterate_result=1 或最后一次 emit=false）：
+			 * 设备未遍历完，本次调用结束，下次从 fi_head->dev_pos
+			 * 续读。ctx->pos 仅作 VFS 进度指示（seq 单调递增），
+			 * 不再被解析。 */
+			err = 0;                        /* 正数返回值规范化为 0 */
+			ctx->pos = hmdfs_set_pos(device_id, 0, ++fi_head->seq);
+			file->f_pos = ctx->pos;
 			goto done;
 		}
-		/*
-		 * ctx->actor return nonzero means buffer is exhausted or
-		 * something is wrong, thus we should not continue.
-		 */
-		if (ctx_merge.result) {
-			/* 当前设备已遍历完成（最后一次 emit 成功）：推进到
-			 * 下一个设备，避免 ctx->pos 停在设备 f_pos（EOF 标记）
-			 * 导致 VFS 判定位置无进展而提前结束 readdir。 */
-			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-			if (fi_iter) {
-				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
-				ctx->pos = file->f_pos;
-			} else {
-				ctx->pos = -1;
-			}
-			goto done;
-		}
+
+		/* 设备遍历完成（最后一次 emit 成功）：推进到下一个设备，
+		 * 同一调用内继续遍历。 */
+		fi_head->dev_pos = 0;
 		fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-		if (fi_iter) {
-			file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
-			ctx->pos = file->f_pos;
+		if (!fi_iter) {
+			ctx->pos = -1;                      /* EOF */
+			file->f_pos = ctx->pos;
+			fi_head->cur_dev = -1;
+			goto done;
 		}
+		fi_head->cur_dev = fi_iter->device_id;
+		ctx->pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
+		file->f_pos = ctx->pos;
 	}
+	ctx->pos = -1;
+	file->f_pos = ctx->pos;
 done:
 	trace_hmdfs_iterate_merge(file->f_path.dentry, start_pos, ctx->pos,
 				  err);

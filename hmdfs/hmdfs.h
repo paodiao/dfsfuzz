@@ -268,6 +268,10 @@ struct hmdfs_file_info {
 		};
 	};
 	struct list_head comrade_list;
+	/* merge readdir 跨调用遍历状态（fi_head 持有，open 期间存活） */
+	int   cur_dev;    /* 当前遍历设备（get 用；取不到时回退链表第一个） */
+	loff_t dev_pos;   /* 当前设备内续读位置（原样保存 ctx_merge.ctx.pos） */
+	loff_t seq;       /* VFS 进度计数（缓冲满时 ctx->pos = set_pos(dev,0,seq)） */
 };
 
 static inline struct hmdfs_file_info *hmdfs_f(struct file *file)
