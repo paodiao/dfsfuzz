@@ -128,9 +128,9 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	}
 	exePath := filepath.Dir(ex)
 
-	// Large payloads (prog text, checkInfos, seq programs) exceed the Linux
-	// ARG_MAX limit when passed via argv (E2BIG with big directories), so
-	// write them to temp files and pass the paths instead.
+	// Large payloads (prog text, checkInfos, seq programs, stat snapshot)
+	// exceed the command-line limits (ARG_MAX / MAX_ARG_STRLEN with big
+	// directories), so write them to temp files and pass the paths instead.
 	writeTemp := func(name string, data []byte) (string, error) {
 		fp, err := os.CreateTemp("", "symsc-"+name+"-*")
 		if err != nil {
@@ -165,17 +165,24 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	}
 	defer os.Remove(seqsFile)
 
+	statFile, err := writeTemp("stat", []byte(symsc_stat))
+	if err != nil {
+		log.Logf(0, "write symsc stat temp file error: %v\n", err)
+		return false, nil
+	}
+	defer os.Remove(statFile)
+
 	cmd := exec.Command("python3",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
 		"-v", "-t", fsType, "-p", progFile,
-		"-i", infosFile, "-c", symsc_stat,
+		"-i", infosFile, "-c", statFile,
 		"-g", seqsFile, "-s", fmt.Sprintf("%v", srvNum),
 		"-f", cfg_mode, "-a", initIP, "-n", fmt.Sprintf("%v", testdirIno))
 
-	log.Logf(0, "python3 %v -v -t %v -p %v -i %v -c \"%v\" -g %v -s %v -f \"%v\" -a \"%v\" -n %v",
+	log.Logf(0, "python3 %v -v -t %v -p %v -i %v -c %v -g %v -s %v -f \"%v\" -a \"%v\" -n %v",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
 		fsType, progFile, infosFile,
-		symsc_stat, seqsFile,
+		statFile, seqsFile,
 		srvNum, cfg_mode, initIP, testdirIno)
 
 	cmd.Stdout = os.Stdout
