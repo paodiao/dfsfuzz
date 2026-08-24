@@ -72,7 +72,7 @@ def glusterfs_init_vol(srv_nodes_cnt, mode, init_ip):
         elif "disperse" in mode:
             c.FSCFG["mode"] = "disperse"
         subvol_cnt_per_group = int(mode.split(" ")[1])
-        vol_cnt = srv_nodes_cnt / subvol_cnt_per_group
+        vol_cnt = srv_nodes_cnt // subvol_cnt_per_group
         c.FSCFG["subvol_groups"] = list()
         srv_node_ids = [i for i in range(srv_nodes_cnt)]
         for i in range(vol_cnt):
@@ -84,7 +84,7 @@ def glusterfs_init_vol(srv_nodes_cnt, mode, init_ip):
 
     print("vol_cnt", vol_cnt)
     start_vol = get_consistent_hash("/", 1)  % vol_cnt
-    chunk = 0xffffffff / vol_cnt
+    chunk = 0xffffffff // vol_cnt
     c.FSCFG["lalive_nodesyout"] = [()]*vol_cnt
     # TODO: more accurate
     c.FSCFG["layout"] = [(0,0)]*vol_cnt

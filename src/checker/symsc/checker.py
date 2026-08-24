@@ -180,7 +180,7 @@ def check_data(inode, entry, ret_on_err=0, print_err=1):
     else:
         effective_data = inode.datablock.data
 
-    crc_emul = binascii.crc32(effective_data) & 0xFFFFFFFF
+    crc_emul = binascii.crc32(effective_data.encode()) & 0xFFFFFFFF
     datahex = map(lambda c: hex(ord(c)), effective_data)
     try:
         crc_crash = int(entry[c.IDX_DATACHKSUM])
@@ -702,7 +702,7 @@ def state_check(retval, emul_state, call_idx):
     elif syscall_name in ["SYS_read", "SYS_readlink", "SYS_pread64"]:
         buf_var = syscall_argv[1].replace("(long)", "")
         print("crc val:", c.BUF_DATA[buf_var][:retval])
-        crc_val = binascii.crc32(c.BUF_DATA[buf_var][:retval]) & 0xFFFFFFFF
+        crc_val = binascii.crc32(c.BUF_DATA[buf_var][:retval].encode()) & 0xFFFFFFFF
         print("read returns ", retval, " crc ", crc_val, c.BUF_DATA[buf_var][:retval])
         if (retval == -1 or retval == 0) and op_runtime_stat['Checksum'] == 0:
             print("read fails/nothing")

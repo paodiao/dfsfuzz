@@ -294,7 +294,7 @@ def parse_memcpy(line, state):
     pat_escape = re.compile(r"\\x[0189a-f][0-9a-f]|\\x7f")
     esclist = pat_escape.findall(var_string)
     for esc in esclist:
-        var_string = var_string.replace(esc, esc.decode("unicode-escape"))
+        var_string = var_string.replace(esc, esc.encode('ascii').decode('unicode-escape'))
 
     state["BUF_DATA"][var_name] = var_string[:var_size]
 

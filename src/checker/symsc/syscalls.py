@@ -1687,10 +1687,10 @@ str(inode.name)))
     if keep_size and not (punch_hole or collapse_range or insert_range):
         if offset + length > inode.size:
             dummysize = offset + length
-            bs = dummysize / c.BLKSIZE
+            bs = dummysize // c.BLKSIZE
             if dummysize % c.BLKSIZE:
                 bs += 1
-            inode.numblk = bs * c.BLKSIZE / 512
+            inode.numblk = bs * c.BLKSIZE // 512
 
         zero_range = 0
     if zero_range or punch_hole:

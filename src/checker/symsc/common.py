@@ -292,10 +292,10 @@ class Inode:
         self.numblk = numblk
         if type == FILE:
             self.datablock = DataBlock("", "\x00"*65536)
-            bs = size / BLKSIZE
+            bs = size // BLKSIZE
             if size % BLKSIZE:
                 bs += 1
-            self.numblk = bs * BLKSIZE / 512
+            self.numblk = bs * BLKSIZE // 512
         elif type == SYMLINK:
             self.target = ""
         INODE_CNT += 1 # increment global inode counter whenever new inode is created
