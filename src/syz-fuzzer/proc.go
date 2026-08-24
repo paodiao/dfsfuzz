@@ -1261,7 +1261,15 @@ func (proc *Proc) saveCsanBug(ps []*prog.Prog, output []byte, diffs []string,
 		log.Logf(0, "diff: %s", d)
 	}
 
-	dir := filepath.Join(proc.fuzzer.bugDir, "csan-"+time.Now().Format("20060102-150405.000"))
+	ex, err := os.Executable()
+	if err != nil {
+		log.Logf(0, "saveCsanBug: failed to get executable path: %v", err)
+		return
+	}
+	// exe = <deploy-root>/bin/linux_amd64/syz-fuzzer, so 3 levels up is the
+	// project root where the csan bug dumps are collected.
+	dir := filepath.Join(filepath.Dir(ex), "../../../hmdfs-bugs",
+		"csan-"+time.Now().Format("20060102-150405.000"))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Logf(0, "saveCsanBug: failed to create dir %v: %v", dir, err)
 		return

@@ -86,8 +86,6 @@ type Fuzzer struct {
 	// bucket 0 is unreachable), to validate the depth bucket boundaries.
 	dagDepthCount [4]uint64
 	tscoffs       []int64
-	// bugDir is the root directory for saved consistency-bug dumps.
-	bugDir string
 
 	checkResult *rpctype.CheckArgs
 	logMu       sync.Mutex
@@ -386,7 +384,6 @@ func main() {
 		maxDagSchedSignal:        make(signal.Signal),
 		newDagSchedSignal:        make(signal.Signal),
 		tscoffs:                  parseTscOffsets(config.TSCOFF),
-		bugDir:                   "./hmdfs-bugs",
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)
