@@ -1225,12 +1225,15 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	// executions; triage re-runs are excluded to avoid timing-jitter noise).
 	// Does not depend on csan/fsMds: call-window matching needs neither, and
 	// ino-based resolution (writepage/lookup) degrades gracefully without fsMd.
+	log.Logf(0, "hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
 	if stat != StatTriage && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
 		vertices := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.fuzzer.tscoffs)
 		hbPairs, ccPairs := prog.ExtractPairs(vertices)
 		allPairs := append(hbPairs, ccPairs...)
 		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg)
+		log.Logf(0, "hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d",
+			len(vertices), len(hbPairs), len(ccPairs), len(pairBits))
 		if len(pairBits) > 0 {
 			for _, info := range infos[proc.fuzzer.config.ServNum:] {
 				if info != nil {
