@@ -306,9 +306,6 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 	if (&fi_iter->comrade_list == &fi_head->comrade_list)
 		return NULL;
 
-	hmdfs_info("get_next: in_devid=%d out_devid=%lld",
-		   device_id,
-		   fi_result != fi_head ? (long long)fi_result->device_id : -1LL);
 	return fi_result != fi_head ? fi_result : NULL;
 }
 
@@ -368,25 +365,10 @@ int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
 		return 0;
 	fi_head->cur_dev = fi_iter->device_id;
 
-	{
-		struct hmdfs_file_info *fi_tmp;
-		hmdfs_info("iterate_merge: entry pos=%lld cur_dev=%d",
-			   ctx->pos, fi_head->cur_dev);
-		mutex_lock(&fi_head->comrade_list_lock);
-		list_for_each_entry(fi_tmp, &(fi_head->comrade_list),
-				    comrade_list)
-			hmdfs_info("iterate_merge: list devid=%d",
-				   fi_tmp->device_id);
-		mutex_unlock(&fi_head->comrade_list_lock);
-	}
-
 	while (fi_iter) {
 		ctx_merge.dev_id = fi_iter->device_id;
 		device_id = ctx_merge.dev_id;
 		lower_file_iter = fi_iter->lower_file;
-		hmdfs_info("iterate_merge: dentry=%s traverse devid=%llu",
-			   file->f_path.dentry->d_name.name,
-			   fi_iter->device_id);
 		ctx_merge.ctx.pos = fi_head->dev_pos;   /* 恢复设备内续读位置 */
 		err = iterate_dir(lower_file_iter, &ctx_merge.ctx);
 		fi_head->dev_pos = ctx_merge.ctx.pos;   /* 保存设备内位置（原样） */
@@ -443,13 +425,6 @@ int do_dir_open_merge(struct file *file, const struct cred *cred,
 	wait_event(dim->wait_queue, !has_merge_lookup_work(dim));
 
 	mutex_lock(&dim->comrade_list_lock);
-	{
-		int c_cnt = 0;
-		list_for_each_entry(comrade, &(dim->comrade_list), list)
-			c_cnt++;
-		hmdfs_info("dir_open_merge: dentry=%s total_comrades=%d",
-			   file->f_path.dentry->d_name.name, c_cnt);
-	}
 	list_for_each_entry(comrade, &(dim->comrade_list), list) {
 		fi = kzalloc(sizeof(*fi), GFP_KERNEL);
 		if (!fi) {
@@ -460,8 +435,6 @@ int do_dir_open_merge(struct file *file, const struct cred *cred,
 		// make sure that dentry will not be dentry_kill before open
 		dget(lo_p.dentry);
 		if (unlikely(d_is_negative(lo_p.dentry))) {
-			hmdfs_info("dir_open_merge: devid=%llu skipped NEGATIVE",
-				   comrade->dev_id);
 			kfree(fi);
 			dput(lo_p.dentry);
 			continue;  // skip this device
@@ -469,12 +442,9 @@ int do_dir_open_merge(struct file *file, const struct cred *cred,
 		lower_file = dentry_open(&lo_p, file->f_flags, cred);
 		dput(lo_p.dentry);
 		if (IS_ERR(lower_file)) {
-			hmdfs_info("dir_open_merge: devid=%llu open FAILED err=%ld",
-				   comrade->dev_id, PTR_ERR(lower_file));
 			kfree(fi);
 			continue;
 		}
-		hmdfs_info("dir_open_merge: devid=%llu opened", comrade->dev_id);
 		ret = 0;
 		fi->device_id = comrade->dev_id;
 		fi->lower_file = lower_file;

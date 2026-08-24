@@ -1635,20 +1635,13 @@ void reply_execute(int status, int iter) {
 
   clt_finish();
   write_metadata(execution_index);
-  fprintf(stderr, "PHASE1_AFTER_WM: exec=%lld pos=%ld val=%u\n",
-          executor_index, (long)((char *)output_pos - (char *)output_data),
-          *output_pos_value);
   stop_collect_hmdfs_trace();
-  fprintf(stderr, "PHASE2_AFTER_TRACE: exec=%lld pos=%ld val=%u\n",
-          executor_index, (long)((char *)output_pos - (char *)output_data),
-          *output_pos_value);
 
   execute_reply reply = {};
   reply.magic = kOutMagic;
   reply.done = true;
   reply.status = status;
   memcpy(execute_reply_pos, &reply, sizeof(reply));
-  fprintf(stderr, "PHASE3_AFTER_REPLY: exec=%lld\n", executor_index);
 
   if (in_kernel(SERVER)) {
 #if MDEBUG
@@ -1663,7 +1656,6 @@ void reply_execute(int status, int iter) {
   // visible before the executionFinished flag (paired with atomic loads in ipc.go)
   __sync_synchronize();
   output_ctl_pos->executionFinished = 1;
-  fprintf(stderr, "PHASE4_DONE: exec=%lld\n", executor_index);
   // if (write(kOutPipeFd, &reply, sizeof(reply)) != sizeof(reply))
   //	fail("control pipe write failed");
 }
@@ -1735,10 +1727,6 @@ void execute_one() {
                sizeof(uint32 **));
     output_pos = output_data;
     *output_pos_value = 0;
-    *(uint32 *)(output_data_org + 32) = 0xA5A5A5A5;
-    fprintf(stderr, "RESET: exec=%lld pos=%ld val=%u\n", executor_index,
-            (long)((char *)output_pos - (char *)output_data),
-            *output_pos_value);
     write_output(0); // Number of executed syscalls (updated later).
     // Get the inode of test dir for CephFS concurrent semantic checker.
     if (is_dfs_client) {
@@ -3153,15 +3141,7 @@ void write_metadata(int iter) {
 
     stat_cnt = 0;
     mnt_path_len = strlen(cwdbuf) + 1;
-    fprintf(stderr, "MD start: exec=%lld pos=%ld val=%u\n", executor_index,
-            (long)((char *)output_pos - (char *)output_data),
-            *output_pos_value);
     write_dir_info(cwdbuf, NULL);
-    fprintf(stderr, "MD end: exec=%lld pos=%ld cnt=%u\n", executor_index,
-            (long)((char *)output_pos - (char *)output_data), stat_cnt);
-    fprintf(stderr, "PHASE0_WM_TAIL: exec=%lld pos=%ld val=%u\n",
-            executor_index, (long)((char *)output_pos - (char *)output_data),
-            *output_pos_value);
 #ifdef MDEBUG
     fprintf(stderr,
             "executor %lld write_dir_info begins is_dfs_client:%lld %p %p %d "
@@ -3282,12 +3262,8 @@ uint32 *write_stat(struct stat *stat_buf, char *filepath, int xattr_len,
   write_output(filepath_size);
   write_output(xattr_len);
   write_output(link_len);
-  fprintf(stderr,
-          "MD: exec=%lld pos=%ld cnt=%u f=%d x=%d l=%d magic=%x\n",
-          executor_index,
-          (long)((char *)output_pos - (char *)output_data),
-          stat_cnt, filepath_size, xattr_len, link_len,
-          *(uint32 *)(output_data_org + 32));
+  fprintf(stderr, "filepath_size %d xattr_len %d symlink_len %d\n",
+          filepath_size, xattr_len, link_len);
 
   // filepath
   memcpy((void *)output_pos, (const void *)relative_filepath, filepath_size);

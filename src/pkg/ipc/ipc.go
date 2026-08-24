@@ -844,25 +844,20 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 
 	// |size_of_file_path | size_of_xattr | size_of_symlink_path
 	// | filepath | xattr | checksum(uint32) | symlink path |  stat metadata |
-	consumed := 0
 	for i := 0; i < stat_cnt; i++ {
 		filepathSize, ok := readUint32(&out)
 		if !ok {
 			return nil, fmt.Errorf("failed to read filepathSize")
 		}
-		consumed += 4
 		xattrSize, ok := readUint32(&out)
 		if !ok {
 			return nil, fmt.Errorf("failed to read xattrSize")
 		}
-		consumed += 4
 		sympathSize, ok := readUint32(&out)
 		if !ok {
 			return nil, fmt.Errorf("failed to read sympathSize")
 		}
-		consumed += 4
-		log.Logf(0, "MD parse: rec=%d consumed=%d fsize=%d xsize=%d ssize=%d",
-			i, consumed, filepathSize, xattrSize, sympathSize)
+		log.Logf(0, "----- filepathSize %d xattrSize %d", filepathSize, xattrSize)
 
 		//filepath
 		if uint32(len(out)) < filepathSize {
@@ -870,7 +865,6 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 		}
 		filepath := string(out[:filepathSize])
 		out = out[filepathSize:]
-		consumed += int(filepathSize)
 
 		log.Logf(0, "filepath: %v", filepath)
 
@@ -883,7 +877,6 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 			xattrs = string(out[:xattrSize-1]) //Get rid of the last byte which is zero
 		}
 		out = out[xattrSize:]
-		consumed += int(xattrSize)
 
 		xattrsMap := make(map[string]string)
 		log.Logf(0, "----- xattrs: %v", xattrs)
@@ -908,16 +901,13 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 		if !ok {
 			return nil, fmt.Errorf("failed to read checksum")
 		}
-		consumed += 4
 
 		//sympath link
 		if uint32(len(out)) < sympathSize {
-			return nil, fmt.Errorf("bad symlink size %v/%v (rec=%d consumed=%d fsize=%v xsize=%v)",
-				sympathSize, len(out), i, consumed, filepathSize, xattrSize)
+			return nil, fmt.Errorf("bad symlink size %v/%v", sympathSize, len(out))
 		}
 		symlinkPath := string(out[:sympathSize])
 		out = out[sympathSize:]
-		consumed += int(sympathSize)
 
 		//stat
 		var statMd syscall.Stat_t
@@ -928,7 +918,6 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 		statMdData := (*[unsafe.Sizeof(statMd)]byte)(unsafe.Pointer(&statMd))[:]
 		copy(statMdData, out[:statSize])
 		out = out[statSize:]
-		consumed += int(statSize)
 
 		fileMd := prog.FileMetadata{
 			StatMd:      statMd,
@@ -939,8 +928,7 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 		if _, ok := fsMd[filepath]; !ok {
 			fsMd[filepath] = fileMd
 		} else {
-			return nil, fmt.Errorf("Duplicated file in received metadata (rec=%d consumed=%d)",
-				i, consumed)
+			return nil, fmt.Errorf("Duplicated file in received metadata")
 		}
 	}
 
@@ -1125,7 +1113,6 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 	errnos := make([]int, 0, ncmd)
 	//tao end
 	log.Logf(0, "[CLIENT] executor %d has %d replies\n", idx, ncmd)
-	replyConsumed := 0
 	for i := uint32(0); i < ncmd; i++ {
 		if len(out) < int(unsafe.Sizeof(callReply{})) {
 			retChan <- parseRet{info: nil, fsMd: nil, err: fmt.Errorf("failed to read call %v reply", i),
@@ -1134,9 +1121,6 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 		}
 		reply := *(*callReply)(unsafe.Pointer(&out[0]))
 		out = out[unsafe.Sizeof(callReply{}):]
-		replyConsumed += int(unsafe.Sizeof(callReply{}))
-		log.Logf(0, "REPLY: exec-%d rec=%d consumed=%d idx=%d sig=%d cov=%d comps=%d",
-			idx, i, replyConsumed, reply.index, reply.signalSize, reply.coverSize, reply.compsSize)
 		var inf *CallInfo
 		if reply.index != extraReplyIndex && idx >= env.config.ServNum {
 			if int(reply.index) >= len(info.Calls) {
@@ -1171,20 +1155,16 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 				i, reply.index, reply.num, reply.signalSize, len(out)), idx: idx, callInfo: nil}
 			return
 		}
-		replyConsumed += int(reply.signalSize) * 4
 		if inf.Cover, ok = readUint32Array(&out, reply.coverSize); !ok {
 			retChan <- parseRet{info: nil, fsMd: nil, err: fmt.Errorf("call %v/%v/%v: cover overflow: %v/%v",
 				i, reply.index, reply.num, reply.coverSize, len(out)), idx: idx, callInfo: nil}
 			return
 		}
-		replyConsumed += int(reply.coverSize) * 4
-		compsStartLen := len(out)
 		comps, err := readComps(&out, reply.compsSize)
 		if err != nil {
 			retChan <- parseRet{info: nil, fsMd: nil, err: err, idx: idx, callInfo: nil}
 			return
 		}
-		replyConsumed += compsStartLen - len(out)
 		inf.Comps = comps
 		//tao added
 		ret, ok := readUint64(&out)
@@ -1196,8 +1176,6 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 		}
 		syscall_ret := int(ret)
 		syscall_rets = append(syscall_rets, syscall_ret)
-		replyConsumed += 8
-		log.Logf(0, "REPLY-END: exec-%d rec=%d consumed=%d", idx, i, replyConsumed)
 
 		var checkInfo prog.FileMetadata
 		if int32(reply.index) == -1 {

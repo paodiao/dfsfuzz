@@ -409,8 +409,6 @@ static void merge_lookup_work_func(struct work_struct *work)
 	comrade = merge_lookup_comrade(ml_work->sbi, ml_work->name,
 		ml_work->devid, ml_work->flags);
 	if (IS_ERR(comrade)) {
-		hmdfs_info("merge_lookup_work: devid=%d name=%s FAILED err=%ld",
-			   ml_work->devid, ml_work->name, PTR_ERR(comrade));
 		mutex_lock(&mdi->work_lock);
 		goto out;
 	}
@@ -421,8 +419,6 @@ static void merge_lookup_work_func(struct work_struct *work)
 		destroy_comrade(comrade);
 	} else {
 		found = true;
-		hmdfs_info("merge_lookup_work: devid=%d name=%s OK linked",
-			   ml_work->devid, ml_work->name);
 		link_comrade(&mdi->comrade_list, comrade);
 	}
 	mutex_unlock(&mdi->comrade_list_lock);
@@ -633,31 +629,16 @@ static int lookup_merge_root(struct inode *root_inode __maybe_unused,
 	mutex_lock(&mdi->work_lock);
 	mutex_lock(&sbi->connections.node_lock);
 
-	{
-		int peer_cnt = 0;
-		list_for_each_entry(peer, &sbi->connections.node_list, list)
-			peer_cnt++;
-		hmdfs_info("merge_lookup_root: peers_in_node_list=%d work_count_before=%d",
-			   peer_cnt, mdi->work_count);
-	}
-
 	/* lookup real_dst/device_view/local */
 	snprintf(cpath, PATH_MAX, DEVICE_VIEW_ROOT "/" DEVICE_VIEW_LOCAL);
 	err = merge_lookup_async(mdi, sbi, HMDFS_DEVID_LOCAL, cpath, flags,
 		child_dentry);
-	if (err)
-		hmdfs_info("merge_lookup_root: local async fail err=%d", err);
 
 	/* lookup real_dst/device_view/cidxx */
 	list_for_each_entry(peer, &sbi->connections.node_list, list) {
 		snprintf(cpath, PATH_MAX, DEVICE_VIEW_ROOT "/%s", peer->cid);
-		hmdfs_info("merge_lookup_root: schedule peer devid=%u cid=%.16s",
-			   peer->device_id, peer->cid);
 		err = merge_lookup_async(mdi, sbi, peer->device_id, cpath,
 			flags, child_dentry);
-		if (err)
-			hmdfs_info("merge_lookup_root: peer devid=%u async fail err=%d",
-				   peer->device_id, err);
 	}
 	mutex_unlock(&sbi->connections.node_lock);
 	mutex_unlock(&mdi->work_lock);
@@ -666,9 +647,6 @@ static int lookup_merge_root(struct inode *root_inode __maybe_unused,
 
 	if (!is_comrade_list_empty(mdi))
 		ret = 0;
-
-	hmdfs_info("merge_lookup_root: done work_count=%d ret=%d",
-		   mdi->work_count, ret);
 
 	kfree(cpath);
 	return ret;

@@ -219,38 +219,6 @@ static void close_wb_tracepoint(struct perf_state *ps)
 /* ── Perf: drain ring buffer into collected[] ────────────────── */
 static void drain_wb_events(struct perf_state *ps)
 {
-	unsigned char vec[8] = {0};
-	int mr = -1;
-	int mr_errno = 0;
-	if (ps->buf && ps->page_cnt > 0) {
-		errno = 0;
-		mr = mincore(ps->buf, (size_t)ps->page_cnt * 4096, vec);
-		mr_errno = errno;
-	}
-	char fdinfo[256] = "n/a";
-	char fdlink[128] = "n/a";
-	if (ps->fd >= 0) {
-		char fdpath[64];
-		snprintf(fdpath, sizeof(fdpath), "/proc/self/fdinfo/%d", ps->fd);
-		FILE *ff = fopen(fdpath, "r");
-		if (ff) {
-			if (fgets(fdinfo, sizeof(fdinfo), ff))
-				fdinfo[strcspn(fdinfo, "\n")] = 0;
-			fclose(ff);
-		} else {
-			snprintf(fdinfo, sizeof(fdinfo), "open-fail");
-		}
-		snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", ps->fd);
-		ssize_t ll = readlink(fdpath, fdlink, sizeof(fdlink) - 1);
-		if (ll < 0)
-			snprintf(fdlink, sizeof(fdlink), "readlink-fail");
-		else
-			fdlink[ll] = 0;
-	}
-	fprintf(stderr,
-		"TRACE3A0: pid=%d fd=%d buf=%p page_cnt=%d mincore=%d merr=%d vec=%02x%02x%02x%02x%02x fdinfo=%s fdlink=%s\n",
-		getpid(), ps->fd, ps->buf, ps->page_cnt, mr, mr_errno, vec[0],
-		vec[1], vec[2], vec[3], vec[4], fdinfo, fdlink);
 	if (ps->fd < 0)
 		return;
 
@@ -278,10 +246,6 @@ static void drain_wb_events(struct perf_state *ps)
 
 	uint64_t base = (uint64_t)ps->buf + mp->data_offset;
 	uint64_t size = mp->data_size;
-	fprintf(stderr, "TRACE3A: pid=%d fd=%d buf=%p head=%llu tail=%llu base=%llu size=%llu cnt=%d\n",
-		getpid(), ps->fd, ps->buf, (unsigned long long)head,
-		(unsigned long long)tail, (unsigned long long)base,
-		(unsigned long long)size, collected_count);
 
 	while (tail < head) {
 		if (collected_count >= MAX_HMDFS_TRACE_EVENTS)
@@ -293,9 +257,6 @@ static void drain_wb_events(struct perf_state *ps)
 
 		if (hdr->size == 0 || tail + hdr->size > head)
 			break;
-		fprintf(stderr, "TRACE3B: pid=%d pos=%llu hdr_size=%u cnt=%d\n",
-			getpid(), (unsigned long long)pos, hdr->size,
-			collected_count);
 
 		/* advance past header to sample data */
 		unsigned char *data = (unsigned char *)(pos + sizeof(*hdr));
@@ -305,11 +266,6 @@ static void drain_wb_events(struct perf_state *ps)
 		uint32_t raw_sz = *(uint32_t *)data;
 		data += 4;
 		(void)raw_sz;
-		fprintf(stderr,
-			"TRACE3C: pid=%d data=%p raw_sz=%u off_err=%d off_ino=%d off_remote=%d off_dev=%d off_page=%d cnt=%d\n",
-			getpid(), data, raw_sz, ps->off_err, ps->off_ino_raw,
-			ps->off_remote_ino, ps->off_device_id, ps->off_page_index,
-			collected_count);
 		/* data now points at raw trace buffer (common +
 		 * custom fields) — use format offsets */
 
@@ -336,8 +292,6 @@ static void drain_wb_events(struct perf_state *ps)
 		collected[collected_count].args[5] = 0;
 
 		collected_count++;
-		fprintf(stderr, "TRACE3D: pid=%d cnt=%d\n", getpid(),
-			collected_count);
 
 		tail += hdr->size;
 	}
@@ -392,32 +346,24 @@ void start_hmdfs_trace(void)
 
 void stop_collect_hmdfs_trace(void)
 {
-	fprintf(stderr, "TRACE0_ENTER: pid=%d cnt=%d\n", getpid(), collected_count);
 	/* 1. drain BPF kretprobe events */
 	if (skel && rb) {
-		fprintf(stderr, "TRACE1_BEFORE_CONSUME: pid=%d cnt=%d\n", getpid(), collected_count);
 		ring_buffer__consume(rb);
-		fprintf(stderr, "TRACE2_AFTER_CONSUME: pid=%d cnt=%d\n", getpid(), collected_count);
 	}
 
 	/* 2. drain perf writepage events */
 	if (wb_perf.fd >= 0)
 		ioctl(wb_perf.fd, PERF_EVENT_IOC_DISABLE, 0);
-	fprintf(stderr, "TRACE3_BEFORE_DRAIN: pid=%d cnt=%d\n", getpid(), collected_count);
 	drain_wb_events(&wb_perf);
-	fprintf(stderr, "TRACE4_AFTER_DRAIN: pid=%d cnt=%d\n", getpid(), collected_count);
 
 	/* 3. sort merged events by timestamp */
 	if (collected_count > 0) {
-		fprintf(stderr, "TRACE5_BEFORE_SORT: pid=%d cnt=%d\n", getpid(), collected_count);
 		std::sort(collected, collected + collected_count,
 			  event_before);
-		fprintf(stderr, "TRACE6_BEFORE_TSC: pid=%d cnt=%d\n", getpid(), collected_count);
 		/* convert bpf_ktime_get_ns() timestamps to the global
 		 * raw-TSC domain (shared with per-call windows) */
 		for (int i = 0; i < collected_count; i++)
 			collected[i].timestamp = tsc_ns_to_global(collected[i].timestamp);
-		fprintf(stderr, "TRACE7_BEFORE_WRITE: pid=%d cnt=%d\n", getpid(), collected_count);
 	}
 
 	/* 4. write to output */
@@ -431,7 +377,6 @@ void stop_collect_hmdfs_trace(void)
 			write_output_64(collected[i].args[j]);
 		write_output_64(collected[i].off);
 	}
-	fprintf(stderr, "TRACE8_DONE: pid=%d cnt=%d\n", getpid(), collected_count);
 
 	/* 5. reset for the next round: this runs in the parent (loop) process,
 	 * whose collected_count is never reset by the forked child's
