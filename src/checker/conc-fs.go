@@ -128,17 +128,54 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	}
 	exePath := filepath.Dir(ex)
 
+	// Large payloads (prog text, checkInfos, seq programs) exceed the Linux
+	// ARG_MAX limit when passed via argv (E2BIG with big directories), so
+	// write them to temp files and pass the paths instead.
+	writeTemp := func(name string, data []byte) (string, error) {
+		fp, err := os.CreateTemp("", "symsc-"+name+"-*")
+		if err != nil {
+			return "", err
+		}
+		defer fp.Close()
+		if _, err := fp.Write(data); err != nil {
+			os.Remove(fp.Name())
+			return "", err
+		}
+		return fp.Name(), nil
+	}
+
+	progFile, err := writeTemp("prog", []byte(symscProgStr))
+	if err != nil {
+		log.Logf(0, "write symsc prog temp file error: %v\n", err)
+		return false, nil
+	}
+	defer os.Remove(progFile)
+
+	infosFile, err := writeTemp("infos", checkInfos_json)
+	if err != nil {
+		log.Logf(0, "write symsc infos temp file error: %v\n", err)
+		return false, nil
+	}
+	defer os.Remove(infosFile)
+
+	seqsFile, err := writeTemp("seqs", seq_programs_json)
+	if err != nil {
+		log.Logf(0, "write symsc seqs temp file error: %v\n", err)
+		return false, nil
+	}
+	defer os.Remove(seqsFile)
+
 	cmd := exec.Command("python3",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
-		"-v", "-t", fsType, "-p", symscProgStr,
-		"-i", string(checkInfos_json), "-c", symsc_stat,
-		"-g", string(seq_programs_json), "-s", fmt.Sprintf("%v", srvNum),
+		"-v", "-t", fsType, "-p", progFile,
+		"-i", infosFile, "-c", symsc_stat,
+		"-g", seqsFile, "-s", fmt.Sprintf("%v", srvNum),
 		"-f", cfg_mode, "-a", initIP, "-n", fmt.Sprintf("%v", testdirIno))
 
-	log.Logf(0, "python3 %v -v -t %v -p \"%v\" -i \"%v\" -c \"%v\" -g \"%v\" -s %v -f \"%v\" -a \"%v\" -n %v",
+	log.Logf(0, "python3 %v -v -t %v -p %v -i %v -c \"%v\" -g %v -s %v -f \"%v\" -a \"%v\" -n %v",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
-		fsType, strings.Replace(symscProgStr, "\"", "\\\"", -1), strings.Replace(string(checkInfos_json), "\"", "\\\"", -1),
-		symsc_stat, string(seq_programs_json),
+		fsType, progFile, infosFile,
+		symsc_stat, seqsFile,
 		srvNum, cfg_mode, initIP, testdirIno)
 
 	cmd.Stdout = os.Stdout

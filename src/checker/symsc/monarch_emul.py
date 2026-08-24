@@ -45,6 +45,14 @@ if __name__ == "__main__":
     print("start parsing arguments\n")
     args = parser.parse_args()
 
+    # -p/-i/-g may carry temp file paths instead of inline content when the
+    # payload is too large for the command line (ARG_MAX).
+    for name in ("prog", "input", "seq_programs"):
+        val = getattr(args, name)
+        if val and os.path.isfile(val):
+            with open(val) as f:
+                setattr(args, name, f.read())
+
     if args.crashed:
         args.crashed = args.crashed[1:-2]
         print("prog:\n{}\ncrash state:\n{}\n".format(args.prog, args.crashed))
