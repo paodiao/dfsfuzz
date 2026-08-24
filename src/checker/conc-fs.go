@@ -240,15 +240,43 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata) []
 	if m1.Checksum != m2.Checksum {
 		ics = append(ics, fmt.Sprintf("%s: checksum %d vs %d", path, m1.Checksum, m2.Checksum))
 	}
-	if m1.StatMd.Mode != m2.StatMd.Mode {
-		ics = append(ics, fmt.Sprintf("%s: mode %o vs %o", path, m1.StatMd.Mode, m2.StatMd.Mode))
+	/*
+	 * Only compare the directory bit (S_IFDIR):
+	 *
+	 * 1. Under CONFIG_HMDFS_FS_PERMISSION, uid/gid/mode permission bits
+	 *    on the remote view are simplified values (uid/gid inherited from
+	 *    the parent dir, mode hardcoded 0660), so they are intentionally
+	 *    inconsistent across nodes.
+	 * 2. A full S_IFMT type compare is avoided because hmdfs hardcodes
+	 *    the symlink inode type as S_IFREG (fill_inode_remote LNK branch),
+	 *    which would falsely report S_IFLNK (owning node) vs S_IFREG
+	 *    (remote view) on symlinks.
+	 *
+	 * Directory vs non-directory must match across nodes - that is the
+	 * meaningful cross-node type consistency signal (path-set equality is
+	 * already checked by MdCmp; a same-path file/dir type conflict would
+	 * otherwise go undetected).
+	 *
+	 * Migration note: for other DFSes, compare the full S_IFMT type bits
+	 * instead if their remote views return the real file type.
+	 */
+	if (m1.StatMd.Mode & syscall.S_IFDIR) != (m2.StatMd.Mode & syscall.S_IFDIR) {
+		ics = append(ics, fmt.Sprintf("%s: dirtype %o vs %o", path,
+			m1.StatMd.Mode & syscall.S_IFDIR, m2.StatMd.Mode & syscall.S_IFDIR))
 	}
-	if m1.StatMd.Uid != m2.StatMd.Uid {
-		ics = append(ics, fmt.Sprintf("%s: uid %d vs %d", path, m1.StatMd.Uid, m2.StatMd.Uid))
-	}
-	if m1.StatMd.Gid != m2.StatMd.Gid {
-		ics = append(ics, fmt.Sprintf("%s: gid %d vs %d", path, m1.StatMd.Gid, m2.StatMd.Gid))
-	}
+	/*
+	 * Uid/Gid comparison disabled: with CONFIG_HMDFS_FS_PERMISSION the
+	 * remote view returns uid/gid inherited from the parent dir (e.g.
+	 * 1008) while the owning node returns the real ext4 values (e.g.
+	 * 1000) - intentionally inconsistent by design. Kept commented out
+	 * for reuse if another filesystem needs strict uid/gid comparison.
+	 */
+	// if m1.StatMd.Uid != m2.StatMd.Uid {
+	// 	ics = append(ics, fmt.Sprintf("%s: uid %d vs %d", path, m1.StatMd.Uid, m2.StatMd.Uid))
+	// }
+	// if m1.StatMd.Gid != m2.StatMd.Gid {
+	// 	ics = append(ics, fmt.Sprintf("%s: gid %d vs %d", path, m1.StatMd.Gid, m2.StatMd.Gid))
+	// }
 	if m1.StatMd.Mtim.Sec != m2.StatMd.Mtim.Sec {
 		ics = append(ics, fmt.Sprintf("%s: mtime %d vs %d", path, m1.StatMd.Mtim.Sec, m2.StatMd.Mtim.Sec))
 	}
