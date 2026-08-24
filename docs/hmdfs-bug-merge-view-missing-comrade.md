@@ -1,4 +1,4 @@
-# HMDFS 内核 Bug：merge_view 遍历丢失 peer 内容（get_next_hmdfs_file_info 错误返回 + readdir 跨调用 pos 错乱）
+# HMDFS 内核 Bug：merge_view readdir 跨调用状态（ctx->pos 位域）机制缺陷与 fi_head 状态机重构
 
 ## 元信息
 
@@ -6,19 +6,20 @@
 | --- | --- |
 | 发现日期 | 2026-08-23 |
 | 复现环境 | 3 节点 QEMU（192.168.0.59/.60/.61）、Linux 6.6.0-dirty、Monarch (syzkaller) fuzzer + hmdfs agent 隧道（`update_socket_param` 移交 fd 模式） |
-| Bug 标题 | merge_view 聚合视图丢失"最后注册 peer"的全部内容 |
-| 位置 | `hmdfs/file_merge.c:289-304`（`get_next_hmdfs_file_info`）；`hmdfs/file_merge.c:323-383`（`hmdfs_iterate_merge`） |
-| 性质 | 链表遍历语义错误 + readdir 跨调用位置（pos）状态不一致，导致 merge 目录遍历提前终止、遗漏设备 |
-| 影响 | 节点间 merge_view 内容不一致（"三方互缺"），分布式一致性测试（CSAN 文件数校验）失败：exec 0/2=400、exec 1=1501 |
+| Bug 标题 | merge_view 聚合视图遍历丢失设备内容（readdir 跨调用状态损坏） |
+| 位置 | `hmdfs/file_merge.c:332-427`（`hmdfs_iterate_merge`）；`hmdfs/file_merge.c:289-307`（`get_next_hmdfs_file_info`）；`hmdfs/hmdfs.h:259-274`（`struct hmdfs_file_info`） |
+| 性质 | 目录遍历迭代器的跨调用状态（`ctx->pos` 位域编码）被设备层 f_pos 语义污染、且位域容量不足，叠加"设备完成/缓冲满"判定语义错乱，导致设备遍历遗漏与分批续读失效 |
+| 影响 | 节点间 merge_view 内容不一致（"三方互缺"）；大目录（1100 文件）分批 readdir 丢剩余条目；分布式一致性测试（CSAN 文件数校验）失败：exec 0/2=400、exec 1=1501 |
 
 ## 摘要
 
-HMDFS 的 merge_view（合并视图）在遍历各设备（本地 + 各 peer）目录内容时，存在两个叠加的内核缺陷：
+HMDFS 的 merge_view（合并视图）readdir 通过 `hmdfs_iterate_merge` 遍历各设备（本地 + 各 peer），依赖 `ctx->pos` 的位域编码（`hmdfs_set_pos`，`POS_BIT_NUM=64/DEV_ID_BIT_NUM=16/GROUP_ID_BIT_NUM=39/OFFSET_BIT_NUM=8`）实现跨调用续读。该机制存在三类缺陷：
 
-1. **`get_next_hmdfs_file_info()` 在"未找到匹配 device_id"时错误返回链表首节点**（应为 NULL）。`list_for_each_entry_safe` 遍历完链表后，safe 指针 `n` 恰好等于 `next(head)`（链表首节点），原实现仅检查 `fi_result != fi_head`，误把首节点当作有效返回值。
-2. **`hmdfs_iterate_merge()` 的跨调用位置状态损坏**：设备目录遍历结束（EOF）后 `ctx->pos` 被置为 `LLONG_MAX`，而函数入口的结束检查是 `ctx->pos == -1`（`0xFFFF...`），二者不一致；`LLONG_MAX` 经位域解码得到 `device_id = ULONG_MAX`，随后触发缺陷 1 的错误返回，遍历序列错乱（首设备被重复遍历、最后一个设备从未遍历）。
+1. **`get_next_hmdfs_file_info()` 无匹配时错误返回链表首节点**（`list_for_each_entry_safe` 遍历完 `n = next(head)` 误判），破坏遍历序列；
+2. **`ctx->pos` 被设备 f_pos 污染**：设备遍历完/中断后设备 f_pos（`LLONG_MAX` 等）被直接赋给 `ctx->pos`，下次调用解码出 `ULONG_MAX`，设备定位错乱；且 **`OFFSET_BIT_NUM` 仅 8 位**，本地设备（ext4 透传）的目录偏移超过 255 即溢出，设备内续读位置无法经位域无损承载；
+3. **"设备完成/缓冲满"判定语义错乱**：`ctx_merge.result`（最后一次 emit 的返回值）为 `true` 恰是"设备正常遍历完"，原代码却当作"缓冲满"提前停止（每次调用只遍历 1 个设备 → VFS 位置无进展判定 EOF → 后续设备永不遍历）；而远程设备 `err=1`（filldir 满）又曾被误当"完成"推进/EOF（大目录分批丢剩余）。
 
-实际表现为：merge_view 聚合后**缺失"最后注册的 peer"的全部专属内容**（例如节点 2 缺 edd5a2a9 的 8 个专属根目录），且与访问时机、连接状态、peer 在线与否**均无关**——peer 已注册、连接已建立、`device_view` 直访正常，但 merge_view 中永久缺失该 peer。
+最终以 **`fi_head`（file->private_data，open 期间存活）显式状态机**重构迭代器：`cur_dev`（当前设备）+ `dev_pos`（设备内续读位置，原样保存/恢复，不经位域）+ `seq`（VFS 进度计数），彻底放弃从 `ctx->pos` 解码恢复进度；`ctx->pos` 仅作 VFS 进度指示。
 
 ## 复现现象
 
@@ -32,45 +33,40 @@ HMDFS 的 merge_view（合并视图）在遍历各设备（本地 + 各 peer）�
 | 节点 1（edd5a2a9） | 12 项（同上） | ab44c6ad 的 6 个专属根 |
 | 节点 2（ab44c6ad） | 10 项 = 74cb 的 4 根 + 本地 6 根 | edd5a2a9 的 8 个专属根 |
 
-规律：**每个节点恰好缺失"自己最后注册的 peer"（device_id 最大的）的全部内容**。全量应为 18 项（4+6+8）。
-
-排除项：
-- `device_view/<cid>` 直访正常（能看到缺失 peer 的内容）→ 连接层/agent 无问题
-- 等待 2-5 分钟（peer 全部 online）后访问仍缺 → 与访问时机无关
-- `echo 2 > /proc/sys/vm/drop_caches` 后仍缺 → 与 dentry 缓存无关（mount root 常驻，comrade 列表不重建）
+规律：**每个节点恰好缺失"自己最后注册的 peer"（device_id 最大的）的全部内容**。全量应为 18 项（4+6+8）。排除项：`device_view/<cid>` 直访正常（连接层无问题）；等待 2-5 分钟（peer 全部 online）仍缺（与访问时机无关）；`drop_caches` 后仍缺（mount root 常驻，comrade 列表不重建）。
 
 ### 现象 2：分布式一致性测试（CSAN）文件数不一致
 
-executor 每轮在 `merge_view` 目录下遍历统计（`src/executor/executor.cc:3141-3159`，`write_dir_info("/mnt/hmdfs/100/non_account/merge_view")`），各节点 executor 看到的 merge_view 内容不同 → 统计结果不一致（exec 0/2=400、exec 1=1501），触发 saveCsanBug。
+executor 每轮在 `merge_view` 目录下遍历统计（`src/executor/executor.cc:3141-3159`，`write_dir_info("/mnt/hmdfs/100/non_account/merge_view")`），各节点 executor 看到的 merge_view 内容不同 → 统计不一致（exec 0/2=400、exec 1=1501），触发 saveCsanBug。
+
+### 现象 3：大目录分批 readdir 丢剩余条目（修复演进中暴露）
+
+大目录（`Eris_qfehribmzl_93443936692.d`，1100 文件，位于 edd5a2a9，见附录"大目录结构说明"）在节点 2（远程单设备 merge 目录，comrade 仅 edd5a2a9）上 `ls | wc -l` 仅得 **585**——1100 文件分批（> getdents64 缓冲 ~32KB）时，第一批后的续读失效，剩余 515 丢失。
 
 ### 诊断日志摘录（节点 2，Linux 6.6.0-dirty 诊断打印）
 
+**merge_view 根（修复推进后）**：
+
 ```
 lookup_merge_root() merge_lookup_root: peers_in_node_list=2 work_count_before=0
-lookup_merge_root() merge_lookup_root: schedule peer devid=1 cid=74cb462516cfffba
-lookup_merge_root() merge_lookup_root: schedule peer devid=2 cid=edd5a2a95088dcc6
-merge_lookup_work_func() merge_lookup_work: devid=0 name=device_view/local OK linked
-merge_lookup_work_func() merge_lookup_work: devid=1 name=device_view/74cb... OK linked
-merge_lookup_work_func() merge_lookup_work: devid=2 name=device_view/edd5a2a9... OK linked
-lookup_merge_root() merge_lookup_root: done work_count=0 ret=0
+merge_lookup_work_func() merge_lookup_work: devid=0/1/2 ... OK linked   （3 comrade 全建）
 do_dir_open_merge() dir_open_merge: dentry=merge_view total_comrades=3
-do_dir_open_merge() dir_open_merge: devid=0 opened
-do_dir_open_merge() dir_open_merge: devid=1 opened
+do_dir_open_merge() dir_open_merge: devid=0/1/2 opened
+iterate_merge: traverse devid=0 → get_next: in=0 out=1
+iterate_merge: entry pos=-9223231299366420480 decoded_devid=1  → traverse devid=1 → get_next: in=1 out=2
+iterate_merge: entry pos=-9223090561878065152 decoded_devid=2  → traverse devid=2 → get_next: in=2 out=-1
+（EOF：pos=-1 → 函数入口直接返回）
+```
+
+**大目录（585 现象，修复前 err 分支缺陷期）**：
+
+```
+do_dir_open_merge() dir_open_merge: dentry=Eris_qfehribmzl... total_comrades=1
 do_dir_open_merge() dir_open_merge: devid=2 opened
-hmdfs_iterate_merge() iterate_merge: entry pos=0 decoded_devid=0
-hmdfs_iterate_merge() iterate_merge: list devid=0
-hmdfs_iterate_merge() iterate_merge: list devid=1
-hmdfs_iterate_merge() iterate_merge: list devid=2
-hmdfs_iterate_merge() iterate_merge: traverse devid=0
-get_next_hmdfs_file_info() get_next: in_devid=-1 out_devid=0     ← 入参 -1（ULONG_MAX 截断），错误返回首节点
-hmdfs_iterate_merge() iterate_merge: entry pos=9223372036854775807 decoded_devid=18446744073709551615
-hmdfs_iterate_merge() iterate_merge: list devid=0
-hmdfs_iterate_merge() iterate_merge: list devid=1
-hmdfs_iterate_merge() iterate_merge: list devid=2
-hmdfs_iterate_merge() iterate_merge: traverse devid=0            ← 首设备被重复遍历
-get_next_hmdfs_file_info() get_next: in_devid=0 out_devid=1
-hmdfs_iterate_merge() iterate_merge: traverse devid=1
-                                                                    ← devid=2 从未遍历！
+iterate_merge: entry pos=0 decoded_devid=0
+iterate_merge: list devid=2
+iterate_merge: traverse devid=2
+get_next: in=2 out=-1          ← 单设备；第一批 585 项后 filldir 满 → err=1 → 被当"完成"推进 → -1 EOF → 丢 515
 ```
 
 ## 根因分析
@@ -79,142 +75,165 @@ hmdfs_iterate_merge() iterate_merge: traverse devid=1
 
 | 文件 | 行号 | 内容 |
 | --- | --- | --- |
-| `hmdfs/file_merge.c` | :289-304 | `get_next_hmdfs_file_info()`（缺陷 1） |
-| `hmdfs/file_merge.c` | :306-321 | `get_hmdfs_file_info()`（按 device_id 精确查找） |
-| `hmdfs/file_merge.c` | :323-383 | `hmdfs_iterate_merge()`（merge 目录 readdir 主流程，缺陷 2） |
-| `hmdfs/file_merge.c` | :342 | `if (ctx->pos == -1) return 0;`（EOF 检查，与缺陷 2 相关） |
-| `hmdfs/file_merge.c` | :209-287 | `hmdfs_actor_merge()`（去重/输出 actor，:249-250 目录重复跳过） |
-| `hmdfs/inode_merge.c` | :606-675 | `lookup_merge_root()`（merge_view 根 lookup，comrade 建立） |
-| `hmdfs/file_remote.c` | :885-893 | `hmdfs_set_pos()`（device_id/group/offset 位域编码） |
-| `hmdfs/hmdfs_dentryfile.h` | :31-33 | `POS_BIT_NUM=64`、`DEV_ID_BIT_NUM=16`、`GROUP_ID_BIT_NUM=39` |
+| `hmdfs/file_merge.c` | :289-307 | `get_next_hmdfs_file_info()`（缺陷 1） |
+| `hmdfs/file_merge.c` | :332-427 | `hmdfs_iterate_merge()`（缺陷 2/3；最终状态机重构处） |
+| `hmdfs/file_merge.c` | :209-287 | `hmdfs_actor_merge()`（去重树 + 输出 actor，:276 记录 result） |
+| `hmdfs/file_merge.c` | :429-489 | `do_dir_open_merge()`（fi 列表建立，open 期间固定） |
+| `hmdfs/hmdfs.h` | :259-274 | `struct hmdfs_file_info`（状态机字段） |
+| `hmdfs/file_remote.c` | :885-893 | `hmdfs_set_pos()`（位域编码） |
+| `hmdfs/file_remote.c` | :900-1006 | 远程设备 readdir（`iterate_result` 语义、:960/:966 设备内位置更新） |
+| `hmdfs/file_local.c` | :231-250 | 本地设备 readdir（ext4 透传） |
+| `hmdfs/hmdfs_dentryfile.h` | :31-35 | 位域定义（`OFFSET_BIT_NUM=8`、`OFFSET_BIT_MASK=0xFF`） |
 
-### 缺陷 1：`get_next_hmdfs_file_info` 无匹配时错误返回链表首节点
+### 原设计：ctx->pos 位域承载跨调用续读
 
 ```c
-struct hmdfs_file_info *
-get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
+loff_t hmdfs_set_pos(unsigned long dev_id, unsigned long group_id, unsigned long offset)
 {
-	struct hmdfs_file_info *fi_iter = NULL;
-	struct hmdfs_file_info *fi_result = NULL;
-
-	mutex_lock(&fi_head->comrade_list_lock);
-	list_for_each_entry_safe(fi_iter, fi_result, &(fi_head->comrade_list),
-				  comrade_list) {
-		if (fi_iter->device_id == device_id)
-			break;
-	}
-	mutex_unlock(&fi_head->comrade_list_lock);
-
-	return fi_result != fi_head ? fi_result : NULL;
+    pos = (dev_id << 47) + (group_id << 8) + offset;
+    if (dev_id) pos |= (1 << 63);          /* 远程标记 */
 }
+/* 解码（原 file_merge.c:339-340） */
+device_id = (pos << 1) >> 48;
 ```
 
-`list_for_each_entry_safe(pos, n, head, member)` 的语义：遍历结束后（未 `break`），`pos` 回落为链表头 `head`，而 `n` 是"当前节点的 next"，即 `n = next(head) = 链表首节点`。
+意图：`ctx->pos` 同时携带"设备号 + 设备内位置"，readdir 分批（filldir 满）时下次调用从编码位置续读。**该机制在实现层面有三处破坏**：
 
-因此：
-- **匹配成功**（`break`）：`fi_result = 匹配节点的 next`，返回正确；
-- **匹配失败**（遍历完）：`fi_result = next(head) = 链表首节点`，**不等于 `fi_head`，通过检查，错误返回首节点**（应为 NULL）。
+### 缺陷 1：`get_next_hmdfs_file_info` 无匹配时返回链表首节点
 
-### 缺陷 2：`hmdfs_iterate_merge` 跨调用位置状态不一致
+`list_for_each_entry_safe(pos, n, head, member)` 遍历完（未 `break`）时 `pos` 回落为链表头、`n = next(head) = 链表首节点`。原实现仅检查 `fi_result != fi_head`，把首节点误当有效"下一个"返回（应为 NULL）。导致解码无效（ULONG_MAX）时错误回到首设备，遍历序列错乱。
 
-`hmdfs_iterate_merge` 的跨调用续读机制依赖 `ctx->pos` 携带"当前遍历到哪个设备 + 设备内位置"，由 `hmdfs_set_pos(dev_id, group_id, offset)` 位域编码（`hmdfs_dentryfile.h:31-33`）：
+### 缺陷 2：`ctx->pos` 被设备 f_pos 污染 + 位域容量不足
+
+**f_pos 污染**：原实现在每次设备遍历后执行：
 
 ```c
-loff_t hmdfs_set_pos(unsigned long dev_id, unsigned long group_id,
-		     unsigned long offset)
-{
-	loff_t pos;
-	pos = ((loff_t)dev_id << (POS_BIT_NUM - 1 - DEV_ID_BIT_NUM)) +
-	      ((loff_t)group_id << OFFSET_BIT_NUM) + offset;
-	if (dev_id)
-		pos |= ((loff_t)1 << (POS_BIT_NUM - 1));
-	return pos;
-}
+err = iterate_dir(lower_file_iter, &ctx_merge.ctx);
+file->f_pos = lower_file_iter->f_pos;      /* 设备 f_pos 直接赋给 hmdfs f_pos */
+ctx->pos = file->f_pos;                    /* ctx->pos 被污染 */
 ```
 
-解码（`file_merge.c:330-331`）：
+本地设备遍历**完成**后设备 f_pos = `LLONG_MAX`（EOF 标记，日志实锤）→ `ctx->pos = LLONG_MAX` → 下次调用解码 `(LLONG_MAX << 1) >> 48`（算术右移符号扩展）→ **ULONG_MAX**（日志 `decoded=18446744073709551615`）→ 设备定位失效，依赖缺陷 1 的错误返回"苟延"。
 
-```c
-unsigned long device_id = (unsigned long)((ctx->pos) << 1 >>
-			  (POS_BIT_NUM - DEV_ID_BIT_NUM));
-```
+**位域容量不足**：`OFFSET_BIT_NUM=8`（`OFFSET_BIT_MASK=0xFF`）——本地设备（ext4 透传）的目录偏移（大目录可达数 KB）**超过 255 即溢出**；远程设备内部位置是 `set_pos(dev,i,j)` 编码（与 hmdfs 层编码同形但语义是"设备内组/项"）。**设备内续读位置无法经 `ctx->pos` 位域无损承载**——这是"从头 + 去重树续读"（而非真续读）出现的根因，也是最终选择 `fi_head` 直接保存原值的原因。
 
-问题链（诊断日志实锤）：
+### 缺陷 3："设备完成/缓冲满"判定语义错乱
 
-1. 某设备遍历结束后，其 `f_pos` 被置为 `LLONG_MAX`（`0x7FFF...`，EOF 标记）；`hmdfs_iterate_merge` 在 `iterate_dir` 之后执行 `file->f_pos = lower_file_iter->f_pos; ctx->pos = file->f_pos;`（:362-363），`ctx->pos` 因而变成 `LLONG_MAX`；
-2. 函数入口的 EOF 检查是 `ctx->pos == -1`（:342，即 `0xFFFF...`）——**与设备层 EOF 标记 `LLONG_MAX` 不一致**，检查永不触发；
-3. 下一次调用对 `LLONG_MAX` 解码：`(LLONG_MAX << 1) >> 48` → 算术右移符号扩展 → `0xFFFF...` → `device_id = ULONG_MAX`（日志：`decoded_devid=18446744073709551615`）；
-4. `get_hmdfs_file_info(ULONG_MAX)` 返回 NULL → 调用 `get_next_hmdfs_file_info(ULONG_MAX)` → **触发缺陷 1**，错误返回首节点（日志：`in_devid=-1 out_devid=0`）→ 首设备被重复遍历（`traverse devid=0` 第二次）；
-5. 重复遍历首设备（去重树跳过、无新输出）后经 `get_next(0)` 回到正常序列（`in=0 out=1` → `traverse devid=1`），但**调用在 devid=1 之后提前结束，devid=2 从未被遍历** → 缺失最后注册 peer 的全部内容。
+设备 readdir 返回三个独立信号：
+
+| 信号 | 含义 | 本地（ext4 透传） | 远程 |
+| --- | --- | --- | --- |
+| `err` | 设备 readdir 返回值 | 恒 0 | `iterate_result`：0=组遍历完；1=filldir 满（file_remote.c:964-966） |
+| `ctx_merge.result` | **最后一次 actor 返回值**（:276） | 完成=true；满=false | 同左 |
+| `ctx_merge.ctx.pos` | 设备内部遍历位置 | ext4 偏移 | `set_pos(dev,i,j)`（:960/:966） |
+
+两个误判：
+
+1. **`result=true`（=设备完成）被原代码当"缓冲满"提前停**（原 :391 `if (ctx_merge.result) goto done;`，注释语义与实现相反）→ **每次调用只遍历 1 个设备** → done 后 `ctx->pos` 停在设备 f_pos（LLONG_MAX）→ 与调用进入时相同 → **VFS `vfs_getdents` 的 `ctx->pos == last_pos` 检查判定位置无进展 → 提前 EOF** → 后续设备（如 dev 2）**永不遍历**（merge_view 根缺 dev 2 的直接机制）；
+2. **`err>0`（=filldir 满）曾被当"完成"推进/EOF**（修复 4 期）→ 大目录第一批 585 项后 `err=1` → 单设备 `get_next=NULL` → `ctx->pos=-1` → EOF → **剩余 515 永久丢失**。
+
+### 设计 vs 实现对照表
+
+| 设计意图 | 实现缺陷 | 后果 |
+| --- | --- | --- |
+| ctx->pos 编码跨调用续读 | 设备 f_pos（LLONG_MAX）污染 ctx->pos（原 :396-397） | 解码 ULONG_MAX → 设备定位错乱 |
+| ctx->pos 携带设备内位置 | OFFSET_BIT_NUM=8 容量不足；远程/本地语义不一 | 真续读不可行 → 只能从头+去重（259 改名重复风险） |
+| result=false=满、true=完成 | 原代码把 true 当"满"提前停 | 每调用 1 设备 → VFS pos 无进展 EOF → 缺 dev 2 |
+| err>0=满（远程） | 修复 4 期被当"完成"推进/EOF | 大目录分批丢剩余（585/1100） |
 
 ## 触发链路
 
 ```
 挂载 + agent 连接建立（所有 peer 注册、online，device_view 直访正常）
-  → 首次访问 merge_view 根（用户 ls / executor write_dir_info）
-  → lookup_merge_root：对 local + 各 peer 发起 merge_lookup_async（全部 OK，3 个 comrade 建立）
-  → do_dir_open_merge：3 个 comrade 全部打开成功（fi 列表 [0,1,2]）
-  → hmdfs_iterate_merge 第 1 次调用：遍历 devid=0（本地）后提前退出，ctx->pos=LLONG_MAX
-  → 第 2 次调用：解码 device_id=ULONG_MAX → get_next 错误返回首节点（缺陷 1）
-  → 遍历序列错乱（0 重复、2 缺失）→ merge_view 缺最后注册 peer 的全部内容
+  → 访问 merge_view 根 / 大目录（用户 ls / executor write_dir_info）
+  → lookup_merge_root / lookup_merge_normal：comrade 建立（work 全 OK）
+  → do_dir_open_merge：comrade 全部打开（fi 列表建立，open 期间固定）
+  → hmdfs_iterate_merge 跨调用遍历：
+      · 设备遍历完 → result=true → （原代码）提前停 → ctx->pos=LLONG_MAX
+        → 下次调用解码 ULONG_MAX → 遍历错乱 → 后续设备缺失（三方互缺）
+      · 分批（filldir 满）→ 设备内位置无可靠载体 → 从头+去重续读
+        （259 改名重复风险）或 err>0 被当完成 → EOF → 大目录丢剩余
 ```
 
 ## 为什么 100% 是内核 Bug（排除用户态/连接层）
 
-1. **连接层完全正常**：`merge_lookup_work` 三个 work 全部 `OK linked`；`dir_open_merge` 三个 comrade 全部 `opened`；`device_view/<cid>` 直访正常（能看到缺失 peer 的完整内容）；连接建立日志无任何 broken/reject。
-2. **与访问时机无关**：等待 2-5 分钟（peer 全部 online）后首访仍缺；`drop_caches` 后仍缺。
-3. **与 agent 无关**：本次环境 agent 全部连接成功（`tcp_update_socket` state 正常、握手完成、online 回调正常），无旧版"双向连接竞争拒绝"问题。
-4. **内核日志自证**：`get_next: in=-1 out=0`（入参 ULONG_MAX 截断为 -1，返回首节点）、`decoded_devid=18446744073709551615`、`traverse` 序列缺 devid=2——全部是内核 `file_merge.c` 内部遍历逻辑的行为。
+1. **连接层完全正常**：`merge_lookup_work` 全 OK、comrade 全 opened、`device_view` 直访正常、连接日志无 broken/reject；
+2. **与访问时机无关**：等待 2-5 分钟（peer 全 online）后首访仍缺；`drop_caches` 后仍缺；
+3. **与 agent 无关**：agent 连接全部成功，无旧版"双向连接竞争拒绝"问题；
+4. **内核日志自证**：`get_next: in=-1 out=0`（错误返回）、`decoded=18446744073709551615`（ULONG_MAX）、`traverse` 序列缺 dev 2、大目录 585 后 EOF——全部是 `file_merge.c` 迭代器内部行为。
 
 ## 影响分析
 
-- merge_view 聚合视图缺失"最后注册 peer"的全部内容 → 各节点视图不一致（"三方互缺"）→ 分布式文件系统一致性校验（文件数、目录结构比对）失败；
-- CSAN 测试（`exec 0/2=400`、`exec 1=1501`）被误报为文件系统一致性 bug；
-- 缺陷 2（EOF 标记与结束检查不一致）在任意"设备遍历完 + 提前退出"的路径下都可能损坏跨调用状态，影响所有 merge 目录（含大目录）的 readdir 分批行为。
+- merge_view 聚合视图缺失"最后注册 peer"全部内容 → 各节点视图不一致（"三方互缺"）→ 分布式一致性校验（文件数/目录结构比对）失败；
+- 大目录（1100 文件）分批 readdir 丢剩余 → 内容不可见/统计不准；
+- CSAN 测试（exec 0/2=400、exec 1=1501）被误报为文件系统一致性 bug。
 
 ## 修复方案（内核侧补丁）
 
-### 修复 1：`get_next_hmdfs_file_info` 无匹配时返回 NULL
+### 修复 1：`get_next_hmdfs_file_info` 无匹配时返回 NULL（保留）
 
 ```c
-struct hmdfs_file_info *
-get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
-{
-	struct hmdfs_file_info *fi_iter = NULL;
-	struct hmdfs_file_info *fi_result = NULL;
-
-	mutex_lock(&fi_head->comrade_list_lock);
-	list_for_each_entry_safe(fi_iter, fi_result, &(fi_head->comrade_list),
-				  comrade_list) {
-		if (fi_iter->device_id == device_id)
-			break;
-	}
 	mutex_unlock(&fi_head->comrade_list_lock);
 
-	/* 遍历完链表未找到匹配：fi_iter 回落为链表头（list_for_each_entry_safe
-	 * 遍历结束语义），此时 fi_result == next(head) == 链表首节点，
-	 * 原实现误判为有效返回值。显式检查链表头。 */
+	/* 遍历完链表未找到匹配（list_for_each_entry_safe 结束后 fi_iter
+	 * 回落为链表头、fi_result == next(head) == 链表首节点）：
+	 * 必须返回 NULL，否则首节点被误当作"下一个"返回，破坏遍历序列。 */
 	if (&fi_iter->comrade_list == &fi_head->comrade_list)
 		return NULL;
 	return fi_result != fi_head ? fi_result : NULL;
-}
 ```
 
-要点：匹配成功（`break`）时 `fi_iter` 是有效节点、`fi_result` 是其 next；遍历完（未匹配）时 `fi_iter` 回落为链表头，`&fi_iter->comrade_list == &fi_head->comrade_list` 成立 → 返回 NULL。匹配到链表尾节点时 `fi_result == fi_head` → 返回 NULL（原有语义不变）。
+### 最终修复：fi_head 显式状态机重构 `hmdfs_iterate_merge`
 
-### 修复 2：`hmdfs_iterate_merge` 解码出的 device_id 无效时从头遍历
+**动机**：`ctx->pos` 位域既被设备 f_pos 污染（缺陷 2），又无法承载设备内续读位置（8 位 offset 溢出），且"完成/满"判定被多次误用（缺陷 3）——跨调用状态需要一个**不受位域约束、open 期间存活**的载体，即 `fi_head`（file->private_data）。
+
+**hmdfs.h（`struct hmdfs_file_info` +3 字段）**：
 
 ```c
-	fi_iter = get_hmdfs_file_info(fi_head, device_id);
-	if (!fi_iter)
-		fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
+struct hmdfs_file_info {
+	union {
+		struct { struct rb_root root; struct mutex comrade_list_lock; };
+		struct { struct file *lower_file; int device_id; };
+	};
+	struct list_head comrade_list;
+	/* merge readdir 跨调用遍历状态（fi_head 持有，open 期间存活） */
+	int   cur_dev;    /* 当前遍历设备（get 用；取不到时回退链表第一个） */
+	loff_t dev_pos;   /* 当前设备内续读位置（原样保存 ctx_merge.ctx.pos） */
+	loff_t seq;       /* VFS 进度计数（缓冲满时 ctx->pos = set_pos(dev,0,seq)） */
+};
+```
+
+**file_merge.c（`hmdfs_iterate_merge` 重写，:332-427）**：
+
+```c
+int hmdfs_iterate_merge(struct file *file, struct dir_context *ctx)
+{
+	int err = 0;
+	struct hmdfs_file_info *fi_head = hmdfs_f(file);
+	struct hmdfs_file_info *fi_iter = NULL;
+	struct file *lower_file_iter = NULL;
+	loff_t start_pos = ctx->pos;
+	int device_id = -1;
+	struct hmdfs_iterate_callback_merge ctx_merge = {
+		.ctx.actor = hmdfs_actor_merge,
+		.caller = ctx,
+		.root = &fi_head->root,
+		.dev_id = 0
+	};
+
+	/* pos = -1 indicates that all devices have been traversed
+	 * or an error has occurred.
+	 */
+	if (ctx->pos == -1)
+		return 0;
+
+	/*
+	 * 设备定位：从 fi_head 状态恢复，不再解析 ctx->pos 位域——
+	 * 原实现把设备 f_pos（遍历完为 LLONG_MAX 等 EOF 标记）直接赋给
+	 * ctx->pos，下次调用解码出 ULONG_MAX 导致遍历错乱。
+	 */
+	fi_iter = get_hmdfs_file_info(fi_head, fi_head->cur_dev);
 	if (!fi_iter) {
-		/* get/get_next 都未命中：解码出的 device_id 在 comrade 链表中
-		 * 不存在（如单设备 merge 目录——大目录只在 peer 上有，链表无
-		 * local/dev 0——首访 pos=0 解码 device_id=0 找不到；
-		 * 或 EOF 标记 LLONG_MAX 被错解为 ULONG_MAX）。
-		 * 从头开始遍历，已输出的条目由去重树
-		 * （fi_head->root / insert_filename）跳过，不会重复输出。 */
 		mutex_lock(&fi_head->comrade_list_lock);
 		if (!list_empty(&fi_head->comrade_list))
 			fi_iter = list_first_entry(&fi_head->comrade_list,
@@ -222,88 +241,91 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 						   comrade_list);
 		mutex_unlock(&fi_head->comrade_list_lock);
 	}
-```
+	if (!fi_iter)
+		return 0;
+	fi_head->cur_dev = fi_iter->device_id;
 
-要点：
-- 插入位置：位于 `if (!fi_iter) { ... }` 块（:346-352，内含 `get_next` 与 `ctx_merge.ctx.pos = hmdfs_set_pos(...)` 设置）**之后**——此时 `ctx_merge.ctx.pos` 保持初始化值 0，被遍历设备从第 0 项开始（"从头"）；
-- **条件为 `!fi_iter`（不含 `device_id != 0` 限制）**：最初版本带 `device_id != 0`（假设"device_id=0 且都未命中 = 链表空"），但**单设备 peer merge 目录**（大目录只在 edd5a2a9 有，comrade 链表只有 dev 2、无 dev 0）在**首访 `pos=0` 解码出 `device_id=0`** 时同样未命中——带条件会跳过"从头"导致空输出（实测 `ls 大目录 | wc -l` = 0）。放宽后：链表空时 `list_empty` 兜底返回 NULL（无死循环，VFS 位置检查终止）；merge_view 根（链表含 dev 0）`get(0)` 命中不触发，无影响；
-- 取链表第一个节点（不依赖 device_id == 0 存在与否，比 `get(0)` 更健壮）；
-- 去重树兜底：`hmdfs_actor_merge` 对已输出条目返回旧类型（:249-250 目录 `goto done` 跳过），重复遍历无副作用；
-- 行为与原代码"缺陷 1 错误返回首节点"等效（原代码正是靠错误返回实现"从头"），修复后显式化，不再依赖 bug。
+	while (fi_iter) {
+		ctx_merge.dev_id = fi_iter->device_id;
+		device_id = ctx_merge.dev_id;
+		lower_file_iter = fi_iter->lower_file;
+		ctx_merge.ctx.pos = fi_head->dev_pos;   /* 恢复设备内续读位置 */
+		err = iterate_dir(lower_file_iter, &ctx_merge.ctx);
+		fi_head->dev_pos = ctx_merge.ctx.pos;   /* 保存设备内位置（原样） */
 
-### 修复 3（曾尝试，已放弃）：`while` 正常退出时置 EOF 标记
+		if (err < 0)
+			goto done;                          /* 真实错误 */
 
-**尝试方案**：在 `while` 循环正常退出（`get_next` 返回 NULL）后执行 `ctx->pos = -1`，使下次调用命中函数入口的 `ctx->pos == -1` 检查而直接返回。
-
-**放弃原因（实测后推演确认）**：`while` 正常退出只发生在 `ctx_merge.result == false` 的路径上——即"设备遍历因缓冲满而中断"（最后一次 emit 返回 false）。此时**设备尚未遍历完**（大目录 1100 项 > getdents64 缓冲 ~32KB，必然分批），置 `-1` 会**切断续读、永久丢失剩余条目**（大目录统计将从 1501 掉到 ~1201）。而 merge_view 根场景（每设备 6/4/8 项，缓冲不满）的 `while` 正常退出**永不发生**（设备完成后 `result=true` 走修复 4 的提前 done 分支）——因此该方案"要么不触发、要么有害"，予以放弃。merge_view 根的 EOF 由修复 4 覆盖（`get_next` 无下一个设备时置 `-1`）。
-
-### 修复 4：设备遍历完成（提前退出）后推进到下一个设备
-
-**背景**：`ctx_merge.result` 记录的是**最后一次 actor（emit）的返回值**（file_merge.c:276）——设备正常遍历完（最后条目 emit 成功）时 `result=true`，原代码 391 行 `if (ctx_merge.result) goto done;` 将其当作"缓冲满"提前停止。**结果：每次调用只处理 1 个设备就提前 done**，且 done 后 `ctx->pos` 停在设备 f_pos（EOF 标记 `LLONG_MAX`）——与调用进入时相同 → **VFS 的 `ctx->pos == last_pos` 检查判定位置无进展 → readdir 提前 EOF** → 后续设备永不遍历（devid=2 缺失的直接原因）。
-
-```c
-		if (err) {
-			/* 远程设备 readdir 返回 iterate_result（>0 表示输出中止/
-			 * 本次调用完成，<0 为真实错误）：推进到下一个设备 */
-			if (err < 0)
-				goto done;
-			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-			if (fi_iter) {
-				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
-				ctx->pos = file->f_pos;
-			} else {
-				ctx->pos = -1;
-			}
+		if (err > 0 || !ctx_merge.result) {
+			/* 缓冲满（远程 iterate_result=1 或最后一次 emit=false）：
+			 * 设备未遍历完，本次调用结束，下次从 fi_head->dev_pos
+			 * 续读。ctx->pos 仅作 VFS 进度指示（seq 单调递增），
+			 * 不再被解析。 */
+			err = 0;                        /* 正数返回值规范化为 0 */
+			ctx->pos = hmdfs_set_pos(device_id, 0, ++fi_head->seq);
+			file->f_pos = ctx->pos;
 			goto done;
 		}
-		if (ctx_merge.result) {
-			/* 当前设备已遍历完成（最后一次 emit 成功）：推进到
-			 * 下一个设备，避免 ctx->pos 停在设备 f_pos（EOF 标记）
-			 * 导致 VFS 判定位置无进展而提前结束 readdir。 */
-			fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
-			if (fi_iter) {
-				file->f_pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
-				ctx->pos = file->f_pos;
-			} else {
-				ctx->pos = -1;
-			}
+
+		/* 设备遍历完成（最后一次 emit 成功）：推进到下一个设备，
+		 * 同一调用内继续遍历。 */
+		fi_head->dev_pos = 0;
+		fi_iter = get_next_hmdfs_file_info(fi_head, device_id);
+		if (!fi_iter) {
+			ctx->pos = -1;                      /* EOF */
+			file->f_pos = ctx->pos;
+			fi_head->cur_dev = -1;
 			goto done;
 		}
+		fi_head->cur_dev = fi_iter->device_id;
+		ctx->pos = hmdfs_set_pos(fi_iter->device_id, 0, 0);
+		file->f_pos = ctx->pos;
+	}
+	ctx->pos = -1;
+	file->f_pos = ctx->pos;
+done:
+	trace_hmdfs_iterate_merge(file->f_path.dentry, start_pos, ctx->pos, err);
+	return err;
+}
 ```
 
-**修复后调用序列**（merge_view 根，每次调用推进一个设备）：
+**设计要点**：
 
-```
-调用1: fi0(6项) → 推进 fi1 → ctx->pos = set_pos(1,0,0)（≠进入时 → VFS 继续）
-调用2: fi1(4项) → 推进 fi2 → ctx->pos = set_pos(2,0,0)
-调用3: fi2(8项) → get_next(2)=NULL → ctx->pos = -1
-调用4: ctx->pos == -1 → 函数入口直接返回 0 → EOF
-总输出 18 项 ✓
-```
+1. **设备定位不再依赖 ctx->pos 位域解码**：`get_hmdfs_file_info(fi_head->cur_dev)`，取不到回退链表第一个（覆盖单设备 peer merge 目录——大目录只在 peer 有、链表无 dev 0——首访场景）；
+2. **真设备内续读**：`dev_pos` 原样保存/恢复 `ctx_merge.ctx.pos`（本地=ext4 偏移、远程=`set_pos` 编码，均无损）——根治位域容量问题，**不再"从头 + 去重"**（消除 259 改名重复风险）；
+3. **"完成/满"语义统一**：`err<0`=真实错误；`err>0 || !result`=缓冲满（本次结束，下次续读）；`result=true`=设备完成（同调用内推进下一个设备，`get_next` 依赖修复 1 的 NULL 语义）；
+4. **ctx->pos 纯 VFS 进度指示**：满=`set_pos(dev,0,seq++)`（单调，保证 `pos != last_pos` 不提前 EOF）、推进=`set_pos(next,0,0)`、EOF=`-1`；**`file->f_pos` 三处显式同步**（VFS 下次调用用 `file->f_pos` 初始化 ctx->pos）；
+5. **`err>0` 规范化 0**（iterate_shared 惯例返回 0/负，避免未来 VFS 对正数敏感）。
 
-**大目录（单设备）"缓冲满"路径**（`result=false`）：不触发本分支，走 `get_next` 推进（单设备返回 NULL）→ `while` 正常退出 → 无 EOF 标记（修复 3 已放弃）→ `ctx->pos` 停在设备 f_pos → 下次调用从头续读（去重树跳过已输出条目）→ 剩余输出——恢复修复前的分批续读行为，大目录统计保持准确。
+**收敛性论证**：满 → `seq` 单调 → VFS 位置前进 → 用户态再调 → `cur_dev`+`dev_pos` 续读；EOF（-1）→ 入口直接返回 0 → `pos == last_pos` → 终止。无死循环、无重复输出（每设备只遍历一次，去重树仅兜底"最后条目恰好满"的边界）。
 
-### 收敛性论证（无死循环、无重复输出）
+### 修复演进记录（尝试与教训，供论文/提交参考）
 
-- 每次 `hmdfs_iterate_merge` 调用从有效 device 开始遍历；设备完成后由修复 4 推进到下一个设备（`ctx->pos` 编码为 `set_pos(next, 0, 0)`，位置有进展）；
-- 已输出条目由去重树跳过（目录 `:249-250`）——正常推进路径每设备只遍历一次，不产生重复；
-- 全部设备遍历完 → `ctx->pos = -1` → 下次调用 `:342` 直接返回 0；
-- VFS 侧兜底：`vfs_getdents` 对每次 `iterate_dir` 调用检查 `ctx->pos == last_pos`（位置无进展即视为 EOF，`fs/readdir.c`）——即使出现位置未编码等异常，VFS 也必然终止（这也是当前代码在遍历错乱后 ls 仍能正常结束的机制），保证无死循环。
+| 阶段 | 方案 | 结果 | 放弃/替代原因 |
+| --- | --- | --- | --- |
+| 修复 2 | 解码无效时"从头遍历"（去重树兜底） | 部分生效 | 依赖重遍历：条件边角（单设备无 dev 0 首访）、"从头"对文件触发 259 改名重复风险——被状态机替代 |
+| 修复 3 | `while` 正常退出置 `ctx->pos=-1`（EOF） | 弃用 | `while` 正常退出仅发生在"缓冲满"路径（`result=false`）——置 -1 切断大目录续读（1501→~1201 预测） |
+| 修复 4 | 设备完成（result=true / err>0）推进到下一设备 | 部分生效 | 对 merge_view 根有效（18 项 ✓）；但 `err>0`（filldir 满）被当"完成"推进/EOF → 大目录 585 丢 515——被状态机替代 |
 
 ## 验证方法
 
-1. 应用上述修复（修复 1/2/4），重新编译 hmdfs 内核模块，部署到 3 个节点 VM；
+1. 应用修复（hmdfs.h + file_merge.c），重新编译 hmdfs 内核模块，部署到 3 个节点 VM；
 2. 挂载 + 启动 agent，等待连接全部建立（peer online）；
 3. `ls merge_view/` → 预期 18 项全输出（含 edd5a2a9 的 8 个专属根、hisrrykxiv 大目录根）；
-4. `dmesg` 中 `traverse` 序列应为 `0 → 1 → 2`（跨 2-3 次调用，每次推进一个设备）；
-5. 重跑 CSAN 分布式一致性测试 → 各 executor 文件数统计一致（三方互缺消失）；
-6. 重点确认大目录统计不受影响（exec 1 仍为 1501——验证"缓冲满"路径的续读未被子修复破坏）。
+4. 大目录完整路径 `ls | wc -l` → 预期 1100（分批续读无重复无丢失；节点 2 远程单设备场景为关键验证）；
+5. `dmesg` 中 `traverse` 序列应为 `0 → 1 → 2`（merge_view 根，同调用内连续推进）；大目录 `cur_dev=2` 保持、分多批续读；
+6. 重跑 CSAN 分布式一致性测试 → 各 executor 文件数统计一致（三方互缺消失）。
+
+## 验证结果（截至 2026-08-24）
+
+- **merge_view 根 18 项全输出 ✓**（修复 4 期验证：`traverse 0→1→2` 跨调用推进、EOF 干净）；
+- **大目录 585/1100**（修复 4 期暴露：`err>0` 被当完成 → EOF 丢 515）；
+- **状态机重写后：待部署验证**（预期 1100 无重复无丢失——验证通过后回填本段）。
 
 ## 遗留问题（后续调查项）
 
-1. **"设备遍历后提前退出"的确切触发点**：已基本定位——`ctx_merge.result` 记录最后一次 emit 的返回值，设备正常遍历完（最后条目 emit 成功）时 `result=true`，原代码 391 行将其误当"缓冲满"提前停止（修复 4 已处理）；"缓冲满"（`result=false`，真实分批）路径仍依赖"从头续读"（去重树兜底），无设备内续读机制，值得后续统一。
-2. **跨调用位置（pos）状态机脆弱**：设备层 EOF 标记（`LLONG_MAX`）与 merge 层结束检查（`-1`）不一致、提前退出时 `ctx->pos` 未按位域编码（直接赋值设备 f_pos）——建议后续统一 EOF 语义并完善编码（设备内续读），从根本上消除状态损坏。
-3. **文件冲突改名行为**：`hmdfs_actor_merge` 对重复文件条目（`:259-266`）会改名后输出（`CONFLICTING_FILE_SUFFIX`）。在"从头重遍历"路径（大目录分批续读）下同名文件可能被误判为冲突而改名重复输出（当前实测大目录统计 1501 未观察到重复，但存在理论风险），需在统一续读机制后复查。
+1. **同一 fd 的并发 readdir 不加锁（已知限制）**：`cur_dev`/`dev_pos`/`seq` 与去重树 `rb_root` 均无锁。POSIX 对同一 fd 并发 readdir 行为未定义；`iterate_shared` 语义由 FS 自担并发或接受未定义；64 位平台字段读写原子（无撕裂），真正风险（`rb_root` 并发 insert）无法用短临界区解决（`iterate_dir` 远程调用期间不可持锁）。如追求形式完整，可选方案：fi_head 加 `state_lock`（mutex），仅在"状态快照/更新"短临界区持锁（约 10 行），不跨 `iterate_dir`——收益有限，测试（单线程）不触发。
+2. **设备内位置语义未统一**：本地（ext4 偏移）与远程（`set_pos` 编码）的 `ctx_merge.ctx.pos` 语义不同，状态机原样保存规避了编码问题，但若未来需要统一（如持久化/校验）建议给设备 readdir 定义统一的位置语义。
 
 ## 附录
 
@@ -311,20 +333,27 @@ get_next_hmdfs_file_info(struct hmdfs_file_info *fi_head, int device_id)
 
 | 文件 | 行号 | 说明 |
 | --- | --- | --- |
-| `hmdfs/file_merge.c` | :289-304 | `get_next_hmdfs_file_info`（缺陷 1） |
-| `hmdfs/file_merge.c` | :323-383 | `hmdfs_iterate_merge`（缺陷 2，修复 2/3） |
-| `hmdfs/file_merge.c` | :342 | `ctx->pos == -1` EOF 检查 |
-| `hmdfs/file_merge.c` | :209-287 | `hmdfs_actor_merge`（去重树、冲突改名） |
-| `hmdfs/file_merge.c` | :382-428 | `do_dir_open_merge`（comrade → lower_file） |
-| `hmdfs/inode_merge.c` | :606-675 | `lookup_merge_root`（comrade 建立） |
-| `hmdfs/inode_merge.c` | :345-374 | `merge_lookup_comrade`（vfs_path_lookup） |
+| `hmdfs/file_merge.c` | :289-307 | `get_next_hmdfs_file_info`（修复 1） |
+| `hmdfs/file_merge.c` | :332-427 | `hmdfs_iterate_merge`（状态机重写） |
+| `hmdfs/file_merge.c` | :209-287 | `hmdfs_actor_merge`（去重树、冲突改名 :259-266） |
+| `hmdfs/file_merge.c` | :429-489 | `do_dir_open_merge`（fi 列表建立） |
+| `hmdfs/hmdfs.h` | :259-274 | `struct hmdfs_file_info`（cur_dev/dev_pos/seq） |
 | `hmdfs/file_remote.c` | :885-893 | `hmdfs_set_pos`（位域编码） |
-| `hmdfs/hmdfs_dentryfile.h` | :31-33 | 位域定义（POS=64/DEV=16/GROUP=39） |
+| `hmdfs/file_remote.c` | :900-1006 | 远程设备 readdir（iterate_result/设备内位置） |
+| `hmdfs/file_local.c` | :231-250 | 本地设备 readdir（ext4 透传） |
+| `hmdfs/hmdfs_dentryfile.h` | :31-35 | 位域定义（OFFSET_BIT_NUM=8） |
 | `src/executor/executor.cc` | :3141-3159 | executor 遍历 merge_view（触发者） |
 
-### 诊断代码（临时，定位后应移除）
+### 大目录结构说明（测试环境）
 
-本次定位过程在 `hmdfs/file_merge.c` 与 `hmdfs/inode_merge.c` 中加入了诊断打印（`merge_lookup_root`/`merge_lookup_work`/`dir_open_merge`/`iterate_merge`/`get_next` 各环节），已随调试提交。修复方案落地并验证通过后，应删除全部诊断打印，仅保留功能性修复。
+- `initialdir/large_dir.info` 显示大目录路径为 **6 层嵌套**：`Eris_hisrrykxiv_451072199116.d/Eris_pifhmayyvd_504478729483.d/Eris_kpajhwdhpa_566550034554.d/Eris_quiwhjbffo_119403881206.d/Eris_bhuojnglng_234302675950.d/Eris_qfehribmzl_93443936692.d`（1100 文件，位于节点 1/edd5a2a9）；
+- **中间 5 层是 `num_dirs`（--num-dirs 50）生成的普通目录**（全部在 `initialdir/<node_id>.dir` 中），由 `generate_test_files.py` 的 `force_deep` 逻辑（15% 目录强制从深度 ≥4 池选父，保证 5+ 层深度 bucket 覆盖）形成——**不是 tmpdir**；
+- `initialdir/<node_id>.tmpdir` 恒为空（0 行）：`.tmpdir` 对应 `intermediate_dirs`（`create_intermediate_dirs` 收集"创建目标时自动产生的中间父目录"），但 `generate_dir_name`/`generate_file_name` 均为单层生成、父链总是已存在 → 收集恒空——**死逻辑**；
+- 中间目录"未填充"（无文件）是随机性：`num_files=50` 用 `random.choice(current_dirs)` 随机放文件，深层目录可能未被选中——非刻意留空（`empty_dirs` 才是刻意不填充）。
+
+### 诊断代码（临时，验证后应移除）
+
+定位过程在 `hmdfs/file_merge.c` 与 `hmdfs/inode_merge.c` 中加入了诊断打印（`merge_lookup_root`/`merge_lookup_work`/`dir_open_merge`/`iterate_merge`/`get_next` 各环节），已随调试提交。状态机重写验证通过后，应删除全部诊断打印，仅保留功能性修复。
 
 ### 与测试环境的关系
 
