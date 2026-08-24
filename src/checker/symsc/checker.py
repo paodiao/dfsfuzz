@@ -665,7 +665,10 @@ def test_self_consistency(METADATA, print_err=1):
     for entry in METADATA:
         if entry[c.IDX_FTYPE] == "2": # skip additional check if directory
             continue
-        if int(entry[c.IDX_NLINK]) != id_list.count(entry[c.IDX_INUM]):
+        # hmdfs remote stat reports nlink=0 (cached getattr leaves it unset),
+        # so only the nlink comparison is waived there (same rationale as
+        # the is_hmdfs skips in check_meta).
+        if c.FSTYPE != "hmdfs" and int(entry[c.IDX_NLINK]) != id_list.count(entry[c.IDX_INUM]):
             errstr = "Failed self-consistency test:\n"
             errstr += "*** [META] Incorrect metadata: {0} id:{1} lcnt:{2}".format(
                     entry[c.IDX_PATH], entry[c.IDX_INUM], entry[c.IDX_NLINK])
@@ -715,17 +718,26 @@ def state_check(retval, emul_state, call_idx):
         if retval != -1:
             buf_var = syscall_argv[1].replace("(long)", "")
             emulate_stat = c.BUF_DATA[buf_var]
-            runtime_stat = str(op_runtime_stat['StatMd']['Mode'] & (c.MODEMASK | c.S_IFMT)) + \
-                            str(op_runtime_stat['StatMd']['Nlink']) + str(op_runtime_stat['StatMd']['Size'])
+            if c.FSTYPE == "hmdfs":
+                # hmdfs remote stat leaves nlink unset and hardcodes mode
+                # perms (0660/0751), so only size is comparable.
+                runtime_stat = str(op_runtime_stat['StatMd']['Size'])
+            else:
+                runtime_stat = str(op_runtime_stat['StatMd']['Mode'] & (c.MODEMASK | c.S_IFMT)) + \
+                                str(op_runtime_stat['StatMd']['Nlink']) + str(op_runtime_stat['StatMd']['Size'])
             if emulate_stat != runtime_stat:
                 if c.verbose:
                     print("stat differs", emulate_stat, runtime_stat,\
                         "runtime mode and type", op_runtime_stat['StatMd']['Mode']&c.MODEMASK,\
                         op_runtime_stat['StatMd']['Mode']&c.S_IFMT)
                 return False
+        elif c.FSTYPE == "hmdfs":
+            if op_runtime_stat['StatMd']['Size'] != 0:
+                print("stat differs, retval=-1 but runtime size is {}".format(op_runtime_stat['StatMd']))
+                return False
         elif (op_runtime_stat['StatMd']['Mode'] & (c.MODEMASK | c.S_IFMT)) != 0 or \
             op_runtime_stat['StatMd']['Nlink'] != 0 or op_runtime_stat['StatMd']['Size'] != 0:
-            print("stat differs, retval=-1 but runtime stat is %v", op_runtime_stat['StatMd'])
+            print("stat differs, retval=-1 but runtime stat is {}".format(op_runtime_stat['StatMd']))
             return False
 
     elif syscall_name in ["SYS_getxattr", "SYS_lgetxattr", "SYS_fgetxattr"]:
@@ -772,7 +784,7 @@ def state_check(retval, emul_state, call_idx):
                 print("dents differ", emulate_dents, op_runtime_stat['Dents'])
                 return False
         elif op_runtime_stat['Dents'] != "":
-            print("dents differ, retval=-1 but runtime dents is %v", op_runtime_stat['Dents'])
+            print("dents differ, retval=-1 but runtime dents is {}".format(op_runtime_stat['Dents']))
             return False
     
     return True

@@ -3291,8 +3291,13 @@ def stat_base(argv, syscall_name, fd):
     if c.verbose:
         print("Stat: type", inode.type, "mode", inode.mode, "linkcnt",
             inode.linkcnt, "size", inode.size)
-    buf_data = str(inode.mode | inode.type) + \
-            str(inode.linkcnt) + str(inode.size)
+    if c.FSTYPE == "hmdfs":
+        # hmdfs remote stat leaves nlink unset and hardcodes mode perms
+        # (0660/0751), so only size is comparable.
+        buf_data = str(inode.size)
+    else:
+        buf_data = str(inode.mode | inode.type) + \
+                str(inode.linkcnt) + str(inode.size)
     c.BUF_DATA[buf_var] = buf_data
 
     return len(buf_data)
