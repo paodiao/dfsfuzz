@@ -318,9 +318,10 @@ done:
 
 ## 验证结果（截至 2026-08-24）
 
-- **merge_view 根 18 项全输出 ✓**（修复 4 期验证：`traverse 0→1→2` 跨调用推进、EOF 干净）；
-- **大目录 585/1100**（修复 4 期暴露：`err>0` 被当完成 → EOF 丢 515）；
-- **状态机重写后：待部署验证**（预期 1100 无重复无丢失——验证通过后回填本段）。
+- **merge_view 根 18 项全输出 ✓**（状态机重写后：同调用内 0→1→2 连续推进、EOF 干净）；
+- **大目录 1102 项 ✓**（节点 2 远程单设备场景：分批续读正常——`entry cur_dev=2` 保持、两批 `traverse devid=2`、`get_next: in=2 out=-1`、无提前 EOF、**无 conflict 改名副本（无重复）、无丢失**）；
+- **1102 vs large_dir.info 的 file_count=1100**：大目录实际存在 1102 个**可见条目**（多出的 2 个非 `.`/`..`、非 conflict 副本，为真实条目——与 CSAN 分析中 exec 1=1501 的"大目录 1102 文件"吻合），生成器记录值与目录实际内容的差异不影响迭代器正确性（ls 忠实反映目录内容）；
+- 修复演进中暴露的两个中间态问题均已闭环：585/1100（`err>0` 被当完成 → EOF 丢 515）由状态机根治；单设备 peer 目录首访空由状态机"取不到回退链表第一个"根治。
 
 ## 遗留问题（后续调查项）
 
@@ -349,7 +350,8 @@ done:
 - `initialdir/large_dir.info` 显示大目录路径为 **6 层嵌套**：`Eris_hisrrykxiv_451072199116.d/Eris_pifhmayyvd_504478729483.d/Eris_kpajhwdhpa_566550034554.d/Eris_quiwhjbffo_119403881206.d/Eris_bhuojnglng_234302675950.d/Eris_qfehribmzl_93443936692.d`（1100 文件，位于节点 1/edd5a2a9）；
 - **中间 5 层是 `num_dirs`（--num-dirs 50）生成的普通目录**（全部在 `initialdir/<node_id>.dir` 中），由 `generate_test_files.py` 的 `force_deep` 逻辑（15% 目录强制从深度 ≥4 池选父，保证 5+ 层深度 bucket 覆盖）形成——**不是 tmpdir**；
 - `initialdir/<node_id>.tmpdir` 恒为空（0 行）：`.tmpdir` 对应 `intermediate_dirs`（`create_intermediate_dirs` 收集"创建目标时自动产生的中间父目录"），但 `generate_dir_name`/`generate_file_name` 均为单层生成、父链总是已存在 → 收集恒空——**死逻辑**；
-- 中间目录"未填充"（无文件）是随机性：`num_files=50` 用 `random.choice(current_dirs)` 随机放文件，深层目录可能未被选中——非刻意留空（`empty_dirs` 才是刻意不填充）。
+- 中间目录"未填充"（无文件）是随机性：`num_files=50` 用 `random.choice(current_dirs)` 随机放文件，深层目录可能未被选中——非刻意留空（`empty_dirs` 才是刻意不填充）；
+- 大目录实际可见条目 **1102**（`large_dir.info` 记录 1100）：多出的 2 个为真实可见条目（非 `.`/`..`、非 conflict 改名副本），与 CSAN 分析（exec 1=1501 中"大目录 1102 文件"）一致——生成器 `file_count` 记录与目录实际内容存在小幅差异，不影响迭代器正确性（ls 忠实反映目录内容）。
 
 ### 诊断代码（临时，验证后应移除）
 
