@@ -1,4 +1,4 @@
-python2.7 ./monarch-emul.py -v -p 'v0[] = "./file0";
+﻿python3 ./monarch-emul.py -v -p 'v0[] = "./file0";
 v1[] = "./file0";
 v2[100];
 v3[100];

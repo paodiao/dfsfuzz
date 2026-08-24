@@ -158,7 +158,7 @@ class FileTree:
         elif inode.type == SYMLINK:
             line += " -> {0}".format(inode.target)
 
-        print line
+        print(line)
 
         depth += 1
         cur_tup_nodelist = self[tup]
@@ -307,11 +307,13 @@ class Inode:
         self.name.remove(name_old)
         self.u_name.append((name_old, name_new)) # store (old, new) tuple
 
-    def add_child(self, (id, name)):
+    def add_child(self, child):
+        (id, name) = child
         tup_children = (id, name)
         self.children.append(tup_children)
 
-    def remove_child(self, (id, name), unlink=0):
+    def remove_child(self, child, unlink=0):
+        (id, name) = child
         tup_children = (id, name)
         try:
             self.children.remove(tup_children)
@@ -410,9 +412,9 @@ SYMLINK = 0xA000
 FIFO    = 0x1000
 TYPESTR = {FILE:"regular file", DIR:"directory", SYMLINK:"symbolic link", FIFO:"fifo file"}
 
-S_IFMT = 00170000
-UMASK = 022
-MODEMASK = 0777
+S_IFMT = 0o0170000
+UMASK = 0o22
+MODEMASK = 0o777
 
 # FSTYPE
 # NFS       = 10
@@ -421,42 +423,42 @@ MODEMASK = 0777
 # Lustre    = 13
 
 # MODE
-S_IRWXU =  0700
-S_IRUSR =  0400
-S_IWUSR =  0200
-S_IXUSR =  0100
-S_IWRXG =   070
-S_IRGRP =   040
-S_IWGRP =   020
-S_IXGRP =   010
-S_IRWXO =    07
-S_IROTH =    04
-S_IWOTH =    02
-S_IXOTH =    01
-S_ISUID = 04000
-S_ISGID = 02000
-S_ISVTX = 01000
+S_IRWXU =  0o700
+S_IRUSR =  0o400
+S_IWUSR =  0o200
+S_IXUSR =  0o100
+S_IWRXG =   0o70
+S_IRGRP =   0o40
+S_IWGRP =   0o20
+S_IXGRP =   0o10
+S_IRWXO =    0o7
+S_IROTH =    0o4
+S_IWOTH =    0o2
+S_IXOTH =    0o1
+S_ISUID = 0o4000
+S_ISGID = 0o2000
+S_ISVTX = 0o1000
 
 # OPEN FLAGS
-O_RDONLY    = 00000000
-O_WRONLY    = 00000001
-O_RDWR      = 00000002
-O_ACCMODE   = 00000003 # non-standard
-O_CREAT     = 00000100
-O_EXCL      = 00000200
-O_NOCTTY    = 00000400
-O_TRUNC     = 00001000
-O_APPEND    = 00002000
-O_NONBLOCK  = 00004000
-O_DSYNC     = 00010000
-FASYNC      = 00020000
-O_DIRECT    = 00040000
-O_LARGEFILE = 00100000
-O_DIRECTORY = 00200000
-O_NOFOLLOW  = 00400000
-O_NOATIME   = 01000000
-O_CLOEXEC   = 02000000
-O_SYNC      = 04000000
+O_RDONLY    = 0o0000000
+O_WRONLY    = 0o0000001
+O_RDWR      = 0o0000002
+O_ACCMODE   = 0o0000003 # non-standard
+O_CREAT     = 0o0000100
+O_EXCL      = 0o0000200
+O_NOCTTY    = 0o0000400
+O_TRUNC     = 0o0001000
+O_APPEND    = 0o0002000
+O_NONBLOCK  = 0o0004000
+O_DSYNC     = 0o0010000
+FASYNC      = 0o0020000
+O_DIRECT    = 0o0040000
+O_LARGEFILE = 0o0100000
+O_DIRECTORY = 0o0200000
+O_NOFOLLOW  = 0o0400000
+O_NOATIME   = 0o1000000
+O_CLOEXEC   = 0o2000000
+O_SYNC      = 0o4000000
 
 # GLOBAL DATA STRUCTURES
 VAR_STACK = {} # {filename_var_name: assigned_string_for_filename}

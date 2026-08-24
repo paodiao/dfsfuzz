@@ -1,4 +1,4 @@
-﻿package checker
+package checker
 
 import (
 	"fmt"
@@ -128,14 +128,14 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	}
 	exePath := filepath.Dir(ex)
 
-	cmd := exec.Command("python2.7",
+	cmd := exec.Command("python3",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
 		"-v", "-t", fsType, "-p", symscProgStr,
 		"-i", string(checkInfos_json), "-c", symsc_stat,
 		"-g", string(seq_programs_json), "-s", fmt.Sprintf("%v", srvNum),
 		"-f", cfg_mode, "-a", initIP, "-n", fmt.Sprintf("%v", testdirIno))
 
-	log.Logf(0, "python2.7 %v -v -t %v -p \"%v\" -i \"%v\" -c \"%v\" -g \"%v\" -s %v -f \"%v\" -a \"%v\" -n %v",
+	log.Logf(0, "python3 %v -v -t %v -p \"%v\" -i \"%v\" -c \"%v\" -g \"%v\" -s %v -f \"%v\" -a \"%v\" -n %v",
 		filepath.Join(exePath, "../../checker/symsc/monarch_emul.py"),
 		fsType, strings.Replace(symscProgStr, "\"", "\\\"", -1), strings.Replace(string(checkInfos_json), "\"", "\\\"", -1),
 		symsc_stat, string(seq_programs_json),
@@ -172,7 +172,7 @@ func filter_failure_sync_calls(progs []*prog.Prog) (error, []prog.Prog) {
 				call.Meta.Name == "preadv" ||
 				call.Meta.Name == "pwritev" ||
 				call.Meta.Name == "flock" ||
-				strings.Contains(call.Meta.Name, "$")  {
+				strings.Contains(call.Meta.Name, "$") {
 				return fmt.Errorf("not supported syscalls"), nil
 			}
 			filtered_calls = append(filtered_calls, call)
@@ -262,7 +262,7 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata) []
 	 */
 	if (m1.StatMd.Mode & syscall.S_IFDIR) != (m2.StatMd.Mode & syscall.S_IFDIR) {
 		ics = append(ics, fmt.Sprintf("%s: dirtype %o vs %o", path,
-			m1.StatMd.Mode & syscall.S_IFDIR, m2.StatMd.Mode & syscall.S_IFDIR))
+			m1.StatMd.Mode&syscall.S_IFDIR, m2.StatMd.Mode&syscall.S_IFDIR))
 	}
 	/*
 	 * Uid/Gid comparison disabled: with CONFIG_HMDFS_FS_PERMISSION the

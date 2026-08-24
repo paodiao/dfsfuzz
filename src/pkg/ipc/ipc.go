@@ -618,7 +618,7 @@ func (env *Env) semanticSanitizers(fsMds []map[string]prog.FileMetadata, symc3Pr
 			}
 			symc3_stat = symc3_stat + statPerNode
 		}
-		output, _ := exec.Command("python2.7", filepath.Join(env.config.Syzkaller,
+		output, _ := exec.Command("python3", filepath.Join(env.config.Syzkaller,
 			"/checker/symc3/monarch_emul.py"), "-v", "-p", "'"+symc3Prog+"'", "-c",
 			"'"+symc3_stat+"'").CombinedOutput()
 		log.Logf(0, "monarch_emul:"+string(output))

@@ -183,12 +183,12 @@ def emulate(prev_state, call_idx):
 def _print_err(code, funcname, argc, argv):
     if c.verbose:
         if code == ERR_ARG:
-            print "[-] EMUL-ERR {0} requires at least {1} args, {2} given".format(
-                    funcname, argc, len(argv))
+            print("[-] EMUL-ERR {0} requires at least {1} args, {2} given".format(
+funcname, argc, len(argv)))
         elif code == ERR_OBJ:
-            print "[-] EMUL-ERR Wrong object detected in {0}({1})".format(funcname, argv)
+            print("[-] EMUL-ERR Wrong object detected in {0}({1})".format(funcname, argv))
         elif code == ERR_MIS:
-            print "[-] EMUL-ERR Missing inode detedted in {0}({1})".format(funcname, argv)
+            print("[-] EMUL-ERR Missing inode detedted in {0}({1})".format(funcname, argv))
 
 
 def _abspath(pathstr):
@@ -210,19 +210,19 @@ def _get_path(string): # gets file path from variable name
         path = c.BUF_DATA[varname]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a variable holding path".format(varname)
+            print("[-] EMUL-ERR {0} is not a variable holding path".format(varname))
         return None
 
     try:
         size = c.BUF_SIZE[varname]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR the path size of {0} does not exist".format(varname)
+            print("[-] EMUL-ERR the path size of {0} does not exist".format(varname))
         return None
     # mkdir(&(0x7f0000000380)='\x00', 0x4)
     if size <= 0 or (size == 1 and path == '\x00'):
         if c.verbose:
-            print "[-] EMUL-ERR the path pointed by {0} is empty".format(varname)
+            print("[-] EMUL-ERR the path pointed by {0} is empty".format(varname))
         return None
     print("debug path", path, size, size <= 0)
     path = _res_path(path)
@@ -238,19 +238,19 @@ def _get_raw_path(string): # gets file path from variable name
         path = c.BUF_DATA[varname]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a variable holding path".format(varname)
+            print("[-] EMUL-ERR {0} is not a variable holding path".format(varname))
         return None
 
     try:
         size = c.BUF_SIZE[varname]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR the path size of {0} does not exist".format(varname)
+            print("[-] EMUL-ERR the path size of {0} does not exist".format(varname))
         return None
 
     if size <= 0:
         if c.verbose:
-            print "[-] EMUL-ERR the path pointed by {0} is empty".format(varname)
+            print("[-] EMUL-ERR the path pointed by {0} is empty".format(varname))
         return None
 
     return path
@@ -265,19 +265,19 @@ def _get_raw_path_from_state(string, state): # gets file path from variable name
         path = state["BUF_DATA"][varname]
     except KeyError:
         if c.verbose:
-            print "[-] DEP-CHECK {0} is not a variable holding path".format(varname)
+            print("[-] DEP-CHECK {0} is not a variable holding path".format(varname))
         return ""
 
     try:
         size = c.BUF_SIZE[varname]
     except KeyError:
         if c.verbose:
-            print "[-] DEP-CHECK the path size of {0} does not exist".format(varname)
+            print("[-] DEP-CHECK the path size of {0} does not exist".format(varname))
         return ""
 
     if size <= 0:
         if c.verbose:
-            print "[-] DEP-CHECK the path pointed by {0} is empty".format(varname)
+            print("[-] DEP-CHECK the path pointed by {0} is empty".format(varname))
         return "" 
 
     return path
@@ -286,7 +286,7 @@ def _res_path(pathstr):
     pathstr = _abspath(pathstr)
     namelist = pathstr.split("/")
     flag = 0
-    for i in xrange(1, len(namelist)+1):
+    for i in range(1, len(namelist)+1):
         subpath = '/'.join(namelist[:i])
         try:
             subid = c.DENTRY[subpath]
@@ -310,7 +310,7 @@ def _res_path(pathstr):
         if c.cnt_recursion > c.MAX_SYMLINK:
             c.cnt_recursion = 0
             if c.verbose:
-                print "[-] EMUL-ERR too many levels of symbolic links"
+                print("[-] EMUL-ERR too many levels of symbolic links")
             return _abspath(pathstr)
         return _res_path(pathstr)
     else:
@@ -327,11 +327,11 @@ def _get_inode_of_fd_from_state(fd_var, state):
         inode = state["FD_STACK"][varname]
     except KeyError:
         if c.verbose:
-            print "[-] DEP-CHECK {} not a valid file descriptor".format(varname)
+            print("[-] DEP-CHECK {} not a valid file descriptor".format(varname))
         return "", ""
     if inode == "":
         if c.verbose:
-            print "[-] DEP-CHECK fd {0} is not defined".format(varname)
+            print("[-] DEP-CHECK fd {0} is not defined".format(varname))
         return "", ""
 
     return varname, inode.path
@@ -341,19 +341,19 @@ def _get_inode_of_fd(string): # gets inode object from fd variable name
     if succeed, returns inode object
     else, returns -1 (only for fsync)
     """
-    print "fd name: {}".format(string)
+    print("fd name: {}".format(string))
     varname = string.replace("(long)", "")
     inode = None
     try:
         inode = c.FD_STACK[varname]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR {} not a valid file descriptor".format(varname)
-            print c.FD_STACK
+            print("[-] EMUL-ERR {} not a valid file descriptor".format(varname))
+            print(c.FD_STACK)
         return -1
     if inode == "":
         if c.verbose:
-            print "[-] EMUL-ERR fd {0} is not defined".format(varname)
+            print("[-] EMUL-ERR fd {0} is not defined".format(varname))
         return -1
 
     # Get the inode ID from the FD_STACK
@@ -374,8 +374,8 @@ def _reset_inode_of_fd(string):
         c.FD_STACK[varname] = -1
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR {} not a valid file descriptor".format(varname)
-            print c.FD_STACK
+            print("[-] EMUL-ERR {} not a valid file descriptor".format(varname))
+            print(c.FD_STACK)
         return -1
 
 def _get_size_and_data_of_buf(string): # gets the size and data of buffer
@@ -400,7 +400,7 @@ def _get_assigned_value_of_var(string):
         value = c.BUF_DATA[varname]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR Not a valid variable {0}".format(varname)
+            print("[-] EMUL-ERR Not a valid variable {0}".format(varname))
         return -1
     return value
 
@@ -446,7 +446,7 @@ def _get_parent_inode(id_parent):
             inode_parent = None
     if inode_parent is None: # if not, must be an error
         if c.verbose:
-            print "[-] EMUL-ERR parent inode doesn't exist"
+            print("[-] EMUL-ERR parent inode doesn't exist")
         return -1
 
     return inode_parent
@@ -524,8 +524,8 @@ def _resolve_symlink_path(path, inode, all_paths):
         res_id = c.DENTRY[res_path]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR Symlink's resolved path {0} does not exist".format(
-                    res_path)
+            print("[-] EMUL-ERR Symlink's resolved path {0} does not exist".format(
+res_path))
         c.cnt_recursion = 0
         return -1, -1
 
@@ -539,12 +539,12 @@ def _resolve_symlink_path(path, inode, all_paths):
         if c.cnt_recursion > c.MAX_SYMLINK:
             c.cnt_recursion = 0
             if c.verbose:
-                print "[-] EMUL-ERR too many levels of symbolic links"
+                print("[-] EMUL-ERR too many levels of symbolic links")
             return -1, -1
         return _resolve_symlink_path(res_path, inode, all_paths)
     else:
         if c.verbose:
-            print "(symlink resolved: {0})".format(res_path)
+            print("(symlink resolved: {0})".format(res_path))
         c.cnt_recursion = 0
         return res_path, inode
 
@@ -552,7 +552,7 @@ def _resolve_symlink_path(path, inode, all_paths):
 def _parse_open_flags(flags_as_int):
 
     # Just exit if there are flags we cannot handle
-    black_list = {"O_PATH":010000000}
+    black_list = {"O_PATH":0o10000000}
     for key in black_list:
         flag = black_list[key]
         if flag & flags_as_int != 0:
@@ -622,7 +622,7 @@ def open(argv, varname):
     path = _get_path(argv[0])
     if path == None:
         if c.verbose:
-            print "[-] EMUL-ERR path not exist"
+            print("[-] EMUL-ERR path not exist")
         return 1
     name = _get_name(path)
     parent_path = _get_parent_path(path)
@@ -631,7 +631,7 @@ def open(argv, varname):
         id_parent = c.DENTRY[parent_path]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR path {0} not valid".format(path)
+            print("[-] EMUL-ERR path {0} not valid".format(path))
         return 1
 
     flags = int(argv[1])
@@ -652,7 +652,7 @@ def open(argv, varname):
 
     if inode_parent.type != c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a directory".format(parent_path)
+            print("[-] EMUL-ERR {0} is not a directory".format(parent_path))
         return 1
 
     try: # file to open already exists in image
@@ -664,22 +664,22 @@ def open(argv, varname):
 
         if opt_dict[c.O_CREAT] and opt_dict[c.O_EXCL]:
             if c.verbose:
-                print "[-] EMUL-ERR cannot open existing files with O_CREAT | O_EXCL"
+                print("[-] EMUL-ERR cannot open existing files with O_CREAT | O_EXCL")
             return 1
 
         if opt_dict[c.O_DIRECTORY] and inode.type != c.DIR:
             if c.verbose:
-                print "[-] EMUL-ERR cannot open non-directory {0} with O_DIRECTORY flag".format(path)
+                print("[-] EMUL-ERR cannot open non-directory {0} with O_DIRECTORY flag".format(path))
             return 1
 
         if inode.type == c.DIR and (opt_dict[c.O_WRONLY] or opt_dict[c.O_RDWR]):
             if c.verbose:
-                print "[-] EMUL-ERR cannot open directory with O_WRONLY or O_RDWR"
+                print("[-] EMUL-ERR cannot open directory with O_WRONLY or O_RDWR")
             return 1
 
         if opt_dict[c.O_NOFOLLOW] and inode.type == c.SYMLINK:
             if c.verbose:
-                print "[-] EMUL-ERR cannot open symlink with O_NOFOLLOW flag"
+                print("[-] EMUL-ERR cannot open symlink with O_NOFOLLOW flag")
             return 1
 
         if inode.type == c.SYMLINK:
@@ -708,19 +708,19 @@ def open(argv, varname):
     except KeyError: # new path - create file
         if not opt_dict[c.O_CREAT]:
             if c.verbose:
-                print "[-] EMUL-ERR cannot create file {0} without O_CREAT flag".format(path)
+                print("[-] EMUL-ERR cannot create file {0} without O_CREAT flag".format(path))
             return 1
 
         if opt_dict[c.O_DIRECTORY]:
             if c.verbose:
-                print "[-] EMUL-ERR non-specified behavior for O_CREAT | O_DIRECTORY"
+                print("[-] EMUL-ERR non-specified behavior for O_CREAT | O_DIRECTORY")
             exit()
 
         if argv[2]:
             mode = int(argv[2]) & c.MODEMASK & ~c.UMASK
         else:
-            mode = 0644
-        print "mode", mode
+            mode = 0o644
+        print("mode", mode)
 
         id_fd = c.INODE_CNT
 
@@ -740,7 +740,7 @@ def open(argv, varname):
     inode_mem.refs += 1
 
     if c.verbose:
-        print "[+] opened {0} (inode #{1}) and saved in {2}".format(path, inode_mem.id, varname)
+        print("[+] opened {0} (inode #{1}) and saved in {2}".format(path, inode_mem.id, varname))
         #print "options:", opt_dict
         #print "stat mode", inode_mem.mode
 
@@ -753,7 +753,7 @@ def mkdir(argv):
     - If path names a symbolic link, mkdir() shall fail and set errno to [EEXIST].
     """
     if len(argv) == 1:
-        argv.append(0755) # assumption: default permission is 755
+        argv.append(0o755) # assumption: default permission is 755
     if len(argv) < 2:
         _print_err(ERR_ARG, __name__, 2, argv)
         return 1
@@ -762,7 +762,7 @@ def mkdir(argv):
     path = _get_path(argv[0])
     if path == None:
         if c.verbose:
-            print "[-] EMUL-ERR path not exist"
+            print("[-] EMUL-ERR path not exist")
         return 1
     name = _get_name(path)
     parent_path = _get_parent_path(path)
@@ -779,7 +779,7 @@ def mkdir(argv):
         id_parent = c.DENTRY[parent_path]
     except KeyError: # if parent doesn't exist in the tree, it's an error
         if c.verbose:
-            print "[-] EMUL-ERR cannot recursively mkdir (parent inode doesn't exist)"
+            print("[-] EMUL-ERR cannot recursively mkdir (parent inode doesn't exist)")
         return 1
 
     inode_parent = _get_parent_inode(id_parent)
@@ -794,7 +794,7 @@ def mkdir(argv):
 
     if inode_parent.type != c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a directory".format(parent_path)
+            print("[-] EMUL-ERR {0} is not a directory".format(parent_path))
         return 1
 
     ret = _chk_stat(id)
@@ -811,7 +811,7 @@ def mkdir(argv):
         _add_child_to_parent_dentry(tup, inode_parent)
 
         if c.verbose:
-            print "[+] Made directory {0}".format(path)
+            print("[+] Made directory {0}".format(path))
 
 
 def rmdir(argv):
@@ -827,7 +827,7 @@ def rmdir(argv):
     path = _get_path(argv[0])
     if path == None:
         if c.verbose:
-            print "[-] EMUL-ERR path not exist"
+            print("[-] EMUL-ERR path not exist")
         return 1
     name = _get_name(path)
 
@@ -838,7 +838,7 @@ def rmdir(argv):
         id = c.DENTRY[path]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR path does not exist"
+            print("[-] EMUL-ERR path does not exist")
         return 1
     tup = (id, name)
 
@@ -849,14 +849,14 @@ def rmdir(argv):
 
     if inode.type != c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a directory".format(path)
+            print("[-] EMUL-ERR {0} is not a directory".format(path))
         return 1
 
     # 1. Get children nodes
     children = c.FT[tup][0].children
     if children:
         if c.verbose:
-            print "[-] EMUL-ERR cannot remove non-empty directory {0}".format(path)
+            print("[-] EMUL-ERR cannot remove non-empty directory {0}".format(path))
         return 1
 
     # 2. Get parent id
@@ -865,7 +865,7 @@ def rmdir(argv):
     except KeyError: # if parent doesn't exist in the tree, it's an error
         #_print_err(ERR_MIS, __name__, None, argv)
         if c.verbose:
-            print "[-] EMUL-ERR parent node does not exist"
+            print("[-] EMUL-ERR parent node does not exist")
         return 1
     tup_parent = (id_parent, parent_name)
 
@@ -882,7 +882,7 @@ def rmdir(argv):
         inode = c.DISK[id]
         if inode.type != c.DIR:
             if c.verbose:
-                print "[-] EMUL-ERR cannot rmdir non-directory: {0} is type {1}".format(path, inode.type)
+                print("[-] EMUL-ERR cannot rmdir non-directory: {0} is type {1}".format(path, inode.type))
             return 1
         inode_mem = copy.deepcopy(inode)
         inode_mem.removed = 1
@@ -892,7 +892,7 @@ def rmdir(argv):
         inode = c.MEM[id]
         if inode.type != c.DIR:
             if c.verbose:
-                print "[-] EMUL-ERR cannot rmdir non-directory: {0} is type {1}".format(path, inode.type)
+                print("[-] EMUL-ERR cannot rmdir non-directory: {0} is type {1}".format(path, inode.type))
             return 1
         inode.removed = 1
 
@@ -904,7 +904,7 @@ def rmdir(argv):
 
     c.DENTRY.pop(path, None)
     if c.verbose:
-        print "[+] Removed directory {0}".format(path)
+        print("[+] Removed directory {0}".format(path))
 
 
 def link(argv):
@@ -927,39 +927,39 @@ def link(argv):
     path_existing = _abspath(_get_raw_path(argv[0]))
     if path_existing == None:
         if c.verbose:
-            print "[-] EMUL-ERR not path is specified"
+            print("[-] EMUL-ERR not path is specified")
         return 1
     name_existing = _get_name(path_existing)
     path_new = _get_raw_path(argv[1])
     if path_new == None:
         if c.verbose:
-            print "[-] EMUL-ERR not path is specified"
+            print("[-] EMUL-ERR not path is specified")
         return 1
     path_existing_parent = _get_parent_path(path_existing)
     path_existing_parent = _res_path(path_existing_parent)
     name_existing_parent = _get_name(path_existing_parent)
     path_existing = _abspath(os.path.normpath(os.path.join(path_existing_parent, name_existing)))
 
-    print "path_existing", path_existing, "path_new", path_new, argv[0], argv[1]
+    print("path_existing", path_existing, "path_new", path_new, argv[0], argv[1])
 
     try:
         id_existing_parent = c.DENTRY[path_existing_parent]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR parent inode of path1 doesn't exist"
+            print("[-] EMUL-ERR parent inode of path1 doesn't exist")
         return 1
 
     if path_existing == ".":
         if c.verbose:
-            print "[-] EMUL-ERR cannot create link to '.'"
+            print("[-] EMUL-ERR cannot create link to '.'")
         return 1
 
     try:
         id_existing = c.DENTRY[path_existing]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR path 1 ({0}) does not exist".format(
-                    path_existing)
+            print("[-] EMUL-ERR path 1 ({0}) does not exist".format(
+path_existing))
         return 1
     try:
         inode = c.DISK[id_existing]
@@ -967,18 +967,18 @@ def link(argv):
         inode = c.MEM[id_existing]
     if inode.type == c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR hard link not allowed for directory"
+            print("[-] EMUL-ERR hard link not allowed for directory")
         return 1
     if path_new in c.DENTRY:
         if c.verbose:
-            print "[-] EMUL-ERR path2 already exists"
+            print("[-] EMUL-ERR path2 already exists")
         return 1
     path_new_parent = _get_parent_path(path_new)
     try:
         id_new_parent = c.DENTRY[path_new_parent]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR invalid path2"
+            print("[-] EMUL-ERR invalid path2")
         return 1
 
     name_new_parent = _get_name(path_new_parent)
@@ -998,7 +998,7 @@ def link(argv):
 
     if inode_new_parent.type != c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a directory".format(path_new_parent)
+            print("[-] EMUL-ERR {0} is not a directory".format(path_new_parent))
         return 1
 
     c.FT.add_node(tup_new, tup_new_parent)
@@ -1027,7 +1027,7 @@ def link(argv):
 
     c.DENTRY[path_new] = id_existing
     if c.verbose:
-        print "[+] Linked new name {0} to {1}".format(path_new, path_existing)
+        print("[+] Linked new name {0} to {1}".format(path_new, path_existing))
 
 
 def unlink(argv):
@@ -1052,7 +1052,7 @@ def unlink(argv):
     path = _abspath(_get_raw_path(argv[0]))
     if path == None:
         if c.verbose:
-            print "[-] EMUL-ERR not path is specified"
+            print("[-] EMUL-ERR not path is specified")
         return 1
     name = _get_name(path)
     path_parent = _get_parent_path(path)
@@ -1063,14 +1063,14 @@ def unlink(argv):
         id_parent = c.DENTRY[path_parent]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR parent node does not exist"
+            print("[-] EMUL-ERR parent node does not exist")
         return 1
 
     try:
         id = c.DENTRY[path]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR path does not exist"
+            print("[-] EMUL-ERR path does not exist")
         return 1
 
     tup_parent = (id_parent, name_parent)
@@ -1091,7 +1091,7 @@ def unlink(argv):
 
     if inode.type == c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR cannot unlink a directory {0}".format(path)
+            print("[-] EMUL-ERR cannot unlink a directory {0}".format(path))
         return 1
 
     _unsync_inode_by_id(id)
@@ -1108,7 +1108,7 @@ def unlink(argv):
     c.DENTRY.pop(path, None)
 
     if c.verbose:
-        print "[+] Unlinked {0}, refs={1}".format(path, inode.refs)
+        print("[+] Unlinked {0}, refs={1}".format(path, inode.refs))
 
 def close(argv):
     if len(argv) < 1:
@@ -1142,14 +1142,14 @@ def symlink(argv):
     #path1 is NULL
     if path1 == None:
         if c.verbose:
-            print "[-] EMUL-ERR invalid original file path (e.g., NULL)"
+            print("[-] EMUL-ERR invalid original file path (e.g., NULL)")
         return 1
     path1_name = _get_name(path1)
 
     path2 = _get_raw_path(argv[1]) # symlink
     if path2 == None:
         if c.verbose:
-            print "[-] EMUL-ERR not path is specified"
+            print("[-] EMUL-ERR not path is specified")
         return 1
     path2_name = _get_name(path2)
     path2_parent_path = _get_parent_path(path2)
@@ -1158,7 +1158,7 @@ def symlink(argv):
         id_parent = c.DENTRY[path2_parent_path]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR invalid path"
+            print("[-] EMUL-ERR invalid path")
         return 1
     tup_parent = (id_parent, path2_parent_name)
     inode_parent = _get_parent_inode(id_parent)
@@ -1171,15 +1171,15 @@ def symlink(argv):
 
     if path2 in c.DENTRY:
         if c.verbose:
-            print "[-] EMUL-ERR cannot create symlink with existing path {0}".format(path2)
+            print("[-] EMUL-ERR cannot create symlink with existing path {0}".format(path2))
         return 1
     if inode_parent.type != c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a directory".format(path2_parent_path)
+            print("[-] EMUL-ERR {0} is not a directory".format(path2_parent_path))
         return 1
 
     id = c.INODE_CNT
-    inode_mem = c.Inode(id=c.INODE_CNT, name=path2_name, type=c.SYMLINK, mode=0777, size=0, path=path2)
+    inode_mem = c.Inode(id=c.INODE_CNT, name=path2_name, type=c.SYMLINK, mode=0o777, size=0, path=path2)
     #if c.FSTYPE == c.NFS:
     #    inode_mem.xattr["system.nfs4_acl"] = ""
     inode_mem.target = path1
@@ -1191,8 +1191,8 @@ def symlink(argv):
     c.FT.add_node(tup, tup_parent)
 
     if c.verbose:
-        print "[+] created symlink {0} pointing to {1}".format(path2, path1)
-        print "attr:", inode_mem.xattr
+        print("[+] created symlink {0} pointing to {1}".format(path2, path1))
+        print("attr:", inode_mem.xattr)
 
 def rename(argv):
     """
@@ -1215,14 +1215,14 @@ def rename(argv):
     path_old = _abspath(_get_raw_path(argv[0]))
     if path_old == None:
         if c.verbose:
-            print "[-] EMUL-ERR not path is specified"
+            print("[-] EMUL-ERR not path is specified")
         return 1
     name_old = _get_name(path_old)
 
     path_new = _abspath(_get_raw_path(argv[1]))
     if path_new == None:
         if c.verbose:
-            print "[-] EMUL-ERR not path is specified"
+            print("[-] EMUL-ERR not path is specified")
         return 1
     name_new = _get_name(path_new)
 
@@ -1238,19 +1238,19 @@ def rename(argv):
 
     if path_old == path_new:
         if c.verbose:
-            print "[-] EMUL-ERR cannot rename to same file"
+            print("[-] EMUL-ERR cannot rename to same file")
         return 1
 
     if path_old == ".":
         if c.verbose:
-            print "[-] EMUL-ERR cannot rename '.'"
+            print("[-] EMUL-ERR cannot rename '.'")
         return 1
 
     try:
         id_old = c.DENTRY[path_old]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR old path does not exist"
+            print("[-] EMUL-ERR old path does not exist")
         return 1
 
     # Get old's parent id
@@ -1259,7 +1259,7 @@ def rename(argv):
     except KeyError: # if parent doesn't exist in the tree, it's an error
         #_print_err(ERR_MIS, __name__, None, argv)
         if c.verbose:
-            print "[-] EMUL-ERR parent node does not exist"
+            print("[-] EMUL-ERR parent node does not exist")
         return 1
     # Get new's parent id
     try:
@@ -1267,7 +1267,7 @@ def rename(argv):
     except KeyError: # if parent doesn't exist in the tree, it's an error
         #_print_err(ERR_MIS, __name__, None, argv)
         if c.verbose:
-            print "[-] EMUL-ERR parent node does not exist"
+            print("[-] EMUL-ERR parent node does not exist")
         return 1
 
     inode_old_parent = _get_parent_inode(id_parent_old)
@@ -1282,8 +1282,8 @@ def rename(argv):
             id_parent_old = c.DENTRY[path_old_parent]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR old parent's path {0} does not exist".format(
-                        path_old_parent)
+                print("[-] EMUL-ERR old parent's path {0} does not exist".format(
+path_old_parent))
             return 1
 
     inode_new_parent = _get_parent_inode(id_parent_new)
@@ -1298,13 +1298,13 @@ def rename(argv):
             id_parent_new = c.DENTRY[path_new_parent]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR new parent's path {0} does not exist".format(
-                        path_new_parent)
+                print("[-] EMUL-ERR new parent's path {0} does not exist".format(
+path_new_parent))
             return 1
 
     if inode_new_parent.type != c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a directory".format(path_new_parent)
+            print("[-] EMUL-ERR {0} is not a directory".format(path_new_parent))
         return 1
 
     tup_old_parent = (id_parent_old, name_old_parent)
@@ -1315,8 +1315,8 @@ def rename(argv):
     path_tup_list, pathstr = c.FT.get_path(c.ROOT, tup_new_parent, c.ROOT)
     if tup_old in path_tup_list:
         if c.verbose:
-            print "[-] EMUL-ERR cannot rename {0} to its subdirectory, {1}".format(
-                    path_old, path_new)
+            print("[-] EMUL-ERR cannot rename {0} to its subdirectory, {1}".format(
+path_old, path_new))
         return 1
 
     try:
@@ -1346,20 +1346,20 @@ def rename(argv):
             new_children = c.FT[tup_new_existing][0].children
         if new_children:
             if c.verbose:
-                print "[-] EMUL-ERR new path is not empty (has children)"
+                print("[-] EMUL-ERR new path is not empty (has children)")
             return 1
 
         if (inode_old.type == c.DIR and inode_new_existing.type != c.DIR)\
                 or\
             (inode_old.type != c.DIR and inode_new_existing.type == c.DIR):
             if c.verbose:
-                print "[-] EMUL-ERR rename type mismatch"
+                print("[-] EMUL-ERR rename type mismatch")
             return 1
 
         if inode_old.id == inode_new_existing.id:
             if c.verbose:
-                print "[-] EMUL-ERR {0} and {1} are the same files".format(
-                        path_old, path_new)
+                print("[-] EMUL-ERR {0} and {1} are the same files".format(
+path_old, path_new))
             return 1
     # Handling old file: keep inode, change name from old to new
     # then, remove the old name from name-id-map
@@ -1369,12 +1369,12 @@ def rename(argv):
         if inode_old.type == c.FILE: # rename fail situation 1 - rename FILE to DIR
             if inode_new_existing.type == c.DIR:
                 if c.verbose:
-                    print "[-] EMUL-ERR cannot rename file {0} to directory {1}".format(path_old, path_new)
+                    print("[-] EMUL-ERR cannot rename file {0} to directory {1}".format(path_old, path_new))
                 return 1
         elif inode_old.type == c.DIR: # rename fail situation 2 - rename DIR to non DIR
             if inode_new_existing.type != c.DIR:
                 if c.verbose:
-                    print "[-] EMUL-ERR cannot rename directory {0} to non-directory {1}".format(path_old, path_new)
+                    print("[-] EMUL-ERR cannot rename directory {0} to non-directory {1}".format(path_old, path_new))
                 return 1
     # new path does not exist
 
@@ -1409,7 +1409,7 @@ def rename(argv):
         c.DENTRY[child_path.replace(path_old, path_new)] = child_inum
 
     if c.verbose:
-        print "[+] Renamed {0} to {1}".format(path_old, path_new)
+        print("[+] Renamed {0} to {1}".format(path_old, path_new))
 
 def sync():
     """
@@ -1431,7 +1431,7 @@ def sync():
             inode.persist_children()
 
     if c.verbose:
-        print "[+] synced {0} inodes".format(len(keys))
+        print("[+] synced {0} inodes".format(len(keys)))
 
 def syncfs(argv):
     """
@@ -1469,7 +1469,7 @@ def fsync(argv):
     inode = _get_inode_of_fd(argv[0])
     if inode == -1:
         if c.verbose:
-            print "EMUL-ERR inode not found"
+            print("EMUL-ERR inode not found")
         return 1
 
     if inode.id in c.MEM:
@@ -1480,11 +1480,11 @@ def fsync(argv):
         c.MEM.pop(inode.id, None)
 
         if c.verbose:
-            print "[+] fsynced inode #{0}: {1}".format(inode.id, argv[0])
+            print("[+] fsynced inode #{0}: {1}".format(inode.id, argv[0]))
     else:
         if c.verbose:
-            print "[+] inode #{0}: {1} is already fsync'ed".format(
-                    inode.id, argv[0])
+            print("[+] inode #{0}: {1} is already fsync'ed".format(
+inode.id, argv[0]))
 
     # at this point, this inode is in disk
     inode_disk = c.DISK[inode.id]
@@ -1497,7 +1497,7 @@ def fsync(argv):
         path = _get_path(argv[0])
         if path == 1:
             if c.verbose:
-                print "[-] aborting fsync"
+                print("[-] aborting fsync")
             return 1
         name = _get_name(path)
         _update_dentry()
@@ -1516,7 +1516,7 @@ def fsync(argv):
                 c.DISK[id].datablock.synced = 1
             c.MEM.pop(inode_mem.id, None)
         if c.verbose:
-            print "[+] fsynced {0}".format(argv[0])
+            print("[+] fsynced {0}".format(argv[0]))
     '''
 
 def fdatasync(argv):
@@ -1548,7 +1548,7 @@ def fdatasync(argv):
         inode.datablock.synced = 1
 
     if c.verbose:
-        print "[+] fdatasynced {0}".format(argv[0])
+        print("[+] fdatasynced {0}".format(argv[0]))
 
 def fallocate(argv):
     """
@@ -1596,18 +1596,18 @@ def fallocate(argv):
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] EMUL-ERR cannot fallocate to non-regular file {0}".format(
-                    str(inode.name))
+            print("[-] EMUL-ERR cannot fallocate to non-regular file {0}".format(
+str(inode.name)))
         return 1
 
     if inode.opt_dict[fd][c.O_ACCMODE]:
         if c.verbose:
-            print "[-] EMUL-ERR Cannot perform under O_ACCMODE"
+            print("[-] EMUL-ERR Cannot perform under O_ACCMODE")
         return 1
 
     if inode.opt_dict[fd][c.O_RDONLY]:
         if c.verbose:
-            print "[-] EMUL-ERR cannot write to file (O_RDONLY is set)"
+            print("[-] EMUL-ERR cannot write to file (O_RDONLY is set)")
         return 1
 
     mode = int(argv[1])
@@ -1633,7 +1633,7 @@ def fallocate(argv):
     length = int(argv[3])
     if (offset < 0) or (length <= 0):
         if c.verbose:
-            print "[-] error in offset or length"
+            print("[-] error in offset or length")
         return 1
 
     if default: # POSIX
@@ -1680,7 +1680,7 @@ def fallocate(argv):
 
     if error:
         if c.verbose:
-            print "[-] EMUL-ERR mode error"
+            print("[-] EMUL-ERR mode error")
         return 1
 
     # then emulate if extension option's set
@@ -1770,7 +1770,7 @@ def fallocate(argv):
         _unsync_inode_by_id(inode.id)
 
     if c.verbose:
-        print "[+] fallocated to {0}".format(inode.name)
+        print("[+] fallocated to {0}".format(inode.name))
 
 def read(argv):
     """
@@ -1796,22 +1796,22 @@ def read(argv):
 
     if not check_R_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the read permission {}".format(oct(inode.mode))
+            print("[-] not have the read permission {}".format(oct(inode.mode)))
         return -1
 
     if inode.opt_dict[varname][c.O_ACCMODE]:
         if c.verbose:
-            print "[-] EMUL-ERR Cannot perform under O_ACCMODE"
+            print("[-] EMUL-ERR Cannot perform under O_ACCMODE")
         return -1
 
     if inode.opt_dict[varname][c.O_WRONLY]:
         if c.verbose:
-            print "[-] EMUL-ERR cannot read from file (O_WRONLY is set)"
+            print("[-] EMUL-ERR cannot read from file (O_WRONLY is set)")
         return -1
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a regular file".format(inode.name)
+            print("[-] EMUL-ERR {0} is not a regular file".format(inode.name))
         return -1
 
     buf_var = argv[1].replace("(long)", "")
@@ -1819,7 +1819,7 @@ def read(argv):
         buf_size = int(c.BUF_SIZE[buf_var])
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var))
         return -1
     try:
         buf_data = c.BUF_DATA[buf_var]
@@ -1852,8 +1852,8 @@ def read(argv):
         # or by lseek(fd, 0, SEEK_CUR);
 
     if c.verbose:
-        print "[+] Read {0} bytes from {1} to buffer {2}".format(
-                nbyte, inode.name, buf_var)
+        print("[+] Read {0} bytes from {1} to buffer {2}".format(
+nbyte, inode.name, buf_var))
     return nbyte
 
 def pread64(argv):
@@ -1880,22 +1880,22 @@ def pread64(argv):
 
     if not check_R_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the read permission {}".format(oct(inode.mode))
+            print("[-] not have the read permission {}".format(oct(inode.mode)))
         return -1
 
     if inode.opt_dict[fd][c.O_ACCMODE]:
         if c.verbose:
-            print "[-] EMUL-ERR Cannot perform under O_ACCMODE"
+            print("[-] EMUL-ERR Cannot perform under O_ACCMODE")
         return -1
 
     if inode.opt_dict[fd][c.O_WRONLY]:
         if c.verbose:
-            print "[-] EMUL-ERR cannot read from file (O_WRONLY is set)"
+            print("[-] EMUL-ERR cannot read from file (O_WRONLY is set)")
         return -1
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] EMUL-ERR {0} is not a regular file".format(inode.name)
+            print("[-] EMUL-ERR {0} is not a regular file".format(inode.name))
         return -1
 
     buf_var = argv[1].replace("(long)", "")
@@ -1903,7 +1903,7 @@ def pread64(argv):
         buf_size = int(c.BUF_SIZE[buf_var])
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var))
         return -1
     try:
         buf_data = c.BUF_DATA[buf_var]
@@ -1932,8 +1932,8 @@ def pread64(argv):
         c.BUF_DATA[buf_var] = buf_data
 
     if c.verbose:
-        print "[+] Pread {0} bytes from offset {1} of {2} to buf {3}".format(
-                nbyte, offset, inode.name, buf_var)
+        print("[+] Pread {0} bytes from offset {1} of {2} to buf {3}".format(
+nbyte, offset, inode.name, buf_var))
 
     return nbyte
 
@@ -1965,23 +1965,23 @@ def write(argv):
 
     if not check_W_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the write permission {}".format(oct(inode.mode))
+            print("[-] not have the write permission {}".format(oct(inode.mode)))
         return 1
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] Cannot write to non-regular file {0} {1}".format(
-                    varname, str(inode.name))
+            print("[-] Cannot write to non-regular file {0} {1}".format(
+varname, str(inode.name)))
         return 1
 
     if inode.opt_dict[varname][c.O_ACCMODE]:
         if c.verbose:
-            print "[-] EMUL-ERR Cannot perform under O_ACCMODE"
+            print("[-] EMUL-ERR Cannot perform under O_ACCMODE")
         return 1
 
     if inode.opt_dict[varname][c.O_RDONLY]:
         if c.verbose:
-            print "[-] EMUL-ERR cannot write to file (O_RDONLY is set)"
+            print("[-] EMUL-ERR cannot write to file (O_RDONLY is set)")
         return 1
 
     buf_var = argv[1].replace("(long)", "")
@@ -1989,8 +1989,8 @@ def write(argv):
         buf_size = int(c.BUF_SIZE[buf_var])
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized: {}".format(
-                    buf_var, c.BUF_SIZE)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized: {}".format(
+buf_var, c.BUF_SIZE))
         return 1
     try:
         buf_data = c.BUF_DATA[buf_var]
@@ -2006,8 +2006,8 @@ def write(argv):
     nbyte = int(argv[2])
     if nbyte == 0:
         if c.verbose:
-            print "[+] Wrote {0} bytes from buffer {1} to {2}".format(
-                    nbyte, buf_var, inode.name)
+            print("[+] Wrote {0} bytes from buffer {1} to {2}".format(
+nbyte, buf_var, inode.name))
         return 0
 
     if nbyte > buf_size:
@@ -2050,8 +2050,8 @@ def write(argv):
     _unsync_inode_by_id(inode.id)
 
     if c.verbose:
-        print "[+] Wrote {0} bytes from buffer {1} to {2}".format(
-                nbyte, buf_var, inode.name)
+        print("[+] Wrote {0} bytes from buffer {1} to {2}".format(
+nbyte, buf_var, inode.name))
 
 def pwrite64(argv):
     """
@@ -2081,23 +2081,23 @@ def pwrite64(argv):
 
     if not check_W_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the write permission {}".format(oct(inode.mode))
+            print("[-] not have the write permission {}".format(oct(inode.mode)))
         return 1
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] Cannot write to non-regular file {0} {1}".format(
-                    varname, str(inode.name))
+            print("[-] Cannot write to non-regular file {0} {1}".format(
+varname, str(inode.name)))
         return 1
 
     if inode.opt_dict[varname][c.O_ACCMODE]:
         if c.verbose:
-            print "[-] EMUL-ERR Cannot perform under O_ACCMODE"
+            print("[-] EMUL-ERR Cannot perform under O_ACCMODE")
         return 1
 
     if inode.opt_dict[varname][c.O_RDONLY]:
         if c.verbose:
-            print "[-] EMUL-ERR cannot write to file (O_RDONLY is set)"
+            print("[-] EMUL-ERR cannot write to file (O_RDONLY is set)")
         return 1
 
     buf_var = argv[1].replace("(long)", "")
@@ -2105,8 +2105,8 @@ def pwrite64(argv):
         buf_size = int(c.BUF_SIZE[buf_var])
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(
-                    buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(
+buf_var))
         return 1
     try:
         buf_data = c.BUF_DATA[buf_var]
@@ -2119,8 +2119,8 @@ def pwrite64(argv):
     nbyte = int(argv[2])
     if nbyte == 0:
         if c.verbose:
-            print "[+] Pwrote {0} bytes from buffer {1} to offset {2} of file {3}"\
-                    .format(nbyte, buf_var, offset, inode.name)
+            print("[+] Pwrote {0} bytes from buffer {1} to offset {2} of file {3}"\
+.format(nbyte, buf_var, offset, inode.name))
         return 0
 
     if nbyte > buf_size:
@@ -2160,8 +2160,8 @@ def pwrite64(argv):
     _unsync_inode_by_id(inode.id)
 
     if c.verbose:
-        print "[+] Pwrote {0} bytes from buffer {1} to offset {2} of file {3}"\
-                .format(nbyte, buf_var, offset, inode.name)
+        print("[+] Pwrote {0} bytes from buffer {1} to offset {2} of file {3}"\
+.format(nbyte, buf_var, offset, inode.name))
 
 def lseek(argv):
     """
@@ -2202,15 +2202,15 @@ def lseek(argv):
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] EMUL-ERR cannot lseek on non-regular file {0}: {1}".format(
-                    varname, str(inode.name))
+            print("[-] EMUL-ERR cannot lseek on non-regular file {0}: {1}".format(
+varname, str(inode.name)))
 
     old_offset = inode.offset[varname]
     offset = int(argv[1])
     whence = int(argv[2])
     if whence > SEEK_HOLE:
         if c.verbose:
-            print "[-] EMUL-ERR invalid value for whence: {0}".format(whence)
+            print("[-] EMUL-ERR invalid value for whence: {0}".format(whence))
         return 1
 
     if whence == SEEK_SET:
@@ -2222,7 +2222,7 @@ def lseek(argv):
     elif whence == SEEK_DATA:
         if inode.size <= offset:
             if c.verbose:
-                print "[-] offset if beyond the end of file"
+                print("[-] offset if beyond the end of file")
             return 1
         data_offset = offset
         try:
@@ -2242,12 +2242,12 @@ def lseek(argv):
                 inode.offset[varname] = data_offset
             else:
                 if c.verbose:
-                    print "[-] lseek SEEK_DATA failed to find any data"
+                    print("[-] lseek SEEK_DATA failed to find any data")
                 return 1
     elif whence == SEEK_HOLE:
         if inode.size <= offset:
             if c.verbose:
-                print "[-] offset is beyond the end of file"
+                print("[-] offset is beyond the end of file")
             return 1
         hole_offset = offset
         flag = 0
@@ -2262,8 +2262,8 @@ def lseek(argv):
             inode.offset[varname] = inode.size
 
     if c.verbose:
-        print "[+] Changed offset from {0} to {1}".format(
-                old_offset, inode.offset[varname])
+        print("[+] Changed offset from {0} to {1}".format(
+old_offset, inode.offset[varname]))
 
 def truncate(argv):
     """
@@ -2282,7 +2282,7 @@ def truncate(argv):
     path = _get_path(argv[0])
     if path == None:
         if c.verbose:
-            print "[-] EMUL-ERR path not exist"
+            print("[-] EMUL-ERR path not exist")
         return 1
     length = int(argv[1])
 
@@ -2290,7 +2290,7 @@ def truncate(argv):
         id = c.DENTRY[path]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR file {0} does not exist".format(path)
+            print("[-] EMUL-ERR file {0} does not exist".format(path))
         return 1
 
     try:
@@ -2306,12 +2306,12 @@ def truncate(argv):
 
     if not check_W_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the write permission {}".format(oct(inode.mode))
+            print("[-] not have the write permission {}".format(oct(inode.mode)))
         return 1
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] Cannot truncate non-regular file {0}".format(path)
+            print("[-] Cannot truncate non-regular file {0}".format(path))
         return 1
 
     _unsync_inode_by_id(id)
@@ -2337,8 +2337,8 @@ def truncate(argv):
         inode.datablock.synced = 0
 
     if c.verbose:
-        print "[+] Truncated {0} from {1} to {2} bytes".format(
-                path, old_length, length)
+        print("[+] Truncated {0} from {1} to {2} bytes".format(
+path, old_length, length))
 
 def ftruncate(argv):
     """
@@ -2353,7 +2353,7 @@ def ftruncate(argv):
     inode = _get_inode_of_fd(fd)
     if inode == -1:
         if c.verbose:
-            print "[-] EMUL-ERR invalid file descriptor: {0}".format(fd)
+            print("[-] EMUL-ERR invalid file descriptor: {0}".format(fd))
         return 1
     id = inode.id
     try:
@@ -2363,23 +2363,23 @@ def ftruncate(argv):
 
     if not check_W_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the write permission {}".format(oct(inode.mode))
+            print("[-] not have the write permission {}".format(oct(inode.mode)))
         return 1
 
     if inode.type != c.FILE:
         if c.verbose:
-            print "[-] EMUL-ERR Cannot truncate non-regular file {0}".format(
-                    str(inode.name))
+            print("[-] EMUL-ERR Cannot truncate non-regular file {0}".format(
+str(inode.name)))
         return 1
 
     if inode.opt_dict[fd][c.O_ACCMODE]:
         if c.verbose:
-            print "[-] EMUL-ERR Cannot perform under O_ACCMODE"
+            print("[-] EMUL-ERR Cannot perform under O_ACCMODE")
         return 1
 
     if inode.opt_dict[fd][c.O_RDONLY]:
         if c.verbose:
-            print "[-] EMUL-ERR cannot modify file (O_RDONLY is set)"
+            print("[-] EMUL-ERR cannot modify file (O_RDONLY is set)")
         return 1
 
     length = int(argv[1])
@@ -2407,8 +2407,8 @@ def ftruncate(argv):
         inode.datablock.synced = 0
 
     if c.verbose:
-        print "[+] ftruncated inode {0} from {1} to {2} bytes".format(
-            inode.id, old_length, length)
+        print("[+] ftruncated inode {0} from {1} to {2} bytes".format(
+inode.id, old_length, length))
 
 def utimes(argv):
     """
@@ -2450,7 +2450,7 @@ def readlink(argv):
     path = _abspath(_get_raw_path(argv[0]))
     if path == None:
         if c.verbose:
-            print "[-] EMUL-ERR not path is specified"
+            print("[-] EMUL-ERR not path is specified")
         return -1
     name = _get_name(path)
     path_parent = _get_parent_path(path)
@@ -2462,13 +2462,13 @@ def readlink(argv):
         buf_size = int(c.BUF_SIZE[buf_var])
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(
-                    buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(
+buf_var))
         return -1
 
     if buf_size == 0:
         if c.verbose:
-            print "[-] EMUL-ERR buffer size is zero"
+            print("[-] EMUL-ERR buffer size is zero")
         return -1
 
     try:
@@ -2483,7 +2483,7 @@ def readlink(argv):
         id = c.DENTRY[path]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR file {0} does not exist".format(path)
+            print("[-] EMUL-ERR file {0} does not exist".format(path))
         return -1
 
     try:
@@ -2493,12 +2493,12 @@ def readlink(argv):
 
     if inode.type != c.SYMLINK:
         if c.verbose:
-            print "[-] EMUL-ERR cannot readlink from non-symlink"
+            print("[-] EMUL-ERR cannot readlink from non-symlink")
         return -1
 
     if not check_R_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the read permission {}".format(oct(inode.mode))
+            print("[-] not have the read permission {}".format(oct(inode.mode)))
         return -1
 
     target = inode.target
@@ -2510,8 +2510,8 @@ def readlink(argv):
     c.BUF_DATA[buf_var] = buf_data
 
     if c.verbose:
-        print "[+] read link target of file {0} and wrote to buffer {1}".format(
-                path, buf_var)
+        print("[+] read link target of file {0} and wrote to buffer {1}".format(
+path, buf_var))
 
     return return_size
 
@@ -2527,13 +2527,13 @@ def chmod_base(argv, fd):
         path = _get_path(argv[0])
         if path == None:
             if c.verbose:
-                print "[-] EMUL-ERR path not exist"
+                print("[-] EMUL-ERR path not exist")
             return 1
         try:
             id = c.DENTRY[path]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR file {0} does not exist".format(path)
+                print("[-] EMUL-ERR file {0} does not exist".format(path))
             return 1
         try:
             inode = c.MEM[id]
@@ -2543,14 +2543,14 @@ def chmod_base(argv, fd):
         inode = _get_inode_of_fd(fd)
         if inode == -1:
             if c.verbose:
-                print "[-] EMUL-ERR inode for fd {} doesn't exist".format(fd)
+                print("[-] EMUL-ERR inode for fd {} doesn't exist".format(fd))
             return -1
 
     id = inode.id
 
     new_mode = int(argv[1])
     # fchmod(r0, 0xbe0888a1c86747ff) should succeed
-    new_mode &= 07777
+    new_mode &= 0o7777
     # if new_mode < 0 or new_mode > 07777:
     #    if c.verbose:
     #        print "[-] EMUL-ERR invalid mode: {0}".format(new_mode)
@@ -2572,7 +2572,7 @@ def chmod_base(argv, fd):
         inode = c.MEM[id]
 
     if c.verbose:
-        print "[+] Changed mode of {0} to {1}".format(inode.name, inode.mode)
+        print("[+] Changed mode of {0} to {1}".format(inode.name, inode.mode))
 
 def chmod(argv):
     return chmod_base(argv, -1)
@@ -2613,13 +2613,13 @@ def setxattr_base(argv, syscall_name, fd):
         path = _get_path(argv[0])
         if path == None:
             if c.verbose:
-                print "[-] EMUL-ERR not path is specified"
+                print("[-] EMUL-ERR not path is specified")
             return 1
 
     xattr_name = _get_assigned_value_of_var(argv[1])
     if xattr_name == -1:
         if c.verbose:
-            print "[-] EMUL-ERR invalid xattr name {0}".format(argv[1])
+            print("[-] EMUL-ERR invalid xattr name {0}".format(argv[1]))
         return 1
     xattr_name = zero_terminiated_str(xattr_name)
     xattr_value_size, xattr_value = _get_size_and_data_of_buf(argv[2])
@@ -2629,7 +2629,7 @@ def setxattr_base(argv, syscall_name, fd):
             # lsetxattr$user('./file0\x00', "user.x", 0x0, 0x0, 0x0) should pass
             # setxattr("./file0", "user.+@*)!-)", NULL, 53, 0) should fail
             # lsetxattr$trusted_overlay_redirect(&(0x7f0000000040)='./file0\x00', &(0x7f0000000100), &(0x7f00000000c0)='\x00', 0x1, 0x1)
-            print "[-] EMUL-ERR xattr value is NULL"
+            print("[-] EMUL-ERR xattr value is NULL")
         return 1
     xattr_flags = int(argv[4]) & 0xffffffff
 
@@ -2640,7 +2640,7 @@ def setxattr_base(argv, syscall_name, fd):
             id = c.DENTRY[path]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR file {0} does not exist".format(path)
+                print("[-] EMUL-ERR file {0} does not exist".format(path))
             return 1
         try:
             inode = c.MEM[id]
@@ -2650,14 +2650,14 @@ def setxattr_base(argv, syscall_name, fd):
         inode = _get_inode_of_fd(fd)
         if inode == -1:
             if c.verbose:
-                print "[-] EMUL-ERR inode is not found for fd {}".format(fd)
+                print("[-] EMUL-ERR inode is not found for fd {}".format(fd))
             return -1
     
     id = inode.id
 
     splits = xattr_name.split(".")
     if len(splits) < 2:
-        print "[-] EMUL-ERR setxattr the xattr name format is wrong, not namespace.attr"
+        print("[-] EMUL-ERR setxattr the xattr name format is wrong, not namespace.attr")
         return 1
 
     namespace = splits[0]
@@ -2666,19 +2666,19 @@ def setxattr_base(argv, syscall_name, fd):
         # NFS doesn't allowit, but glusterfs allows it
         if c.FSTYPE == 'nfs':
             if c.verbose:
-                print "[-] EMUL-ERR setxattr namespace {0} is not permitted".format(priv_namespace)
+                print("[-] EMUL-ERR setxattr namespace {0} is not permitted".format(priv_namespace))
             return 1
     elif namespace == "user":
         pass
     else:
         if c.verbose:
-            print "[-] EMUL-ERR setxattr invalid namespace"
+            print("[-] EMUL-ERR setxattr invalid namespace")
         return 1
 
     remaining = "".join(splits[1:])
     if remaining == "":
         if c.verbose:
-            print "[-] EMUL-ERR setxattr with empty content after namespace, such as 'namespace.'"
+            print("[-] EMUL-ERR setxattr with empty content after namespace, such as 'namespace.'")
         return 1
 
     if inode.type == c.SYMLINK and syscall_name != "lsetxattr":
@@ -2689,7 +2689,7 @@ def setxattr_base(argv, syscall_name, fd):
 
     if not check_W_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the write permission {}".format(oct(inode.mode))
+            print("[-] not have the write permission {}".format(oct(inode.mode)))
         return 1
 
     # XATTR_CREATE : 0x1
@@ -2699,18 +2699,18 @@ def setxattr_base(argv, syscall_name, fd):
     elif xattr_flags == 1:
         if xattr_name in inode.xattr:
             if c.verbose:
-                print "[-] EMUL-ERR Invalid mode: xattr {0} already exists".format(
-                        xattr_name)
+                print("[-] EMUL-ERR Invalid mode: xattr {0} already exists".format(
+xattr_name))
             return 1
     elif xattr_flags == 2:
         if xattr_name not in inode.xattr:
             if c.verbose:
-                print "[-] EMUL-ERR Invalid mode: xattr {0} does not exist".format(
-                        xattr_name)
+                print("[-] EMUL-ERR Invalid mode: xattr {0} does not exist".format(
+xattr_name))
             return 1
     else:
         if c.verbose:
-            print "[-] EMUL-ERR Invalid flag, not in [0, 1, 2]"
+            print("[-] EMUL-ERR Invalid flag, not in [0, 1, 2]")
         return 1
 
     """
@@ -2725,10 +2725,10 @@ def setxattr_base(argv, syscall_name, fd):
     _unsync_inode_by_id(id)
 
     if c.verbose:
-        print "[+] Set xattr {0} to file {1}".format(xattr_name, path)
-        print "value ({0} bytes):".format(len(xattr_value))
+        print("[+] Set xattr {0} to file {1}".format(xattr_name, path))
+        print("value ({0} bytes):".format(len(xattr_value)))
         _print_hex(xattr_value)
-        print "current xattr:", inode.xattr
+        print("current xattr:", inode.xattr)
 
 def setxattr(argv):
     return setxattr_base(argv, "setxattr", -1)
@@ -2760,13 +2760,13 @@ def removexattr_base(argv, syscall_name, fd):
         path = _get_path(argv[0])
         if path == None:
             if c.verbose:
-                print "[-] EMUL-ERR not path is specified"
+                print("[-] EMUL-ERR not path is specified")
             return 1
     
     xattr_name = _get_assigned_value_of_var(argv[1])
     if xattr_name == -1:
         if c.verbose:
-            print "[-] EMUL-ERR invalid xattr name {0}".format(argv[1])
+            print("[-] EMUL-ERR invalid xattr name {0}".format(argv[1]))
         return 1
     xattr_name = zero_terminiated_str(xattr_name)
 
@@ -2776,7 +2776,7 @@ def removexattr_base(argv, syscall_name, fd):
             id = c.DENTRY[path]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR file {0} does not exist".format(path)
+                print("[-] EMUL-ERR file {0} does not exist".format(path))
             return 1
         try:
             inode = c.MEM[id]
@@ -2786,7 +2786,7 @@ def removexattr_base(argv, syscall_name, fd):
         inode = _get_inode_of_fd(fd)
         if inode == -1:
             if c.verbose:
-                print "[-] EMUL-ERR inode is not found for fd {}".format(fd)
+                print("[-] EMUL-ERR inode is not found for fd {}".format(fd))
             return -1
     
     id = inode.id
@@ -2799,21 +2799,21 @@ def removexattr_base(argv, syscall_name, fd):
 
     if not check_W_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the write permission {}".format(oct(inode.mode))
+            print("[-] not have the write permission {}".format(oct(inode.mode)))
         return 1
 
     if xattr_name in inode.xattr:
         inode.xattr.pop(xattr_name, None)
     else:
         if c.verbose:
-            print "[-] EMUL-ERR file {0} does not have xattr {1}".format(
-                    path, xattr_name)
+            print("[-] EMUL-ERR file {0} does not have xattr {1}".format(
+path, xattr_name))
         return 1
 
     _unsync_inode_by_id(id)
 
     if c.verbose:
-        print "[+] Removed xattr {0} from file {1}".format(xattr_name, path)
+        print("[+] Removed xattr {0} from file {1}".format(xattr_name, path))
 
 def removexattr(argv):
     return removexattr_base(argv, "removexattr", -1)
@@ -2851,13 +2851,13 @@ def listxattr_base(argv, syscall_name, fd):
         path = _get_path(argv[0])
         if path == None:
             if c.verbose:
-                print "[-] EMUL-ERR path not exist"
+                print("[-] EMUL-ERR path not exist")
             return -1
         try:
             id = c.DENTRY[path]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR file {0} does not exist".format(path)
+                print("[-] EMUL-ERR file {0} does not exist".format(path))
             return -1
 
     buf_var = argv[1].replace("(long)", "")
@@ -2865,8 +2865,8 @@ def listxattr_base(argv, syscall_name, fd):
         buf_size = int(c.BUF_SIZE[buf_var])
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(
-                    buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(
+buf_var))
         return -1
     try:
         buf_data = c.BUF_DATA[buf_var]
@@ -2879,7 +2879,7 @@ def listxattr_base(argv, syscall_name, fd):
 
     if buf_size == 0:
         if c.verbose:
-            print "[-] EMUL-ERR the buf specified is NULL"
+            print("[-] EMUL-ERR the buf specified is NULL")
         return -1
     
     inode = None
@@ -2892,7 +2892,7 @@ def listxattr_base(argv, syscall_name, fd):
         inode = _get_inode_of_fd(fd)
         if inode == -1:
             if c.verbose:
-                print "[-] EMUL-ERR inode is not found for fd {}".format(fd)
+                print("[-] EMUL-ERR inode is not found for fd {}".format(fd))
             return -1
         try:
             inode = c.MEM[inode.id]
@@ -2910,12 +2910,12 @@ def listxattr_base(argv, syscall_name, fd):
 
     if not inode.xattr:
         if c.verbose:
-            print "[-] {0} has no xattr".format(path)
+            print("[-] {0} has no xattr".format(path))
         return -1
 
     if not check_R_perm(inode.mode):
         if c.verbose:
-            print "[-] not have the read permission {}".format(oct(inode.mode))
+            print("[-] not have the read permission {}".format(oct(inode.mode)))
         return -1
 
     xattr_name_str = ";".join(sorted(inode.xattr))+";"
@@ -2925,7 +2925,7 @@ def listxattr_base(argv, syscall_name, fd):
 
     if len(xattr_name_str) > size:
         if c.verbose:
-            print "[-] EMUL-ERR size of xattr list string {0} is larger than the given size {1}".format(len(xattr_name_str), size)
+            print("[-] EMUL-ERR size of xattr list string {0} is larger than the given size {1}".format(len(xattr_name_str), size))
         return -1
 
     if len(buf_data) >= len(xattr_name_str):
@@ -2935,8 +2935,8 @@ def listxattr_base(argv, syscall_name, fd):
 
     c.BUF_DATA[buf_var] = buf_data
     if c.verbose:
-        print "[+] listxattr stored xattr list of {0} to {1}".format(
-                path, buf_var)
+        print("[+] listxattr stored xattr list of {0} to {1}".format(
+path, buf_var))
 
     return len(xattr_name_str)
 
@@ -2992,13 +2992,13 @@ def getxattr_base(argv, syscall_name, fd):
         path = _get_path(argv[0])
         if path == None:
             if c.verbose:
-                print "[-] EMUL-ERR path not exist"
+                print("[-] EMUL-ERR path not exist")
             return -1
         try:
             id = c.DENTRY[path]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR file {0} does not exist".format(path)
+                print("[-] EMUL-ERR file {0} does not exist".format(path))
             return -1
         try:
             inode = c.MEM[id]
@@ -3008,13 +3008,13 @@ def getxattr_base(argv, syscall_name, fd):
         inode = _get_inode_of_fd(fd)
         if inode == -1:
             if c.verbose:
-                print "[-] EMUL-ERR inode of fd {} doesn't exist".format(fd)
+                print("[-] EMUL-ERR inode of fd {} doesn't exist".format(fd))
             return -1
     
     xattr_name = _get_assigned_value_of_var(argv[1])
     if xattr_name == -1:
         if c.verbose:
-            print "[-] EMUL-ERR invalid xattr name {0}".format(argv[1])
+            print("[-] EMUL-ERR invalid xattr name {0}".format(argv[1]))
         return -1
     xattr_name = zero_terminiated_str(xattr_name)
 
@@ -3023,8 +3023,8 @@ def getxattr_base(argv, syscall_name, fd):
         buf_size = int(c.BUF_SIZE[buf_var])
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(
-                    buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(
+buf_var))
         return -1
     try:
         buf_data = c.BUF_DATA[buf_var]
@@ -3036,7 +3036,7 @@ def getxattr_base(argv, syscall_name, fd):
 
     if buf_size == 0:
         if c.verbose:
-            print "[-] EMUL-ERR the buf specified is NULL"
+            print("[-] EMUL-ERR the buf specified is NULL")
         return -1    
 
     if inode.type == c.SYMLINK and syscall_name != "llistxattr":
@@ -3046,19 +3046,19 @@ def getxattr_base(argv, syscall_name, fd):
 
     if not inode.xattr:
         if c.verbose:
-            print "[-] {0} has no xattr".format(path)
+            print("[-] {0} has no xattr".format(path))
         return -1
 
     try:
         xattr_value_str = inode.xattr[xattr_name]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR xattr {} doesn't exist".format(xattr_name)
+            print("[-] EMUL-ERR xattr {} doesn't exist".format(xattr_name))
         return -1
 
     if len(xattr_value_str) > size:
         if c.verbose:
-            print "[-] EMUL-ERR size of xattr value {0} is larger than the given size {1}".format(len(xattr_value_str), size)
+            print("[-] EMUL-ERR size of xattr value {0} is larger than the given size {1}".format(len(xattr_value_str), size))
         return -1
 
     if len(buf_data) >= len(xattr_value_str):
@@ -3068,8 +3068,8 @@ def getxattr_base(argv, syscall_name, fd):
 
     c.BUF_DATA[buf_var] = buf_data
     if c.verbose:
-        print "[+] listxattr stored xattr list of {0} to {1}".format(
-                path, buf_var)
+        print("[+] listxattr stored xattr list of {0} to {1}".format(
+path, buf_var))
 
     return len(xattr_value_str)
 
@@ -3098,7 +3098,7 @@ def dup(argv, varname, ret_dup2=None):
     inode = _get_inode_of_fd(fd)
     if inode == -1:
         if c.verbose:
-            print "[-] EMUL-ERR inode of fd {} doesn't exist".format(fd)
+            print("[-] EMUL-ERR inode of fd {} doesn't exist".format(fd))
         return -1
     c.FD_STACK[varname] = inode
     inode.offset[varname] = 0 # init offset for fd
@@ -3133,12 +3133,12 @@ def dup2(argv, varname):
     inode = _get_inode_of_fd(fd1)
     if inode == -1:
         if c.verbose:
-            print "[-] EMUL-ERR inode referred by fd1 doesn't exist"
+            print("[-] EMUL-ERR inode referred by fd1 doesn't exist")
         return -1
 
     if fd1 == fd2:
         if c.verbose:
-            print "[-] EMUL-ERR fd2 is fd1"
+            print("[-] EMUL-ERR fd2 is fd1")
         return
     
     # If fd2 is valid, invalidate it
@@ -3162,12 +3162,12 @@ def getdents(argv):
     inode = _get_inode_of_fd(fd)
     if inode == -1:
         if c.verbose:
-            print "[-] EMUL-ERR invalid fd {}".format(fd)
+            print("[-] EMUL-ERR invalid fd {}".format(fd))
         return -1
 
     if inode.type != c.DIR:
         if c.verbose:
-            print "[-] EMUL-ERR cannot getdents on a non-dir file"
+            print("[-] EMUL-ERR cannot getdents on a non-dir file")
         return -1
 
     try:
@@ -3176,12 +3176,12 @@ def getdents(argv):
         buf_data = c.BUF_DATA[buf_var]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var))
         buf_data = ""
         return -1
     if buf_size == 0:
         if c.verbose:
-            print "[-] EMUL-ERR dirp buffer is NULL"
+            print("[-] EMUL-ERR dirp buffer is NULL")
         return -1
 
     count = int(argv[2])
@@ -3230,13 +3230,13 @@ def stat_base(argv, syscall_name, fd):
         path = _get_path(argv[0])
         if path == None:
             if c.verbose:
-                print "[-] EMUL-ERR path not exist"
+                print("[-] EMUL-ERR path not exist")
             return -1
         try:
             id = c.DENTRY[path]
         except KeyError:
             if c.verbose:
-                print "[-] EMUL-ERR file {0} does not exist".format(path)
+                print("[-] EMUL-ERR file {0} does not exist".format(path))
             return -1
         try:
             inode = c.MEM[id]
@@ -3247,7 +3247,7 @@ def stat_base(argv, syscall_name, fd):
         inode = _get_inode_of_fd(fd)
         if inode == -1:
             if c.verbose:
-                print "[-] EMUL-ERR invalid fd {}".format(fd)
+                print("[-] EMUL-ERR invalid fd {}".format(fd))
             return -1
 
     try:
@@ -3256,19 +3256,19 @@ def stat_base(argv, syscall_name, fd):
         buf_data = c.BUF_DATA[buf_var]
     except KeyError:
         if c.verbose:
-            print "[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var)
+            print("[-] EMUL-ERR buffer variable {0} is not initialized".format(buf_var))
         buf_data = ""
         return -1
     if buf_size == 0:
         if c.verbose:
-            print "[-] EMUL-ERR dirp buffer is NULL"
+            print("[-] EMUL-ERR dirp buffer is NULL")
         return -1
 
     if inode.type == c.SYMLINK and syscall_name != "lstat":
         _, inode = _resolve_symlink_path(path, inode, [])
         if inode == -1:
             if c.verbose:
-                print "[-] EMUL-ERR failed to resolve the symlink path"
+                print("[-] EMUL-ERR failed to resolve the symlink path")
             return -1
 
     """

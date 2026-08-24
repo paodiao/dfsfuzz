@@ -17,12 +17,12 @@ def _print_hex(s):
         if (i+1) % 16 == 0:
             p += "  "
         if (i+1) % 64 == 0:
-            print p
+            print(p)
             p = ""
     if len(s) < 64:
-        print p
+        print(p)
     elif p != "":
-        print p
+        print(p)
 
 
 def check_child_exist(inode, inumlist, ret_on_err=0, print_err=1):
@@ -36,7 +36,7 @@ def check_child_exist(inode, inumlist, ret_on_err=0, print_err=1):
             errstr = "*** [META] missing child {0} of dir {1} ({2})".format(
                     child_name, inode.name, inode.id)
             if print_err:
-                print errstr
+                print(errstr)
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
             return 1
@@ -44,26 +44,30 @@ def check_child_exist(inode, inumlist, ret_on_err=0, print_err=1):
 
 def check_meta(inode, entry, ret_on_err=0, print_err=1):
     global BTRFS_ERRSTR
+    # hmdfs 适配：远程视图 stat 为简化值（cached getattr 不填 nlink、
+    # mode 权限位硬编码 0660/0751），跨节点不保证一致——跳过这两个字段
+    # 的对比（与 CSAN compareFileMeta 的筛选依据一致）。其他 FS 保持原校验。
+    is_hmdfs = (c.FSTYPE == "hmdfs")
 
     # print inode.id, inode.name, inode.u_name, inode.mode, inode.size
     # lcnt
-    if inode.type != c.DIR:
+    if not is_hmdfs and inode.type != c.DIR:
         if inode.linkcnt != int(entry[c.IDX_NLINK]):
             errstr = "*** [META] Link count mismatch in {0} {1} linkcnt: em {2} vs ex {3}".format(
                     c.TYPESTR[inode.type], str(inode.name), inode.linkcnt, int(entry[c.IDX_NLINK]))
             if print_err:
-                print errstr
+                print(errstr)
             BTRFS_ERRSTR += errstr + "\n"
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
             return 1
 
     # mode
-    if inode.mode & 0777 != int(entry[c.IDX_MODE], 8) & 0777:
+    if not is_hmdfs and inode.mode & 0o777 != int(entry[c.IDX_MODE], 8) & 0o777:
         errstr = "*** [META] Mode mismatch in {0} {1} mode: em {2} vs ex {3}".format(
                 c.TYPESTR[inode.type], str(inode.name), oct(inode.mode), oct(int(entry[c.IDX_MODE], 8)))
         if print_err:
-            print errstr
+            print(errstr)
         BTRFS_ERRSTR += errstr + "\n"
         # if not c.REGTEST:
         #    c.FP_LOG.write(errstr + "\n")
@@ -75,7 +79,7 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
             errstr = "*** [META] Size mismatch in {0} {1} size: em {2} vs ex {3}".format(
                     c.TYPESTR[inode.type], str(inode.name), inode.size, entry[c.IDX_SIZE])
             if print_err:
-                print errstr
+                print(errstr)
             BTRFS_ERRSTR += errstr + "\n"
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
@@ -86,7 +90,7 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
             if ret_on_err:
                 errstr = "*** [META] Num blocks mismatch in {0} {1}: em {2} vs ex {3}".format(
                         c.TYPESTR[inode.type], str(inode.name), inode.numblk, entry[c.IDX_BLOCKS])
-                print errstr
+                print(errstr)
                 BTRFS_ERRSTR += errstr + "\n"
                 if not c.REGTEST:
                     c.FP_LOG.write(errstr + "\n")
@@ -98,7 +102,7 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
     xattr_crashed = entry[c.IDX_XATTR]
     xattr_crashed_list = xattr_crashed.split(";")
     # pat_xattr = re.compile("(\w+[.]\w+): {1}(.*?), {1}", re.DOTALL)
-    pat_xattr = re.compile("([\w.]+):(.*)", re.DOTALL)
+    pat_xattr = re.compile(r"([\w.]+):(.*)", re.DOTALL)
     black_list = ["system.nfs4_acl"]
     if pat_xattr.match(xattr_crashed):
         # found = pat_xattr.findall(xattr_crashed)
@@ -111,7 +115,7 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
                 errstr = "*** [META] Missing xattr {0} in {1} {2}".format(
                         tup[0], c.TYPESTR[inode.type], str(inode.name))
                 if print_err:
-                    print errstr
+                    print(errstr)
                 BTRFS_ERRSTR += errstr + "\n"
                 # if not c.REGTEST:
                 #    c.FP_LOG.write(errstr + "\n")
@@ -129,7 +133,7 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
                 else:
                     idx = len_eval
 
-                for i in xrange(idx):
+                for i in range(idx):
                     if ord(emul_xattr_val[i]) != ord(crash_xattr_val[i]):
                         errflag = 1
                         break
@@ -138,14 +142,14 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
                     errstr = u"*** [META] Wrong value for xattr {0} in {1} {2}".format(
                             tup[0], c.TYPESTR[inode.type], str(inode.name))
                     if print_err:
-                        print errstr
+                        print(errstr)
                     BTRFS_ERRSTR += errstr + "\n"
                     # if not c.REGTEST:
                     #    c.FP_LOG.write(errstr + "\n")
                     if c.verbose:
-                        print "emulated xattr:"
+                        print("emulated xattr:")
                         _print_hex(emul_xattr_val)
-                        print "recovered xattr:"
+                        print("recovered xattr:")
                         _print_hex(crash_xattr_val)
                     return 1
     return 0
@@ -159,7 +163,7 @@ def check_symlink(inode, entry, ret_on_err=0, print_err=1):
         errstr = "*** [META] Symlink target mismatch in {0}: em {1} vs ex {2}".format(
                 str(inode.name), inode.target, entry[c.IDX_SYMTARGET])
         if print_err:
-            print errstr
+            print(errstr)
         BTRFS_ERRSTR += errstr + "\n"
         # if not c.REGTEST:
         #    c.FP_LOG.write(errstr + "\n")
@@ -186,7 +190,7 @@ def check_data(inode, entry, ret_on_err=0, print_err=1):
         errstr = "*** [DATA] Inconsistency in {0} {1}: em {2} vs ex {3}".format(
                 c.TYPESTR[inode.type], str(inode.name), crc_emul, crc_crash)
         if print_err:
-            print errstr
+            print(errstr)
         BTRFS_ERRSTR += errstr + "\n"
         # if not c.REGTEST:
         #    c.FP_LOG.write(errstr + "\n")
@@ -217,7 +221,7 @@ def _dfs_traverse(tup, pers, stack, entry_list, level=0):
         meta = 1
 
     if c.verbose:
-        print "\t"*level, "digging", tup, pers, meta, stackcpy
+        print("\t"*level, "digging", tup, pers, meta, stackcpy)
     # pers: if current tuple's parent persisted it
     # meta: if current tuple's metadata has been persisted
     newlist = [stackcpy, pers, meta, inode]
@@ -227,7 +231,7 @@ def _dfs_traverse(tup, pers, stack, entry_list, level=0):
 
     for ci, ch in enumerate(children):
         if c.verbose:
-            print "\t"*level, "ch {0}/{1}: {2}".format(ci+1, len(children), ch)
+            print("\t"*level, "ch {0}/{1}: {2}".format(ci+1, len(children), ch))
         if ch in inode.p_children:
             pers = 1
         else:
@@ -277,7 +281,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
         # find all dependencies and add in list
         cur_path = _create_path(pathlist)
         if c.verbose:
-            print "Finding dependencies of", inum, cur_path,  ":", inode.u_name
+            print("Finding dependencies of", inum, cur_path,  ":", inode.u_name)
         for hist in inode.u_name:
             if hist[1] == name:
                 idx = 1
@@ -328,7 +332,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
                 deps.remove(perm)
     """
     if c.verbose:
-        print "DEPS:", deps
+        print("DEPS:", deps)
 
     # only ONE of the directory entries in each list element should exist.
     # we're gonna check that first in the recovered image metadata
@@ -399,10 +403,10 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
                     pass
 
     if c.verbose:
-        print "FINAL LIST OF ENTRIES"
+        print("FINAL LIST OF ENTRIES")
     for entry in entry_list_final:
         if c.verbose:
-            print entry
+            print(entry)
         inum = entry[0][-1][0]
         name = entry[0][-1][1]
         if name == ".":
@@ -431,7 +435,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
     found_bug = 0
 
     if c.verbose:
-        print "Testing case 1: name and meta persisted"
+        print("Testing case 1: name and meta persisted")
     # case 1: both name and meta persisted
     # Check name's existence and its metadata consistency
     # - Name should be in the image with correct metadata
@@ -440,7 +444,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
         pathlist = entry[0]
         path = _create_path(pathlist)
         if c.verbose:
-            print path
+            print(path)
         inode = entry[3]
 
         flag = 0
@@ -458,13 +462,13 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
             else:
                 typestr = "file"
             errstr = "*** [META] Missing {0}: {1}".format(typestr, path)
-            print errstr
+            print(errstr)
             found_bug += 1
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
 
     if c.verbose:
-        print "Testing case 2: only name persisted"
+        print("Testing case 2: only name persisted")
     # Case 2: only name persisted
     # Check name's existence but don't need to check metadata inconsistency
     # - If name is not found, that is a bug
@@ -472,7 +476,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
         pathlist = entry[0]
         path = _create_path(pathlist)
         if c.verbose:
-            print path
+            print(path)
         inode = entry[3]
 
         flag = 0
@@ -485,7 +489,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
             else:
                 typestr = "file"
             errstr = "*** [META] Missing {0}: {1}".format(typestr, path)
-            print errstr
+            print(errstr)
             found_bug += 1
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
@@ -506,7 +510,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
     dup_grp = {}
 
     if c.verbose:
-        print "Testing case 3: only metadata persisted"
+        print("Testing case 3: only metadata persisted")
     # Case 3: only metadata persisted
     # Search name first.
     # - If name is found in the image, then check metadata
@@ -515,7 +519,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
         pathlist = entry[0]
         path = _create_path(pathlist)
         if c.verbose:
-            print path
+            print(path)
         inode = entry[3]
         perm = entry[1]
         meta = entry[2]
@@ -551,14 +555,14 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
 
     for gid in dup_grp:
         if 0 not in dup_grp[gid]:
-            print "Entry", dup_path_list[gid], "is not consistent:"
+            print("Entry", dup_path_list[gid], "is not consistent:")
             found_bug += 1
             entries = path_entry_map[dup_path_list[gid]]
 
             for ei, entry in enumerate(entries):
                 pathlist = entry[0]
                 path = _create_path(pathlist)
-                print "Case {0}".format(ei+1, path)
+                print("Case {0}".format(ei+1, path))
                 inode = entry[3]
                 for img_entry in METADATA:
                     if img_entry[0] == path:
@@ -570,7 +574,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
 
     # Case 4: nothing's persisted
     if c.verbose:
-        print "Testing case 4: neither metadata and names are not persisted"
+        print("Testing case 4: neither metadata and names are not persisted")
     ret = 0
     for entry in noname_nometa:
         pathlist = entry[0]
@@ -595,7 +599,7 @@ def test_fs_history(list_inum_ondisk, METADATA, sd):
     if ret > 0:
         found_bug += 1
         if c.verbose:
-            print "metadata or data check error in testing case 4"
+            print("metadata or data check error in testing case 4")
 
     # No test needed for these entries.
     if found_bug > 0 :
@@ -617,7 +621,7 @@ def test_fs_inum(list_inum_ondisk, METADATA, sd):
             continue
         found = 0
         if c.verbose:
-            print iid, c.DISK[iid].name
+            print(iid, c.DISK[iid].name)
 
         for entry in METADATA:
             if int(entry[c.IDX_INUM]) == iid:
@@ -648,9 +652,9 @@ def test_fs_inum(list_inum_ondisk, METADATA, sd):
                 cnt += 1
         if cnt == len(errlist):
             if test_self_consistency(METADATA, print_err=0):
-                print BTRFS_ERRSTR
+                print(BTRFS_ERRSTR)
         else:
-            print BTRFS_ERRSTR
+            print(BTRFS_ERRSTR)
 '''
 
 def test_self_consistency(METADATA, print_err=1):
@@ -668,7 +672,7 @@ def test_self_consistency(METADATA, print_err=1):
             err_cnt += 1
 
             if print_err:
-                print errstr
+                print(errstr)
 
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")

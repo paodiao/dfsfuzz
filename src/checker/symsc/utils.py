@@ -8,7 +8,7 @@ import re
 
 def init_state(prog, node_cnt):
     if c.verbose:
-        print "Initialize file system state"
+        print("Initialize file system state")
 
     state = {
         "BUF_DATA": {},
@@ -26,7 +26,7 @@ def init_state(prog, node_cnt):
     }
 
     # Root inode
-    inode = c.Inode(id=0, name=".", type=c.DIR, mode=0755, size=6, path=".")
+    inode = c.Inode(id=0, name=".", type=c.DIR, mode=0o755, size=6, path=".")
     state["DISK"][0] = inode
     state["DENTRY"]["."] = 0
 
@@ -48,19 +48,19 @@ def init_img(fifofile=True):
     """
     For compatibility with JANUS..
     Call this method if we have to run fuzzer
-    with the sample image (samples/oracle/btrfs-00.image)
+    with the sample image (samples/oracle/btrfs-0o0.image)
     e.g., ./combined/afl-syscall/afl-fuzz
           -S slave1 -i i3 -o o3 -u 11 -m none
           -- lkl/tools/lkl/combined-consistency
           -t btrfs
-          -i samples/oracle/btrfs-00.image
+          -i samples/oracle/btrfs-0o0.image
           -e emulator/emulator.py
           -p @@
     """
     if c.verbose:
-        print "Initialize base img"
+        print("Initialize base img")
 
-    inode = c.Inode(id=0, name=".", type=c.DIR, mode=0755, size=6)
+    inode = c.Inode(id=0, name=".", type=c.DIR, mode=0o755, size=6)
     c.DISK[0] = inode
     c.DENTRY["."] = 0
 
@@ -80,7 +80,7 @@ def init_img(fifofile=True):
     inum_fifo  = inum_baz + 4
     inum_sln   = inum_baz + 5
 
-    inode = c.Inode(id=inum_foo, name="foo", type=c.DIR, mode=0755, size=6)
+    inode = c.Inode(id=inum_foo, name="foo", type=c.DIR, mode=0o755, size=6)
     c.DISK[inode.id] = inode
     c.DENTRY["./foo"] = inode.id
     tup = (inode.id, "foo")
@@ -89,7 +89,7 @@ def init_img(fifofile=True):
     c.DISK[0].persist_children()
     c.FT.add_node(tup, tup_parent)
 
-    inode = c.Inode(id=inum_bar, name="bar", type=c.DIR, mode=0755, size=54)
+    inode = c.Inode(id=inum_bar, name="bar", type=c.DIR, mode=0o755, size=54)
     c.DISK[inode.id] = inode
     c.DENTRY["./foo/bar"] = inode.id
     tup = (inode.id, "bar")
@@ -98,7 +98,7 @@ def init_img(fifofile=True):
     c.DISK[inum_foo].persist_children()
     c.FT.add_node(tup, tup_parent)
 
-    inode = c.Inode(id=inum_baz, name="baz", type=c.FILE, mode=0644, size=12)
+    inode = c.Inode(id=inum_baz, name="baz", type=c.FILE, mode=0o644, size=12)
     inode.datablock.data = "hello world\n"
     c.DISK[inode.id] = inode
     c.DENTRY["./foo/bar/baz"] = inode.id
@@ -115,7 +115,7 @@ def init_img(fifofile=True):
         c.DISK[inum_bar].add_child(tup)
         c.FT.add_node(tup, tup_parent)
 
-    inode = c.Inode(id=inum_xattr, name="xattr", type=c.FILE, mode=0644, size=0)
+    inode = c.Inode(id=inum_xattr, name="xattr", type=c.FILE, mode=0o644, size=0)
     inode.xattr["user.mime_type"] = "text/plain"
     c.DISK[inode.id] = inode
     inode.datablock.data = ""
@@ -125,7 +125,7 @@ def init_img(fifofile=True):
     c.DISK[inum_bar].add_child(tup)
     c.FT.add_node(tup, tup_parent)
 
-    inode = c.Inode(id=inum_acl, name="acl", type=c.FILE, mode=0644, size=0)
+    inode = c.Inode(id=inum_acl, name="acl", type=c.FILE, mode=0o644, size=0)
     inode.xattr["system.posix_acl_access"] = "\x02"
     c.DISK[inode.id] = inode
     inode.datablock.data = ""
@@ -135,7 +135,7 @@ def init_img(fifofile=True):
     c.DISK[inum_bar].add_child(tup)
     c.FT.add_node(tup, tup_parent)
 
-    inode = c.Inode(id=inum_aoa, name="æøå", type=c.FILE, mode=0644, size=4)
+    inode = c.Inode(id=inum_aoa, name="æøå", type=c.FILE, mode=0o644, size=4)
     c.DISK[inode.id] = inode
     inode.datablock.data = "xyz\n"
     c.DENTRY["./foo/bar/æøå"] = inode.id
@@ -145,7 +145,7 @@ def init_img(fifofile=True):
     c.FT.add_node(tup, tup_parent)
 
     if fifofile:
-        inode = c.Inode(id=inum_fifo, name="fifo", type=c.FIFO, mode=0644, size=0)
+        inode = c.Inode(id=inum_fifo, name="fifo", type=c.FIFO, mode=0o644, size=0)
         c.DISK[inode.id] = inode
         c.DENTRY["./foo/bar/fifo"] = inode.id
         tup = (inode.id, "fifo")
@@ -155,7 +155,7 @@ def init_img(fifofile=True):
     else:
         if c.FSTYPE == c.BTRFS:
             inum_fifo = 265
-        inode = c.Inode(id=inum_fifo, name="fifo", type=c.FILE, mode=0644, size=0)
+        inode = c.Inode(id=inum_fifo, name="fifo", type=c.FILE, mode=0o644, size=0)
         c.DISK[inode.id] = inode
         c.DENTRY["./foo/bar/fifo"] = inode.id
         tup = (inode.id, "fifo")
@@ -164,7 +164,7 @@ def init_img(fifofile=True):
         c.FT.add_node(tup, tup_parent)
 
     if c.FSTYPE != c.VFAT:
-        inode = c.Inode(id=inum_sln, name="sln", type=c.SYMLINK, mode=0777, size=15)
+        inode = c.Inode(id=inum_sln, name="sln", type=c.SYMLINK, mode=0o777, size=15)
         c.DISK[inode.id] = inode
         inode.target = "mnt/foo/bar/baz"
         c.DENTRY["./foo/bar/sln"] = inode.id
@@ -183,12 +183,12 @@ def init_img(fifofile=True):
     # for iid in c.DISK:
     #     print iid, c.DISK[iid].name, c.DISK[iid].children
     if c.verbose:
-        print c.DENTRY
+        print(c.DENTRY)
         c.FT.display((0, "."))
     '''
 
 def init_mutated_img(statfile):
-    inode = c.Inode(id=0, name=".", type=c.DIR, mode=0755, size=6)
+    inode = c.Inode(id=0, name=".", type=c.DIR, mode=0o755, size=6)
     c.DISK[0] = inode
     c.DENTRY["."] = 0
 
@@ -217,20 +217,20 @@ def init_mutated_img(statfile):
             STAT[cur_idx-offset][-1] += "\x0a" + "\x0a".join(entry)
             STAT[cur_idx] = [""]
 
-    for i in xrange(STAT.count([""])):
+    for i in range(STAT.count([""])):
         STAT.remove([""])
 
     # initialize data structure using STAT info!
     for entry in STAT:
-        print entry
+        print(entry)
 
 
-p_var_str = re.compile("(v[0-9]+)\[\].*\"(.*)\"")
+p_var_str = re.compile(r"(v[0-9]+)\[\].*\"(.*)\"")
 p_var_fd = re.compile("(v[0-9]+);")
-p_var_buf = re.compile("(v[0-9]+)\[([0-9]+)\]")
-p_arg = re.compile("\((.*)\)")
+p_var_buf = re.compile(r"(v[0-9]+)\[([0-9]+)\]")
+p_arg = re.compile(r"\((.*)\)")
 #
-p_var_def = re.compile("(v[0-9]+)\[([0-9]*)\] *(= *\"(.*)\"| *)")
+p_var_def = re.compile(r"(v[0-9]+)\[([0-9]*)\] *(= *\"(.*)\"| *)")
 # p_var_def = re.compile("(v[0-9]+)\[([0-9]*)\].*\"(.*)\"")
 
 def parse_var_assignment(line, state):
@@ -238,7 +238,7 @@ def parse_var_assignment(line, state):
     m_var = p_var_str.search(line)
     var_name = m_var.group(1)
     var_value = m_var.group(2)
-    print "parse_var_assignment", var_name, var_value
+    print("parse_var_assignment", var_name, var_value)
     state["VAR_STACK"][var_name] = var_value
 
 def parse_buf(line, state):
@@ -320,11 +320,11 @@ def parse_wrapper(line, state):
     line = line.strip()
     if c.verbose:
         if c.SHOWDATA:
-            print line
+            print(line)
         elif "memcpy" not in line:
-            print line
+            print(line)
         elif "memcpy" in line:
-            print line.split(",")[0] + ", \"DATA (-d to see)\");"
+            print(line.split(",")[0] + ", \"DATA (-d to see)\");")
     if "syscall" in line:
         parse_call(line)
     elif line.endswith(";"):
@@ -377,16 +377,16 @@ def _pretty_print_data(data):
 
     for key in sorted(ddict):
         if key in ni:
-            print "\\x00*{0}".format(ddict[key]),
+            print("\\x00*{0}".format(ddict[key]), end=" ")
         else:
-            print data[key:key+ddict[key]],
-    print ""
+            print(data[key:key+ddict[key]], end=" ")
+    print("")
 
 
 def _show_inode_info(inode):
-    print "inode id:", inode.id
-    print "- name  :", inode.name
-    print "- hist  :", inode.u_name
+    print("inode id:", inode.id)
+    print("- name  :", inode.name)
+    print("- hist  :", inode.u_name)
     if inode.type == c.FILE:
         typestr = "Regular file"
     elif inode.type == c.DIR:
@@ -395,27 +395,27 @@ def _show_inode_info(inode):
         typestr = "Symbolic link"
     elif inode.type == c.FIFO:
         typestr = "FIFO file"
-    print "- type  :", typestr
-    print "- isize :", inode.size
-    print "- link  :", inode.linkcnt
-    print "- mode  :", oct(inode.mode)
+    print("- type  :", typestr)
+    print("- isize :", inode.size)
+    print("- link  :", inode.linkcnt)
+    print("- mode  :", oct(inode.mode))
     if inode.xattr:
-        print "- xattr :", inode.xattr
+        print("- xattr :", inode.xattr)
     if inode.type == c.FILE:
-        print "- blocks: {0}".format(inode.numblk)
-        print "- data  : {0} bytes".format(len(inode.datablock.data))
+        print("- blocks: {0}".format(inode.numblk))
+        print("- data  : {0} bytes".format(len(inode.datablock.data)))
         if c.SHOWDATA:
             _pretty_print_data(inode.datablock.data)
 
     elif inode.type == c.DIR:
         try:
-            print "- child :", c.FT[(inode.id, inode.name[0])][0].children
-            print "- old_child :", c.FT[(inode.id, inode.name[0])][0].old_children
+            print("- child :", c.FT[(inode.id, inode.name[0])][0].children)
+            print("- old_child :", c.FT[(inode.id, inode.name[0])][0].old_children)
         except:
-            print "(removed)"
+            print("(removed)")
     elif inode.type == c.SYMLINK:
-        print "- symlink target :", inode.target
-    print ""
+        print("- symlink target :", inode.target)
+    print("")
 
 
 def zero_terminiated_str(string):
