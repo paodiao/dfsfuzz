@@ -81,6 +81,9 @@ static long syz_net_down_sleep_up(volatile long usec) {
 
 #if SYZ_EXECUTOR || __NR_syz_failure_net_down || __NR_syz_failure_net_up || __NR_syz_net_delay_add || __NR_syz_net_delay_del
 #include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <string.h>
 
 static long syz_failure_net_down(volatile char *cmd) {
   debug_cmd((const char *)cmd);
@@ -90,9 +93,25 @@ static long syz_failure_net_down(volatile char *cmd) {
 }
 
 static long syz_failure_net_up() {
-  debug_cmd("iptables -F; iptables -S;sleep 2s");
-  // system("iptables -F; sleep 2s; LD_PRELOAD=/root/dfs-fuzzing/libucov.so
-  // gluster vol heal test-volume"); usleep(2000000);
+  debug_cmd("iptables -F; iptables -S");
+  // Notify the hmdfs_agent that the network is back so it can reconnect
+  // any OFFLINE nodes (the agent listens on a unix socket; failure is
+  // harmless and only logged via the silent path below).
+  int s = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (s >= 0) {
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, "/tmp/hmdfs-netup.sock", sizeof(a.sun_path) - 1);
+    if (connect(s, (struct sockaddr *)&a, sizeof(a)) == 0) {
+      char sig = 'N';
+      send(s, &sig, 1, MSG_NOSIGNAL);   // avoid SIGPIPE if the agent closed the connection
+    }
+    close(s);
+  }
+  // Wait for the agent to finish reconnecting (separated from iptables -F
+  // so the wait actually covers the reconnect window).
+  usleep(2000000);
   return 0;
 }
 

@@ -37,6 +37,7 @@
 #include <sys/time.h>  // 提供gettimeofday函数支持
 #include <linux/tcp.h>
 #include <poll.h>
+#include <sys/un.h>
 
 /* 定义小端序类型 - 兼容内核模块中的类型定义 */
 typedef uint16_t __le16;
@@ -126,6 +127,7 @@ typedef struct {
     time_t last_heartbeat;       // 上次心跳时间
     time_t last_update;          // 上次状态更新时间
     int fd;                      // 连接文件描述符
+    volatile int connecting;     // 重连进行中（防止多线程重复 connect）
 } remote_node;
 
 /* 客户端连接结构体 */
@@ -197,7 +199,7 @@ int g_watch_fd = -1;
 char g_cmd_file_path[PATH_MAX];
 //peer_connection *g_connections = NULL;
 int g_connection_count = 0;
-int g_running = 1;
+volatile int g_running = 1;
 
 /* 心跳检测相关变量 */
 pthread_t g_heartbeat_thread = 0; // 心跳检测线程ID
@@ -208,6 +210,11 @@ pthread_t g_connector_thread = 0;
 pthread_t g_notify_handler_thread = 0;
 pthread_t g_connect_checker_thread = 0;
 pthread_t g_sysfs_checker_thread = 0;
+pthread_t g_netup_listener_thread = 0;
+volatile int g_netup_srv_fd = -1;   /* netup unix socket fd, closed by signal handler to wake accept */
+
+/* executor 的 syz_failure_net_up 通过此 unix socket 通知 agent 网络已恢复 */
+#define NETUP_SOCK_PATH "/tmp/hmdfs-netup.sock"
 
 /* 互斥锁 */
 pthread_mutex_t g_connection_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -709,6 +716,125 @@ int connect_to_remote_node(remote_node *node) {
     return sockfd;
 }
 
+/* Try to reconnect a single node. Mutual exclusion is handled by the caller
+ * via node->connecting. Returns 0 on success, -1 on failure.
+ */
+static int try_reconnect_node(remote_node *node) {
+    pthread_mutex_lock(&g_device_mutex);
+    // Self-managed mutual exclusion: another reconnect (netup worker or
+    // GET_SESSION branch) is in progress for this node.
+    if (node->connecting) {
+        pthread_mutex_unlock(&g_device_mutex);
+        return -1;
+    }
+    node->connecting = 1;
+    pthread_mutex_unlock(&g_device_mutex);
+
+    int remote_fd = connect_to_remote_node(node);
+
+    pthread_mutex_lock(&g_device_mutex);
+    node->connecting = 0;
+    if (remote_fd >= 0) {
+        update_socket_param cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.cmd = CMD_UPDATE_SOCKET;
+        cmd.newfd = remote_fd;
+        cmd.devsl = 3;
+        cmd.status = SOCKET_STAT_OPEN; // active connection
+        memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
+        memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
+        if (send_update_socket_cmd(&cmd) < 0) {
+            log_message(LOG_LEVEL_ERROR, "Failed to send UPDATE_SOCKET cmd for node %s", node->cid);
+            close(remote_fd);
+            update_device_status(node, DEVICE_STATUS_OFFLINE);
+            pthread_mutex_unlock(&g_device_mutex);
+            return -1;
+        }
+        log_message(LOG_LEVEL_INFO, "Sent UPDATE_SOCKET cmd to HMDFS for node %s, fd=%d", node->cid, remote_fd);
+        node->fd = remote_fd;
+        update_device_status(node, DEVICE_STATUS_CONNECTED);
+        pthread_mutex_unlock(&g_device_mutex);
+        return 0;
+    }
+    // Reconnect failed: normalize to OFFLINE so a later netup signal can retry.
+    log_message(LOG_LEVEL_INFO, "Reconnect failed for node %s, mark OFFLINE", node->cid);
+    update_device_status(node, DEVICE_STATUS_OFFLINE);
+    pthread_mutex_unlock(&g_device_mutex);
+    return -1;
+}
+
+
+static void *netup_reconnect_worker(void *arg) {
+    remote_node *node = (remote_node *)arg;
+    try_reconnect_node(node);
+    return NULL;
+}
+
+/* Listen for the net-up signal from the executor (syz_failure_net_up) and
+ * reconnect all OFFLINE nodes in parallel. Event-driven: blocking accept,
+ * close(srv) wakes it on shutdown. The socket file is created here (bind).
+ */
+void *netup_listener_thread_func(void *arg) {
+    unlink(NETUP_SOCK_PATH);
+    int srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) {
+        log_message(LOG_LEVEL_ERROR, "netup listener: socket failed: %s", strerror(errno));
+        return NULL;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, NETUP_SOCK_PATH, sizeof(addr.sun_path) - 1);
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_message(LOG_LEVEL_ERROR, "netup listener: bind failed: %s", strerror(errno));
+        close(srv);
+        return NULL;
+    }
+    chmod(NETUP_SOCK_PATH, 0666);
+    listen(srv, 8);
+    g_netup_srv_fd = srv;
+    log_message(LOG_LEVEL_INFO, "netup listener started on %s", NETUP_SOCK_PATH);
+
+    while (g_running) {
+        int cfd = accept(srv, NULL, NULL);
+        if (cfd < 0) {
+            if (errno == EINTR)
+                continue;
+            if (!g_running)
+                break;
+            usleep(10000);
+            continue;
+        }
+        char sig;
+        int n = read(cfd, &sig, 1);
+        close(cfd);
+        if (n <= 0)
+            continue;
+        log_message(LOG_LEVEL_INFO, "netup signal received, reconnecting offline nodes");
+        for (int i = 0; i < g_config.node_count; i++) {
+            remote_node *node = &g_config.nodes[i];
+            int need = 0;
+            pthread_mutex_lock(&g_device_mutex);
+            if (node->fd == -1 && node->status == DEVICE_STATUS_OFFLINE && !node->connecting)
+                need = 1;
+            pthread_mutex_unlock(&g_device_mutex);
+            if (need) {
+                pthread_t th;
+                if (pthread_create(&th, NULL, netup_reconnect_worker, node) == 0)
+                    pthread_detach(th);
+            }
+        }
+    }
+
+    if (g_netup_srv_fd == srv) {   // signal handler may have closed it already
+        g_netup_srv_fd = -1;
+        close(srv);
+    }
+    unlink(NETUP_SOCK_PATH);
+    log_message(LOG_LEVEL_INFO, "netup listener stopped");
+    return NULL;
+}
+
 /* 向HMDFS发送更新套接字命令 */
 int send_update_socket_cmd(const update_socket_param *cmd) {
     int fd = open(g_cmd_file_path, O_WRONLY);
@@ -1073,85 +1199,89 @@ void HandleAllNotify(int fd) {
         switch (param.notify) {
             case NOTIFY_GET_SESSION: {
                 log_message(LOG_LEVEL_INFO, "Handling NOTIFY_GET_SESSION for CID %s", cid_str);
-            
-                // 检查是否为空CID请求（查找所有远程节点）
+                update_socket_param cmd;
+                // Empty CID: reconnect all configured remote nodes
                 if (strlen(cid_str) == 0) {
                     log_message(LOG_LEVEL_INFO, "No specific CID provided, connecting to all configured remote nodes");
-                
-                    // 遍历所有配置的远程节点
                     for (int i = 0; i < g_config.node_count; i++) {
                         remote_node *node = &g_config.nodes[i];
                         pthread_mutex_lock(&g_device_mutex);
-                        // 连接真实存活则跳过；stale fd 先清理再重连
-                        if (node->fd != -1 && socketConnected(node->fd) == 1) {
+                        // Mutual exclusion with the netup reconnect workers
+                        if (node->connecting) {
                             pthread_mutex_unlock(&g_device_mutex);
                             continue;
                         }
-                        if (node->fd != -1) { // stale fd, 清理后重连
+                        if (node->fd != -1) { // stale fd, close and reconnect
                             close(node->fd);
                             node->fd = -1;
                         }
-                        // 建立到远程节点的连接
+                        node->connecting = 1;
+                        // Kernel decided the connection must be rebuilt (GET_SESSION),
+                        // so reconnect unconditionally (do not trust user-space TCP state).
                         int remote_fd = connect_to_remote_node(node);
+                        if (remote_fd >= 0) {
+                            memset(&cmd, 0, sizeof(cmd));
+                            cmd.cmd = CMD_UPDATE_SOCKET;
+                            cmd.newfd = remote_fd;
+                            cmd.devsl = 3;
+                            cmd.status = SOCKET_STAT_OPEN; // active connection
+                            memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
+                            memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
+                            if (send_update_socket_cmd(&cmd) < 0) {
+                                log_message(LOG_LEVEL_ERROR, "Failed to send UPDATE_SOCKET cmd for node %s", node->cid);
+                                close(remote_fd);
+                                update_device_status(node, DEVICE_STATUS_OFFLINE);
+                            } else {
+                                log_message(LOG_LEVEL_INFO, "Sent UPDATE_SOCKET cmd to HMDFS for node %s, fd=%d", node->cid, remote_fd);
+                                node->fd = remote_fd;
+                                update_device_status(node, DEVICE_STATUS_CONNECTED);
+                            }
+                        } else {
+                            // Reconnect failed: normalize to OFFLINE so a later
+                            // netup signal can pick the node up again.
+                            log_message(LOG_LEVEL_INFO, "Reconnect failed for node %s, mark OFFLINE", node->cid);
+                            update_device_status(node, DEVICE_STATUS_OFFLINE);
+                        }
+                        node->connecting = 0;
+                        pthread_mutex_unlock(&g_device_mutex);
+                    }
+                } else {
+                    // Specific CID request
+                    remote_node *node = find_remote_node(cid_str);
+                    if (node) {
+                        pthread_mutex_lock(&g_device_mutex);
+                        if (node->connecting) {
+                            pthread_mutex_unlock(&g_device_mutex);
+                            log_message(LOG_LEVEL_INFO, "Node %s reconnecting, skip", node->cid);
+                        } else {
+                            if (node->fd != -1) { // stale fd, close and reconnect
+                                close(node->fd);
+                                node->fd = -1;
+                            }
+                            node->connecting = 1;
+                            int remote_fd = connect_to_remote_node(node);
                             if (remote_fd >= 0) {
-                                // 准备更新套接字命令
                                 memset(&cmd, 0, sizeof(cmd));
                                 cmd.cmd = CMD_UPDATE_SOCKET;
                                 cmd.newfd = remote_fd;
                                 cmd.devsl = 3;
-                                cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
+                                cmd.status = SOCKET_STAT_OPEN;
                                 memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
                                 memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
-                            
-                                // 发送命令给HMDFS模块
                                 if (send_update_socket_cmd(&cmd) < 0) {
                                     log_message(LOG_LEVEL_ERROR, "Failed to send UPDATE_SOCKET cmd for node %s", node->cid);
                                     close(remote_fd);
+                                    update_device_status(node, DEVICE_STATUS_OFFLINE);
                                 } else {
                                     log_message(LOG_LEVEL_INFO, "Sent UPDATE_SOCKET cmd to HMDFS for node %s, fd=%d", node->cid, remote_fd);
                                     node->fd = remote_fd;
                                     update_device_status(node, DEVICE_STATUS_CONNECTED);
                                 }
+                            } else {
+                                log_message(LOG_LEVEL_INFO, "Reconnect failed for node %s, mark OFFLINE", node->cid);
+                                update_device_status(node, DEVICE_STATUS_OFFLINE);
                             }
-                        pthread_mutex_unlock(&g_device_mutex);
-                    }
-                } else {
-                    // 查找匹配的远程节点（特定CID请求）
-                    remote_node *node = find_remote_node(cid_str);
-                
-                    if (node) {
-                        pthread_mutex_lock(&g_device_mutex);
-                        // 连接真实存活则跳过；stale fd 先清理再重连
-                        if (node->fd != -1 && socketConnected(node->fd) == 1) {
-                            pthread_mutex_unlock(&g_device_mutex);
-                            log_message(LOG_LEVEL_INFO, "Node %s already connected, skip", node->cid);
-                        } else {
-                            if (node->fd != -1) { // stale fd, 清理后重连
-                                close(node->fd);
-                                node->fd = -1;
-                            }
-                            // 建立到远程节点的连接
-                            int remote_fd = connect_to_remote_node(node);
-                            if (remote_fd >= 0) {
-                                // 准备更新套接字命令
-                                memset(&cmd, 0, sizeof(cmd));
-                                cmd.cmd = CMD_UPDATE_SOCKET;
-                                cmd.newfd = remote_fd;
-                                cmd.devsl = 3;
-                                cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
-                                memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
-                                memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
-                            
-                                // 发送命令给HMDFS模块
-                                if (send_update_socket_cmd(&cmd) < 0) {
-                                    log_message(LOG_LEVEL_ERROR, "Failed to send UPDATE_SOCKET cmd");
-                                    close(remote_fd);
-                                } else {
-                                    log_message(LOG_LEVEL_INFO, "Sent UPDATE_SOCKET cmd to HMDFS, fd=%d", remote_fd);
-                                    node->fd = remote_fd;
-                                    update_device_status(node, DEVICE_STATUS_CONNECTED);
-                                }
-                            }
+                            node->connecting = 0;
                             pthread_mutex_unlock(&g_device_mutex);
                         }
                     } else {
@@ -1160,7 +1290,7 @@ void HandleAllNotify(int fd) {
                 }
                 break;
             }
-        
+
             case NOTIFY_OFFLINE: {
                 log_message(LOG_LEVEL_INFO, "Handling NOTIFY_OFFLINE for CID %s", cid_str);
                 // 处理设备离线通知
@@ -1205,85 +1335,85 @@ void handle_hmdfs_notify(void) {
     switch (param.notify) {
         case NOTIFY_GET_SESSION: {
             log_message(LOG_LEVEL_INFO, "Handling NOTIFY_GET_SESSION for CID %s", cid_str);
-            
-            // 检查是否为空CID请求（查找所有远程节点）
+            update_socket_param cmd;
+            // Empty CID: reconnect all configured remote nodes
             if (strlen(cid_str) == 0) {
                 log_message(LOG_LEVEL_INFO, "No specific CID provided, connecting to all configured remote nodes");
-                
-                // 遍历所有配置的远程节点
                 for (int i = 0; i < g_config.node_count; i++) {
                     remote_node *node = &g_config.nodes[i];
                     pthread_mutex_lock(&g_device_mutex);
-                    // 连接真实存活则跳过；stale fd 先清理再重连
-                    if (node->fd != -1 && socketConnected(node->fd) == 1) {
+                    // Mutual exclusion with the netup reconnect workers
+                    if (node->connecting) {
                         pthread_mutex_unlock(&g_device_mutex);
                         continue;
                     }
-                    if (node->fd != -1) { // stale fd, 清理后重连
+                    if (node->fd != -1) { // stale fd, close and reconnect
                         close(node->fd);
                         node->fd = -1;
                     }
-                    // 建立到远程节点的连接
+                    node->connecting = 1;
                     int remote_fd = connect_to_remote_node(node);
+                    if (remote_fd >= 0) {
+                        memset(&cmd, 0, sizeof(cmd));
+                        cmd.cmd = CMD_UPDATE_SOCKET;
+                        cmd.newfd = remote_fd;
+                        cmd.devsl = 3;
+                        cmd.status = SOCKET_STAT_OPEN;
+                        memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
+                        memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
+                        if (send_update_socket_cmd(&cmd) < 0) {
+                            log_message(LOG_LEVEL_ERROR, "Failed to send UPDATE_SOCKET cmd for node %s", node->cid);
+                            close(remote_fd);
+                            update_device_status(node, DEVICE_STATUS_OFFLINE);
+                        } else {
+                            log_message(LOG_LEVEL_INFO, "Sent UPDATE_SOCKET cmd to HMDFS for node %s, fd=%d", node->cid, remote_fd);
+                            node->fd = remote_fd;
+                            update_device_status(node, DEVICE_STATUS_CONNECTED);
+                        }
+                    } else {
+                        log_message(LOG_LEVEL_INFO, "Reconnect failed for node %s, mark OFFLINE", node->cid);
+                        update_device_status(node, DEVICE_STATUS_OFFLINE);
+                    }
+                    node->connecting = 0;
+                    pthread_mutex_unlock(&g_device_mutex);
+                }
+            } else {
+                // Specific CID request
+                remote_node *node = find_remote_node(cid_str);
+                if (node) {
+                    pthread_mutex_lock(&g_device_mutex);
+                    if (node->connecting) {
+                        pthread_mutex_unlock(&g_device_mutex);
+                        log_message(LOG_LEVEL_INFO, "Node %s reconnecting, skip", node->cid);
+                    } else {
+                        if (node->fd != -1) { // stale fd, close and reconnect
+                            close(node->fd);
+                            node->fd = -1;
+                        }
+                        node->connecting = 1;
+                        int remote_fd = connect_to_remote_node(node);
                         if (remote_fd >= 0) {
-                            // 准备更新套接字命令
                             memset(&cmd, 0, sizeof(cmd));
                             cmd.cmd = CMD_UPDATE_SOCKET;
                             cmd.newfd = remote_fd;
                             cmd.devsl = 3;
-                            cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
+                            cmd.status = SOCKET_STAT_OPEN;
                             memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
                             memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
-                            
-                            // 发送命令给HMDFS模块
                             if (send_update_socket_cmd(&cmd) < 0) {
                                 log_message(LOG_LEVEL_ERROR, "Failed to send UPDATE_SOCKET cmd for node %s", node->cid);
                                 close(remote_fd);
+                                update_device_status(node, DEVICE_STATUS_OFFLINE);
                             } else {
                                 log_message(LOG_LEVEL_INFO, "Sent UPDATE_SOCKET cmd to HMDFS for node %s, fd=%d", node->cid, remote_fd);
                                 node->fd = remote_fd;
                                 update_device_status(node, DEVICE_STATUS_CONNECTED);
                             }
+                        } else {
+                            log_message(LOG_LEVEL_INFO, "Reconnect failed for node %s, mark OFFLINE", node->cid);
+                            update_device_status(node, DEVICE_STATUS_OFFLINE);
                         }
-                    pthread_mutex_unlock(&g_device_mutex);
-                }
-            } else {
-                // 查找匹配的远程节点（特定CID请求）
-                remote_node *node = find_remote_node(cid_str);
-                
-                if (node) {
-                    pthread_mutex_lock(&g_device_mutex);
-                    // 连接真实存活则跳过；stale fd 先清理再重连
-                    if (node->fd != -1 && socketConnected(node->fd) == 1) {
-                        pthread_mutex_unlock(&g_device_mutex);
-                        log_message(LOG_LEVEL_INFO, "Node %s already connected, skip", node->cid);
-                    } else {
-                        if (node->fd != -1) { // stale fd, 清理后重连
-                            close(node->fd);
-                            node->fd = -1;
-                        }
-                        // 建立到远程节点的连接
-                        int remote_fd = connect_to_remote_node(node);
-                        if (remote_fd >= 0) {
-                            // 准备更新套接字命令
-                            memset(&cmd, 0, sizeof(cmd));
-                            cmd.cmd = CMD_UPDATE_SOCKET;
-                            cmd.newfd = remote_fd;
-                            cmd.devsl = 3;
-                            cmd.status = SOCKET_STAT_OPEN; // 使用官方定义的状态值，主动打开连接
-                            memset(cmd.masterkey, 0, HMDFS_KEY_SIZE);
-                            memcpy(cmd.cid, node->cid, HMDFS_CID_SIZE);
-                            
-                            // 发送命令给HMDFS模块
-                            if (send_update_socket_cmd(&cmd) < 0) {
-                                log_message(LOG_LEVEL_ERROR, "Failed to send UPDATE_SOCKET cmd");
-                                close(remote_fd);
-                            } else {
-                                log_message(LOG_LEVEL_INFO, "Sent UPDATE_SOCKET cmd to HMDFS, fd=%d", remote_fd);
-                                node->fd = remote_fd;
-                                update_device_status(node, DEVICE_STATUS_CONNECTED);
-                            }
-                        }
+                        node->connecting = 0;
                         pthread_mutex_unlock(&g_device_mutex);
                     }
                 } else {
@@ -1292,7 +1422,7 @@ void handle_hmdfs_notify(void) {
             }
             break;
         }
-        
+
         case NOTIFY_OFFLINE: {
             log_message(LOG_LEVEL_INFO, "Handling NOTIFY_OFFLINE for CID %s", cid_str);
             // 处理设备离线通知
@@ -1645,54 +1775,26 @@ int parse_config_cmd(const char *cmd_line) {
 
 /* 信号处理函数 */
 void handle_signal(int sig) {
-    log_message(LOG_LEVEL_INFO, "Received signal %d, shutting down...", sig);
-    
+    // async-signal-safe only: no printf/stdio (lock reentrancy), no
+    // pthread_mutex (self-deadlock if delivered to a lock-holding thread),
+    // no exit()/atexit (cleanup_agent takes the mutex). Just flag shutdown
+    // and wake the blocking threads; cleanup runs in cleanup_agent via atexit
+    // after main's joins return.
+    static const char msg[] = "signal received, shutting down...\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
     g_running = 0;
-    
-    // 清理心跳检测线程
-    //cleanup_heartbeat();
-    
-    // 关闭服务器socket
-    if (g_server_fd >= 0) {
-        close(g_server_fd);
-        g_server_fd = -1;
+    if (g_netup_srv_fd >= 0) {
+        close(g_netup_srv_fd);   // wake netup_listener accept
+        g_netup_srv_fd = -1;     // avoid double close / stale fd reuse
     }
-    
-    // 关闭所有客户端连接
-    pthread_mutex_lock(&g_device_mutex);
-    for (int i = 0; i < g_config.node_count; i++) {
-        if(g_config.nodes[i].fd != -1) {
-            close(g_config.nodes[i].fd);
-            g_config.nodes[i].fd = -1;
-            if(g_config.nodes[i].status == DEVICE_STATUS_CONNECTED) {
-                if(set_and_send_offline(&g_config.nodes[i]) == 0) {
-                    update_device_status(&g_config.nodes[i], DEVICE_STATUS_OFFLINE);
-                }
-            }
-        }
-    }
-    pthread_mutex_unlock(&g_device_mutex);
-    
-    // 清理inotify资源
-    // cleanup_inotify();
-    
-    // 关闭日志文件
-    if (g_log_file) {
-        fclose(g_log_file);
-        g_log_file = NULL;
-    }
-    
-    // 释放客户端数组
-    /* if (g_connections) {
-        free(g_connections);
-        g_connections = NULL;
-    } */
-    
-    exit(0);
+    if (g_server_fd >= 0)
+        close(g_server_fd);      // wake listener
 }
+
 
 void cleanup_agent() {
     g_running = 0;
+    unlink(NETUP_SOCK_PATH);
     
     // 清理心跳检测线程
     //cleanup_heartbeat();
@@ -1790,44 +1892,19 @@ void *listener_thread_func(void *arg) {
 }
 
 void *notify_handler_thread_func(void *arg) {
-    fd_set readfds;
-    struct timeval timeout;
-
+    // inotify never fires for kernel notifies on sysfs (the cmd file is static
+    // and sysfs_notify does not produce directory inotify events), so poll the
+    // notify kfifo directly. It races with sysfs_checker_thread (poll cmdFd
+    // POLLPRI, immediate) on the same kfifo -- a consuming queue, so no notify
+    // is processed twice. This thread is currently disabled (creation in main
+    // is commented out).
     while (g_running) {
-        FD_ZERO(&readfds);
-        FD_SET(g_inotify_fd, &readfds);
-
-        // 设置超时，实现主动轮询
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-
-        int ret = select(g_inotify_fd + 1, &readfds, NULL, NULL, &timeout);
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            log_message(LOG_LEVEL_ERROR, "select NOTIFY");
-            break;
-        }
-
-        // 检查inotify事件
-        if (FD_ISSET(g_inotify_fd, &readfds)) {
-            char buf[1024];
-            ssize_t len = read(g_inotify_fd, buf, sizeof(buf));
-            if (len > 0) {
-                handle_hmdfs_notify();
-            } else if (len < 0) {
-                log_message(LOG_LEVEL_ERROR, "Error reading inotify events: %s", strerror(errno));
-                // inotify可能已失效，尝试恢复
-                recover_hmdfs_connection();
-            }
-        }
-
         handle_hmdfs_notify();
-
-
+        sleep(1);
     }
-    
     return NULL;
 }
+
 
 // 连接线程函数
 void *connector_thread_func(void *arg) {
@@ -2034,10 +2111,15 @@ int main(int argc, char *argv[]) {
     }
     
     // 启动NOTIFY监听线程
-    if (pthread_create(&g_notify_handler_thread, NULL, notify_handler_thread_func, NULL) != 0) {
+    /* DISABLED: inotify watch on /sys/fs/hmdfs/ (IN_CREATE|IN_MODIFY) never fires
+     * for kernel notifies (cmd file is static, sysfs_notify does not produce
+     * directory inotify events), so this thread cannot receive them. Notify
+     * consumption is fully covered by sysfs_checker_thread (poll cmdFd POLLPRI).
+     */
+    /* if (pthread_create(&g_notify_handler_thread, NULL, notify_handler_thread_func, NULL) != 0) {
         log_message(LOG_LEVEL_ERROR, "Failed to create notify handler thread");
         return 1;
-    }
+    } */
 
     // 启动连接线程
     if (pthread_create(&g_connector_thread, NULL, connector_thread_func, NULL) != 0) {
@@ -2060,6 +2142,12 @@ int main(int argc, char *argv[]) {
         log_message(LOG_LEVEL_ERROR, "Failed to create sysfs checker thread");
         return 1;
     }
+
+    // netup listener thread: executor's syz_failure_net_up signal -> reconnect offline nodes
+    if (pthread_create(&g_netup_listener_thread, NULL, netup_listener_thread_func, NULL) != 0) {
+        log_message(LOG_LEVEL_ERROR, "Failed to create netup listener thread");
+        return 1;
+    }
     
     // 等待所有线程完成
     pthread_join(g_listener_thread, NULL);
@@ -2067,6 +2155,7 @@ int main(int argc, char *argv[]) {
     pthread_join(g_connector_thread, NULL);
     //pthread_join(g_connect_checker_thread, NULL); // DISABLED: 见上方线程创建处注释
     pthread_join(g_sysfs_checker_thread, NULL);
+    pthread_join(g_netup_listener_thread, NULL);
     
     log_message(LOG_LEVEL_INFO, "HMDFS Agent stopped");
     return 0;
