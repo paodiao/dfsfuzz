@@ -69,6 +69,8 @@ typedef unsigned long long uint64;
 extern uint32 *write_output(uint32 v);
 extern uint32 *write_output_64(uint64 v);
 extern uint64_t tsc_ns_to_global(uint64_t ns);
+extern signed long long int tsc_offset;
+extern uint64_t g_prog_end_raw;
 
 static struct hmdfs_trace_bpf *skel;
 static struct ring_buffer *rb;
@@ -340,6 +342,13 @@ void init_hmdfs_trace(void)
 void start_hmdfs_trace(void)
 {
 	collected_count = 0;
+	/* Drain any events captured after the previous stop_collect (the BPF
+	 * kretprobes keep firing during write_metadata's tree traversal, whose
+	 * timestamps fall outside the program's call windows). Without this the
+	 * stale traversal events would be attributed to the current round and
+	 * fail every matchEventToCall again. */
+	if (skel && rb)
+		ring_buffer__consume(rb);
 	if (wb_perf.fd >= 0)
 		ioctl(wb_perf.fd, PERF_EVENT_IOC_ENABLE, 0);
 }
@@ -365,7 +374,16 @@ void stop_collect_hmdfs_trace(void)
 		for (int i = 0; i < collected_count; i++)
 			collected[i].timestamp = tsc_ns_to_global(collected[i].timestamp);
 	}
-	fprintf(stderr, "executor %d hmdfs trace collected=%d\n", (int)getpid(), collected_count);
+	/* Split into program-phase vs collection-phase events: events before
+	 * g_prog_end_raw (recorded after clt_finish(), converted to the same
+	 * raw-TSC-minus-offset domain) belong to the program execution. */
+	int prog_cnt = 0;
+	uint64_t prog_end_global = g_prog_end_raw - (uint64_t)tsc_offset;
+	for (int i = 0; i < collected_count; i++)
+		if (collected[i].timestamp < prog_end_global)
+			prog_cnt++;
+	fprintf(stderr, "executor %d hmdfs trace: collected=%d prog_events=%d\n",
+		(int)getpid(), collected_count, prog_cnt);
 
 	/* 4. write to output */
 	write_output((uint32)collected_count);

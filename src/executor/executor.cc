@@ -469,6 +469,11 @@ char mnt_dir[100];
 
 signed long long int tsc_offset;
 
+/* Program-phase end (raw guest TSC), recorded after clt_finish() so that
+ * hmdfs_trace.cc can split collected events into program vs collection
+ * phases for diagnostics. */
+uint64_t g_prog_end_raw;
+
 int metadata_delay_ms = 0;
 
 #if defined(__i386__) || defined(__x86_64__)
@@ -1634,8 +1639,19 @@ void collect_srv_cover(bool wait) {
 void reply_execute(int status, int iter) {
 
   clt_finish();
-  write_metadata(execution_index);
+  g_prog_end_raw = rdtsc();
+  // Stop the BPF trace before write_metadata: the metadata collection
+  // (30s sleep + full tree traversal) would otherwise flood the trace ring
+  // with traversal events whose timestamps fall outside the program's call
+  // windows, making every matchEventToCall fail. The output stream order
+  // becomes [program output][trace][fsMd]; the fuzzer parses it in that
+  // order (parseHmdfsTraceEvents before parseFsMd).
   stop_collect_hmdfs_trace();
+  // Keep the persistent write pointer in sync: write_metadata() resets
+  // output_pos from *output_pos_value, so without this it would rewind past
+  // the just-written trace data and overwrite it with fsMd records.
+  *output_pos_value = output_pos - output_data;
+  write_metadata(execution_index);
 
   execute_reply reply = {};
   reply.magic = kOutMagic;

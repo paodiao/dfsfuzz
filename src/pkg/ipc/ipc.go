@@ -1144,6 +1144,14 @@ func (env *Env) parseServerOutput(idx int, isClient bool, retChan chan parseRet)
 	info := &ProgInfo{}
 	info.Extra = convertExtra(extraParts)
 
+	// The executor writes [program output][trace][fsMd] (trace is stopped
+	// before metadata collection), so trace must be parsed first.
+	var hmdfsTraceEvents []prog.HmdfsTraceEvent
+	hmdfsTraceEvents = parseHmdfsTraceEvents(&out)
+	for i := range hmdfsTraceEvents {
+		hmdfsTraceEvents[i].ProgIdx = idx
+	}
+
 	var fsMd map[string]prog.FileMetadata
 	var err error
 	//ParseFsMd when it's a client or a LFS-based server
@@ -1153,12 +1161,6 @@ func (env *Env) parseServerOutput(idx int, isClient bool, retChan chan parseRet)
 			retChan <- parseRet{info: info, fsMd: nil, err: fmt.Errorf("parseCOnsistencySan error"), idx: idx}
 			return
 		}
-	}
-
-	var hmdfsTraceEvents []prog.HmdfsTraceEvent
-	hmdfsTraceEvents = parseHmdfsTraceEvents(&out)
-	for i := range hmdfsTraceEvents {
-		hmdfsTraceEvents[i].ProgIdx = idx
 	}
 
 	retChan <- parseRet{info: info, fsMd: fsMd, err: nil, idx: idx, hmdfsTraceEvents: hmdfsTraceEvents}
@@ -1336,10 +1338,15 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 		info.Extra = convertExtra(extraParts)
 	}
 
+	// The executor writes [program output][trace][fsMd]; parse trace first.
+	var hmdfsTraceEvents []prog.HmdfsTraceEvent
+	hmdfsTraceEvents = parseHmdfsTraceEvents(&out)
+	for i := range hmdfsTraceEvents {
+		hmdfsTraceEvents[i].ProgIdx = idx
+	}
+
 	// Only kernel clients' fsMd is returned; the stream (stat_cnt + records)
-	// is always consumed so that parseHmdfsTraceEvents below stays aligned
-	// (the executor unconditionally writes a stat_cnt header, 0xFFFFFFFF
-	// when there is no metadata).
+	// is consumed afterwards.
 	var fsMd map[string]prog.FileMetadata
 	var err error
 	if env.config.EnableCsan && idx >= env.config.ServNum {
@@ -1355,12 +1362,6 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 			retChan <- parseRet{info: info, fsMd: nil, err: err, idx: idx}
 			return
 		}
-	}
-
-	var hmdfsTraceEvents []prog.HmdfsTraceEvent
-	hmdfsTraceEvents = parseHmdfsTraceEvents(&out)
-	for i := range hmdfsTraceEvents {
-		hmdfsTraceEvents[i].ProgIdx = idx
 	}
 
 	retChan <- parseRet{info: info, fsMd: fsMd, err: nil, idx: idx, callInfo: nil, testdirIno: testdirIno, hmdfsTraceEvents: hmdfsTraceEvents}
