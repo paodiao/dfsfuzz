@@ -719,6 +719,8 @@ int connect_to_remote_node(remote_node *node) {
 /* Try to reconnect a single node. Mutual exclusion is handled by the caller
  * via node->connecting. Returns 0 on success, -1 on failure.
  */
+int send_update_socket_cmd(const update_socket_param *cmd);
+
 static int try_reconnect_node(remote_node *node) {
     pthread_mutex_lock(&g_device_mutex);
     // Self-managed mutual exclusion: another reconnect (netup worker or
@@ -1179,7 +1181,6 @@ remote_node *find_remote_node(const char *cid) {
 
 void HandleAllNotify(int fd) {
     notify_param param;
-    update_socket_param cmd;
 
     while (g_running) {
         lseek(fd, 0, SEEK_SET);
@@ -1317,7 +1318,6 @@ void HandleAllNotify(int fd) {
 /* 处理HMDFS通知 */
 void handle_hmdfs_notify(void) {
     notify_param param;
-    update_socket_param cmd;
     
     // 读取通知参数
     if (read_notify_param(&param) < 0) {
@@ -1781,7 +1781,8 @@ void handle_signal(int sig) {
     // and wake the blocking threads; cleanup runs in cleanup_agent via atexit
     // after main's joins return.
     static const char msg[] = "signal received, shutting down...\n";
-    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    ssize_t n_written __attribute__((unused)) =
+        write(STDERR_FILENO, msg, sizeof(msg) - 1);
     g_running = 0;
     if (g_netup_srv_fd >= 0) {
         close(g_netup_srv_fd);   // wake netup_listener accept
