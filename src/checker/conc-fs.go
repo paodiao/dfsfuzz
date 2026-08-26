@@ -403,11 +403,12 @@ func initTreeSubset(ps []*prog.Prog, ft *prog.FileTree) string {
 			for _, arg := range call.Args {
 				switch a := arg.(type) {
 				case *prog.PointerArg:
-					if d, ok := a.Res.(*prog.DataArg); ok && strings.Contains(string(d.Data()), "merge_view") {
+					if d, ok := a.Res.(*prog.DataArg); ok && d.Dir() != prog.DirOut &&
+						strings.Contains(string(d.Data()), "merge_view") {
 						addPath(string(d.Data()))
 					}
 				case *prog.DataArg:
-					if strings.Contains(string(a.Data()), "merge_view") {
+					if a.Dir() != prog.DirOut && strings.Contains(string(a.Data()), "merge_view") {
 						addPath(string(a.Data()))
 					}
 				}
