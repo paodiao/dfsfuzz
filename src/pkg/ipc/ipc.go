@@ -2012,7 +2012,7 @@ func (c *command) exec(opts *ExecOpts, progData []byte, progSizes [64]uint64, pr
 			err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
 		case <-hang:
 			log.Logf(0, "------ all executors finish execution")
-		case <-time.After(c.config.Timeouts.Program*100 + 120*time.Second):
+		case <-time.After(c.config.Timeouts.Program*100 + 60*time.Second):
 			stop <- true
 			err0 = fmt.Errorf("executors hang and timeout")
 			output = <-c.readDone

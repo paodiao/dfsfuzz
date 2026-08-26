@@ -92,6 +92,30 @@ type DAGPair struct {
 	PathRel  PathRel
 }
 
+// DagDiag captures per-round diagnostics of the DAG feedback pipeline
+// (BuildVertices/ExtractPairs/ComputeFeedback). It is emitted as a single
+// log line per execution to pinpoint where events get dropped or pairs
+// filtered out.
+type DagDiag struct {
+	// BuildVertices.
+	Events          int   // events fed into BuildVertices
+	MatchFailed     int   // events dropped because no call window matched
+	ProgIdxBad      int   // events dropped because ProgIdx is out of range
+	PathEmpty       int   // events dropped because the path could not be resolved
+	PerNodeVertices []int // vertices per ProgIdx (node)
+	// ExtractPairs.
+	TotalPairs      int // all vertex pairs considered
+	OverlapPairs    int // pairs with overlapping windows (cc candidates)
+	HBForwardPairs  int // pairs where A ends before B starts (hb candidates, A first)
+	HBReversePairs  int // pairs where B ends before A starts (hb candidates, B first)
+	FilteredNoMod   int // candidates dropped: no succeeded modifier on the ordering side
+	FilteredPathRel int // candidates dropped: path relation is PathNone
+	HBPairs         int // produced happens-before pairs
+	CCPairs         int // produced concurrent pairs
+	// ComputeFeedback.
+	PairBitsUnique int // deduplicated pair hash count
+}
+
 type renameEvent struct {
 	ts      uint64
 	oldPath string
@@ -109,7 +133,9 @@ type deleteEvent struct {
 // Events without a resolvable path are dropped.
 func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 	fsMds []map[string]FileMetadata, hmcfg *Hmdfs_config,
-	tscoffs []int64) []DAGVertex {
+	tscoffs []int64) ([]DAGVertex, *DagDiag) {
+
+	diag := &DagDiag{Events: len(events)}
 
 	// 1. per-node ino -> path (inos are node-local; cross-node the same file
 	// has a different ino, so lookups must use the event's own node first)
@@ -191,6 +217,7 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 	for i := range events {
 		ev := &events[i]
 		if ev.ProgIdx < 0 || ev.ProgIdx >= len(ps) {
+			diag.ProgIdxBad++
 			continue
 		}
 		p := ps[ev.ProgIdx]
@@ -221,6 +248,7 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		default:
 			callIdx := matchEventToCall(ev, p, tscoffs)
 			if callIdx < 0 {
+				diag.MatchFailed++
 				continue
 			}
 			call := p.Calls[callIdx]
@@ -255,12 +283,17 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 			}
 		}
 		if v.Path == "" {
+			diag.PathEmpty++
 			continue
 		}
 		v.IsDir = nodeType[v.Path]
 		v.Off = ev.Off
 		v.Size = pathSize[v.Path]
 		vertices = append(vertices, v)
+		if diag.PerNodeVertices == nil {
+			diag.PerNodeVertices = make([]int, len(ps))
+		}
+		diag.PerNodeVertices[v.ProgIdx]++
 	}
 
 	sort.Slice(vertices, func(i, j int) bool {
@@ -269,13 +302,17 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		}
 		return vertices[i].Stime < vertices[j].Stime
 	})
-	return vertices
+	return vertices, diag
 }
 
 // ExtractPairs computes happens-before edges (from succeeded modifiers) and
 // concurrent pairs (at least one modifier, overlapping windows).
-func ExtractPairs(vertices []DAGVertex) (hbPairs, ccPairs []DAGPair) {
+func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPair) {
+	if diag == nil {
+		diag = &DagDiag{}
+	}
 	n := len(vertices)
+	diag.TotalPairs = n * (n - 1) / 2
 	for i := 0; i < n; i++ {
 		for j := i + 1; j < n; j++ {
 			A, B := &vertices[i], &vertices[j]
@@ -283,26 +320,43 @@ func ExtractPairs(vertices []DAGVertex) (hbPairs, ccPairs []DAGPair) {
 			aMod, bMod := isSucceededModifier(A), isSucceededModifier(B)
 			switch {
 			case overlap:
+				diag.OverlapPairs++
 				if rel := determinePathRel(A, B, false); rel != PathNone && (aMod || bMod) {
 					ccPairs = append(ccPairs, DAGPair{A: A, B: B, Temporal: TemporalConcurrent, PathRel: rel})
+				} else if rel == PathNone {
+					diag.FilteredPathRel++
+				} else {
+					diag.FilteredNoMod++
 				}
 			case A.Etime < B.Stime:
+				diag.HBForwardPairs++
 				if rel := determinePathRel(A, B, true); rel != PathNone && aMod {
 					hbPairs = append(hbPairs, DAGPair{A: A, B: B, Temporal: TemporalHB, PathRel: rel})
+				} else if rel == PathNone {
+					diag.FilteredPathRel++
+				} else {
+					diag.FilteredNoMod++
 				}
 			default:
+				diag.HBReversePairs++
 				if rel := determinePathRel(B, A, true); rel != PathNone && bMod {
 					hbPairs = append(hbPairs, DAGPair{A: B, B: A, Temporal: TemporalHB, PathRel: rel})
+				} else if rel == PathNone {
+					diag.FilteredPathRel++
+				} else {
+					diag.FilteredNoMod++
 				}
 			}
 		}
 	}
+	diag.HBPairs = len(hbPairs)
+	diag.CCPairs = len(ccPairs)
 	return
 }
 
 // ComputeFeedback hashes every pair into a novelty bit; the schedule bit
 // hashes the whole sorted pair set.
-func ComputeFeedback(hbPairs, ccPairs []DAGPair, hmcfg *Hmdfs_config) (pairBits []uint32, schedBit uint32) {
+func ComputeFeedback(hbPairs, ccPairs []DAGPair, hmcfg *Hmdfs_config, diag *DagDiag) (pairBits []uint32, schedBit uint32) {
 	all := make([]DAGPair, 0, len(hbPairs)+len(ccPairs))
 	all = append(all, hbPairs...)
 	all = append(all, ccPairs...)
@@ -314,6 +368,15 @@ func ComputeFeedback(hbPairs, ccPairs []DAGPair, hmcfg *Hmdfs_config) (pairBits 
 		pairBits = append(pairBits, uint32(h))
 	}
 	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
+	if diag != nil {
+		unique := 0
+		for i := range hashes {
+			if i == 0 || hashes[i] != hashes[i-1] {
+				unique++
+			}
+		}
+		diag.PairBitsUnique = unique
+	}
 	h := fnv1a64()
 	for _, v := range hashes {
 		h = fnvAdd64(h, v)

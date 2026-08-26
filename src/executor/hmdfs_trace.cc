@@ -365,6 +365,7 @@ void stop_collect_hmdfs_trace(void)
 		for (int i = 0; i < collected_count; i++)
 			collected[i].timestamp = tsc_ns_to_global(collected[i].timestamp);
 	}
+	fprintf(stderr, "executor %d hmdfs trace collected=%d\n", (int)getpid(), collected_count);
 
 	/* 4. write to output */
 	write_output((uint32)collected_count);

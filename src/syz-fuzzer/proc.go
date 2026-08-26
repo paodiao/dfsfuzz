@@ -1226,14 +1226,23 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	// Does not depend on csan/fsMds: call-window matching needs neither, and
 	// ino-based resolution (writepage/lookup) degrades gracefully without fsMd.
 	log.Logf(0, "hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
+	appendDagDiagLog("hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
 	if stat != StatTriage && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
-		vertices := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.fuzzer.tscoffs)
-		hbPairs, ccPairs := prog.ExtractPairs(vertices)
+		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.fuzzer.tscoffs)
+		hbPairs, ccPairs := prog.ExtractPairs(vertices, dagDiag)
 		allPairs := append(hbPairs, ccPairs...)
-		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg)
-		log.Logf(0, "hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d",
-			len(vertices), len(hbPairs), len(ccPairs), len(pairBits))
+		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg, dagDiag)
+		log.Logf(0, "hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
+			len(vertices), len(hbPairs), len(ccPairs), len(pairBits),
+			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices,
+			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
+			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
+		appendDagDiagLog("hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
+			len(vertices), len(hbPairs), len(ccPairs), len(pairBits),
+			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices,
+			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
+			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
 		if len(pairBits) > 0 {
 			for _, info := range infos[proc.fuzzer.config.ServNum:] {
 				if info != nil {
@@ -1247,6 +1256,24 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	}
 
 	return infos, fsMds, testdirIno
+}
+
+// Temporary DAG-pipeline diagnostic log on the host (hardcoded path; remove
+// after the vertices>0/pairs=0 issue is diagnosed).
+var dagDiagLog *os.File
+
+func appendDagDiagLog(format string, args ...interface{}) {
+	if dagDiagLog == nil {
+		f, err := os.OpenFile("/home/user/dfsfuzz/dag.log",
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Logf(0, "dag log open failed: %v", err)
+			return
+		}
+		dagDiagLog = f
+	}
+	fmt.Fprintf(dagDiagLog, "%s %s\n",
+		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
 }
 
 // saveCsanBug dumps everything needed to locate/reproduce/analyze a
