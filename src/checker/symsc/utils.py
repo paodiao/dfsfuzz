@@ -338,16 +338,31 @@ def parse_var_def(line, state):
 def parse_fd(line, state):
     # print "fd:", line
     m_var = p_var_fd.search(line)
+    if not m_var:
+        return
     var_name = m_var.group(1)
     state["FD_STACK"][var_name] = ""
 
 
 def parse_memcpy(line, state):
-    in_par = line[line.find("(")+1:line.rfind(")")]
+    lparen = line.find("(")
+    rparen = line.rfind(")")
+    if lparen < 0 or rparen <= lparen:
+        return
+    in_par = line[lparen+1:rparen]
     in_par_s = in_par.split(", ")
+    if len(in_par_s) < 3:
+        return
     var_name = in_par_s[0]
-    var_size = int(in_par_s[-1])
-    var_string = in_par[in_par.find("\"")+1:in_par.rfind("\"")]
+    try:
+        var_size = int(in_par_s[-1])
+    except ValueError:
+        return
+    q1 = in_par.find("\"")
+    q2 = in_par.rfind("\"")
+    if q1 < 0 or q2 <= q1:
+        return
+    var_string = in_par[q1+1:q2]
 
     var_string = _unescape(var_string)
 
@@ -360,7 +375,7 @@ def parse_call(line):
     arglist = m_arg.group(1).split(", ")
     syscall_name = arglist[0]
     syscall_args = arglist[1:]
-    if syscall_name in ["SYS_open", "SYS_dup", "SYS_dup2"]:
+    if syscall_name in ["SYS_open", "SYS_creat", "SYS_dup", "SYS_dup2"]:
         splits = line.split(" = ")
         if len(splits) > 1:
             syscall_ret = line.split(" = ")[0]

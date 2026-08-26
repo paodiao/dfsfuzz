@@ -27,7 +27,12 @@ def _print_hex(s):
 
 def check_child_exist(inode, inumlist, ret_on_err=0, print_err=1):
     global BTRFS_ERRSTR
-    children = c.FT[(inode.id, inode.name[0])][0].children
+    if not inode.name:
+        return 0
+    ft_entry = c.FT.get((inode.id, inode.name[0]))
+    if ft_entry is None:
+        return 0
+    children = ft_entry[0].children
 
     for child in children:
         child_id = child[0]

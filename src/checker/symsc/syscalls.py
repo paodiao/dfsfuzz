@@ -112,6 +112,8 @@ def emulate(prev_state, call_idx):
         ret = syncfs(argv)
     elif syscall == "SYS_open":
         ret = open(argv, syscall_ret) #
+    elif syscall == "SYS_creat":
+        ret = creat(argv, syscall_ret) #
     elif syscall == "SYS_write":
         ret = write(argv) #
     elif syscall == "SYS_pwrite64":
@@ -172,6 +174,11 @@ def emulate(prev_state, call_idx):
         ret = lstat(argv)
     elif syscall == "SYS_fstat":
         ret = fstat(argv)
+    else:
+        # Unmodeled syscall (e.g. creat): keep ret=0 but make it visible so
+        # coverage blind spots are detectable instead of silent.
+        if c.verbose:
+            print("[-] EMUL-ERR unknown syscall: {0}".format(syscall))
 
     # Write global state back to the local state
     state["INODE_CNT"] = c.INODE_CNT
@@ -551,17 +558,19 @@ res_path))
 
 def _parse_open_flags(flags_as_int):
 
-    # Just exit if there are flags we cannot handle
+    # Return an error (instead of exiting the script) for flags we cannot
+    # handle; the emulation fails that call instead of crashing symsc.
     black_list = {"O_PATH":0o10000000}
     for key in black_list:
         flag = black_list[key]
         if flag & flags_as_int != 0:
             if c.verbose:
                 print("We cannot handle flag {} until now".format(key))
-            exit()
+            return None
 
-    flags = oct(flags_as_int)
-    str_flags = str(flags).replace("L", "")
+    # format(..., 'o') avoids the "0o" prefix of oct() which made the
+    # per-digit int() below fail with ValueError.
+    str_flags = format(flags_as_int, 'o')
     opt_dict = {}
     digitlist = [int(d) for d in str_flags.zfill(7)]
 
@@ -641,6 +650,8 @@ def open(argv, varname):
     #    return 1
 
     opt_dict = _parse_open_flags(flags)
+    if opt_dict is None:
+        return 1
     tup_parent = (id_parent, parent_name)
     inode_parent = _get_parent_inode(id_parent)
     if inode_parent == -1:
@@ -714,7 +725,7 @@ def open(argv, varname):
         if opt_dict[c.O_DIRECTORY]:
             if c.verbose:
                 print("[-] EMUL-ERR non-specified behavior for O_CREAT | O_DIRECTORY")
-            exit()
+            return 1
 
         if argv[2]:
             mode = int(argv[2]) & c.MODEMASK & ~c.UMASK
@@ -743,6 +754,16 @@ def open(argv, varname):
         print("[+] opened {0} (inode #{1}) and saved in {2}".format(path, inode_mem.id, varname))
         #print "options:", opt_dict
         #print "stat mode", inode_mem.mode
+
+
+def creat(argv, varname):
+    # int creat(const char *path, mode_t mode);
+    # Equivalent to open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
+    if len(argv) < 2:
+        _print_err(ERR_ARG, __name__, 2, argv)
+        return 1
+    flags = c.O_CREAT | c.O_WRONLY | c.O_TRUNC
+    return open([argv[0], str(flags), argv[1]], varname)
 
 
 def mkdir(argv):
@@ -3326,15 +3347,25 @@ def syz_failure_up(argv, node_idx):
 def ip_difference(ip1, ip2):
     # Convert IP addresses to single integers
     def ip_to_int(ip):
-        parts = list(map(int, ip.split('.')))
-        return (parts[0] << 24) + (parts[1] << 16) + (parts[2] << 8) + parts[3]
+        parts = ip.split('.')
+        if len(parts) != 4 or not all(p.isdigit() for p in parts):
+            raise ValueError("invalid IP address: {0}".format(ip))
+        p = list(map(int, parts))
+        return (p[0] << 24) + (p[1] << 16) + (p[2] << 8) + p[3]
 
-    ip1_num = ip_to_int(ip1)
-    ip2_num = ip_to_int(ip2)
+    try:
+        ip1_num = ip_to_int(ip1)
+        ip2_num = ip_to_int(ip2)
+    except ValueError:
+        if c.verbose:
+            print("[-] EMUL-ERR invalid IP: {0} {1}".format(ip1, ip2))
+        return -1
 
     # Calculate the difference
     if ip1_num > ip2_num:
-        raise ValueError("The first IP address should be smaller than the second one.")
+        if c.verbose:
+            print("[-] EMUL-ERR first IP {0} is larger than second {1}".format(ip1, ip2))
+        return -1
     
     return ip2_num - ip1_num
 
@@ -3345,9 +3376,19 @@ def syz_failure_net_down(argv, node_idx):
         print(cmd)
         if cmd == "":
             continue
-        ip = cmd.split(" ")[4]
+        parts = cmd.split(" ")
+        # Extract the IP after -s/-d; iptables -F/-X etc. carry no IP - skip.
+        ip = None
+        for i, tok in enumerate(parts):
+            if tok in ("-s", "-d") and i + 1 < len(parts):
+                ip = parts[i + 1]
+                break
+        if ip is None:
+            continue
         print(c.FSCFG["init_ip"], ip)
         part_node_idx = ip_difference(c.FSCFG["init_ip"], ip)
+        if part_node_idx == -1:
+            continue
         c.NETSTATE.append((node_idx, part_node_idx))
 
 def syz_failure_net_up(argv, node_idx):

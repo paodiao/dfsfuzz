@@ -206,7 +206,8 @@ def cephfs(syscall_name, argv, offset=0, min_osds=1):
 
         ino = 0
         if filepath not in c.DENTRY:
-            if syscall_name == "open" and int(argv[2]) & c.O_CREAT or \
+            if syscall_name == "open" and int(argv[1]) & c.O_CREAT or \
+               syscall_name == "creat" or \
                syscall_name == "mkdir":
                 ino = c.INODE_CNT
             else:

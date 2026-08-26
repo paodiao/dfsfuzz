@@ -45,7 +45,7 @@ def get_path_fd(state, call_name, call_argv, call_ret):
 
     # One fd as a argument
     if call_name.startswith("f") or \
-    call_name == ["getdents", "getdents64", "read", "pread64", "write", "pwrite64", "lseek"]:
+    call_name in ["getdents", "getdents64", "read", "pread64", "write", "pwrite64", "lseek"]:
         fd, path = syscalls._get_inode_of_fd_from_state(call_argv[0], state)
         fds.append(fd)
         paths += path
@@ -105,9 +105,9 @@ def get_syscall_name_path(state, call_idx1, call_idx2):
 
     all_depcalls = depcalls.file_tree_ops + depcalls.regular_ops
 
-    if call1 == "open" and int(call_info1[1][1]) & c.O_CREAT:
+    if call1 == "creat" or (call1 == "open" and int(call_info1[1][1]) & c.O_CREAT):
         call1 = "open_create"
-    elif call2 == "open" and int(call_info2[1][1]) & c.O_CREAT:
+    elif call2 == "creat" or (call2 == "open" and int(call_info2[1][1]) & c.O_CREAT):
         call2 = "open_create"
         tmp = (call1, call_info1)
         call1, call_info1 = call2, call_info2
