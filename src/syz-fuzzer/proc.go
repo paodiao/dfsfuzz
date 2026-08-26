@@ -309,6 +309,11 @@ func (proc *Proc) loop() {
 	}
 	for i := 0; ; i++ {
 		item := proc.fuzzer.workQueue.dequeue()
+		wq := proc.fuzzer.workQueue
+		wq.mu.RLock()
+		appendDiagLog("loop: work triage=%d triageCand=%d cand=%d smash=%d fsmash=%d",
+			len(wq.triage), len(wq.triageCandidate), len(wq.candidate), len(wq.smash), len(wq.fsmash))
+		wq.mu.RUnlock()
 		if item != nil {
 			switch item := item.(type) {
 			case *WorkTriage:
@@ -428,6 +433,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		callName = item.ps[item.subNum].Calls[item.call].Meta.Name
 		logCallName = fmt.Sprintf("call #%v %v", item.call, callName)
 	}
+	appendDiagLog("triage begin: %s dag=%v flags=%x subNum=%d", logCallName, item.triageDag, item.flags, item.subNum)
 
 	var newSignal signal.Signal
 	if !item.triageDag {
@@ -1051,6 +1057,7 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				continue
 			} else {
 				calls, extra := proc.fuzzer.checkNewSignal(ps[idx], info)
+				appendDiagLog("feedback: idx=%d EnableClientFb=%v calls=%d extra=%v", idx, proc.fuzzer.config.EnableClientFb, len(calls), extra)
 				for _, callIndex := range calls {
 					proc.enqueueCallTriage(ps, flags, callIndex, info.Calls[callIndex], idx, true) //idx -> subNum
 					clientHasNew = true
@@ -1060,6 +1067,8 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				}
 			}
 		}
+	} else {
+		appendDiagLog("feedback: EnableClientFb=false (skipped)")
 	}
 
 	//(1). With failures, exploit server feedback
@@ -1231,7 +1240,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	// Does not depend on csan/fsMds: call-window matching needs neither, and
 	// ino-based resolution (writepage/lookup) degrades gracefully without fsMd.
 	log.Logf(0, "hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
-	appendDiagLog("hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
+	appendDiagLog("hmdfs trace events=%d csanPassed=%v stat=%d", len(hmdfsTraceEvents), csanPassed, stat)
 	if stat != StatTriage && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
 		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.fuzzer.tscoffs)

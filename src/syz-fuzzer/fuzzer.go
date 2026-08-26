@@ -500,6 +500,9 @@ func main() {
 	}
 
 	log.Logf(0, "starting %v fuzzer processes", *flagProcs)
+	appendDiagLog("config: EnableClientFb=%v EnableSrvFb=%v EnableDagFb=%v EnableDagScheduleFb=%v DFSName=%s ServNum=%d procs=%d MetadataDelayMs=%d",
+		config.EnableClientFb, config.EnableSrvFb, config.EnableDagFb, config.EnableDagScheduleFb,
+		config.DFSName, config.ServNum, *flagProcs, config.MetadataDelayMs)
 	for pid := 0; pid < *flagProcs; pid++ {
 		proc, err := newProc(fuzzer, pid)
 		if err != nil {
@@ -638,6 +641,7 @@ func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
 	maxSignal := r.MaxSignal.Deserialize()
 	log.Logf(1, "poll: candidates=%v inputs=%v signal=%v",
 		len(r.Candidates), len(r.NewInputs), maxSignal.Len())
+	appendDiagLog("poll: maxSignal=%d newInputs=%d candidates=%d", maxSignal.Len(), len(r.NewInputs), len(r.Candidates))
 	fuzzer.addMaxSignal(maxSignal)
 
 	//tao TODO

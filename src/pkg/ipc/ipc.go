@@ -934,8 +934,27 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 
 	*outp = out[:]
 	log.Logf(0, "----- parsed fsMd len %d", len(fsMd))
+	appendParseDiag("parseFsMd: stat_cnt=%d remaining=%d fsMd=%d", stat_cnt, len(out), len(fsMd))
 	return fsMd, nil
 
+}
+
+// appendParseDiag writes parser diagnostics to a host-side file (same style
+// as the fuzzer's dag.log). Temporary diagnostic aid.
+var parseDiagFile *os.File
+
+func appendParseDiag(format string, args ...interface{}) {
+	if parseDiagFile == nil {
+		f, err := os.OpenFile("/home/user/dfsfuzz/parse-dbg.log",
+			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Logf(0, "parse-dbg log open failed: %v", err)
+			return
+		}
+		parseDiagFile = f
+	}
+	fmt.Fprintf(parseDiagFile, "%s %s\n",
+		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
 }
 
 // diagWriter mirrors executor stderr lines containing diagnostic keywords to
@@ -1015,6 +1034,7 @@ func parseHmdfsTraceEvents(data *[]byte) []prog.HmdfsTraceEvent {
 		return nil
 	}
 	count, ok := readUint32(&out)
+	appendParseDiag("parseTrace: count=%d remaining=%d", count, len(out))
 	if !ok || count == 0 {
 		*data = out
 		return nil
@@ -1226,6 +1246,7 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 				i, reply.index, reply.num, reply.signalSize, len(out)), idx: idx, callInfo: nil}
 			return
 		}
+		appendParseDiag("parseInfo: idx=%d call=%v signalSize=%d coverSize=%d", idx, reply.index, reply.signalSize, reply.coverSize)
 		if inf.Cover, ok = readUint32Array(&out, reply.coverSize); !ok {
 			retChan <- parseRet{info: nil, fsMd: nil, err: fmt.Errorf("call %v/%v/%v: cover overflow: %v/%v",
 				i, reply.index, reply.num, reply.coverSize, len(out)), idx: idx, callInfo: nil}
