@@ -53,22 +53,22 @@ def emulate(prev_state, call_idx):
 
     # Execute fault syscalls whenenver
     if syscall == "SYS_syz_failure_down":
-        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs"]:
+        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs", "hmdfs"]:
             exit()
         ret = syz_failure_down(argv, c.CURNODE)
         return ret, state
     elif syscall == "SYS_syz_failure_up":
-        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs"]:
+        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs", "hmdfs"]:
             exit()
         ret = syz_failure_up(argv, c.CURNODE)
         return ret, state
     elif syscall == "SYS_syz_failure_net_down":
-        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs"]:
+        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs", "hmdfs"]:
             exit()
         ret = syz_failure_net_down(argv, c.CURNODE)
         return ret, state
     elif syscall == "SYS_syz_failure_net_up":
-        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs"]:
+        if c.FSTYPE not in ["nfs", "glusterfs", "cephfs", "hmdfs"]:
             exit()
         ret = syz_failure_net_up(argv, c.CURNODE)
         return ret, state

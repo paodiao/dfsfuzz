@@ -2575,6 +2575,8 @@ void execute_call(thread_t *th) {
   th->etime = rdtsc();
   // Save the output of read-type syscalls
   th->reserrno = errno;
+  fprintf(stderr, "executor %lld call %d %s ret %lld errno %d\n",
+          executor_index, th->call_num, call->name, (long long)th->res, th->reserrno);
   // Our pseudo-syscalls may misbehave.
   if ((th->res == -1 && th->reserrno == 0) || call->attrs.ignore_return)
     th->reserrno = EINVAL;

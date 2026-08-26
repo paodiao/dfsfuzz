@@ -30,7 +30,7 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	// Cross-check states from multiple client nodes
 	allIcs := make([]string, 0)
 	for i := srvNum; i < len(fsMds)-1; i++ {
-		ics := MdCmp(fsMds[i], fsMds[i+1])
+		ics := MdCmp(fsMds[i], fsMds[i+1], fsType)
 		allIcs = append(allIcs, ics...)
 	}
 
@@ -246,7 +246,7 @@ func xattrCmp(xattr1 map[string]string, xattr2 map[string]string) bool {
 }
 
 func MdCmp(fsMd1 map[string]prog.FileMetadata,
-	fsMd2 map[string]prog.FileMetadata) []string {
+	fsMd2 map[string]prog.FileMetadata, fsType string) []string {
 	var ics []string
 
 	log.Logf(0, "----- comparison: clientMdCmp: %v\n%v\n", fsMd1, fsMd2)
@@ -268,7 +268,7 @@ func MdCmp(fsMd1 map[string]prog.FileMetadata,
 		}
 		outputBuf := fmt.Sprintf("ConsistencySan stat:\n%+v\n%+v\n", md1, md2)
 		log.Logf(0, outputBuf)
-		ics = append(ics, compareFileMeta(filepath, md1, md2)...)
+		ics = append(ics, compareFileMeta(filepath, md1, md2, fsType)...)
 	}
 
 	for filepath := range fsMd2 {
@@ -288,7 +288,7 @@ func MdCmp(fsMd1 map[string]prog.FileMetadata,
 	return ics
 }
 
-func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata) []string {
+func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata, fsType string) []string {
 	var ics []string
 
 	if m1.Checksum != m2.Checksum {
@@ -319,6 +319,21 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata) []
 			m1.StatMd.Mode&syscall.S_IFDIR, m2.StatMd.Mode&syscall.S_IFDIR))
 	}
 	/*
+	 * Nlink and full-mode comparisons are skipped for hmdfs: the
+	 * remote-view cached attr leaves nlink unset (0) and hardcodes mode
+	 * permission bits (0660), so they are intentionally inconsistent across
+	 * nodes (same rationale as mtime/size below). The directory bit is
+	 * still compared for all filesystems.
+	 */
+	if fsType != "hmdfs" && m1.StatMd.Nlink != m2.StatMd.Nlink {
+		ics = append(ics, fmt.Sprintf("%s: nlink %d vs %d", path,
+			m1.StatMd.Nlink, m2.StatMd.Nlink))
+	}
+	if fsType != "hmdfs" && m1.StatMd.Mode != m2.StatMd.Mode {
+		ics = append(ics, fmt.Sprintf("%s: mode %o vs %o", path,
+			m1.StatMd.Mode, m2.StatMd.Mode))
+	}
+	/*
 	 * Uid/Gid comparison disabled: with CONFIG_HMDFS_FS_PERMISSION the
 	 * remote view returns uid/gid inherited from the parent dir (e.g.
 	 * 1008) while the owning node returns the real ext4 values (e.g.
@@ -331,11 +346,20 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata) []
 	// if m1.StatMd.Gid != m2.StatMd.Gid {
 	// 	ics = append(ics, fmt.Sprintf("%s: gid %d vs %d", path, m1.StatMd.Gid, m2.StatMd.Gid))
 	// }
-	if m1.StatMd.Mtim.Sec != m2.StatMd.Mtim.Sec {
+	/*
+	 * mtime/size comparison is skipped for hmdfs: the remote-view stat
+	 * (get_cached_attr_remote) returns the device_view inode's cached
+	 * getattr_isize/i_mtime, which only refresh on open/own-write/inode
+	 * rebuild - not on stat or cross-node write. The values are therefore
+	 * intentionally inconsistent across nodes (weak consistency), same
+	 * rationale as nlink/mode/uid-gid above. Content integrity is still
+	 * covered by the Checksum comparison.
+	 */
+	if fsType != "hmdfs" && m1.StatMd.Mtim.Sec != m2.StatMd.Mtim.Sec {
 		ics = append(ics, fmt.Sprintf("%s: mtime %d vs %d", path, m1.StatMd.Mtim.Sec, m2.StatMd.Mtim.Sec))
 	}
 	isDir := (m1.StatMd.Mode & syscall.S_IFDIR) != 0
-	if !isDir && m1.StatMd.Size != m2.StatMd.Size {
+	if fsType != "hmdfs" && !isDir && m1.StatMd.Size != m2.StatMd.Size {
 		ics = append(ics, fmt.Sprintf("%s: size %d vs %d", path, m1.StatMd.Size, m2.StatMd.Size))
 	}
 	if !xattrCmp(m1.Xattr, m2.Xattr) {
