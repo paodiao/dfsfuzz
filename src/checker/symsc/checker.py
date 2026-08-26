@@ -761,8 +761,7 @@ def state_check(retval, emul_state, call_idx):
         buf_var = syscall_argv[2].replace("(long)", "")
         xattr = None
         if op_runtime_stat['Xattr'] != None:
-            parts = re.split(r'(\\x[0-9a-fA-F].)', str(op_runtime_stat['Xattr']['file']))
-            xattr = ''.join(chr(int(part[2:], 16)) if part.startswith("\\x") else part for part in parts)
+            xattr = utils._unescape(str(op_runtime_stat['Xattr']['file']))
 
         if retval == -1 and op_runtime_stat['Xattr'] == None:
             print("no xattr")
@@ -777,8 +776,7 @@ def state_check(retval, emul_state, call_idx):
         buf_var = syscall_argv[1].replace("(long)", "")
         xattr = None
         if op_runtime_stat['Xattr'] != None:
-            parts = re.split(r'(\\x[0-9a-fA-F].)', str(op_runtime_stat['Xattr']['file']))
-            xattr = ''.join(chr(int(part[2:], 16)) if part.startswith("\\x") else part for part in parts)
+            xattr = utils._unescape(str(op_runtime_stat['Xattr']['file']))
 
         if retval == -1 and op_runtime_stat['Xattr'] == None:
             print("no xattrs")

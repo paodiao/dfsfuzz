@@ -75,8 +75,7 @@ if __name__ == "__main__":
             if entry == "":
                 continue
             es = entry.rstrip("\n").split("\t")
-            parts = re.split(r'(\\x[0-9a-fA-F].)', es[c.IDX_XATTR])
-            es[c.IDX_XATTR] = ''.join([chr(int(part[2:], 16)) if part.startswith("\\x") else part for part in parts])
+            es[c.IDX_XATTR] = utils._unescape(es[c.IDX_XATTR])
             print("es:", es)
             c.METADATA.append(es)
 

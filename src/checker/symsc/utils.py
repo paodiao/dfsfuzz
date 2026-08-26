@@ -289,21 +289,46 @@ def parse_buf(line, state):
     state["BUF_SIZE"][var_name] = var_size
     state["BUF_DATA"][var_name] = "\x00" * int(var_size)
 
+_ESCAPE_MAP = {'n': '\n', 't': '\t', 'r': '\r', '0': '\0', '\\': '\\', '"': '"'}
+
+def _unescape(data):
+    """Decode C-style escapes (\\xNN, \\\\, \\", \\n, \\t, \\r) in a prog
+    description string. Invalid/truncated sequences are kept verbatim so the
+    parser never raises (the old re.split-based decoder crashed on malformed
+    \\x fragments with ValueError)."""
+    out = []
+    i = 0
+    while i < len(data):
+        if data[i] != '\\' or i + 1 >= len(data):
+            out.append(data[i])
+            i += 1
+            continue
+        nxt = data[i + 1]
+        if nxt == 'x' and i + 3 < len(data) and \
+            all(ch in '0123456789abcdefABCDEF' for ch in data[i + 2:i + 4]):
+            out.append(chr(int(data[i + 2:i + 4], 16)))
+            i += 4
+            continue
+        out.append(_ESCAPE_MAP.get(nxt, '\\' + nxt))
+        i += 2
+    return ''.join(out)
+
 def parse_var_def(line, state):
     m_var = p_var_def.search(line)
+    if not m_var:
+        return
     var_name = m_var.group(1)
     var_size = m_var.group(2)
     var_data = m_var.group(4)
 
-    if var_size == None:
+    if var_data is not None:
+        var_data = _unescape(var_data)
         var_size = str(len(var_data))
+    elif var_size is None:
+        var_size = "0"
 
-    if var_data == None:
+    if var_data is None:
         var_data = "\x00" * int(var_size)
-    else:
-        parts = re.split(r'(\\x[0-9a-fA-F].)', var_data)
-        var_data = ''.join(chr(int(part[2:], 16)) if part.startswith("\\x") else part for part in parts)
-        var_size = str(len(var_data))
 
     print("var_data", var_data, "var_name", var_name, "var_size", var_size)
 
@@ -324,17 +349,7 @@ def parse_memcpy(line, state):
     var_size = int(in_par_s[-1])
     var_string = in_par[in_par.find("\"")+1:in_par.rfind("\"")]
 
-    """
-    We need a special way of interpreting the string,
-    because Program::deserialize() does not care about how the result string
-    should be escaped. When parsing, only the non-printable bytes
-    (\x00~\x1f and \x7f~\xff) should be escaped.
-    """
-    # pat_escape = re.compile(r"\\x[0-9a-f]{2}")
-    pat_escape = re.compile(r"\\x[0189a-f][0-9a-f]|\\x7f")
-    esclist = pat_escape.findall(var_string)
-    for esc in esclist:
-        var_string = var_string.replace(esc, esc.encode('ascii').decode('unicode-escape'))
+    var_string = _unescape(var_string)
 
     state["BUF_DATA"][var_name] = var_string[:var_size]
 
@@ -372,7 +387,7 @@ def parse_wrapper(line, state):
             parse_var_def(line, state) # parse_var_assignment(line)
         elif "memcpy" in line:
             parse_memcpy(line, state)
-        elif "[" and "]" in line:
+        elif "[" in line and "]" in line:
             parse_var_def(line, state) # parse_buf(line)
         elif "v" in line and "close" not in line:
             parse_fd(line, state)
