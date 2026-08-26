@@ -435,6 +435,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		inputSignal := signal.FromRaw(item.info.Signal, prio)
 		newSignal = proc.fuzzer.corpusSignalDiff(inputSignal)
 		if newSignal.Empty() {
+			appendDiagLog("triage skip: corpusSignalDiff empty %s", logCallName)
 			return
 		}
 		log.Logf(3, "1 triaging input for %v (new signal=%v)", logCallName, newSignal.Len())
@@ -454,6 +455,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 				notexecuted++
 				if notexecuted > signalRuns/2+1 {
 					log.Logf(0, "----- triage return due to unsuccessful execution %s", logCallName)
+					appendDiagLog("triage return: unsuccessful execution %s", logCallName)
 					return // if happens too often, give up
 				}
 				continue
@@ -464,6 +466,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 			// of coverage after each restart. Mechanics of this are not completely clear.
 			if newSignal.Empty() && item.flags&ProgMinimized == 0 {
 				log.Logf(0, "----- triage return due to empty signal %s", logCallName)
+				appendDiagLog("triage return: empty signal %s", logCallName)
 				return
 			}
 		}
@@ -494,6 +497,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		totalLen += len(p.Calls)
 	}
 	if totalLen == 0 {
+		appendDiagLog("triage return: empty program %s", logCallName)
 		return
 	}
 
@@ -555,6 +559,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		atomic.AddUint64(&proc.fuzzer.dagCorpusCount, 1)
 	}
 	added := proc.fuzzer.addInputToCorpus(item.ps, inputCliSignal, inputSrvSignal, sig)
+	appendDiagLog("triage success: %s added=%v corpus=%d", logCallName, added, len(proc.fuzzer.corpus))
 	if item.triageDag && added {
 		atomic.AddUint64(&proc.fuzzer.dagCorpusEntries, 1)
 	}
@@ -1226,7 +1231,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	// Does not depend on csan/fsMds: call-window matching needs neither, and
 	// ino-based resolution (writepage/lookup) degrades gracefully without fsMd.
 	log.Logf(0, "hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
-	appendDagDiagLog("hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
+	appendDiagLog("hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
 	if stat != StatTriage && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
 		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.fuzzer.tscoffs)
@@ -1238,7 +1243,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices,
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
 			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
-		appendDagDiagLog("hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
+		appendDiagLog("hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
 			len(vertices), len(hbPairs), len(ccPairs), len(pairBits),
 			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices,
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
@@ -1258,11 +1263,11 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	return infos, fsMds, testdirIno
 }
 
-// Temporary DAG-pipeline diagnostic log on the host (hardcoded path; remove
-// after the vertices>0/pairs=0 issue is diagnosed).
+// Temporary DAG/triage-pipeline diagnostic log on the host (hardcoded path;
+// remove after the DAG feedback / corpus growth issues are diagnosed).
 var dagDiagLog *os.File
 
-func appendDagDiagLog(format string, args ...interface{}) {
+func appendDiagLog(format string, args ...interface{}) {
 	if dagDiagLog == nil {
 		f, err := os.OpenFile("/home/user/dfsfuzz/dag.log",
 			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)

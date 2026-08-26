@@ -5,7 +5,7 @@ package ipc
 
 import (
 	"fmt"
-	//"io"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -20,7 +20,7 @@ import (
 	"unsafe"
 
 	//"runtime/debug"
-	//"bytes"
+	"bytes"
 	"encoding/binary"
 	"path/filepath"
 	"sort"
@@ -938,6 +938,77 @@ func (env *Env) parseFsMd(outp *[]byte) (map[string]prog.FileMetadata, error) {
 
 }
 
+// diagWriter mirrors executor stderr lines containing diagnostic keywords to
+// a host-side log file (the executor runs via ssh, so the file lives on the
+// host). Everything else is forwarded to the original stream untouched.
+// Temporary diagnostic aid; remove after the DAG/coverage feedback issues
+// are resolved.
+type diagWriter struct {
+	mu  sync.Mutex
+	f   *os.File
+	buf []byte
+}
+
+type noopWriter struct{}
+
+func (noopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+var (
+	diagWriterMu    sync.Mutex
+	diagWriterCache = map[string]*diagWriter{}
+)
+
+func newDiagWriter(idx int) io.Writer {
+	name := fmt.Sprintf("/home/user/dfsfuzz/executor-dbg-%d-%d.log", os.Getpid(), idx)
+	diagWriterMu.Lock()
+	defer diagWriterMu.Unlock()
+	if w, ok := diagWriterCache[name]; ok {
+		return w
+	}
+	f, err := os.OpenFile(name, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Logf(0, "executor-dbg log open failed: %v", err)
+		return noopWriter{}
+	}
+	w := &diagWriter{f: f}
+	diagWriterCache[name] = w
+	return w
+}
+
+var diagKeywords = []string{
+	"tsc_offset",
+	"hmdfs trace",
+	"hmdfs_trace",
+	"timeout",
+}
+
+func (w *diagWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, data...)
+	for {
+		nl := -1
+		for i, b := range w.buf {
+			if b == '\n' {
+				nl = i
+				break
+			}
+		}
+		if nl < 0 {
+			break
+		}
+		line := w.buf[:nl]
+		w.buf = w.buf[nl+1:]
+		for _, kw := range diagKeywords {
+			if bytes.Contains(line, []byte(kw)) {
+				w.f.Write(append(line, '\n'))
+				break
+			}
+		}
+	}
+	return len(data), nil
+}
+
 func parseHmdfsTraceEvents(data *[]byte) []prog.HmdfsTraceEvent {
 	out := *data
 	if len(out) < 4 {
@@ -1559,7 +1630,7 @@ func makeCommand(pid int, bins [][]string, config *Config, inFile, outFile *os.F
 		}(c)
 	}
 
-	for _, bin := range bins {
+	for i, bin := range bins {
 
 		/*
 			    // executor->ipc command pipe.
@@ -1599,7 +1670,7 @@ func makeCommand(pid int, bins [][]string, config *Config, inFile, outFile *os.F
 			}
 		*/
 		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stdout
+		cmd.Stderr = io.MultiWriter(os.Stdout, newDiagWriter(i))
 
 		if err := cmd.Start(); err != nil {
 			return nil, fmt.Errorf("failed to start executor binary: %v", err)
@@ -1628,7 +1699,7 @@ func makeCommand(pid int, bins [][]string, config *Config, inFile, outFile *os.F
 }
 
 // TODO, readDone and goroutine
-func (c *command) makeOneCommand(bin []string) (error, *exec.Cmd) {
+func (c *command) makeOneCommand(idx int, bin []string) (error, *exec.Cmd) {
 
 	/*
 		rp, wp, err := os.Pipe()
@@ -1647,7 +1718,7 @@ func (c *command) makeOneCommand(bin []string) (error, *exec.Cmd) {
 	cmd.Dir = c.dir
 	// Tell ASAN to not mess with our NONFAILING.
 	cmd.Env = append(append([]string{}, os.Environ()...), "ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1")
-	cmd.Stderr = os.Stdout
+	cmd.Stderr = io.MultiWriter(os.Stdout, newDiagWriter(idx))
 	cmd.Stdout = os.Stdout
 	/*
 		if c.config.Flags&FlagDebug != 0 {
@@ -1724,7 +1795,7 @@ func (c *command) restartExecutorCmd(idx int) error {
 
 	log.Logf(0, "restarting cmd tag bit %d, %v", c.outmems[idx][0], c.cmds[idx].Args)
 
-	err, cmd := c.makeOneCommand(c.cmds[idx].Args)
+	err, cmd := c.makeOneCommand(idx, c.cmds[idx].Args)
 	if err != nil {
 		log.Logf(0, "restarting cmd: failed to makeOneCommand: %v", err)
 		return err
