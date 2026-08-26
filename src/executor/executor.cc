@@ -1640,6 +1640,13 @@ void reply_execute(int status, int iter) {
 
   clt_finish();
   g_prog_end_raw = rdtsc();
+  // The main (loop) process's output_pos is a static global (NULL by
+  // default); only write_metadata() initializes it. stop_collect moved
+  // before write_metadata must initialize it first (from the shared
+  // *output_pos_value maintained by write_output during the child's
+  // program output), otherwise the trace writes hit output_pos=NULL and
+  // fail with "output overflow pos=(nil)".
+  output_pos = output_data + *output_pos_value;
   // Stop the BPF trace before write_metadata: the metadata collection
   // (30s sleep + full tree traversal) would otherwise flood the trace ring
   // with traversal events whose timestamps fall outside the program's call
@@ -1647,10 +1654,9 @@ void reply_execute(int status, int iter) {
   // becomes [program output][trace][fsMd]; the fuzzer parses it in that
   // order (parseHmdfsTraceEvents before parseFsMd).
   stop_collect_hmdfs_trace();
-  // Keep the persistent write pointer in sync: write_metadata() resets
-  // output_pos from *output_pos_value, so without this it would rewind past
-  // the just-written trace data and overwrite it with fsMd records.
-  *output_pos_value = output_pos - output_data;
+  // write_output/write_output_64 inside stop_collect already keep
+  // *output_pos_value in sync (pointing past the trace data), so
+  // write_metadata()'s output_pos reset continues with the fsMd records.
   write_metadata(execution_index);
 
   execute_reply reply = {};
