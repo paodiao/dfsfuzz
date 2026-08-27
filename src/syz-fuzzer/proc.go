@@ -67,11 +67,14 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	// Light mode for triage/minimize rounds (Monarch §3.4): reduction is
 	// judged purely by coverage/signal equivalence, so skip the post-exec
 	// file-tree metadata collection in the executor.
-	// Two variants, matching the original per-site semantics:
-	//   execOptsLight        — sites that merge client cover after the run;
-	//   execOptsLightMinimize — validation/minimize sites whose consumers
-	//     discard cover (thisSignal, _ :=), restoring their former
-	//     no-cover NoCollide semantics while still skipping fsMd.
+	// Two variants, mirroring each site's original opts (per upstream and
+	// this repo's Initial commit):
+	//   execOptsLight         — triage sites that ran execOptsCover (the
+	//     !triageDag first-pass loop, the triageDag signalRuns loop, and
+	//     triageFailure all keep cover collection);
+	//   execOptsLightMinimize — only the prog.Minimize loop, which ran
+	//     execOptsNoCollide (its consumer discards cover) and now also
+	//     skips fsMd.
 	execOptsLight := execOptsCover
 	execOptsLight.Flags |= ipc.FlagSkipFsMd
 	execOptsLightMinimize := execOptsNoCollide
@@ -478,7 +481,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	notexecuted := 0
 	if !item.triageDag {
 		for i := 0; i < signalRuns; i++ {
-			infos, _, _ := proc.executeRaw(proc.execOptsLightMinimize, item.ps, StatTriage)
+			infos, _, _ := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage)
 			if !reexecutionSuccess(infos[item.subNum], &item.info, item.call) {
 				// The call was not executed or failed.
 				notexecuted++
