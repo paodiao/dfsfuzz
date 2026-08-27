@@ -103,6 +103,14 @@ type DagDiag struct {
 	ProgIdxBad      int   // events dropped because ProgIdx is out of range
 	PathEmpty       int   // events dropped because the path could not be resolved
 	PerNodeVertices []int // vertices per ProgIdx (node)
+	// Function-level breakdown (indexed by FuncID 0..15).
+	PerFuncVertices [16]int // matched vertices per FuncID
+	MatchFailFunc   [16]int // unmatched events per FuncID
+	MatchFailRetOK  [16]int // unmatched events with a succeeded ret per FuncID
+	// Match failure reasons (only counted once per event, in the vertex pass).
+	MatchFailNoFunc int // no call of the event's function type in the program
+	MatchFailNoCI   int // matching calls exist but CheckInfo is nil
+	MatchFailTime   int // calls exist with windows, timestamp outside all
 	// ExtractPairs.
 	TotalPairs      int // all vertex pairs considered
 	OverlapPairs    int // pairs with overlapping windows (cc candidates)
@@ -249,6 +257,20 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 			callIdx := matchEventToCall(ev, p, tscoffs)
 			if callIdx < 0 {
 				diag.MatchFailed++
+				if int(ev.FuncID) < len(diag.MatchFailFunc) {
+					diag.MatchFailFunc[ev.FuncID]++
+					if b := bucketizeRet(ev.FuncID, ev.Ret); b == RetSuccess || b == RetWritepageDone {
+						diag.MatchFailRetOK[ev.FuncID]++
+					}
+				}
+				switch callIdx {
+				case -2:
+					diag.MatchFailNoFunc++
+				case -3:
+					diag.MatchFailNoCI++
+				default:
+					diag.MatchFailTime++
+				}
 				continue
 			}
 			call := p.Calls[callIdx]
@@ -289,6 +311,9 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		v.IsDir = nodeType[v.Path]
 		v.Off = ev.Off
 		v.Size = pathSize[v.Path]
+		if int(v.FuncID) < len(diag.PerFuncVertices) {
+			diag.PerFuncVertices[v.FuncID]++
+		}
 		vertices = append(vertices, v)
 		if diag.PerNodeVertices == nil {
 			diag.PerNodeVertices = make([]int, len(ps))
@@ -321,7 +346,12 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 			switch {
 			case overlap:
 				diag.OverlapPairs++
-				if rel := determinePathRel(A, B, false); rel != PathNone && (aMod || bMod) {
+				// Concurrent pairs need a path relation and at least one
+				// modifier operation (by type, not by success): failed
+				// writes/mkdirs still carry state impact worth exploring,
+				// while pure read||read pairs have no consistency value.
+				if rel := determinePathRel(A, B, false); rel != PathNone &&
+					(isModifierFunc(A.FuncID) || isModifierFunc(B.FuncID)) {
 					ccPairs = append(ccPairs, DAGPair{A: A, B: B, Temporal: TemporalConcurrent, PathRel: rel})
 				} else if rel == PathNone {
 					diag.FilteredPathRel++
@@ -467,25 +497,43 @@ func pathIsAncestorOf(parent, child string) bool {
 // matchEventToCall finds the call whose execution window contains the event
 // timestamp. Among overlapping windows (should not happen within one VM since
 // calls run sequentially) the one started last wins.
+// Returns the call index on success, or a negative reason code:
+//   -1 no matching call
+//   -2 no call of the event's function type
+//   -3 calls exist but CheckInfo is nil
+//   -4 calls exist with windows, but the timestamp is outside all of them
 func matchEventToCall(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) int {
 	off := tscoffFor(tscoffs, ev.ProgIdx)
 	best := -1
+	hasFunc := false
+	hasCI := false
 	var bestStime uint64
 	for i, call := range p.Calls {
 		if !funcMatchesCall(ev.FuncID, call.Meta.Name) {
 			continue
 		}
+		hasFunc = true
 		ci := call.CheckInfo
 		if ci == nil {
 			continue
 		}
+		hasCI = true
 		stime := uint64(int64(ci.Stime) - off)
 		etime := uint64(int64(ci.Etime) - off)
 		if ev.Timestamp >= stime && ev.Timestamp <= etime && (best == -1 || stime > bestStime) {
 			best, bestStime = i, stime
 		}
 	}
-	return best
+	if best != -1 {
+		return best
+	}
+	if !hasFunc {
+		return -2
+	}
+	if !hasCI {
+		return -3
+	}
+	return -4
 }
 
 // lookupPath resolves the looked-up path component via the parent directory
