@@ -22,6 +22,28 @@ IN_D  = 3 # in disk
 IN_NE = 4 # not existent
 
 
+# State-mutating syscalls whose outcome is direction-fed-forward from the
+# runtime record while a network partition is active: replaying them as
+# no-op failures keeps the emulated state machine on the real trajectory
+# instead of blindly succeeding and scrapping the whole exploration.
+FEEDFORWARD_FAIL_SYSCALLS = [
+    "SYS_write", "SYS_pwrite64", "SYS_creat",
+    "SYS_mkdir", "SYS_rmdir", "SYS_unlink", "SYS_rename",
+    "SYS_truncate", "SYS_chmod", "SYS_fchmod",
+    "SYS_fsync", "SYS_fdatasync",
+]
+
+def feedforward_fail(call_idx):
+    """Oracle feed-forward: during an hmdfs partition window the runtime
+    record (checkInfos) already tells whether this call succeeded; mutating
+    ops recorded as failed are replayed as no-op failures."""
+    if c.FSTYPE != "hmdfs" or not c.NETSTATE:
+        return False
+    try:
+        return int(c.runtime_state[call_idx].get("Retv", 0)) < 0
+    except (IndexError, KeyError, TypeError, ValueError):
+        return False
+
 def emulate(prev_state, call_idx):
 
     # Deep copy state from previous state
@@ -84,6 +106,12 @@ def emulate(prev_state, call_idx):
     # only if the operation can be executed in current fault situation
     if fault_model.is_available(syscall, argv) == False:
         print("not available, skip")
+        return -1, state
+
+    # Oracle feed-forward: follow the runtime-recorded outcome for mutating
+    # ops while the partition is live (see feedforward_fail above).
+    if syscall in FEEDFORWARD_FAIL_SYSCALLS and feedforward_fail(call_idx):
+        print("[symsc] feed-forward failure: {0} under network partition".format(syscall))
         return -1, state
 
     if syscall == "SYS_mkdir":

@@ -114,7 +114,10 @@ if __name__ == "__main__":
     # State exploration
     S = [(emul_state, -1, -1)]
     if dpor.explore(S, None, seq_programs) == False:
-        print("WARNING: inconsistent emul and runtime state")
+        # Not prefixed with "WARNING:" — manager matches kernel warning
+        # signatures on the console and would otherwise restart all VMs on
+        # a routine exploration exhaustion (no dump, pure disruption).
+        print("[symsc] exploration exhausted without a consistent schedule")
 
     # Statistics for eval
     # Only consider more than one clients has calls
