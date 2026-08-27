@@ -720,7 +720,13 @@ def state_check(retval, emul_state, call_idx):
             # Pre-existing file: the emulation has no initial content for it,
             # so only its metadata is comparable, not the read data.
             print("read pre-existing file, skip content compare")
-        elif (retval == -1 or retval == 0) and op_runtime_stat['Checksum'] == 0:
+        elif retval == -1 or (retval == 0 and op_runtime_stat['Checksum'] == 0):
+            # A failed read (-1) yields no data in the emulation (the buffer
+            # stays at its initial value), so its checksum is not comparable
+            # to the runtime one (which the executor computed from the
+            # successfully read data). Skip unconditionally. EOF (0) with a
+            # zero runtime checksum is also skipped, mirroring the is_init
+            # skip above.
             print("read fails/nothing")
         else:
             buf_var = syscall_argv[1].replace("(long)", "")
