@@ -26,11 +26,18 @@ IN_NE = 4 # not existent
 # runtime record while a network partition is active: replaying them as
 # no-op failures keeps the emulated state machine on the real trajectory
 # instead of blindly succeeding and scrapping the whole exploration.
+# Covers the full set of mutating branches in emulate()'s dispatcher —
+# including ones not (yet) enabled in the fuzzing config, so future
+# enable_syscalls extensions cannot silently outgrow the feed-forward.
 FEEDFORWARD_FAIL_SYSCALLS = [
     "SYS_write", "SYS_pwrite64", "SYS_creat",
     "SYS_mkdir", "SYS_rmdir", "SYS_unlink", "SYS_rename",
-    "SYS_truncate", "SYS_chmod", "SYS_fchmod",
-    "SYS_fsync", "SYS_fdatasync",
+    "SYS_link", "SYS_symlink",
+    "SYS_truncate", "SYS_ftruncate", "SYS_chmod", "SYS_fchmod", "SYS_utimes",
+    "SYS_fsync", "SYS_fdatasync", "SYS_sync", "SYS_syncfs",
+    "SYS_fallocate",
+    "SYS_setxattr", "SYS_lsetxattr", "SYS_fsetxattr",
+    "SYS_removexattr", "SYS_lremovexattr", "SYS_fremovexattr",
 ]
 
 def feedforward_fail(call_idx):
