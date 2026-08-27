@@ -12,6 +12,7 @@
 package prog
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"syscall"
@@ -111,6 +112,11 @@ type DagDiag struct {
 	MatchFailNoFunc int // no call of the event's function type in the program
 	MatchFailNoCI   int // matching calls exist but CheckInfo is nil
 	MatchFailTime   int // calls exist with windows, timestamp outside all
+	// mfTime attribution: direction + nearest-window samples.
+	MatchFailByNode []int    // unmatched events per ProgIdx
+	MFTimeLate      int      // event ts later than every same-type window end
+	MFTimeEarly     int      // event ts earlier than every same-type window start
+	MFSamples       []string // first few mfTime events (capped), for log output
 	// ExtractPairs.
 	TotalPairs      int // all vertex pairs considered
 	OverlapPairs    int // pairs with overlapping windows (cc candidates)
@@ -270,6 +276,26 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 					diag.MatchFailNoCI++
 				default:
 					diag.MatchFailTime++
+					// mfTime attribution: nearest same-type window distance,
+					// direction and per-node split.
+					if diag.MatchFailByNode == nil {
+						diag.MatchFailByNode = make([]int, len(ps))
+					}
+					if ev.ProgIdx >= 0 && ev.ProgIdx < len(diag.MatchFailByNode) {
+						diag.MatchFailByNode[ev.ProgIdx]++
+					}
+					if d, ws, we, found := nearestWindowOfFunc(ev, p, tscoffs); found {
+						if d > 0 {
+							diag.MFTimeLate++
+						} else if d < 0 {
+							diag.MFTimeEarly++
+						}
+						if len(diag.MFSamples) < 4 {
+							diag.MFSamples = append(diag.MFSamples,
+								fmt.Sprintf("idx=%d func=%d d=%+d win=[%d,%d]",
+									ev.ProgIdx, ev.FuncID, d, ws, we))
+						}
+					}
 				}
 				continue
 			}
@@ -534,6 +560,47 @@ func matchEventToCall(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) int {
 		return -3
 	}
 	return -4
+}
+
+// nearestWindowOfFunc returns the signed distance from an unmatched event's
+// timestamp to the nearest window boundary among same-type calls (positive:
+// event is later than the window end; negative: earlier than the window
+// start), along with that window's raw Stime/Etime. Only meaningful when
+// matchEventToCall returned -4.
+func nearestWindowOfFunc(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) (delta int64, stime, etime uint64, found bool) {
+	off := tscoffFor(tscoffs, ev.ProgIdx)
+	var bestAbs int64 = -1
+	for _, call := range p.Calls {
+		if !funcMatchesCall(ev.FuncID, call.Meta.Name) {
+			continue
+		}
+		ci := call.CheckInfo
+		if ci == nil {
+			continue
+		}
+		ws := int64(ci.Stime) - off
+		we := int64(ci.Etime) - off
+		ts := int64(ev.Timestamp)
+		var d int64
+		switch {
+		case ts > we:
+			d = ts - we // late
+		case ts < ws:
+			d = ws - ts // early (negative)
+			d = -d
+		default:
+			return 0, uint64(ws), uint64(we), true // inside; shouldn't happen for -4
+		}
+		abs := d
+		if abs < 0 {
+			abs = -abs
+		}
+		if bestAbs == -1 || abs < bestAbs {
+			bestAbs = abs
+			delta, stime, etime, found = d, uint64(ws), uint64(we), true
+		}
+	}
+	return
 }
 
 // lookupPath resolves the looked-up path component via the parent directory
