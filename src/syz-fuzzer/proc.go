@@ -35,20 +35,21 @@ import (
 
 // Proc represents a single fuzzing process (executor).
 type Proc struct {
-	fuzzer            *Fuzzer
-	pid               int
-	env               *ipc.Env
-	rnd               *rand.Rand
-	execOpts          *ipc.ExecOpts
-	execOptsCover     *ipc.ExecOpts
-	execOptsComps     *ipc.ExecOpts
-	execOptsNoCollide *ipc.ExecOpts
-	execOptsLight     *ipc.ExecOpts
-	freqCov           int32
-	cltTick           chan bool
-	hmcfg             prog.Hmdfs_config
-	lcsInodeops       *prog.LayeredChoiceStrategy
-	lcsFileops        *prog.LayeredChoiceStrategy
+	fuzzer                *Fuzzer
+	pid                   int
+	env                   *ipc.Env
+	rnd                   *rand.Rand
+	execOpts              *ipc.ExecOpts
+	execOptsCover         *ipc.ExecOpts
+	execOptsComps         *ipc.ExecOpts
+	execOptsNoCollide     *ipc.ExecOpts
+	execOptsLight         *ipc.ExecOpts
+	execOptsLightMinimize *ipc.ExecOpts
+	freqCov               int32
+	cltTick               chan bool
+	hmcfg                 prog.Hmdfs_config
+	lcsInodeops           *prog.LayeredChoiceStrategy
+	lcsFileops            *prog.LayeredChoiceStrategy
 }
 
 func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
@@ -66,8 +67,15 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	// Light mode for triage/minimize rounds (Monarch §3.4): reduction is
 	// judged purely by coverage/signal equivalence, so skip the post-exec
 	// file-tree metadata collection in the executor.
+	// Two variants, matching the original per-site semantics:
+	//   execOptsLight        — sites that merge client cover after the run;
+	//   execOptsLightMinimize — validation/minimize sites whose consumers
+	//     discard cover (thisSignal, _ :=), restoring their former
+	//     no-cover NoCollide semantics while still skipping fsMd.
 	execOptsLight := execOptsCover
 	execOptsLight.Flags |= ipc.FlagSkipFsMd
+	execOptsLightMinimize := execOptsNoCollide
+	execOptsLightMinimize.Flags |= ipc.FlagSkipFsMd
 
 	freqCov := int32(10)
 	cltTick := make(chan bool)
@@ -296,20 +304,21 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	}
 
 	proc := &Proc{
-		fuzzer:            fuzzer,
-		pid:               pid,
-		env:               env,
-		rnd:               rnd,
-		execOpts:          fuzzer.execOpts,
-		execOptsCover:     &execOptsCover,
-		execOptsComps:     &execOptsComps,
-		execOptsNoCollide: &execOptsNoCollide,
-		execOptsLight:     &execOptsLight,
-		freqCov:           freqCov,
-		cltTick:           cltTick,
-		hmcfg:             hc,
-		lcsInodeops:       lcsInodeops,
-		lcsFileops:        lcsFileops,
+		fuzzer:                fuzzer,
+		pid:                   pid,
+		env:                   env,
+		rnd:                   rnd,
+		execOpts:              fuzzer.execOpts,
+		execOptsCover:         &execOptsCover,
+		execOptsComps:         &execOptsComps,
+		execOptsNoCollide:     &execOptsNoCollide,
+		execOptsLight:         &execOptsLight,
+		execOptsLightMinimize: &execOptsLightMinimize,
+		freqCov:               freqCov,
+		cltTick:               cltTick,
+		hmcfg:                 hc,
+		lcsInodeops:           lcsInodeops,
+		lcsFileops:            lcsFileops,
 	}
 	return proc, nil
 }
@@ -469,7 +478,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	notexecuted := 0
 	if !item.triageDag {
 		for i := 0; i < signalRuns; i++ {
-			infos, _, _ := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage)
+			infos, _, _ := proc.executeRaw(proc.execOptsLightMinimize, item.ps, StatTriage)
 			if !reexecutionSuccess(infos[item.subNum], &item.info, item.call) {
 				// The call was not executed or failed.
 				notexecuted++
@@ -500,7 +509,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 			item.ps, item.call = prog.Minimize(item.ps, item.call, item.subNum, false, proc.fuzzer.config.ServNum,
 				func(ps1 []*prog.Prog, call1 int) bool {
 					for i := 0; i < minimizeAttempts; i++ {
-						infos := proc.execute(proc.execOptsLight, ps1, ProgNormal, StatMinimize)
+						infos := proc.execute(proc.execOptsLightMinimize, ps1, ProgNormal, StatMinimize)
 						if !reexecutionSuccess(infos[item.subNum], &item.info, call1) {
 							// The call was not executed or failed.
 							continue
