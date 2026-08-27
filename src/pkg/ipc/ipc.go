@@ -65,6 +65,7 @@ const (
 	FlagThreaded                                   // use multiple threads to mitigate blocked syscalls
 	FlagCollide                                    // collide syscalls to provoke data races
 	FlagEnableCoverageFilter                       // setup and use bitmap to do coverage filter
+	FlagSkipFsMd                                   // triage/light rounds: skip the post-exec file-tree metadata collection (bit 6, mirrored in executor.cc)
 )
 
 type ExecOpts struct {

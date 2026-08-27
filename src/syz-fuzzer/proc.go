@@ -43,6 +43,7 @@ type Proc struct {
 	execOptsCover     *ipc.ExecOpts
 	execOptsComps     *ipc.ExecOpts
 	execOptsNoCollide *ipc.ExecOpts
+	execOptsLight     *ipc.ExecOpts
 	freqCov           int32
 	cltTick           chan bool
 	hmcfg             prog.Hmdfs_config
@@ -62,6 +63,11 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	execOptsCover.Flags |= ipc.FlagCollectCover
 	execOptsComps := execOptsNoCollide
 	execOptsComps.Flags |= ipc.FlagCollectComps
+	// Light mode for triage/minimize rounds (Monarch §3.4): reduction is
+	// judged purely by coverage/signal equivalence, so skip the post-exec
+	// file-tree metadata collection in the executor.
+	execOptsLight := execOptsCover
+	execOptsLight.Flags |= ipc.FlagSkipFsMd
 
 	freqCov := int32(10)
 	cltTick := make(chan bool)
@@ -298,6 +304,7 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		execOptsCover:     &execOptsCover,
 		execOptsComps:     &execOptsComps,
 		execOptsNoCollide: &execOptsNoCollide,
+		execOptsLight:     &execOptsLight,
 		freqCov:           freqCov,
 		cltTick:           cltTick,
 		hmcfg:             hc,
@@ -462,7 +469,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	notexecuted := 0
 	if !item.triageDag {
 		for i := 0; i < signalRuns; i++ {
-			infos, _, _ := proc.executeRaw(proc.execOptsCover, item.ps, StatTriage)
+			infos, _, _ := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage)
 			if !reexecutionSuccess(infos[item.subNum], &item.info, item.call) {
 				// The call was not executed or failed.
 				notexecuted++
@@ -518,7 +525,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	var inputCliSignal, inputSrvSignal signal.Signal
 	srvNum := proc.fuzzer.config.ServNum
 	for i := 0; i < signalRuns; i++ {
-		infos, _, _ := proc.executeRaw(proc.execOptsCover, item.ps, StatTriage) //TODO
+		infos, _, _ := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage) //TODO
 		thisSignal, thisCover := getSignalAndCover(item.ps[item.subNum], infos[item.subNum], item.call)
 		if item.triageClient {
 			CliCover.Merge(thisCover)
@@ -981,7 +988,7 @@ func (proc *Proc) triageFailure(ps []*prog.Prog, infos []*ipc.ProgInfo) {
 
 	//stable signals
 	for i := 0; i < 1; i++ {
-		infos, _, _ := proc.executeRaw(proc.execOptsCover, ps, StatTriage)
+		infos, _, _ := proc.executeRaw(proc.execOptsLight, ps, StatTriage)
 		var oneRunSig signal.Signal
 		for idx, info := range infos {
 			if idx >= proc.fuzzer.config.ServNum {
@@ -1215,7 +1222,10 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	prog.SetMfTolTicksFromRatio(tscRatio)
 
 	csanPassed, csanDiffs := true, []string(nil)
-	if proc.fuzzer.config.EnableCsan {
+	// Triage/minimize rounds judge candidates purely by coverage/signal
+	// equivalence (Monarch §3.4): the semantic checker is not part of the
+	// reduction loop, so skip it there to keep each reduce step cheap.
+	if proc.fuzzer.config.EnableCsan && stat != StatTriage {
 		csanPassed, csanDiffs = checker.ConcFSCheck(ps, infos, fsMds, proc.fuzzer.config.ServNum,
 			proc.fuzzer.config.DFSName, proc.fuzzer.config.DfsSetupParams,
 			proc.fuzzer.config.InitIp, testdirIno, proc.hmcfg.FileTree)

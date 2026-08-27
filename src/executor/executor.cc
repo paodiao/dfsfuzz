@@ -185,6 +185,7 @@ static bool flag_wifi;
 static bool flag_collect_cover;
 static bool flag_dedup_cover;
 static bool flag_threaded;
+static bool flag_skip_fs_md;
 static bool flag_collide;
 static bool flag_coverage_filter;
 
@@ -1374,6 +1375,9 @@ uint64 receive_execute() {
   //  tao end
   flag_collide = req.exec_flags & (1 << 4);
   flag_coverage_filter = req.exec_flags & (1 << 5);
+  // tao added: triage/light rounds skip post-exec file-tree metadata
+  // collection (mirror of ipc.FlagSkipFsMd).
+  flag_skip_fs_md = req.exec_flags & (1 << 6);
 
   if (!flag_threaded)
     flag_collide = false;
@@ -3112,6 +3116,14 @@ void debug_dump_data(const char *data, int length) {
 // consistency sanitizer agent
 void write_metadata(int iter) {
   output_pos = output_data + *output_pos_value;
+  if (flag_skip_fs_md) {
+    // Light (triage/minimize) round: skip the whole-tree traversal and
+    // per-file checksums entirely. Emit the "no metadata" sentinel
+    // (parseFsMd maps stat_cnt==0xFFFFFFFF to an empty result).
+    fprintf(stderr, "executor %lld [light] metadata skipped\n", executor_index);
+    write_output(0xFFFFFFFF);
+    return;
+  }
   uint32 *stat_cnt_ptr = output_pos;
   write_output(0);
   // if the storage of servers are local file system based, extract fs
