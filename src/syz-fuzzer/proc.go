@@ -1274,12 +1274,13 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	}
 
 	// DAG feedback: pair novelty bits + schedule bit (only for regular
-	// executions; triage re-runs are excluded to avoid timing-jitter noise).
+	// executions; triage and minimize re-runs are excluded to avoid
+	// timing-jitter noise and candidate-program feedback pollution).
 	// Does not depend on csan/fsMds: call-window matching needs neither, and
 	// ino-based resolution (writepage/lookup) degrades gracefully without fsMd.
 	log.Logf(0, "hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
 	appendDiagLog("hmdfs trace events=%d csanPassed=%v stat=%d tscRatio=%f", len(hmdfsTraceEvents), csanPassed, stat, tscRatio)
-	if stat != StatTriage && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
+	if stat != StatTriage && stat != StatMinimize && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
 		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.fuzzer.tscoffs)
 		hbPairs, ccPairs := prog.ExtractPairs(vertices, dagDiag)
