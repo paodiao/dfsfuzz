@@ -19,6 +19,10 @@
 #ifndef ATTR_SIZE
 #define ATTR_SIZE (1 << 10)
 #endif
+/* TASK_COMM_LEN is a kernel macro that vmlinux.h may not export. */
+#ifndef TASK_COMM_LEN
+#define TASK_COMM_LEN 16
+#endif
 
 /* bpf_tracing.h defines PT_REGS_PARM1..5 only; x86_64's 6th arg is r9. */
 #ifndef PT_REGS_PARM6
@@ -76,6 +80,20 @@ struct {
 SEC("kretprobe/hmdfs_" #name)                                      \
 int BPF_KRETPROBE(hmdfs_##name##_exit, int ret)                    \
 {                                                                   \
+	/* Only the executor's own hmdfs activity is meaningful:      \
+	 * other processes in the VM (agent, daemons, mount-time     \
+	 * traversal) would otherwise flood the event stream with    \
+	 * window-less background reads (e.g. ~3000 events before    \
+	 * the program starts on the persistence node). comm is      \
+	 * "syz-executor" (executed by its plain binary name).       \
+	 */                                                           \
+	char comm[TASK_COMM_LEN];                                    \
+	bpf_get_current_comm(&comm, sizeof(comm));                    \
+	if (comm[0] != 's' || comm[1] != 'y' || comm[2] != 'z' ||    \
+	    comm[3] != '-' || comm[4] != 'e' || comm[5] != 'x' ||    \
+	    comm[6] != 'e' || comm[7] != 'c' || comm[8] != 'u' ||    \
+	    comm[9] != 't' || comm[10] != 'o' || comm[11] != 'r')     \
+		return 0;                                              \
 	struct merge_trace_event *e;                                 \
 	e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);             \
 	if (!e)                                                      \
