@@ -101,6 +101,8 @@ if __name__ == "__main__":
             args.init_ip)
     elif c.FSTYPE == "nfs":
         fault_model.nfs_init(args.init_ip)
+    elif c.FSTYPE == "hmdfs":
+        fault_model.hmdfs_init(args.init_ip)
 
     # Initialize emul_state
     node_cnt = len(seq_programs)
