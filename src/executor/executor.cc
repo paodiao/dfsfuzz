@@ -504,6 +504,9 @@ static void calibrate_tsc(void) {
   tsc_ns_ratio = (double)(m2 - m1) / (double)(t2 - t1);
   tsc_anchor_tsc = t1;
   tsc_anchor_ns = m1;
+  fprintf(stderr, "executor %lld tsc calibrate: ratio=%f anchor_tsc=%llu anchor_ns=%llu\n",
+          executor_index, tsc_ns_ratio,
+          (unsigned long long)tsc_anchor_tsc, (unsigned long long)tsc_anchor_ns);
 }
 
 // Convert a bpf_ktime_get_ns() timestamp into the global raw-TSC domain.

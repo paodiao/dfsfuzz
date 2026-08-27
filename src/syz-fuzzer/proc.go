@@ -149,6 +149,7 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 						hc.Init_file[cid] = files
 						hc.FileSize[cid] = fileSizes
 						log.Logf(0, "Loaded %d initial files for node %s", len(files), cid)
+						appendDiagLog("loaded init: %d initial files for node %s", len(files), cid)
 					}
 
 					// Load directory list
@@ -166,6 +167,7 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 						}
 						hc.Init_dir[cid] = dirs
 						log.Logf(0, "Loaded %d initial directories for node %s", len(dirs), cid)
+						appendDiagLog("loaded init: %d initial directories for node %s", len(dirs), cid)
 					}
 
 					// Load tmpdir list
@@ -183,6 +185,7 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 						}
 						hc.Init_tmpdir[cid] = tmpdirs
 						log.Logf(0, "Loaded %d initial tmpdirs for node %s", len(tmpdirs), cid)
+						appendDiagLog("loaded init: %d initial tmpdirs for node %s", len(tmpdirs), cid)
 					}
 				}
 
@@ -264,6 +267,9 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 					}
 					log.Logf(0, "Loaded persistence config: node_idx=%d, dir=%s, files=%d",
 						hc.Node_idx_of_persistence, hc.Persistence_dir, len(persistFiles))
+					appendDiagLog("loaded persistence config: node_idx=%d dir=%s files=%d persistNodeId=%q persistDirRaw=%v persistLen=%d",
+						hc.Node_idx_of_persistence, hc.Persistence_dir, len(persistFiles),
+						persistNodeId, persistDir != "", len(persistDir))
 				}
 			}
 		} else {
@@ -280,6 +286,7 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		lcsFileops = prog.NewLayeredChoiceStrategy("fileops", &hc, fuzzer.target)
 		lcsInodeops.SetTscOffsets(fuzzer.tscoffs)
 		lcsFileops.SetTscOffsets(fuzzer.tscoffs)
+		appendDiagLog("tscoffs=%v", fuzzer.tscoffs)
 	}
 
 	proc := &Proc{
@@ -1247,18 +1254,18 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		hbPairs, ccPairs := prog.ExtractPairs(vertices, dagDiag)
 		allPairs := append(hbPairs, ccPairs...)
 		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg, dagDiag)
-		log.Logf(0, "hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
+		log.Logf(0, "hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
 			len(vertices), len(hbPairs), len(ccPairs), len(pairBits),
 			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
 			dagDiag.MatchFailFunc, dagDiag.MatchFailRetOK, dagDiag.MatchFailNoFunc, dagDiag.MatchFailNoCI, dagDiag.MatchFailTime,
-			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly,
+			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly, dagDiag.MFGap, dagDiag.MFShift,
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
 			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
-		appendDiagLog("hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
+		appendDiagLog("hmdfs dag: vertices=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
 			len(vertices), len(hbPairs), len(ccPairs), len(pairBits),
 			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
 			dagDiag.MatchFailFunc, dagDiag.MatchFailRetOK, dagDiag.MatchFailNoFunc, dagDiag.MatchFailNoCI, dagDiag.MatchFailTime,
-			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly,
+			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly, dagDiag.MFGap, dagDiag.MFShift,
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
 			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
 		if len(dagDiag.MFSamples) > 0 {

@@ -116,6 +116,8 @@ type DagDiag struct {
 	MatchFailByNode []int    // unmatched events per ProgIdx
 	MFTimeLate      int      // event ts later than every same-type window end
 	MFTimeEarly     int      // event ts earlier than every same-type window start
+	MFGap           int      // event sits between two same-type windows (prevE/nextS both exist)
+	MFShift         int      // event on the outer side of all same-type windows (unilateral)
 	MFSamples       []string // first few mfTime events (capped), for log output
 	// ExtractPairs.
 	TotalPairs      int // all vertex pairs considered
@@ -284,16 +286,25 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 					if ev.ProgIdx >= 0 && ev.ProgIdx < len(diag.MatchFailByNode) {
 						diag.MatchFailByNode[ev.ProgIdx]++
 					}
-					if d, ws, we, found := nearestWindowOfFunc(ev, p, tscoffs); found {
+					if d, ws, we, prevE, nextS, found := nearestWindowOfFunc(ev, p, tscoffs); found {
 						if d > 0 {
 							diag.MFTimeLate++
 						} else if d < 0 {
 							diag.MFTimeEarly++
 						}
+						// prevE/nextS both present: the event sits in the gap
+						// between two same-type windows (async/late trigger).
+						// Otherwise it is on the outer side of all windows
+						// (unilateral: calibration/domain drift candidate).
+						if prevE != -1 && nextS != -1 {
+							diag.MFGap++
+						} else {
+							diag.MFShift++
+						}
 						if len(diag.MFSamples) < 4 {
 							diag.MFSamples = append(diag.MFSamples,
-								fmt.Sprintf("idx=%d func=%d d=%+d win=[%d,%d]",
-									ev.ProgIdx, ev.FuncID, d, ws, we))
+								fmt.Sprintf("idx=%d func=%d d=%+d win=[%d,%d] prevE=%d nextS=%d",
+									ev.ProgIdx, ev.FuncID, d, ws, we, prevE, nextS))
 						}
 					}
 				}
@@ -565,10 +576,13 @@ func matchEventToCall(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) int {
 // nearestWindowOfFunc returns the signed distance from an unmatched event's
 // timestamp to the nearest window boundary among same-type calls (positive:
 // event is later than the window end; negative: earlier than the window
-// start), along with that window's raw Stime/Etime. Only meaningful when
-// matchEventToCall returned -4.
-func nearestWindowOfFunc(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) (delta int64, stime, etime uint64, found bool) {
+// start), along with that window's raw Stime/Etime, the previous same-type
+// window's Etime (prevE) and the next same-type window's Stime (nextS;
+// -1 when absent). Only meaningful when matchEventToCall returned -4.
+func nearestWindowOfFunc(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) (delta int64, stime, etime uint64, prevE, nextS int64, found bool) {
 	off := tscoffFor(tscoffs, ev.ProgIdx)
+	ts := int64(ev.Timestamp)
+	prevE, nextS = -1, -1
 	var bestAbs int64 = -1
 	for _, call := range p.Calls {
 		if !funcMatchesCall(ev.FuncID, call.Meta.Name) {
@@ -580,7 +594,12 @@ func nearestWindowOfFunc(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) (delta i
 		}
 		ws := int64(ci.Stime) - off
 		we := int64(ci.Etime) - off
-		ts := int64(ev.Timestamp)
+		if we < ts && (prevE == -1 || we > prevE) {
+			prevE = we
+		}
+		if ws > ts && (nextS == -1 || ws < nextS) {
+			nextS = ws
+		}
 		var d int64
 		switch {
 		case ts > we:
@@ -589,7 +608,7 @@ func nearestWindowOfFunc(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) (delta i
 			d = ws - ts // early (negative)
 			d = -d
 		default:
-			return 0, uint64(ws), uint64(we), true // inside; shouldn't happen for -4
+			return 0, uint64(ws), uint64(we), prevE, nextS, true // inside; shouldn't happen for -4
 		}
 		abs := d
 		if abs < 0 {
