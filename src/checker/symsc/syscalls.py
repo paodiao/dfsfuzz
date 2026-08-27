@@ -956,7 +956,7 @@ def link(argv):
             print("[-] EMUL-ERR not path is specified")
         return 1
     name_existing = _get_name(path_existing)
-    path_new = _get_raw_path(argv[1])
+    path_new = _abspath(_get_raw_path(argv[1]))
     if path_new == None:
         if c.verbose:
             print("[-] EMUL-ERR not path is specified")
@@ -1208,8 +1208,9 @@ def symlink(argv):
     inode_mem = c.Inode(id=c.INODE_CNT, name=path2_name, type=c.SYMLINK, mode=0o777, size=0, path=path2)
     #if c.FSTYPE == c.NFS:
     #    inode_mem.xattr["system.nfs4_acl"] = ""
-    inode_mem.target = path1
-    inode_mem.size = len(path1)
+    target_path = _abspath(path1)
+    inode_mem.target = target_path
+    inode_mem.size = len(target_path)
     c.MEM[inode_mem.id] = inode_mem
     c.DENTRY[path2] = inode_mem.id
     tup = (id, path2_name)
