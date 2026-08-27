@@ -493,10 +493,14 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 
 		if item.flags&ProgMinimized == 0 && item.subNum >= proc.fuzzer.config.ServNum {
 			//修改：minimize是不是也要定制一下？
+			//定制：是的——minimize 的判据同样只依赖覆盖/信号等价（Monarch
+			//§3.4），且 minimizeAttempts 次迭代是 triage 中最贵的一段，切到
+			//轻量执行（跳 fsMd 收集；csan 门在 executeRaw 内对 StatMinimize
+			//同样豁免）。
 			item.ps, item.call = prog.Minimize(item.ps, item.call, item.subNum, false, proc.fuzzer.config.ServNum,
 				func(ps1 []*prog.Prog, call1 int) bool {
 					for i := 0; i < minimizeAttempts; i++ {
-						infos := proc.execute(proc.execOptsNoCollide, ps1, ProgNormal, StatMinimize)
+						infos := proc.execute(proc.execOptsLight, ps1, ProgNormal, StatMinimize)
 						if !reexecutionSuccess(infos[item.subNum], &item.info, call1) {
 							// The call was not executed or failed.
 							continue
@@ -1225,7 +1229,9 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	// Triage/minimize rounds judge candidates purely by coverage/signal
 	// equivalence (Monarch §3.4): the semantic checker is not part of the
 	// reduction loop, so skip it there to keep each reduce step cheap.
-	if proc.fuzzer.config.EnableCsan && stat != StatTriage {
+	// Covers both StatTriage (input validation) and StatMinimize (the
+	// prog.Minimize verification loop inside triageInput).
+	if proc.fuzzer.config.EnableCsan && stat != StatTriage && stat != StatMinimize {
 		csanPassed, csanDiffs = checker.ConcFSCheck(ps, infos, fsMds, proc.fuzzer.config.ServNum,
 			proc.fuzzer.config.DFSName, proc.fuzzer.config.DfsSetupParams,
 			proc.fuzzer.config.InitIp, testdirIno, proc.hmcfg.FileTree)
