@@ -371,8 +371,10 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata, fs
 }
 
 // initTreeSubset serializes the subset of the initial file tree touched by
-// the test programs (plus all ancestor directories, up to and including the
-// merge_view root) for symsc. The initial tree can contain thousands of
+// the test programs (plus all ancestor directories) for symsc, in the
+// emulation's canonical domain: paths relative to the merge_view root (no
+// "merge_view/" prefix). The merge_view root itself is skipped (symsc
+// pre-creates its root inode). The initial tree can contain thousands of
 // files while a program only touches a few dozen, so passing the whole tree
 // would blow up the emulation's per-call state copies.
 func initTreeSubset(ps []*prog.Prog, ft *prog.FileTree) string {
@@ -385,7 +387,10 @@ func initTreeSubset(ps []*prog.Prog, ft *prog.FileTree) string {
 		path = strings.TrimPrefix(path, "./")
 		if node := ft.FindNode(path); node != nil {
 			for n := node; n != nil; n = n.Parent {
-				fp := n.FullPath
+				if n.Parent == nil {
+					continue // merge_view root: not part of the emulated world
+				}
+				fp := strings.TrimPrefix(n.FullPath, prog.MergeViewPrefix)
 				if seen[fp] {
 					continue
 				}
