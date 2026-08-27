@@ -832,7 +832,11 @@ func prePath(v *DAGVertex) string {
 }
 
 // determinePathRel classifies the path relation between two vertices.
-// For ordered pairs the post-path of A is compared against the pre-path of B.
+// The ordered flag is currently unused: the implementation conservatively
+// compares the Cartesian product of {A.Path, prePath(A)} × {B.Path,
+// prePath(B)}. For ordered pairs this over-approximates (a later rename's
+// old path may match an earlier op's post path), but never misses a real
+// relation.
 func determinePathRel(A, B *DAGVertex, ordered bool) PathRel {
 	aPaths := []string{A.Path, prePath(A)}
 	bPaths := []string{B.Path, prePath(B)}
