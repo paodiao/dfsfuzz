@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -71,18 +72,18 @@ const (
 
 // DAGVertex is a single traced operation bound to a concrete path.
 type DAGVertex struct {
-	FuncID   uint32
-	CallName string // syscall name that triggered the event (from window matching)
-	Path     string
-	OldPath  string // rename source path (only for rename vertices)
+	FuncID    uint32
+	CallName  string // syscall name that triggered the event (from window matching)
+	Path      string
+	OldPath   string // rename source path (only for rename vertices)
 	RetBucket RetBucket
-	Stime    uint64
-	Etime    uint64
-	Ino      uint64
-	ProgIdx  int
-	IsDir    bool
-	Off      uint64 // write/read: kiocb->ki_pos; truncate: ia_size; else 0
-	Size     uint64 // file size at execution (post-exec fsMd)
+	Stime     uint64
+	Etime     uint64
+	Ino       uint64
+	ProgIdx   int
+	IsDir     bool
+	Off       uint64 // write/read: kiocb->ki_pos; truncate: ia_size; else 0
+	Size      uint64 // file size at execution (post-exec fsMd)
 }
 
 // DAGPair is an ordered pair of vertices with temporal and path relations.
@@ -119,6 +120,12 @@ type DagDiag struct {
 	MFGap           int      // event sits between two same-type windows (prevE/nextS both exist)
 	MFShift         int      // event on the outer side of all same-type windows (unilateral)
 	MFSamples       []string // first few mfTime events (capped), for log output
+	// Event-window distance histogram (buckets: <7µs / 7-21 / 21-52 /
+	// 52-140 / 140-350 / 350µs-1ms / >1ms): inside = matched events'
+	// distance to the nearest window edge, outside = -4 events' distance to
+	// the nearest window boundary.
+	MatchDistIn  [7]int
+	MatchDistOut [7]int
 	// ExtractPairs.
 	TotalPairs      int // all vertex pairs considered
 	OverlapPairs    int // pairs with overlapping windows (cc candidates)
@@ -301,6 +308,11 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 						} else {
 							diag.MFShift++
 						}
+						abs := d
+						if abs < 0 {
+							abs = -abs
+						}
+						diag.MatchDistOut[matchDistBucket(abs)]++
 						if len(diag.MFSamples) < 4 {
 							diag.MFSamples = append(diag.MFSamples,
 								fmt.Sprintf("idx=%d func=%d d=%+d win=[%d,%d] prevE=%d nextS=%d",
@@ -317,8 +329,16 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 				continue
 			}
 			off := tscoffFor(tscoffs, ev.ProgIdx)
-			v.Stime = uint64(int64(ci.Stime) - off)
-			v.Etime = uint64(int64(ci.Etime) - off)
+			ws := int64(ci.Stime) - off
+			we := int64(ci.Etime) - off
+			// Distance to the nearest window edge (inside the window).
+			dist := int64(ev.Timestamp) - ws
+			if d2 := we - int64(ev.Timestamp); d2 < dist {
+				dist = d2
+			}
+			diag.MatchDistIn[matchDistBucket(dist)]++
+			v.Stime = uint64(ws)
+			v.Etime = uint64(we)
 			switch ev.FuncID {
 			case FuncMkdir, FuncCreate:
 				v.Path = extractPathFromCall(call)
@@ -531,20 +551,70 @@ func pathIsAncestorOf(parent, child string) bool {
 	return parent != "" && strings.HasPrefix(child, parent+"/")
 }
 
+// mfTolTicks is the tolerance (≈100µs @ 3.42GHz) applied to event-window
+// matching: kretprobe timestamps lag the window end by tens of µs and the
+// ns→TSC calibration has µs-level accuracy, while genuine async/gap events
+// (>1ms, e.g. writeback) stay excluded. The default only applies when the
+// executor-reported calibration ratio is unavailable; SetMfTolTicksFromRatio
+// converts the 100µs semantic per-machine (3418 ticks/µs at 3.42GHz).
+var mfTolTicks int64 = 342000
+
+// SetMfTolTicksFromRatio sets the match tolerance from the executor's
+// calibrated ns-per-tick ratio: 100µs = 100000ns / (ns/tick). Out-of-range
+// ratios keep the default.
+func SetMfTolTicksFromRatio(ratio float64) {
+	if ratio < 0.1 || ratio > 10 {
+		return
+	}
+	tol := int64(100000.0 / ratio)
+	if tol >= 10000 && tol <= 10000000 {
+		atomic.StoreInt64(&mfTolTicks, tol)
+	}
+}
+
+// MfTolTicks returns the current event-window match tolerance in ticks.
+func MfTolTicks() int64 { return atomic.LoadInt64(&mfTolTicks) }
+
+// matchDistBucket buckets a distance in ticks (≈3418 ticks/µs @ 3.42GHz):
+// <7µs / 7-21 / 21-52 / 52-140 / 140-350 / 350µs-1ms / >1ms.
+func matchDistBucket(ticks int64) int {
+	switch {
+	case ticks < 24000:
+		return 0
+	case ticks < 72000:
+		return 1
+	case ticks < 178000:
+		return 2
+	case ticks < 479000:
+		return 3
+	case ticks < 1196000:
+		return 4
+	case ticks < 3418000:
+		return 5
+	default:
+		return 6
+	}
+}
+
 // matchEventToCall finds the call whose execution window contains the event
-// timestamp. Among overlapping windows (should not happen within one VM since
-// calls run sequentially) the one started last wins.
+// timestamp, within mfTolTicks of the window edges (the event may be sampled
+// slightly after the window end by the kretprobe handler, or a few µs before
+// the window start by calibration imprecision). Among overlapping windows
+// (should not happen within one VM since calls run sequentially) the one
+// started last wins.
 // Returns the call index on success, or a negative reason code:
-//   -1 no matching call
-//   -2 no call of the event's function type
-//   -3 calls exist but CheckInfo is nil
-//   -4 calls exist with windows, but the timestamp is outside all of them
+//
+//	-1 no matching call
+//	-2 no call of the event's function type
+//	-3 calls exist but CheckInfo is nil
+//	-4 calls exist with windows, but the timestamp is outside all of them
 func matchEventToCall(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) int {
 	off := tscoffFor(tscoffs, ev.ProgIdx)
 	best := -1
 	hasFunc := false
 	hasCI := false
-	var bestStime uint64
+	var bestStime int64
+	ts := int64(ev.Timestamp)
 	for i, call := range p.Calls {
 		if !funcMatchesCall(ev.FuncID, call.Meta.Name) {
 			continue
@@ -555,10 +625,10 @@ func matchEventToCall(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) int {
 			continue
 		}
 		hasCI = true
-		stime := uint64(int64(ci.Stime) - off)
-		etime := uint64(int64(ci.Etime) - off)
-		if ev.Timestamp >= stime && ev.Timestamp <= etime && (best == -1 || stime > bestStime) {
-			best, bestStime = i, stime
+		ws := int64(ci.Stime) - off
+		we := int64(ci.Etime) - off
+		if ts >= ws-atomic.LoadInt64(&mfTolTicks) && ts <= we+atomic.LoadInt64(&mfTolTicks) && (best == -1 || ws > bestStime) {
+			best, bestStime = i, ws
 		}
 	}
 	if best != -1 {
@@ -878,9 +948,10 @@ func isOffsetFunc(fid uint32) bool {
 
 // offsetBucketOf maps (pos, size) to the offset bucket. Buckets mirror the
 // HMDFS writeback behavior (file_remote.c hmdfs_get_writecount):
-//   pos >= size            -> count = 0          (beyond — no remote write)
-//   size < pos + PAGE_SIZE -> count = size - pos (tail — partial page)
-//   otherwise              -> count = PAGE_SIZE  (full page)
+//
+//	pos >= size            -> count = 0          (beyond — no remote write)
+//	size < pos + PAGE_SIZE -> count = size - pos (tail — partial page)
+//	otherwise              -> count = PAGE_SIZE  (full page)
 func offsetBucketOf(v *DAGVertex) uint64 {
 	if !isOffsetFunc(v.FuncID) {
 		return offsetBucketNA

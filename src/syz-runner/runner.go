@@ -112,7 +112,7 @@ func (rn *Runner) Run(firstProg []byte, idx, runIdx int) {
 			log.Fatalf("failed to deserialise new program: %v", err)
 		}
 
-		_, info, hanged, err := env.Exec(rn.opts, prog)
+		_, info, hanged, err, _, _, _, _ := env.Exec(rn.opts, prog)
 		if err != nil {
 			log.Fatalf("failed to execute the program: %v", err)
 		}

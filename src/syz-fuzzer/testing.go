@@ -268,7 +268,7 @@ func checkSimpleProgram(args *checkArgs, features *host.Features) error {
     //tao modified
     var ps []*prog.Prog
     ps = append(ps, p)
-	output, info, hanged, err := env.Exec(args.ipcExecOpts, ps)
+	output, info, hanged, err, _, _, _, _ := env.Exec(args.ipcExecOpts, ps)
     //tao end
 	if err != nil {
 		return fmt.Errorf("program execution failed: %v\n%s", err, output)

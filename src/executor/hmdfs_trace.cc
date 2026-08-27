@@ -71,6 +71,7 @@ extern uint32 *write_output_64(uint64 v);
 extern uint64_t tsc_ns_to_global(uint64_t ns);
 extern signed long long int tsc_offset;
 extern uint64_t g_prog_end_raw;
+extern double tsc_ns_ratio;
 
 static struct hmdfs_trace_bpf *skel;
 static struct ring_buffer *rb;
@@ -385,7 +386,9 @@ void stop_collect_hmdfs_trace(void)
 	fprintf(stderr, "executor %d hmdfs trace: collected=%d prog_events=%d\n",
 		(int)getpid(), collected_count, prog_cnt);
 
-	/* 4. write to output */
+	/* 4. write to output: fixed-point tsc_ns_ratio (×1e9) first, then the
+	 * event count (always written, even when empty), then the events. */
+	write_output_64((uint64_t)(tsc_ns_ratio * 1000000000.0));
 	write_output((uint32)collected_count);
 	for (int i = 0; i < collected_count; i++) {
 		write_output_64(collected[i].timestamp);

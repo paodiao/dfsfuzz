@@ -654,7 +654,7 @@ func RunTest(req *RunRequest, executor string) {
 		//tao modified
 		var ps []*prog.Prog
 		ps = append(ps, req.P)
-		output, info, hanged, err := env.Exec(req.Opts, ps)
+		output, info, hanged, err, _, _, _, _ := env.Exec(req.Opts, ps)
 		//tao end
 		req.Output = append(req.Output, output...)
 		if err != nil {

@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: MIT
 import pdb
+import sys
 import common as c
 import re
 
@@ -74,10 +75,12 @@ def init_state(prog, node_cnt, init_tree=None):
                         parent.dir_unknown -= 1
                 state["FT"].add_node((inode.id, name), (parent_id, parent.name[0]))
         loaded = len(state["DENTRY"])
-        print("[symsc] init_tree loaded: %d DENTRY entries (incl. root)" % loaded)
+        print("[symsc] init_tree loaded: %d DENTRY entries (incl. root)" % loaded,
+              file=sys.stderr, flush=True)
         print("[symsc] init_tree probe: qfehribmzl=%s bafubtprst=%s" % (
             any("qfehribmzl" in k for k in state["DENTRY"]),
-            any("bafubtprst" in k for k in state["DENTRY"])))
+            any("bafubtprst" in k for k in state["DENTRY"])),
+              file=sys.stderr, flush=True)
         state["INODE_CNT"] = c.INODE_CNT
 
     program_lines = prog.split("\n")
