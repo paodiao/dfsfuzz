@@ -199,12 +199,17 @@ funcname, argc, len(argv)))
 
 
 def _abspath(pathstr):
-    if pathstr == "" or pathstr == None:
+    if pathstr == "" or pathstr is None:
         return None
-    elif not pathstr.startswith("./") and pathstr != ".":
-        return os.path.join(".", pathstr)
-    else:
-        return pathstr
+    # All persisted tree keys are relative to the merge_view root, matching
+    # Go-side FileTree.findNodeLocked's MergeViewPrefix trim. Program args
+    # carry the full mounted prefix, optionally behind "./".
+    s = pathstr[len("./"):] if pathstr.startswith("./") else pathstr
+    if s.startswith("merge_view/"):
+        s = s[len("merge_view/"):]
+    if not s.startswith("./") and s != ".":
+        s = "./" + s
+    return s
 
 
 def _get_path(string): # gets file path from variable name
@@ -1167,7 +1172,7 @@ def symlink(argv):
         return 1
     path1_name = _get_name(path1)
 
-    path2 = _get_raw_path(argv[1]) # symlink
+    path2 = _abspath(_get_raw_path(argv[1])) # symlink
     if path2 == None:
         if c.verbose:
             print("[-] EMUL-ERR not path is specified")
