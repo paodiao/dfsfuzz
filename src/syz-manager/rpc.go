@@ -30,18 +30,20 @@ type RPCServer struct {
 	stats                 *Stats
 	batchSize             int
 
-	mu              sync.Mutex
-	fuzzers         map[string]*Fuzzer
-	checkResult     *rpctype.CheckArgs
-	maxSignal       signal.Signal
-	corpusCliSignal signal.Signal
-	corpusSrvSignal signal.Signal
-	corpusFailSignal signal.Signal
-	corpusCliCover  cover.Cover
-	corpusSrvCover  cover.Cover
-	rotator         *prog.Rotator
-	rnd             *rand.Rand
-	checkFailures   int
+	mu                sync.Mutex
+	fuzzers           map[string]*Fuzzer
+	checkResult       *rpctype.CheckArgs
+	maxSignal         signal.Signal
+	maxDagSignal      signal.Signal
+	maxDagSchedSignal signal.Signal
+	corpusCliSignal   signal.Signal
+	corpusSrvSignal   signal.Signal
+	corpusFailSignal  signal.Signal
+	corpusCliCover    cover.Cover
+	corpusSrvCover    cover.Cover
+	rotator           *prog.Rotator
+	rnd               *rand.Rand
+	checkFailures     int
 
 	startTime int64
 
@@ -50,12 +52,14 @@ type RPCServer struct {
 }
 
 type Fuzzer struct {
-	name          string
-	rotated       bool
-	inputs        []rpctype.RPCInput
-	newMaxSignal  signal.Signal
-	rotatedSignal signal.Signal
-	machineInfo   []byte
+	name              string
+	rotated           bool
+	inputs            []rpctype.RPCInput
+	newMaxSignal      signal.Signal
+	newDagSignal      signal.Signal
+	newDagSchedSignal signal.Signal
+	rotatedSignal     signal.Signal
+	machineInfo       []byte
 }
 
 type BugFrames struct {
@@ -82,6 +86,9 @@ func startRPCServer(mgr *Manager) (*RPCServer, error) {
 		rnd:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		startTime: 0,
 	}
+	serv.maxSignal = make(signal.Signal)
+	serv.maxDagSignal = make(signal.Signal)
+	serv.maxDagSchedSignal = make(signal.Signal)
 	serv.batchSize = 5
 	if serv.batchSize < mgr.cfg.Procs {
 		serv.batchSize = mgr.cfg.Procs
@@ -131,6 +138,8 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 	r.CheckResult = serv.checkResult
 	f.inputs = corpus
 	f.newMaxSignal = serv.maxSignal.Copy()
+	f.newDagSignal = serv.maxDagSignal.Copy()
+	f.newDagSchedSignal = serv.maxDagSchedSignal.Copy()
 	return nil
 }
 
@@ -230,12 +239,12 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
 			disabled[serv.cfg.Target.Syscalls[dc.ID].Name] = dc.Reason
 		}
 		/*
-		for _, id := range serv.cfg.Syscalls {
-			name := serv.cfg.Target.Syscalls[id].Name
-			if reason := disabled[name]; reason != "" {
-				log.Logf(0, "disabling %v: %v", name, reason)
+			for _, id := range serv.cfg.Syscalls {
+				name := serv.cfg.Target.Syscalls[id].Name
+				if reason := disabled[name]; reason != "" {
+					log.Logf(0, "disabling %v: %v", name, reason)
+				}
 			}
-		}
 		*/
 	}
 	if a.Error != "" {
@@ -342,16 +351,16 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 	*/
 
 	/*
-	if a.Call == ".extra" {
-		log.Logf(0, "New covers from server side: srvCover (%d, %d), cliCover (%d, %d)",
-			len(a.SrvCover), len(srvDiff), len(a.CliCover), len(cliDiff))
-	} else if a.Call == "failure" {
-		log.Logf(0, "New covers from failures side: srvCover (%d, %d), cliCover (%d, %d)",
-			len(a.SrvCover), len(srvDiff), len(a.CliCover), len(cliDiff))
-	} else {
-		log.Logf(0, "New covers from client side: srvCover (%d, %d), cliCover (%d, %d)",
-			len(a.SrvCover), len(srvDiff), len(a.CliCover), len(cliDiff))
-	}
+		if a.Call == ".extra" {
+			log.Logf(0, "New covers from server side: srvCover (%d, %d), cliCover (%d, %d)",
+				len(a.SrvCover), len(srvDiff), len(a.CliCover), len(cliDiff))
+		} else if a.Call == "failure" {
+			log.Logf(0, "New covers from failures side: srvCover (%d, %d), cliCover (%d, %d)",
+				len(a.SrvCover), len(srvDiff), len(a.CliCover), len(cliDiff))
+		} else {
+			log.Logf(0, "New covers from client side: srvCover (%d, %d), cliCover (%d, %d)",
+				len(a.SrvCover), len(srvDiff), len(a.CliCover), len(cliDiff))
+		}
 	*/
 
 	serv.stats.corpusCliCover.set(len(serv.corpusCliCover))
@@ -422,11 +431,33 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 			f1.newMaxSignal.Merge(newMaxSignal)
 		}
 	}
+	newDagSignal := serv.maxDagSignal.Diff(a.MaxDagSignal.Deserialize())
+	if !newDagSignal.Empty() {
+		serv.maxDagSignal.Merge(newDagSignal)
+		for _, f1 := range serv.fuzzers {
+			if f1 == f || f1.rotated {
+				continue
+			}
+			f1.newDagSignal.Merge(newDagSignal)
+		}
+	}
+	newDagSched := serv.maxDagSchedSignal.Diff(a.MaxDagSchedSignal.Deserialize())
+	if !newDagSched.Empty() {
+		serv.maxDagSchedSignal.Merge(newDagSched)
+		for _, f1 := range serv.fuzzers {
+			if f1 == f || f1.rotated {
+				continue
+			}
+			f1.newDagSchedSignal.Merge(newDagSched)
+		}
+	}
 	if f.rotated {
 		// Let rotated VMs run in isolation, don't send them anything.
 		return nil
 	}
 	r.MaxSignal = f.newMaxSignal.Split(2000).Serialize()
+	r.MaxDagSignal = f.newDagSignal.Split(2000).Serialize()
+	r.MaxDagSchedSignal = f.newDagSchedSignal.Split(2000).Serialize()
 	if a.NeedCandidates {
 		r.Candidates = serv.mgr.candidateBatch(serv.batchSize)
 	}

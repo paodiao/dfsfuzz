@@ -69,10 +69,12 @@ type NewInputArgs struct {
 }
 
 type PollArgs struct {
-	Name           string
-	NeedCandidates bool
-	MaxSignal      signal.Serial
-	Stats          map[string]uint64
+	Name              string
+	NeedCandidates    bool
+	MaxSignal         signal.Serial
+	MaxDagSignal      signal.Serial
+	MaxDagSchedSignal signal.Serial
+	Stats             map[string]uint64
 }
 
 type PollQueueRes struct {
@@ -80,9 +82,11 @@ type PollQueueRes struct {
 }
 
 type PollRes struct {
-	Candidates []RPCCandidate
-	NewInputs  []RPCInput
-	MaxSignal  signal.Serial
+	Candidates        []RPCCandidate
+	NewInputs         []RPCInput
+	MaxSignal         signal.Serial
+	MaxDagSignal      signal.Serial
+	MaxDagSchedSignal signal.Serial
 }
 
 type RunnerConnectArgs struct {

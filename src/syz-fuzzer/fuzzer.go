@@ -629,10 +629,12 @@ func (fuzzer *Fuzzer) pollLoop() {
 
 func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
 	a := &rpctype.PollArgs{
-		Name:           fuzzer.name,
-		NeedCandidates: needCandidates,
-		MaxSignal:      fuzzer.grabNewSignal().Serialize(),
-		Stats:          stats,
+		Name:              fuzzer.name,
+		NeedCandidates:    needCandidates,
+		MaxSignal:         fuzzer.grabNewSignal().Serialize(),
+		MaxDagSignal:      fuzzer.grabNewDagSignal().Serialize(),
+		MaxDagSchedSignal: fuzzer.grabNewDagSchedSignal().Serialize(),
+		Stats:             stats,
 	}
 	r := &rpctype.PollRes{}
 	if err := fuzzer.manager.Call("Manager.Poll", a, r); err != nil {
@@ -643,6 +645,8 @@ func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
 		len(r.Candidates), len(r.NewInputs), maxSignal.Len())
 	appendDiagLog("poll: maxSignal=%d newInputs=%d candidates=%d", maxSignal.Len(), len(r.NewInputs), len(r.Candidates))
 	fuzzer.addMaxSignal(maxSignal)
+	fuzzer.addMaxDagSignal(r.MaxDagSignal.Deserialize())
+	fuzzer.addMaxDagSchedSignal(r.MaxDagSchedSignal.Deserialize())
 
 	//tao TODO
 	for _, inp := range r.NewInputs {
@@ -828,6 +832,46 @@ func (fuzzer *Fuzzer) grabNewSignal() signal.Signal {
 		return nil
 	}
 	fuzzer.newSignal = nil
+	return sign
+}
+
+func (fuzzer *Fuzzer) addMaxDagSignal(sign signal.Signal) {
+	if sign.Len() == 0 {
+		return
+	}
+	fuzzer.signalMu.Lock()
+	defer fuzzer.signalMu.Unlock()
+	fuzzer.maxDagSignal.Merge(sign)
+}
+
+func (fuzzer *Fuzzer) grabNewDagSignal() signal.Signal {
+	fuzzer.signalMu.Lock()
+	defer fuzzer.signalMu.Unlock()
+	sign := fuzzer.newDagSignal
+	if sign.Empty() {
+		return nil
+	}
+	fuzzer.newDagSignal = nil
+	return sign
+}
+
+func (fuzzer *Fuzzer) addMaxDagSchedSignal(sign signal.Signal) {
+	if sign.Len() == 0 {
+		return
+	}
+	fuzzer.signalMu.Lock()
+	defer fuzzer.signalMu.Unlock()
+	fuzzer.maxDagSchedSignal.Merge(sign)
+}
+
+func (fuzzer *Fuzzer) grabNewDagSchedSignal() signal.Signal {
+	fuzzer.signalMu.Lock()
+	defer fuzzer.signalMu.Unlock()
+	sign := fuzzer.newDagSchedSignal
+	if sign.Empty() {
+		return nil
+	}
+	fuzzer.newDagSchedSignal = nil
 	return sign
 }
 
