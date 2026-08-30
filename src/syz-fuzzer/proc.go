@@ -481,7 +481,11 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	notexecuted := 0
 	if !item.triageDag {
 		for i := 0; i < signalRuns; i++ {
-			infos, _, _ := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage)
+			infos, _, _, err := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage)
+			if err != nil {
+				log.Logf(0, "triage: execution error, aborting this input: %v", err)
+				return
+			}
 			if !reexecutionSuccess(infos[item.subNum], &item.info, item.call) {
 				// The call was not executed or failed.
 				notexecuted++
@@ -513,6 +517,14 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 				func(ps1 []*prog.Prog, call1 int) bool {
 					for i := 0; i < minimizeAttempts; i++ {
 						infos := proc.execute(proc.execOptsLightMinimize, ps1, ProgNormal, StatMinimize)
+						if infos == nil {
+							// Execution error (executor crash/hang): the
+							// environment is unusable for minimization —
+							// keep the original program, executor restarts
+							// on the next Exec.
+							appendDiagLog("minimize abort: execution error on attempt %d", i)
+							return false
+						}
 						if !reexecutionSuccess(infos[item.subNum], &item.info, call1) {
 							// The call was not executed or failed.
 							continue
@@ -541,7 +553,11 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 	var inputCliSignal, inputSrvSignal signal.Signal
 	srvNum := proc.fuzzer.config.ServNum
 	for i := 0; i < signalRuns; i++ {
-		infos, _, _ := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage) //TODO
+		infos, _, _, err := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage) //TODO
+		if err != nil {
+			log.Logf(0, "triage: execution error during coverage run, aborting: %v", err)
+			return
+		}
 		thisSignal, thisCover := getSignalAndCover(item.ps[item.subNum], infos[item.subNum], item.call)
 		if item.triageClient {
 			CliCover.Merge(thisCover)
@@ -651,7 +667,7 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 	}
 
 	//Normal mutation
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 25; i++ {
 		ps := prog.Clones(item.ps)
 		/*
 		   Each time only mutate one sub-testcase because: If we do multiple mutations and only one of them trigger new
@@ -661,7 +677,14 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 		//Tao TODO
 		log.Logf(0, "NetFailure, Node crash: %v %v", proc.fuzzer.config.NetFailure, proc.fuzzer.config.NodeCrash)
 		proc.mutateHmdfs(ps, fuzzerSnapshot.corpus)
-		proc.execute(proc.execOpts, ps, ProgNormal, StatSmash)
+		infos := proc.execute(proc.execOpts, ps, ProgNormal, StatSmash)
+		if infos == nil {
+			// Execution error (executor crash/hang): stop smashing this
+			// seed — the executor is restarted on the next Exec and the
+			// fuzzer keeps running (its state is intact).
+			appendDiagLog("smash break: execution error on iteration %d", i)
+			break
+		}
 	}
 }
 
@@ -931,7 +954,11 @@ func (proc *Proc) failCall(ps []*prog.Prog, call int, subNum int) {
 		log.Logf(1, "#%v: injecting fault into call %v/%v", proc.pid, call, nth)
 		newProgs := prog.Clones(ps)
 		newProgs[subNum].Calls[call].Props.FailNth = nth
-		infos, _, _ := proc.executeRaw(proc.execOpts, newProgs, StatSmash)
+		infos, _, _, err := proc.executeRaw(proc.execOpts, newProgs, StatSmash)
+		if err != nil {
+			log.Logf(0, "failCall: execution error, stopping fault injection: %v", err)
+			break
+		}
 		if infos != nil && len(infos[proc.fuzzer.config.ServNum+subNum].Calls) > call && infos[proc.fuzzer.config.ServNum+subNum].Calls[call].Flags&ipc.CallFaultInjected == 0 {
 			break
 		}
@@ -1004,7 +1031,11 @@ func (proc *Proc) triageFailure(ps []*prog.Prog, infos []*ipc.ProgInfo) {
 
 	//stable signals
 	for i := 0; i < 1; i++ {
-		infos, _, _ := proc.executeRaw(proc.execOptsLight, ps, StatTriage)
+		infos, _, _, err := proc.executeRaw(proc.execOptsLight, ps, StatTriage)
+		if err != nil {
+			log.Logf(0, "triageFailure: execution error, aborting: %v", err)
+			return
+		}
 		var oneRunSig signal.Signal
 		for idx, info := range infos {
 			if idx >= proc.fuzzer.config.ServNum {
@@ -1067,7 +1098,11 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 		return nil
 	}
 	log.Logf(0, "HasCrashFail: %v, .HasNetFail: %v", ps[0].HasCrashFail, ps[0].HasNetFail)
-	infos, _, _ := proc.executeRaw(execOpts, ps, stat)
+	infos, _, _, err := proc.executeRaw(execOpts, ps, stat)
+	if err != nil {
+		log.Logf(0, "execute: execution error (fuzzer survives): %v", err)
+		return nil
+	}
 	if infos == nil {
 		return nil
 	}
@@ -1191,10 +1226,10 @@ func (proc *Proc) enqueueDagTriage(ps []*prog.Prog, flags ProgTypes, subNum int)
 	})
 }
 
-func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]*ipc.ProgInfo, []map[string]prog.FileMetadata, uint64) {
+func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]*ipc.ProgInfo, []map[string]prog.FileMetadata, uint64, error) {
 
 	if len(ps) == 0 {
-		return nil, nil, 0
+		return nil, nil, 0, nil
 	}
 
 	if opts.Flags&ipc.FlagDedupCover == 0 {
@@ -1230,8 +1265,14 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 
 	output, infos, hanged, err, fsMds, testdirIno, hmdfsTraceEvents, tscRatio = proc.env.Exec(opts, ps)
 
+	// Execution errors (executor crash/hang/parse failure) bubble up instead
+	// of killing the fuzzer: the executor is restarted on the next Exec
+	// (env.cmd==nil → makeCommand), so the fuzzer survives and keeps its
+	// workQueue/corpus/tree state. VM-level crashes and CSAN failures keep
+	// their existing spawn-style handling.
 	if err != nil {
-		log.Fatalf("execution errors or hangs: %v\n", err)
+		log.Logf(0, "execution error (executor will be restarted): %v\n", err)
+		return nil, nil, 0, err
 	}
 	log.Logf(2, "result hanged=%v: %s", hanged, output)
 
@@ -1325,7 +1366,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		}
 	}
 
-	return infos, fsMds, testdirIno
+	return infos, fsMds, testdirIno, nil
 }
 
 // Temporary DAG/triage-pipeline diagnostic log on the host (hardcoded path;
