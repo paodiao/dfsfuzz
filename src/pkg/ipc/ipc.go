@@ -1002,6 +1002,7 @@ func newDiagWriter(idx int) io.Writer {
 
 var diagKeywords = []string{
 	"tsc_offset",
+	"tsc calibrate",
 	"hmdfs trace",
 	"hmdfs_trace",
 	"timeout",

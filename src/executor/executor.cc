@@ -494,7 +494,10 @@ static void calibrate_tsc(void) {
   uint64_t t1 = rdtsc();
   if (clock_gettime(CLOCK_MONOTONIC, &ts1) != 0)
     fail("clock_gettime failed");
-  usleep(50000);
+  // 5ms sampling window: ratio error ~20ppm -> at most ~4us phase drift over
+  // one execution round (~200ms), far below the 60us match tolerance. The
+  // shorter window keeps per-round recalibration cheap.
+  usleep(5000);
   uint64_t t2 = rdtsc();
   if (clock_gettime(CLOCK_MONOTONIC, &ts2) != 0)
     fail("clock_gettime failed");
@@ -1349,6 +1352,14 @@ uint64 receive_execute() {
   prog_size = req.prog_sizes[executor_index];
   fprintf(stderr, "executor %lld: prog_data_offset %lld, prog_size %lld\n",
           executor_index, prog_data_offset, prog_size);
+
+  // Recalibrate the ktime->TSC anchor every round. Guest ktime (used by the
+  // eBPF tracer via bpf_ktime_get_ns) and the TSC drift apart at a ppm-level
+  // rate (NTP slewing / kvmclock adjustments), which otherwise accumulates to
+  // milliseconds over hours and pushes in-window events outside the match
+  // tolerance. A fresh anchor bounds the drift to the round duration
+  // (~4us at 20ppm with the 5ms sampling window).
+  calibrate_tsc();
 
   // update file ops offset and size from execute_req
   file_ops_offset = req.file_ops_offset;

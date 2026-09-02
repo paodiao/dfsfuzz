@@ -551,22 +551,23 @@ func pathIsAncestorOf(parent, child string) bool {
 	return parent != "" && strings.HasPrefix(child, parent+"/")
 }
 
-// mfTolTicks is the tolerance (≈100µs @ 3.42GHz) applied to event-window
+// mfTolTicks is the tolerance (≈60µs @ 3.42GHz) applied to event-window
 // matching: kretprobe timestamps lag the window end by tens of µs and the
-// ns→TSC calibration has µs-level accuracy, while genuine async/gap events
-// (>1ms, e.g. writeback) stay excluded. The default only applies when the
-// executor-reported calibration ratio is unavailable; SetMfTolTicksFromRatio
-// converts the 100µs semantic per-machine (3418 ticks/µs at 3.42GHz).
-var mfTolTicks int64 = 342000
+// ns→TSC calibration has µs-level accuracy (per-round recalibration keeps
+// the drift at ~4µs), while genuine async/gap events (>1ms, e.g. writeback)
+// stay excluded. The default only applies when the executor-reported
+// calibration ratio is unavailable; SetMfTolTicksFromRatio converts the
+// 60µs semantic per-machine (3420 ticks/µs at 3.42GHz).
+var mfTolTicks int64 = 205200
 
 // SetMfTolTicksFromRatio sets the match tolerance from the executor's
-// calibrated ns-per-tick ratio: 100µs = 100000ns / (ns/tick). Out-of-range
+// calibrated ns-per-tick ratio: 60µs = 60000ns / (ns/tick). Out-of-range
 // ratios keep the default.
 func SetMfTolTicksFromRatio(ratio float64) {
 	if ratio < 0.1 || ratio > 10 {
 		return
 	}
-	tol := int64(100000.0 / ratio)
+	tol := int64(60000.0 / ratio)
 	if tol >= 10000 && tol <= 10000000 {
 		atomic.StoreInt64(&mfTolTicks, tol)
 	}
