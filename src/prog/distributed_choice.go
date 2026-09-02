@@ -55,7 +55,7 @@ var (
 )
 
 var FileopsSubCalls = []string{
-	"open", "read", "write", "pread64", "pwrite64",
+	"open", "close", "read", "write", "pread64", "pwrite64",
 	"fsync", "fdatasync", "truncate",
 }
 
