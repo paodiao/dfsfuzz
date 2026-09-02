@@ -1688,7 +1688,7 @@ func (lcs *LayeredChoiceStrategy) GetPathsForRenameVariant(basePath string, base
 	}
 	srcPathExt := filepath.Ext(srcPath)
 	if strings.Contains(srcPathExt, "._renamed_") {
-		siblingPath := srcPathExt[:len(srcPath)-len(srcPathExt)]
+		siblingPath := srcPath[:len(srcPath)-len(srcPathExt)]
 		siblingPath = siblingPath + "._renamed_" + randomSuffix(r)
 		return srcPath, siblingPath
 	}
