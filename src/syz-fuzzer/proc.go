@@ -1582,7 +1582,20 @@ func (proc *Proc) logProgram(opts *ipc.ExecOpts, ps []*prog.Prog) {
 		if len(p.Calls) != 0 {
 			log.Logf(0, "prog length: %d\n", len(p.Calls))
 		}
-		data = append(data, p.Serialize()...)
+		data = append(data, func() (out []byte) {
+			// Serialize panics with "no result" when a cross-call reference
+			// violates the serializer's invariants (dangling/forward/out-of-sync
+			// uses). Dump the reference diagnosis first, then re-panic: the
+			// program state is never mutated, so post-mortem reproduction of the
+			// offending mutation stays possible.
+			defer func() {
+				if r := recover(); r != nil {
+					log.Logf(0, "PANIC-DEBUG: serialize panic: %v\n%s", r, p.DumpRefDiagnosis())
+					panic(r)
+				}
+			}()
+			return p.Serialize()
+		}()...)
 		data = append(data, delimiter...)
 	}
 
