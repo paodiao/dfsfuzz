@@ -2636,6 +2636,30 @@ func MutateGroupDataDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 	return true
 }
 
+// mutateMixForSize returns the mutation mix weights for the inodeops/fileops
+// DCT mutators, banded by len(ps[0].Calls): tiny programs grow (insertion
+// heavy — they need to reach a size where modifier pairs exist at all),
+// large ones shrink (removal heavy — bounded execution cost, bounded pair
+// space). Weights are (insertion, remove-one, remove-group, path/data
+// mutation) out of 100:
+//
+//	1-3   (tiny):   85/ 5/ 0/10 — gather the first modifier pairs
+//	4-10  (grow):   60/10/ 5/25
+//	11-15 (peak):   35/25/10/30
+//	16-20 (shrink): 10/40/20/30
+func mutateMixForSize(size int) (ins, removeOne, removeGroup, mutate int) {
+	switch {
+	case size < 4:
+		return 85, 5, 0, 10
+	case size < 11:
+		return 60, 10, 5, 25
+	case size < 16:
+		return 35, 25, 10, 30
+	default:
+		return 10, 40, 20, 30
+	}
+}
+
 func MutateInodeOpsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy) bool {
 	if len(ps) == 0 || lcs == nil {
 		return false
@@ -2644,23 +2668,28 @@ func MutateInodeOpsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *
 	r := newRand(ps[0].Target, rs)
 	r.hmcfg = hmcfg
 
-	switch r.Intn(10) {
-	case 0, 1:
-		return RemoveGroupDynamic(ps, lcs, r)
-	case 2:
-		return RemoveOneInGroupDynamic(ps, lcs, r)
-	case 3:
-		return MutateGroupPathDynamic(ps, lcs, r)
-	case 4:
-		return MutateGroupDataDynamic(ps, lcs, r)
-	default:
+	ins, removeOne, removeGroup, _ := mutateMixForSize(len(ps[0].Calls))
+	roll := r.Intn(100)
+	switch {
+	case roll < ins:
 		if len(ps[0].Calls) >= RecommendedCalls {
-			return false
+			// At the size cap: fall back to removing a call instead of
+			// wasting the round, so programs oscillate around the cap.
+			return RemoveOneInGroupDynamic(ps, lcs, r)
 		}
 		if lcs.ShouldUsePattern(r.Rand) {
 			return insertCallFromPattern(ps, r, sCalls, hmcfg, lcs, "inodeops")
 		}
 		return insertCallFromDCT(ps, r, ct, sCalls, hmcfg, lcs, "inodeops")
+	case roll < ins+removeOne:
+		return RemoveOneInGroupDynamic(ps, lcs, r)
+	case roll < ins+removeOne+removeGroup:
+		return RemoveGroupDynamic(ps, lcs, r)
+	default:
+		if r.bin() {
+			return MutateGroupPathDynamic(ps, lcs, r)
+		}
+		return MutateGroupDataDynamic(ps, lcs, r)
 	}
 }
 
@@ -2672,23 +2701,28 @@ func MutateFileopsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *S
 	r := newRand(ps[0].Target, rs)
 	r.hmcfg = hmcfg
 
-	switch r.Intn(10) {
-	case 0, 1:
-		return RemoveGroupDynamic(ps, lcs, r)
-	case 2:
-		return RemoveOneInGroupDynamic(ps, lcs, r)
-	case 3:
-		return MutateGroupPathDynamic(ps, lcs, r)
-	case 4:
-		return MutateGroupDataDynamic(ps, lcs, r)
-	default:
+	ins, removeOne, removeGroup, _ := mutateMixForSize(len(ps[0].Calls))
+	roll := r.Intn(100)
+	switch {
+	case roll < ins:
 		if len(ps[0].Calls) >= RecommendedCalls {
-			return false
+			// At the size cap: fall back to removing a call instead of
+			// wasting the round, so programs oscillate around the cap.
+			return RemoveOneInGroupDynamic(ps, lcs, r)
 		}
 		if lcs.ShouldUsePattern(r.Rand) {
 			return insertCallFromPattern(ps, r, sCalls, hmcfg, lcs, "fileops")
 		}
 		return insertCallFromDCT(ps, r, ct, sCalls, hmcfg, lcs, "fileops")
+	case roll < ins+removeOne:
+		return RemoveOneInGroupDynamic(ps, lcs, r)
+	case roll < ins+removeOne+removeGroup:
+		return RemoveGroupDynamic(ps, lcs, r)
+	default:
+		if r.bin() {
+			return MutateGroupPathDynamic(ps, lcs, r)
+		}
+		return MutateGroupDataDynamic(ps, lcs, r)
 	}
 }
 

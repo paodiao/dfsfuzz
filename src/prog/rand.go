@@ -19,7 +19,11 @@ import (
 
 const (
 	// "Recommended" number of calls in programs that we try to aim at during fuzzing.
-	RecommendedCalls = 30
+	// Lowered from 30 to 20 for the hmdfs DAG feedback: pair space C(n,2) at
+	// 20 calls (190 pairs) is enough for feedback exploration while keeping
+	// per-round execution cost bounded; the size-banded mutation mix in
+	// mutation.go drives programs toward this band.
+	RecommendedCalls = 20
 	// "Recommended" max number of calls in programs.
 	// If we receive longer programs from hub/corpus we discard them.
 	MaxCalls = 35
