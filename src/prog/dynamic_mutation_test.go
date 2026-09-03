@@ -462,3 +462,75 @@ func TestInsertDcacheCallGetdents64(t *testing.T) {
 		t.Fatal("no O_DIRECTORY open inserted")
 	}
 }
+
+// patternSingleOpenBase builds the base shape that produced the broken-ref
+// programs intercepted in hmdfsfuzz3: every node holds exactly one timed open
+// (no close), so an fd-using pattern op can only reference that open.
+func patternSingleOpenBase(target *Target) []*Prog {
+	paths := []string{"merge_view/dirA/a", "merge_view/dirA/a", "merge_view/dirB/b"}
+	ps := make([]*Prog, 0, len(paths))
+	for i, pth := range paths {
+		o := mkOpen(target, pth)
+		o.CheckInfo = &FileMetadata{Stime: uint64(1000 + i*500), Etime: uint64(1100 + i*500)}
+		ps = append(ps, &Prog{Target: target, Calls: []*Call{o}})
+	}
+	return ps
+}
+
+// patternBrokenSweep runs insertCallFromPattern over deterministic seeds on
+// the given base shape and reports how many resulting programs hold
+// dangling/forward references (the panic: no result root cause). A hit pins
+// the exact seed for single-step reproduction.
+func patternBrokenSweep(t *testing.T, ps []*Prog, seedType string, sCalls *SpecialCalls,
+	cfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seeds int64) (hits int, firstSeed int64, firstDiag string) {
+	firstSeed = -1
+	for seed := int64(0); seed < seeds; seed++ {
+		ps := Clones(ps)
+		r := &randGen{Rand: rand.New(rand.NewSource(seed))}
+		if !insertCallFromPattern(ps, r, sCalls, cfg, lcs, seedType) {
+			continue
+		}
+		for _, p := range ps {
+			if p.HasBrokenRefs() {
+				hits++
+				if firstSeed < 0 {
+					firstSeed = seed
+					firstDiag = p.DumpRefDiagnosis()
+				}
+				break
+			}
+		}
+	}
+	return
+}
+
+func TestInsertCallFromPatternBrokenRefs(t *testing.T) {
+	target := smokeTarget(t)
+	sCalls := hmdfsSmokeSpecialCalls(t, target)
+	cfg := &Hmdfs_config{
+		Cids:     []string{"c1", "c2", "c3"},
+		Node_num: 3,
+		Serv_num: 0,
+		Init_dir: map[string][]string{
+			"c1": {"merge_view/dirA", "merge_view/dirB"},
+		},
+		Init_file: map[string][]string{
+			"c1": {"merge_view/dirA/a", "merge_view/dirB/b"},
+		},
+	}
+	ft := NewFileTree()
+	ft.InitFromHmdfsConfig(cfg)
+	cfg.FileTree = ft
+
+	const seeds = 30000
+	for _, seedType := range []string{"fileops", "inodeops"} {
+		lcs := NewLayeredChoiceStrategy(seedType, cfg, target)
+		hits, firstSeed, firstDiag := patternBrokenSweep(t, patternSingleOpenBase(target),
+			seedType, sCalls, cfg, lcs, seeds)
+		t.Logf("seedType=%s base=single-open: %d broken-ref hits / %d seeds (first at seed %d)",
+			seedType, hits, seeds, firstSeed)
+		if hits > 0 && firstDiag != "" {
+			t.Logf("first hit diagnosis:\n%s", firstDiag)
+		}
+	}
+}
