@@ -489,11 +489,30 @@ double tsc_ns_ratio = 1.0;
 uint64_t tsc_anchor_tsc = 0;
 uint64_t tsc_anchor_ns = 0;
 
+// Anchor samples per calibration: preemption between rdtsc() and
+// clock_gettime() skews that sample's phase by milliseconds, and the whole
+// round inherits the offset. Sampling CALIB_ANCHOR_SAMPLES times and keeping
+// the pair with the smallest TSC-domain read gap (b-a) makes the anchor
+// immune unless all samples are preempted (~p^3 with 3 samples).
+#define CALIB_ANCHOR_SAMPLES 3
+
 static void calibrate_tsc(void) {
-  struct timespec ts1, ts2;
-  uint64_t t1 = rdtsc();
-  if (clock_gettime(CLOCK_MONOTONIC, &ts1) != 0)
-    fail("clock_gettime failed");
+  struct timespec ts2;
+  uint64_t t1 = 0;
+  uint64_t best_gap = ~0ULL;
+  struct timespec ts1;
+  for (int i = 0; i < CALIB_ANCHOR_SAMPLES; i++) {
+    uint64_t a = rdtsc();
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+      fail("clock_gettime failed");
+    uint64_t b = rdtsc();
+    if (b - a < best_gap) {
+      best_gap = b - a;
+      t1 = a;
+      ts1 = ts;
+    }
+  }
   // 5ms sampling window: ratio error ~20ppm -> at most ~4us phase drift over
   // one execution round (~200ms), far below the 60us match tolerance. The
   // shorter window keeps per-round recalibration cheap.
@@ -508,9 +527,10 @@ static void calibrate_tsc(void) {
   tsc_ns_ratio = (double)(m2 - m1) / (double)(t2 - t1);
   tsc_anchor_tsc = t1;
   tsc_anchor_ns = m1;
-  fprintf(stderr, "executor %lld tsc calibrate: ratio=%f anchor_tsc=%llu anchor_ns=%llu\n",
+  fprintf(stderr, "executor %lld tsc calibrate: ratio=%f anchor_tsc=%llu anchor_ns=%llu gap=%llu\n",
           executor_index, tsc_ns_ratio,
-          (unsigned long long)tsc_anchor_tsc, (unsigned long long)tsc_anchor_ns);
+          (unsigned long long)tsc_anchor_tsc, (unsigned long long)tsc_anchor_ns,
+          (unsigned long long)best_gap);
 }
 
 // Convert a bpf_ktime_get_ns() timestamp into the global raw-TSC domain.
@@ -585,7 +605,7 @@ int main(int argc, char **argv) {
   enable_c2san = !strcmp(argv[14], "true") ? 1 : 0;
   tsc_offset = atoll(argv[15]);
   metadata_delay_ms = argv[16] ? atoi(argv[16]) : 0;
-  fprintf(stderr, "executor %lld tsc_offset %lld", executor_index, tsc_offset);
+  fprintf(stderr, "executor %lld tsc_offset %lld\n", executor_index, tsc_offset);
 
   calibrate_tsc();
 
