@@ -12,10 +12,32 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Maximum length of generated binary blobs inserted into the program.
 const maxBlobLen = uint64(100 << 10)
+
+var (
+	lastMutMu   sync.Mutex
+	lastMutName string
+)
+
+// recordLastMutation remembers the most recent mutation entry point. Logged
+// by the broken-ref guard on interception (localization without per-mutate
+// log volume).
+func recordLastMutation(name string) {
+	lastMutMu.Lock()
+	lastMutName = name
+	lastMutMu.Unlock()
+}
+
+// LastMutation returns the most recent mutation entry point name.
+func LastMutation() string {
+	lastMutMu.Lock()
+	defer lastMutMu.Unlock()
+	return lastMutName
+}
 
 // Mutate program p.
 //
@@ -26,7 +48,7 @@ const maxBlobLen = uint64(100 << 10)
 // corpus:  The entire corpus, including original program p.
 func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus [][]*Prog, sCalls *SpecialCalls,
 	srvNum int, hasFail bool, enableC2san bool, hmcfg *Hmdfs_config, idx int) {
-	ProgDiag("mutation: standardMutate idx=%d", idx)
+	recordLastMutation("standardMutate")
 	r := newRand(p.Target, rs)
 	r.hmcfg = hmcfg
 	r.curIdx = idx
@@ -2457,7 +2479,7 @@ func findGroupCalls(ps []*Prog, anchor GroupPosition, anchorPath string, tscoffs
 // the anchor and its concurrent peers ("same pattern, new location"). Calls
 // that did not overlap the anchor (the non-concurrent backbone) stay in place.
 func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
-	ProgDiag("mutation: MutateGroupPathDynamic")
+	recordLastMutation("MutateGroupPathDynamic")
 	if lcs == nil || lcs.FileTree == nil {
 		return false
 	}
@@ -2499,7 +2521,7 @@ func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 
 // RemoveGroupDynamic deletes the anchor and its whole concurrent set.
 func RemoveGroupDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
-	ProgDiag("mutation: RemoveGroupDynamic")
+	recordLastMutation("RemoveGroupDynamic")
 	if lcs == nil {
 		return false
 	}
@@ -2548,7 +2570,7 @@ func callRemovable(ps []*Prog, pos GroupPosition) bool {
 // RemoveOneInGroupDynamic removes one fd-safe call from the anchor's
 // concurrent set.
 func RemoveOneInGroupDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
-	ProgDiag("mutation: RemoveOneInGroupDynamic")
+	recordLastMutation("RemoveOneInGroupDynamic")
 	if lcs == nil {
 		return false
 	}
@@ -2576,7 +2598,7 @@ func RemoveOneInGroupDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 // anchor itself must be a read/write call, so the set always contains
 // something to mutate.
 func MutateGroupDataDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
-	ProgDiag("mutation: MutateGroupDataDynamic")
+	recordLastMutation("MutateGroupDataDynamic")
 	if lcs == nil {
 		return false
 	}
@@ -2732,7 +2754,7 @@ func MutateFileopsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *S
 }
 
 func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seedType string) bool {
-	ProgDiag("mutation: insertCallFromPattern seed=%s", seedType)
+	recordLastMutation("insertCallFromPattern:" + seedType)
 	pattern := lcs.PredefinedPatterns.GetRandomPattern(seedType, r.Rand)
 	if pattern == nil || pattern.ClientCount > len(ps) {
 		return false
@@ -3185,7 +3207,7 @@ func findOpenFdForPath(p *Prog, filePath string, beforeIdx int) *ResultArg {
 }
 
 func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seedType string) bool {
-	ProgDiag("mutation: insertCallFromDCT seed=%s", seedType)
+	recordLastMutation("insertCallFromDCT:" + seedType)
 	if len(ps) == 0 {
 		return false
 	}
