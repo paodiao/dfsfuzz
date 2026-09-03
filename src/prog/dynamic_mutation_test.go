@@ -487,7 +487,7 @@ func patternBrokenSweep(t *testing.T, ps []*Prog, seedType string, sCalls *Speci
 	firstSeed = -1
 	for seed := int64(0); seed < seeds; seed++ {
 		ps := Clones(ps)
-		r := &randGen{Rand: rand.New(rand.NewSource(seed))}
+		r := newRand(ps[0].Target, rand.NewSource(seed))
 		if !insertCallFromPattern(ps, r, sCalls, cfg, lcs, seedType) {
 			continue
 		}
