@@ -2737,6 +2737,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 	if pattern == nil || pattern.ClientCount > len(ps) {
 		return false
 	}
+	ProgDiag("ipf-trace: pattern=%s clientCount=%d seedType=%s", pattern.Name, pattern.ClientCount, seedType)
 
 	var basePath string
 	p0 := ps[0]
@@ -2815,6 +2816,8 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 			insertPos, _ = findInsertPosition(p, r, 0, sCalls, refTime, lcs.tscoffFor(nodeIdx))
 			useExistingFd = false
 		}
+		ProgDiag("ipf-trace: node=%d first=%v insertPos=%d useExisting=%v existingFd=%v callNames=%v",
+			nodeIdx, first, insertPos, useExistingFd, ExistingFd != nil, callNameList(p))
 		if first {
 			referenceInsertPos = insertPos
 			// Reference time for the other progs: 0 = program-start
@@ -2830,6 +2833,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 		}
 		for _, op := range ops {
 			calls, _, _ := r.generateCallFromPatternOp(stateFromProg(p), sCalls, op, basePath, cid, lcs, ExistingFd, useExistingFd, pattern.OffsetRel, sharedOffset)
+			ProgDiag("ipf-trace:   op=%s gen=%v (insertPos=%d before=%v)", op.CallName, callNameListOf(makeProgFromCalls(ps[0].Target, calls)), insertPos, callNameList(p))
 			for _, c := range calls {
 				if insertPos >= len(p.Calls) {
 					p.Calls = append(p.Calls, c)
@@ -2838,6 +2842,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 					insertPos++
 				}
 			}
+			ProgDiag("ipf-trace:   after insert: %v", callNameList(p))
 		}
 	}
 
@@ -2852,6 +2857,8 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 		if verInsertPos < 0 || verInsertPos > len(p.Calls) {
 			verInsertPos = len(p.Calls)
 		}
+		ProgDiag("ipf-trace: verification node=%d verInsertPos=%d refTime=%d before=%v",
+			nodeIdx, verInsertPos, refTime, callNameList(p))
 		flags := uint64(2)
 		if lcs.FileTree != nil {
 			node := lcs.FileTree.FindNode(basePath)
@@ -2860,6 +2867,7 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 			}
 		}
 		calls := r.generateVerificationCalls(stateFromProg(p), sCalls, basePath, cid, seedType, nil, flags)
+		ProgDiag("ipf-trace:   verification gen=%v", callNameListOf(makeProgFromCalls(ps[0].Target, calls)))
 		for _, c := range calls {
 			if verInsertPos >= len(p.Calls) {
 				p.Calls = append(p.Calls, c)
@@ -2868,11 +2876,29 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 				verInsertPos++
 			}
 		}
+		ProgDiag("ipf-trace:   verification after insert: %v", callNameList(p))
 	}
 
 	//TODO: 没有记录插入索引
 
 	return true
+}
+
+// ipf-trace helpers (temporary, removed after broken-ref localization).
+func makeProgFromCalls(target *Target, calls []*Call) *Prog {
+	return &Prog{Target: target, Calls: calls}
+}
+
+func callNameList(p *Prog) []string {
+	var names []string
+	for _, c := range p.Calls {
+		names = append(names, c.Meta.Name)
+	}
+	return names
+}
+
+func callNameListOf(p *Prog) []string {
+	return callNameList(p)
 }
 
 type GroupPosition struct {
