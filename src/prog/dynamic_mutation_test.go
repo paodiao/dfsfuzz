@@ -33,10 +33,11 @@ func mkOpen(target *Target, path string) *Call {
 	meta := target.SyscallMap["open"]
 	ptrType := meta.Args[0].Type.(*PtrType)
 	flagsType := meta.Args[1].Type.(*FlagsType)
+	modeType := meta.Args[2].Type.(*FlagsType)
 	data := MakeDataArg(ptrType.Elem, DirIn, []byte(path+"\x00"))
 	ptr := MakePointerArg(ptrType, DirIn, 0, data)
 	c := MakeCall(meta, nil)
-	c.Args = []Arg{ptr, MakeConstArg(flagsType, DirIn, 2)}
+	c.Args = []Arg{ptr, MakeConstArg(flagsType, DirIn, 2), MakeConstArg(modeType, DirIn, 0o666)}
 	target.assignSizesCall(c)
 	return c
 }
