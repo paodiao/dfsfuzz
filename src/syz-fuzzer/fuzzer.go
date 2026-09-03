@@ -387,6 +387,8 @@ func main() {
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)
+	// Route prog-internal mutation diagnostics into the collected dag.log.
+	prog.SetDiagSink(appendDiagLog)
 
 	for needCandidates, more := true, true; more; needCandidates = false {
 		more = fuzzer.poll(needCandidates, nil)

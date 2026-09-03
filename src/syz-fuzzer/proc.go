@@ -11,6 +11,7 @@ import (
 
 	//"runtime/debug"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -611,7 +612,13 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		atomic.AddUint64(&proc.fuzzer.dagCorpusCount, 1)
 	}
 	added := proc.fuzzer.addInputToCorpus(item.ps, inputCliSignal, inputSrvSignal, sig)
-	appendDiagLog("triage success: %s added=%v corpus=%d", logCallName, added, len(proc.fuzzer.corpus))
+	{
+		total := 0
+		for _, p := range item.ps {
+			total += len(p.Calls)
+		}
+		appendDiagLog("triage success: %s added=%v corpus=%d total=%d dag=%v", logCallName, added, len(proc.fuzzer.corpus), total, item.triageDag)
+	}
 	if item.triageDag && added {
 		atomic.AddUint64(&proc.fuzzer.dagCorpusEntries, 1)
 	}
@@ -660,6 +667,18 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 	//
 	rand.Seed(time.Now().UnixNano())
 	fuzzerSnapshot := proc.fuzzer.snapshot()
+
+	{
+		calls := make([]int, len(item.ps))
+		total := 0
+		for i, p := range item.ps {
+			calls[i] = len(p.Calls)
+			total += len(p.Calls)
+		}
+		appendDiagLog("smash begin: inode=%v file=%v stash=%v dcache=%v calls=%v total=%d",
+			item.ps[0].IsInodeOps, item.ps[0].IsFileOps, item.ps[0].IsStash, item.ps[0].IsDCache,
+			calls, total)
+	}
 
 	//Failure enumeration
 	if (proc.fuzzer.config.NetFailure || proc.fuzzer.config.NodeCrash) && !(item.ps[0].HasNetFail || item.ps[0].HasCrashFail) {
@@ -1115,6 +1134,8 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 
 	servNum := proc.fuzzer.config.ServNum
 	clientHasNew := false
+	covEnqueues := 0
+	dagEnqueues := 0
 	if proc.fuzzer.config.EnableClientFb {
 		for idx, info := range infos {
 			//TODO: how to check the signal from servers and clients
@@ -1125,10 +1146,12 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				appendDiagLog("feedback: idx=%d EnableClientFb=%v calls=%d extra=%v", idx, proc.fuzzer.config.EnableClientFb, len(calls), extra)
 				for _, callIndex := range calls {
 					proc.enqueueCallTriage(ps, flags, callIndex, info.Calls[callIndex], idx, true) //idx -> subNum
+					covEnqueues++
 					clientHasNew = true
 				}
 				if extra {
 					proc.enqueueCallTriage(ps, flags, -1, info.Extra, idx, true)
+					covEnqueues++
 				}
 			}
 		}
@@ -1138,13 +1161,14 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 
 	//(1). With failures, exploit server feedback
 	//(2). Client doesn't have feedback for a while
-	if proc.fuzzer.config.EnableSrvFb && ((!clientHasNew && proc.useSrvCovNow()) || ps[0].HasNetFail || ps[0].HasCrashFail) {
+		if proc.fuzzer.config.EnableSrvFb && ((!clientHasNew && proc.useSrvCovNow()) || ps[0].HasNetFail || ps[0].HasCrashFail) {
 		log.Logf(0, "----- no new client coverage: %v, %v", clientHasNew, proc.fuzzer.config.EnableEval)
 		for idx, info := range infos[:servNum] {
 			_, extra := proc.fuzzer.checkNewSignal(nil, info)
 			if extra {
 				log.Logf(0, "----- enqueue testcases with server coveraged")
 				proc.enqueueCallTriage(ps, flags, -1, info.Extra, idx, false)
+				covEnqueues++
 			}
 		}
 	}
@@ -1164,6 +1188,7 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				maxDag := proc.fuzzer.config.MaxDagCorpus
 				if maxDag == 0 || atomic.LoadUint64(&proc.fuzzer.dagCorpusEntries) < uint64(maxDag) {
 					proc.enqueueDagTriage(ps, flags, idx)
+					dagEnqueues++
 				}
 				newPairs := filterNewDagPairs(info, newBits)
 				proc.feedbackDagPairs(newPairs)
@@ -1191,6 +1216,20 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				proc.executeRaw(execOpts, ps1, stat)
 			}
 		}
+	}
+
+	// Outcome summary: per-node call counts (growth tracking, all nodes not
+	// just ps[0]) plus which feedback channel the product earned (coverage
+	// enqueue vs DAG enqueue; both zero means the product is dropped).
+	{
+		calls := make([]int, len(ps))
+		total := 0
+		for i, p := range ps {
+			calls[i] = len(p.Calls)
+			total += len(p.Calls)
+		}
+		appendDiagLog("exec outcome: stat=%v calls=%v total=%d covEnq=%d dagEnq=%d",
+			statNames[stat], calls, total, covEnqueues, dagEnqueues)
 	}
 
 	return infos
@@ -1238,6 +1277,19 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 
 	for _, p := range ps {
 		proc.fuzzer.checkDisabledCalls(p)
+	}
+
+	// Guard against broken cross-call references produced by mutators
+	// (dangling/forward fd references crash Serialize with "no result"
+	// because serializer vars are registered in call order). Abort the
+	// execution and record the program for mutation-path localization.
+	for i, p := range ps {
+		if p.HasBrokenRefs() {
+			log.Logf(0, "MUTATION-DEBUG: broken refs before execute, copy %d (stat=%v): aborting execution", i, stat)
+			appendDiagLog("MUTATION-DEBUG: broken refs copy %d stat=%d meta: IsStash=%v IsDCache=%v IsFileOps=%v IsInodeOps=%v\n%s",
+				i, stat, ps[0].IsStash, ps[0].IsDCache, ps[0].IsFileOps, ps[0].IsInodeOps, p.DumpRefDiagnosis())
+			return nil, nil, 0, fmt.Errorf("broken refs in program copy %d", i)
+		}
 	}
 
 	// Limit concurrency window and do leak checking once in a while.
@@ -1372,8 +1424,11 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 // Temporary DAG/triage-pipeline diagnostic log on the host (hardcoded path;
 // remove after the DAG feedback / corpus growth issues are diagnosed).
 var dagDiagLog *os.File
+var dagDiagMu sync.Mutex
 
 func appendDiagLog(format string, args ...interface{}) {
+	dagDiagMu.Lock()
+	defer dagDiagMu.Unlock()
 	if dagDiagLog == nil {
 		f, err := os.OpenFile("/home/user/dfsfuzz/dag.log",
 			os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)

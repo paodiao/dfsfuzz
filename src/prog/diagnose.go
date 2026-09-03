@@ -5,6 +5,23 @@ import (
 	"strings"
 )
 
+// Mutation diagnostics: the fuzzer hooks a sink (its appendDiagLog) so
+// prog-internal mutation events land in the collected dag.log. Used to
+// localize which mutation sub-branch produced a broken program.
+var diagSink func(format string, args ...interface{})
+
+func SetDiagSink(fn func(format string, args ...interface{})) {
+	diagSink = fn
+}
+
+// ProgDiag emits a mutation-diagnostic line through the registered sink (no-op
+// when unset). Keep call sites cheap: single line per mutation entry.
+func ProgDiag(format string, args ...interface{}) {
+	if diagSink != nil {
+		diagSink(format, args...)
+	}
+}
+
 // DumpRefDiagnosis builds a read-only report of every cross-call ResultArg
 // reference in the program, classifying each against the invariants the text
 // serializer (serializer.call/allocVarID) relies on:
@@ -87,4 +104,46 @@ func (p *Prog) DumpRefDiagnosis() string {
 		}
 	}
 	return b.String()
+}
+
+// HasBrokenRefs reports whether any cross-call ResultArg reference is
+// dangling (the provider call is absent from the program) or forward (the
+// provider call appears at index >= the referrer). Either form panics at
+// Serialize ("no result") because serializer vars are registered in call
+// order. Used as a pre-execution guard after mutations.
+func (p *Prog) HasBrokenRefs() bool {
+	owners := make(map[*ResultArg]int)
+	for i, c := range p.Calls {
+		if c.Ret != nil {
+			owners[c.Ret] = i
+		}
+	}
+	for i, c := range p.Calls {
+		broken := false
+		check := func(a Arg, _ *ArgCtx) {
+			if broken {
+				return
+			}
+			if ra, ok := a.(*ResultArg); ok && ra.Res != nil {
+				ownerIdx, ok := owners[ra.Res]
+				if !ok || ownerIdx >= i {
+					broken = true
+				}
+			}
+		}
+		for _, arg := range c.Args {
+			ForeachSubArg(arg, check)
+			if broken {
+				return true
+			}
+		}
+		if c.Ret != nil && c.Ret.Res != nil {
+			// Defensive: a Ret must not reference another result.
+			ownerIdx, ok := owners[c.Ret.Res]
+			if !ok || ownerIdx >= i {
+				return true
+			}
+		}
+	}
+	return false
 }
