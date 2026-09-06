@@ -264,8 +264,9 @@ func (target *Target) GenerateProgsForHmdfsInodeops(rs rand.Source, sCalls *Spec
 
 	if lcs.ShouldUsePattern(r.Rand) {
 		ps = r.generateFromPredefinedPattern(s, sCalls, hmcfg, lcs, "inodeops")
+		r.expandWithDCT(ps, sCalls, hmcfg, lcs, "inodeops")
 	} else {
-		ps = r.generateFromDistributedChoiceTable(s, sCalls, hmcfg, lcs, "inodeops")
+		ps = r.generateDCTMultiRound(s, sCalls, hmcfg, lcs, "inodeops")
 	}
 
 	if len(ps) == 0 {
@@ -309,8 +310,9 @@ func (target *Target) GenerateProgsForHmdfsFileops(rs rand.Source, sCalls *Speci
 
 	if lcs.ShouldUsePattern(r.Rand) {
 		ps = r.generateFromPredefinedPattern(s, sCalls, hmcfg, lcs, "fileops")
+		r.expandWithDCT(ps, sCalls, hmcfg, lcs, "fileops")
 	} else {
-		ps = r.generateFromDistributedChoiceTable(s, sCalls, hmcfg, lcs, "fileops")
+		ps = r.generateDCTMultiRound(s, sCalls, hmcfg, lcs, "fileops")
 	}
 
 	if len(ps) == 0 {
@@ -330,4 +332,49 @@ func (target *Target) GenerateProgsForHmdfsFileops(rs rand.Source, sCalls *Speci
 		p.IsFileOps = true
 	}
 	return ps
+}
+
+// expandWithDCT inserts further root+variant groups (via insertCallFromDCT)
+// until the average number of calls across all progs in ps reaches a
+// per-seed target (4-8, randomized for corpus diversity) or the round cap.
+// Shared by both the DCT and the pattern generation entry points: fresh-path
+// mkdir/creat preprocessing, fd lifecycle handling and time-aligned variants
+// are inherited from insertCallFromDCT.
+func (r *randGen) expandWithDCT(ps []*Prog, sCalls *SpecialCalls, hmcfg *Hmdfs_config,
+	lcs *LayeredChoiceStrategy, seedType string) {
+	if len(ps) == 0 {
+		return
+	}
+	target := 6 + r.Intn(4) // 6-9
+	failed := 0
+	for round := 0; round < 6 && failed < 2; round++ {
+		if avgCalls(ps) >= target {
+			break
+		}
+		if !insertCallFromDCT(ps, r, nil, sCalls, hmcfg, lcs, seedType) {
+			failed++ // ct is a dead parameter (unused inside); stop after 2 consecutive failures
+			continue
+		}
+		failed = 0
+	}
+}
+
+// generateDCTMultiRound builds a minimal DCT seed, then grows it with
+// expandWithDCT (multi-group programs with continuous fd lifecycles).
+func (r *randGen) generateDCTMultiRound(s *state, sCalls *SpecialCalls, hmcfg *Hmdfs_config,
+	lcs *LayeredChoiceStrategy, seedType string) []*Prog {
+	ps := r.generateFromDistributedChoiceTable(s, sCalls, hmcfg, lcs, seedType)
+	if len(ps) == 0 {
+		return ps
+	}
+	r.expandWithDCT(ps, sCalls, hmcfg, lcs, seedType)
+	return ps
+}
+
+func avgCalls(ps []*Prog) int {
+	total := 0
+	for _, p := range ps {
+		total += len(p.Calls)
+	}
+	return total / len(ps)
 }
