@@ -1085,6 +1085,17 @@ func (pp *PredefinedPatterns) initInodeopsPatterns() {
 			TestPoint: "multi_rename_conflict",
 			SeedType:  "inodeops",
 		},
+		ConcurrentPattern{
+			Name:        "rmdir_mkdir_same_name",
+			ClientCount: 2,
+			SharedRes:   "same_dir",
+			Operations: [][]ConcurrentOp{
+				{{"rmdir", []PathArgSpec{{PathSelf}}}},
+				{{"mkdir", []PathArgSpec{{PathSame}}}},
+			},
+			TestPoint: "rmdir_mkdir_same_name_recreation",
+			SeedType:  "inodeops",
+		},
 	)
 }
 
@@ -1256,17 +1267,21 @@ func (dct *DistributedChoiceTable) getInitialWeight(rootCall string, variant Cal
 	}
 
 	conflictPairs := map[string]map[string]int{
-		"mkdir":    {"rmdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15},
-		"rmdir":    {"mkdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15},
-		"creat":    {"unlink": 30, "rmdir": 20, "mkdir": 20, "write": 25, "read": 25},
-		"unlink":   {"creat": 30, "mkdir": 15, "rmdir": 15, "write": 30, "read": 20},
-		"rename":   {"rename": 35, "unlink": 25, "creat": 20, "write": 20, "read": 20},
-		"chmod":    {"read": 15, "write": 15, "truncate": 20},
-		"truncate": {"write": 25, "read": 20, "chmod": 20},
-		"stat":     {"write": 10, "read": 10},
-		"open":     {"read": 25, "write": 25, "truncate": 20},
-		"write":    {"read": 30, "write": 25, "truncate": 20, "unlink": 30, "creat": 25, "mkdir": 15, "rmdir": 15},
-		"read":     {"write": 30, "truncate": 15, "unlink": 20, "creat": 25, "mkdir": 15, "rmdir": 15},
+		"mkdir":     {"rmdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15, "open": 20},
+		"rmdir":     {"mkdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15},
+		"creat":     {"unlink": 30, "rmdir": 20, "mkdir": 20, "creat": 25, "write": 25, "read": 25},
+		"unlink":    {"creat": 30, "mkdir": 15, "rmdir": 15, "write": 30, "read": 20},
+		"rename":    {"rename": 35, "unlink": 25, "creat": 20, "write": 20, "read": 20},
+		"chmod":     {"read": 15, "write": 15, "truncate": 20},
+		"truncate":  {"write": 25, "read": 20, "chmod": 20},
+		"stat":      {"write": 10, "read": 10},
+		"open":      {"read": 25, "write": 25, "truncate": 20, "pread64": 20, "pwrite64": 20},
+		"write":     {"read": 30, "write": 25, "truncate": 20, "unlink": 30, "creat": 25, "mkdir": 15, "rmdir": 15, "pread64": 25, "pwrite64": 25, "fsync": 20},
+		"read":      {"write": 30, "truncate": 15, "unlink": 20, "creat": 25, "mkdir": 15, "rmdir": 15, "pread64": 20, "pwrite64": 20},
+		"fsync":     {"write": 25, "read": 15, "truncate": 20},
+		"fdatasync": {"write": 25, "read": 15, "truncate": 20},
+		"pwrite64":  {"read": 25, "write": 25, "pread64": 20, "truncate": 20},
+		"pread64":   {"write": 30, "pwrite64": 20, "truncate": 15},
 	}
 
 	if conflictGroup, ok := conflictPairs[rootCall]; ok {
@@ -1592,7 +1607,7 @@ func NewLayeredChoiceStrategy(seedType string, hmcfg *Hmdfs_config, target *Targ
 		SeedType:            seedType,
 		FileopsChoiceTable:  nil,
 		InodeopsChoiceTable: nil,
-		patternProbability:  0.3,
+		patternProbability:  0.2,
 	}
 
 	if hmcfg != nil && hmcfg.FileTree != nil {
