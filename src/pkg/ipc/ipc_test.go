@@ -107,7 +107,7 @@ func TestExecute(t *testing.T) {
 			opts := &ExecOpts{
 				Flags: flag,
 			}
-			output, infos, hanged, err, _, _, _, _ := env.Exec(opts, []*prog.Prog{p})
+			output, infos, hanged, err, _, _, _, _, _ := env.Exec(opts, []*prog.Prog{p})
 			if err != nil {
 				t.Fatalf("failed to run executor: %v", err)
 			}
@@ -153,7 +153,7 @@ func TestParallel(t *testing.T) {
 			}()
 			p := target.DataMmapProg()
 			opts := &ExecOpts{}
-			output, infos, hanged, err, _, _, _, _ := env.Exec(opts, []*prog.Prog{p})
+			output, infos, hanged, err, _, _, _, _, _ := env.Exec(opts, []*prog.Prog{p})
 			if err != nil {
 				err = fmt.Errorf("failed to run executor: %v", err)
 				return

@@ -386,9 +386,12 @@ void stop_collect_hmdfs_trace(void)
 	fprintf(stderr, "executor %d hmdfs trace: collected=%d prog_events=%d\n",
 		(int)getpid(), collected_count, prog_cnt);
 
-	/* 4. write to output: fixed-point tsc_ns_ratio (×1e9) first, then the
-	 * event count (always written, even when empty), then the events. */
+	/* 4. write to output: fixed-point tsc_ns_ratio (×1e9) first, then this
+	 * executor's global-domain tsc_offset (so the fuzzer can refresh its
+	 * static tscoffs after VM restarts), then the event count (always
+	 * written, even when empty), then the events. */
 	write_output_64((uint64_t)(tsc_ns_ratio * 1000000000.0));
+	write_output_64((uint64_t)tsc_offset);
 	write_output((uint32)collected_count);
 	for (int i = 0; i < collected_count; i++) {
 		write_output_64(collected[i].timestamp);

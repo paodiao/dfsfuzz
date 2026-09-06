@@ -369,7 +369,7 @@ type ExecRet struct {
 // hanged: program hanged and was killed
 // err0: failed to start the process or bug in executor itself.
 func (env *Env) Exec(opts *ExecOpts, ps []*prog.Prog) (output []byte, infos []*ProgInfo, hanged bool,
-	err0 error, fsMds []map[string]prog.FileMetadata, testdirIno uint64, hmdfsTraceEvents []prog.HmdfsTraceEvent, tscRatio float64) {
+	err0 error, fsMds []map[string]prog.FileMetadata, testdirIno uint64, hmdfsTraceEvents []prog.HmdfsTraceEvent, tscRatio float64, tscOffsets []int64) {
 	// Copy-in serialized program.
 	var req executeReq
 	const reqLen = int(unsafe.Sizeof(req))
@@ -439,7 +439,7 @@ func (env *Env) Exec(opts *ExecOpts, ps []*prog.Prog) (output []byte, infos []*P
 
 	var executor_idx int
 	//var fsMds []map[string]prog.FileMetadata
-	infos, err0, executor_idx, _, fsMds, testdirIno, hmdfsTraceEvents, tscRatio = env.parseOutputs(ps)
+	infos, err0, executor_idx, _, fsMds, testdirIno, hmdfsTraceEvents, tscRatio, tscOffsets = env.parseOutputs(ps)
 
 	if err0 != nil {
 		log.Logf(0, "executor %d parseOutput err0 is not nil %v\n", executor_idx, err0)
@@ -499,10 +499,11 @@ type parseRet struct {
 	testdirIno       uint64
 	hmdfsTraceEvents []prog.HmdfsTraceEvent
 	tscRatio         float64
+	tscOffset        int64
 }
 
 func (env *Env) parseOutputs(ps []*prog.Prog) ([]*ProgInfo, error, int, *prog.Prog,
-	[]map[string]prog.FileMetadata, uint64, []prog.HmdfsTraceEvent, float64) {
+	[]map[string]prog.FileMetadata, uint64, []prog.HmdfsTraceEvent, float64, []int64) {
 
 	progsLen := len(ps)
 	srvInfos := make([]*ProgInfo, env.config.ServNum)
@@ -511,6 +512,7 @@ func (env *Env) parseOutputs(ps []*prog.Prog) ([]*ProgInfo, error, int, *prog.Pr
 	testdirIno := uint64(0)
 	var hmdfsTraceEvents []prog.HmdfsTraceEvent
 	tscRatio := float64(0)
+	tscOffsets := make([]int64, progsLen)
 
 	retChan := make(chan parseRet)
 	for idx, p := range ps {
@@ -521,7 +523,7 @@ func (env *Env) parseOutputs(ps []*prog.Prog) ([]*ProgInfo, error, int, *prog.Pr
 	for i := 0; i < progsLen; i++ {
 		ret := <-retChan
 		if ret.err != nil {
-			return nil, ret.err, ret.idx, nil, nil, 0, nil, 0
+			return nil, ret.err, ret.idx, nil, nil, 0, nil, 0, nil
 		}
 		if ret.idx < env.config.ServNum {
 			srvInfos[ret.idx] = ret.info
@@ -540,6 +542,9 @@ func (env *Env) parseOutputs(ps []*prog.Prog) ([]*ProgInfo, error, int, *prog.Pr
 		if ret.tscRatio != 0 {
 			tscRatio = ret.tscRatio
 		}
+		if ret.idx >= 0 && ret.idx < len(tscOffsets) && ret.tscOffset != 0 {
+			tscOffsets[ret.idx] = ret.tscOffset
+		}
 	}
 	log.Logf(0, "fsMds: %v", fsMds)
 
@@ -549,7 +554,7 @@ func (env *Env) parseOutputs(ps []*prog.Prog) ([]*ProgInfo, error, int, *prog.Pr
 		symc3Prog = env.parseCallOrder(ps)
 	}
 
-	return append(srvInfos, clientInfos...), nil, 0, symc3Prog, fsMds, testdirIno, hmdfsTraceEvents, tscRatio
+	return append(srvInfos, clientInfos...), nil, 0, symc3Prog, fsMds, testdirIno, hmdfsTraceEvents, tscRatio, tscOffsets
 }
 
 func (env *Env) semanticSanitizers(fsMds []map[string]prog.FileMetadata, symc3Prog string, progsCnt int) error {
@@ -1035,23 +1040,29 @@ func (w *diagWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func parseHmdfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64) {
+func parseHmdfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64) {
 	out := *data
-	if len(out) < 12 {
-		return nil, 0
+	if len(out) < 20 {
+		return nil, 0, 0
 	}
-	// The executor always writes the fixed-point tsc_ns_ratio (×1e9) before
-	// the event count, even when the count is zero.
+	// The executor always writes the fixed-point tsc_ns_ratio (×1e9) and its
+	// global-domain tsc_offset before the event count, even when the count is
+	// zero.
 	ratioFixed, okRatio := readUint64(&out)
 	ratio := float64(0)
 	if okRatio {
 		ratio = float64(ratioFixed) / 1e9
 	}
+	offsetFixed, okOffset := readUint64(&out)
+	tscOffset := int64(0)
+	if okOffset {
+		tscOffset = int64(offsetFixed)
+	}
 	count, ok := readUint32(&out)
 	appendParseDiag("parseTrace: ratio=%.9f count=%d remaining=%d", ratio, count, len(out))
 	if !ok || count == 0 {
 		*data = out
-		return nil, ratio
+		return nil, ratio, tscOffset
 	}
 	events := make([]prog.HmdfsTraceEvent, count)
 	for i := uint32(0); i < count; i++ {
@@ -1082,7 +1093,7 @@ func parseHmdfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64) {
 		events[i].Off = off
 	}
 	*data = out
-	return events, ratio
+	return events, ratio, tscOffset
 }
 
 /*
@@ -1162,7 +1173,8 @@ func (env *Env) parseServerOutput(idx int, isClient bool, retChan chan parseRet)
 	// before metadata collection), so trace must be parsed first.
 	var hmdfsTraceEvents []prog.HmdfsTraceEvent
 	var tscRatio float64
-	hmdfsTraceEvents, tscRatio = parseHmdfsTraceEvents(&out)
+	var tscOffset int64
+	hmdfsTraceEvents, tscRatio, tscOffset = parseHmdfsTraceEvents(&out)
 	for i := range hmdfsTraceEvents {
 		hmdfsTraceEvents[i].ProgIdx = idx
 	}
@@ -1178,7 +1190,7 @@ func (env *Env) parseServerOutput(idx int, isClient bool, retChan chan parseRet)
 		}
 	}
 
-	retChan <- parseRet{info: info, fsMd: fsMd, err: nil, idx: idx, hmdfsTraceEvents: hmdfsTraceEvents, tscRatio: tscRatio}
+	retChan <- parseRet{info: info, fsMd: fsMd, err: nil, idx: idx, hmdfsTraceEvents: hmdfsTraceEvents, tscRatio: tscRatio, tscOffset: tscOffset}
 }
 
 func xattr_filter(str string) bool {
@@ -1356,7 +1368,8 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 	// The executor writes [program output][trace][fsMd]; parse trace first.
 	var hmdfsTraceEvents []prog.HmdfsTraceEvent
 	var tscRatio float64
-	hmdfsTraceEvents, tscRatio = parseHmdfsTraceEvents(&out)
+	var tscOffset int64
+	hmdfsTraceEvents, tscRatio, tscOffset = parseHmdfsTraceEvents(&out)
 	for i := range hmdfsTraceEvents {
 		hmdfsTraceEvents[i].ProgIdx = idx
 	}
@@ -1380,7 +1393,7 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 		}
 	}
 
-	retChan <- parseRet{info: info, fsMd: fsMd, err: nil, idx: idx, callInfo: nil, testdirIno: testdirIno, hmdfsTraceEvents: hmdfsTraceEvents, tscRatio: tscRatio}
+	retChan <- parseRet{info: info, fsMd: fsMd, err: nil, idx: idx, callInfo: nil, testdirIno: testdirIno, hmdfsTraceEvents: hmdfsTraceEvents, tscRatio: tscRatio, tscOffset: tscOffset}
 }
 
 func convertExtra(extraParts []CallInfo) CallInfo {

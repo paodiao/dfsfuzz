@@ -508,7 +508,12 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 			}
 		}
 
-		if item.flags&ProgMinimized == 0 && item.subNum >= proc.fuzzer.config.ServNum {
+		// Stash programs keep their structural orchestration (sync/fault
+		// positions tracked in GeneralFailPos, which RemoveCall does not
+		// maintain): minimizing them would break the stash layout and defeat
+		// further stash testing, so stash candidates skip minimization and
+		// merge their coverage feedback as-is.
+		if item.flags&ProgMinimized == 0 && item.subNum >= proc.fuzzer.config.ServNum && !item.ps[0].IsStash {
 			//修改：minimize是不是也要定制一下？
 			//定制：是的——minimize 的判据同样只依赖覆盖/信号等价（Monarch
 			//§3.4），且 minimizeAttempts 次迭代是 triage 中最贵的一段，切到
@@ -1315,8 +1320,9 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	var testdirIno uint64
 	var hmdfsTraceEvents []prog.HmdfsTraceEvent
 	var tscRatio float64
+	var tscOffsets []int64
 
-	output, infos, hanged, err, fsMds, testdirIno, hmdfsTraceEvents, tscRatio = proc.env.Exec(opts, ps)
+	output, infos, hanged, err, fsMds, testdirIno, hmdfsTraceEvents, tscRatio, tscOffsets = proc.env.Exec(opts, ps)
 
 	// Execution errors (executor crash/hang/parse failure) bubble up instead
 	// of killing the fuzzer: the executor is restarted on the next Exec
@@ -1330,6 +1336,24 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	log.Logf(2, "result hanged=%v: %s", hanged, output)
 
 	prog.SetMfTolTicksFromRatio(tscRatio)
+
+	// VM restarts change the executor's global-domain tsc_offset (argv[15]),
+	// while the fuzzer's tscoffs are configured once at startup. Without a
+	// refresh the event conversion (new offset) and the call-window offset
+	// (stale tscoffs) diverge after every restart, skewing matches by ms.
+	// The LCS shares the same slice, so in-place updates propagate there too.
+	if len(tscOffsets) > 0 {
+		refreshed := false
+		for i, off := range tscOffsets {
+			if i < len(proc.fuzzer.tscoffs) && off != 0 && proc.fuzzer.tscoffs[i] != off {
+				proc.fuzzer.tscoffs[i] = off
+				refreshed = true
+			}
+		}
+		if refreshed {
+			appendDiagLog("tscoffs refreshed: %v", proc.fuzzer.tscoffs)
+		}
+	}
 
 	csanPassed, csanDiffs := true, []string(nil)
 	// Triage/minimize rounds judge candidates purely by coverage/signal
