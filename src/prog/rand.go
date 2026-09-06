@@ -2171,17 +2171,10 @@ func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, 
 			// 根调用（client 0）的创建/删除类操作预处理——并更新 basePath
 			// 使后续 client 的 PathSame 共享根路径（并发冲突语义）。
 			if nodeIdx == 0 {
-				switch op.CallName {
-				case "mkdir":
-					basePath = basePath + "/mut_dir_" + randomSuffix(r.Rand)
-				case "creat":
-					basePath = basePath + "._creat_" + randomSuffix(r.Rand) + ".txt"
-				case "rmdir":
-					emptyDir := lcs.FileTree.GetRandomEmptyDir(r.Rand, cid)
-					if emptyDir == nil {
-						return ps
-					}
-					basePath = emptyDir.FullPath
+				var ok bool
+				basePath, ok = r.preprocessPatternRootOp(basePath, cid, op.CallName, lcs.FileTree)
+				if !ok {
+					return ps
 				}
 			}
 			calls, wi, path2 := r.generateCallFromPatternOp(s, sCalls, op, basePath, cid, lcs, nil, false, pattern.OffsetRel, sharedOffset)
@@ -2227,6 +2220,26 @@ func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, 
 	}
 
 	return ps
+}
+
+// preprocessPatternRootOp mirrors the seed-generation preprocessing for the
+// root node's create/delete ops: mkdir and creat target fresh paths (so
+// PathSame variants align on the new target), rmdir targets an empty dir
+// (success path). ok=false aborts the caller (e.g. no empty dir available).
+func (r *randGen) preprocessPatternRootOp(basePath, cid, opName string, ft *FileTree) (string, bool) {
+	switch opName {
+	case "mkdir":
+		return basePath + "/mut_dir_" + randomSuffix(r.Rand), true
+	case "creat":
+		return basePath + "._creat_" + randomSuffix(r.Rand) + ".txt", true
+	case "rmdir":
+		emptyDir := ft.GetRandomEmptyDir(r.Rand, cid)
+		if emptyDir == nil {
+			return "", false
+		}
+		return emptyDir.FullPath, true
+	}
+	return basePath, true
 }
 
 func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op ConcurrentOp, basePath string, cid string, lcs *LayeredChoiceStrategy, ExistingFd *ResultArg, UseExistFd bool, offsetRel OffsetRelationType, sharedOffset uint64) ([]*Call, []*WriteInfo, string) {

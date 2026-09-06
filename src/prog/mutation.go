@@ -2851,6 +2851,15 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 			}
 		}
 		for _, op := range ops {
+			// 根节点（node 0）的创建/删除类 op 预处理与生成侧对齐：mkdir/creat
+			// 打新建路径、rmdir 打空目录——变异插入也能产生真实的创建/删除竞争。
+			if nodeIdx == 0 {
+				var ok bool
+				basePath, ok = r.preprocessPatternRootOp(basePath, cid, op.CallName, lcs.FileTree)
+				if !ok {
+					return false // 无空目录——跳过本次插入（调用方 fallback 标准 Mutate）
+				}
+			}
 			calls, _, _ := r.generateCallFromPatternOp(stateFromProg(p), sCalls, op, basePath, cid, lcs, ExistingFd, useExistingFd, pattern.OffsetRel, sharedOffset)
 			for _, c := range calls {
 				if insertPos >= len(p.Calls) {
@@ -3217,26 +3226,31 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 	var basePath string
 	var basePath2 string = ""
 
-	// Collect all file paths from p0's calls, pick one randomly
-	var pathCandidates []string
-	for _, call := range p0.Calls {
-		if call.Meta.Name == "rename" {
-			p1, p2 := extractRenamePaths(call)
-			if p1 != "" {
-				pathCandidates = append(pathCandidates, p1)
-			}
-			if p2 != "" {
-				pathCandidates = append(pathCandidates, p2)
-			}
-		} else {
-			p := extractPathFromCall(call)
-			if p != "" {
-				pathCandidates = append(pathCandidates, p)
+	// basePath 路线：多数沿用 p0 已有路径上下文（fd 可复用、跨组路径关联），
+	// 部分直接 FileTree 新选（fd 必然新开、操作面更广）。生成与变异统一生效。
+	useFreshPath := r.Rand.Float64() < 0.30
+	if !useFreshPath {
+		// Collect all file paths from p0's calls, pick one randomly
+		var pathCandidates []string
+		for _, call := range p0.Calls {
+			if call.Meta.Name == "rename" {
+				p1, p2 := extractRenamePaths(call)
+				if p1 != "" {
+					pathCandidates = append(pathCandidates, p1)
+				}
+				if p2 != "" {
+					pathCandidates = append(pathCandidates, p2)
+				}
+			} else {
+				p := extractPathFromCall(call)
+				if p != "" {
+					pathCandidates = append(pathCandidates, p)
+				}
 			}
 		}
-	}
-	if len(pathCandidates) > 0 {
-		basePath = pathCandidates[r.Intn(len(pathCandidates))]
+		if len(pathCandidates) > 0 {
+			basePath = pathCandidates[r.Intn(len(pathCandidates))]
+		}
 	}
 
 	insertPos := r.biasedRand(len(p0.Calls)+1, 5)
@@ -3287,6 +3301,38 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 				}
 			}
 		}
+	}
+
+	// 与种子生成同款预处理：mkdir/creat root 改用新建路径——变异侧也能
+	// 产生新建路径竞争（dirtype/双 creat 等形态，root 与 PathSame 变体
+	// 通过 GetPathByRelation 的空值 fallback 对齐到同一新路径）。
+	if rootCallName == "mkdir" {
+		// mkdir 需在树内目录下建新目录：basePath 是文件则取其父目录，
+		// 不在树内（被删/树外路径）则随机选一个目录。
+		if lcs != nil && lcs.FileTree != nil {
+			node := lcs.FileTree.FindNode(basePath)
+			switch {
+			case node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir):
+				// 树内目录——就地拼（D/mut_dir_x）
+			case node != nil:
+				// 树内文件——取其父目录（在该文件所在目录建新目录）
+				if parent := lcs.FileTree.GetParent(node); parent != nil {
+					basePath = parent.FullPath
+				}
+			default:
+				// 不在树内——随机选一个目录
+				dir := lcs.FileTree.GetRandomDir(r.Rand, cid0, true)
+				if dir == nil {
+					return false // 树内无目录——跳过本次插入
+				}
+				basePath = dir.FullPath
+			}
+		}
+		basePath = basePath + "/mut_dir_" + randomSuffix(r.Rand)
+	} else if rootCallName == "creat" {
+		// creat 后缀拼在路径后（同目录新文件——父 = dirname(basePath)，
+		// 来自真实调用故父通常存在；树外目录引用偶发 ENOENT 无害）。
+		basePath = basePath + "._creat_" + randomSuffix(r.Rand) + ".txt"
 	}
 
 	var ExistingFd *ResultArg = nil
