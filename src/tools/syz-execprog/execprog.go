@@ -169,7 +169,7 @@ func (ctx *Context) execute(pid int, env *ipc.Env, entry *prog.LogEntry) {
 	// This mimics the syz-fuzzer logic. This is important for reproduction.
 	for try := 0; ; try++ {
 		//tao modified
-		output, info, hanged, err, _, _, _, _ := env.Exec(callOpts, entry.Ps)
+		output, info, hanged, err, _, _, _, _, _ := env.Exec(callOpts, entry.Ps)
 		//tao end
 		if err != nil && err != prog.ErrExecBufferTooSmall {
 			if try > 10 {

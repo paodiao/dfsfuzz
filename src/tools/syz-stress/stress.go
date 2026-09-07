@@ -133,7 +133,7 @@ func execute(pid int, env *ipc.Env, execOpts *ipc.ExecOpts, p *prog.Prog) {
 		outMu.Unlock()
 	}
 	//tao modified
-	output, _, hanged, err, _ := env.Exec(execOpts, p, 0, nil, nil, nil)
+	output, _, hanged, err, _, _, _, _, _ := env.Exec(execOpts, []*prog.Prog{p})
 	//tao end
 	if err != nil {
 		fmt.Printf("failed to execute executor: %v\n", err)
