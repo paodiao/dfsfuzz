@@ -496,11 +496,24 @@ uint64_t tsc_anchor_ns = 0;
 // immune unless all samples are preempted (~p^3 with 3 samples).
 #define CALIB_ANCHOR_SAMPLES 3
 
-static void calibrate_tsc(void) {
-  struct timespec ts2;
-  uint64_t t1 = 0;
+// A calibration takes CALIB_POINTS protected points (each a guarded
+// rdtsc-clock_gettime pair spaced CALIB_SAMPLE_MS apart) and derives
+// CALIB_SAMPLES adjacent ratios. The median is accepted when the three
+// ratios agree within CALIB_CONSISTENCY_TOL: the median is immune to a
+// single polluted sample, and the consistency check catches two. This is
+// environment-agnostic -- no absolute frequency range or previous-ratio
+// reference is hardcoded, so the same code works on any host clock.
+#define CALIB_POINTS 4
+#define CALIB_SAMPLES 3
+#define CALIB_SAMPLE_MS 2
+#define CALIB_CONSISTENCY_TOL 0.005
+
+// Sample an rdtsc-clock_gettime pair and keep the one with the smallest
+// TSC-domain read gap (preemption immune).
+static uint64_t sample_clock_pair(struct timespec *out_ts, uint64_t *out_gap) {
+  uint64_t best_t = 0;
   uint64_t best_gap = ~0ULL;
-  struct timespec ts1;
+  struct timespec best_ts;
   for (int i = 0; i < CALIB_ANCHOR_SAMPLES; i++) {
     uint64_t a = rdtsc();
     struct timespec ts;
@@ -509,28 +522,102 @@ static void calibrate_tsc(void) {
     uint64_t b = rdtsc();
     if (b - a < best_gap) {
       best_gap = b - a;
-      t1 = a;
-      ts1 = ts;
+      best_t = a;
+      best_ts = ts;
     }
   }
-  // 5ms sampling window: ratio error ~20ppm -> at most ~4us phase drift over
-  // one execution round (~200ms), far below the 60us match tolerance. The
-  // shorter window keeps per-round recalibration cheap.
-  usleep(5000);
-  uint64_t t2 = rdtsc();
-  if (clock_gettime(CLOCK_MONOTONIC, &ts2) != 0)
-    fail("clock_gettime failed");
-  uint64_t m1 = (uint64_t)ts1.tv_sec * 1000000000ULL + ts1.tv_nsec;
-  uint64_t m2 = (uint64_t)ts2.tv_sec * 1000000000ULL + ts2.tv_nsec;
-  if (t2 == t1)
-    fail("tsc calibration failed");
-  tsc_ns_ratio = (double)(m2 - m1) / (double)(t2 - t1);
-  tsc_anchor_tsc = t1;
-  tsc_anchor_ns = m1;
-  fprintf(stderr, "executor %lld tsc calibrate: ratio=%f anchor_tsc=%llu anchor_ns=%llu gap=%llu\n",
-          executor_index, tsc_ns_ratio,
-          (unsigned long long)tsc_anchor_tsc, (unsigned long long)tsc_anchor_ns,
-          (unsigned long long)best_gap);
+  *out_ts = best_ts;
+  *out_gap = best_gap;
+  return best_t;
+}
+
+static uint64_t ts_to_ns(const struct timespec *ts) {
+  return (uint64_t)ts->tv_sec * 1000000000ULL + ts->tv_nsec;
+}
+
+static void set_tsc_calib(double ratio, uint64_t anchor_t, const struct timespec *anchor_ts) {
+  tsc_ns_ratio = ratio;
+  tsc_anchor_tsc = anchor_t;
+  tsc_anchor_ns = ts_to_ns(anchor_ts);
+}
+
+static void calibrate_tsc(void) {
+  // The ratio spans adjacent guarded points. A preempted clock_gettime()
+  // inflated the old single-ratio measurement by 1-30% and pushed converted
+  // event timestamps systematically early (raw = anchor + ns/ratio
+  // underestimates). Guarding every point plus median-of-three with a
+  // consistency check makes a polluted calibration virtually impossible
+  // (it would need two of three adjacent ratios polluted).
+  double fb_ratio = 0.0;
+  uint64_t fb_t = 0;
+  struct timespec fb_ts;
+  double fb_ratios[CALIB_SAMPLES];
+  double fb_rel_spread = 0.0;
+  for (int round = 0; round < 2; round++) {
+    uint64_t t[CALIB_POINTS];
+    struct timespec ts[CALIB_POINTS];
+    uint64_t gap[CALIB_POINTS];
+    for (int i = 0; i < CALIB_POINTS; i++) {
+      if (i > 0)
+        usleep(CALIB_SAMPLE_MS * 1000);
+      t[i] = sample_clock_pair(&ts[i], &gap[i]);
+    }
+    double r[CALIB_SAMPLES];
+    for (int i = 0; i < CALIB_SAMPLES; i++) {
+      if (t[i + 1] == t[i])
+        fail("tsc calibration failed");
+      r[i] = (double)(ts_to_ns(&ts[i + 1]) - ts_to_ns(&ts[i])) /
+             (double)(t[i + 1] - t[i]);
+    }
+    // Sort a copy to find the median and the spread.
+    double sorted[CALIB_SAMPLES];
+    for (int i = 0; i < CALIB_SAMPLES; i++)
+      sorted[i] = r[i];
+    for (int i = 0; i < CALIB_SAMPLES; i++)
+      for (int j = i + 1; j < CALIB_SAMPLES; j++)
+        if (sorted[j] < sorted[i]) {
+          double tmp = sorted[i];
+          sorted[i] = sorted[j];
+          sorted[j] = tmp;
+        }
+    double median = sorted[CALIB_SAMPLES / 2];
+    double spread = sorted[CALIB_SAMPLES - 1] - sorted[0];
+    uint64_t best_gap = gap[0];
+    for (int i = 1; i < CALIB_POINTS; i++)
+      if (gap[i] < best_gap)
+        best_gap = gap[i];
+    // Remember this round's candidate: the last round's median is the
+    // fallback when both rounds are inconsistent.
+    fb_ratio = median;
+    fb_t = t[0];
+    fb_ts = ts[0];
+    for (int i = 0; i < CALIB_SAMPLES; i++)
+      fb_ratios[i] = r[i];
+    fb_rel_spread = median > 0 ? spread / median : -1.0;
+    if (median > 0 && spread / median <= CALIB_CONSISTENCY_TOL) {
+      set_tsc_calib(median, t[0], &ts[0]);
+      fprintf(stderr,
+              "executor %lld tsc calibrate: ratio=%f anchor_tsc=%llu anchor_ns=%llu gap=%llu ratios=[%f %f %f]\n",
+              executor_index, tsc_ns_ratio, (unsigned long long)tsc_anchor_tsc,
+              (unsigned long long)tsc_anchor_ns, (unsigned long long)best_gap,
+              r[0], r[1], r[2]);
+      return;
+    }
+    if (round == 0)
+      fprintf(stderr,
+              "executor %lld tsc calibrate retry: ratios=[%f %f %f] spread/median=%f\n",
+              executor_index, r[0], r[1], r[2],
+              median > 0 ? spread / median : -1.0);
+  }
+  // Last-resort fallback after two inconsistent rounds: accept the final
+  // round's median so the conversion stays smooth (two polluted adjacent
+  // ratios per round would be required to reach this point -- virtually
+  // impossible with guarded points).
+  fprintf(stderr,
+          "executor %lld tsc calibrate: accepting median %f after retries ratios=[%f %f %f] spread/median=%f\n",
+          executor_index, fb_ratio, fb_ratios[0], fb_ratios[1], fb_ratios[2],
+          fb_rel_spread);
+  set_tsc_calib(fb_ratio, fb_t, &fb_ts);
 }
 
 // Convert a bpf_ktime_get_ns() timestamp into the global raw-TSC domain.
