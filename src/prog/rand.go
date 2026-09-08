@@ -2121,6 +2121,39 @@ func (r *randGen) generateConcurrentRenameOps(s *state, sCalls *SpecialCalls, hm
 	return ps
 }
 
+// patternOpsFeasible reports whether the pattern's ops can produce their
+// paths on the given base. Creation ops (creat/mkdir) always work (they build
+// a fresh child inside the base — no structural dependency). Self/Same
+// relations target the base itself and always work. Structural relations
+// (Child/Sibling/Parent/NoRel) of the remaining ops — including the rename
+// source relation — must be available for the op's call type on this base.
+func patternOpsFeasible(lcs *LayeredChoiceStrategy, pattern *ConcurrentPattern, basePath string) bool {
+	relOKByType := lcs.availableRelationsForBase(basePath)
+	for _, ops := range pattern.Operations {
+		for _, op := range ops {
+			if op.CallName == "creat" || op.CallName == "mkdir" {
+				continue
+			}
+			if len(op.PathArgs) == 0 {
+				continue // no path dependency (e.g. fsync on an existing fd)
+			}
+			rel := op.PathArgs[0].Relation
+			if len(op.PathArgs) > 1 {
+				rel = op.PathArgs[1].Relation // rename source relation
+			}
+			switch rel {
+			case PathSelf, PathSelfTwo, PathSame:
+				continue
+			}
+			typ := callNameConstraint(op.CallName)
+			if !relOKByType[typ][rel] {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seedType string) []*Prog {
 	var ps []*Prog
 	var writeinfos []*WriteInfo
@@ -2135,18 +2168,27 @@ func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, 
 	}
 
 	basePath := ""
-	if seedType == "fileops" {
-		fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
-		if fileNode == nil {
-			return ps
+	for attempt := 0; attempt < 5; attempt++ {
+		if seedType == "fileops" {
+			fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
+			if fileNode == nil {
+				return ps
+			}
+			basePath = fileNode.FullPath
+		} else {
+			dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], false)
+			if dirNode == nil {
+				return ps
+			}
+			basePath = dirNode.FullPath
 		}
-		basePath = fileNode.FullPath
-	} else {
-		dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], false)
-		if dirNode == nil {
-			return ps
+		if patternOpsFeasible(lcs, pattern, basePath) {
+			break
 		}
-		basePath = dirNode.FullPath
+		basePath = ""
+	}
+	if basePath == "" {
+		return ps
 	}
 
 	sharedOffset := uint64(0)
@@ -2177,13 +2219,11 @@ func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, 
 					return ps
 				}
 			}
-			calls, wi, path2 := r.generateCallFromPatternOp(s, sCalls, op, basePath, cid, lcs, nil, false, pattern.OffsetRel, sharedOffset)
+			calls, wi, _ := r.generateCallFromPatternOp(s, sCalls, op, basePath, cid, lcs, nil, false, pattern.OffsetRel, sharedOffset)
 			for _, c := range calls {
 				p.Calls = append(p.Calls, c)
 			}
 			writeinfos = append(writeinfos, wi...)
-			if path2 != "" {
-			}
 		}
 
 		if seedType == "inodeops" {
@@ -2231,7 +2271,7 @@ func (r *randGen) preprocessPatternRootOp(basePath, cid, opName string, ft *File
 	case "mkdir":
 		return basePath + "/mut_dir_" + randomSuffix(r.Rand), true
 	case "creat":
-		return basePath + "._creat_" + randomSuffix(r.Rand) + ".txt", true
+		return basePath + "/._creat_" + randomSuffix(r.Rand) + ".txt", true
 	case "rmdir":
 		emptyDir := ft.GetRandomEmptyDir(r.Rand, cid)
 		if emptyDir == nil {
@@ -2242,6 +2282,17 @@ func (r *randGen) preprocessPatternRootOp(basePath, cid, opName string, ft *File
 	return basePath, true
 }
 
+// freshChildPath builds a fresh child path inside a directory for creation
+// ops (creat/mkdir) used by pattern ops: the child is a new name under dir
+// (same naming style as the root preprocessing, and inside the directory so
+// that directory reads such as getdents64 observe the new entry).
+func (r *randGen) freshChildPath(dirPath, kind string) string {
+	if kind == "creat" {
+		return dirPath + "/._creat_" + randomSuffix(r.Rand) + ".txt"
+	}
+	return dirPath + "/mut_dir_" + randomSuffix(r.Rand)
+}
+
 func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op ConcurrentOp, basePath string, cid string, lcs *LayeredChoiceStrategy, ExistingFd *ResultArg, UseExistFd bool, offsetRel OffsetRelationType, sharedOffset uint64) ([]*Call, []*WriteInfo, string) {
 	var calls []*Call
 	var writeinfos []*WriteInfo
@@ -2249,18 +2300,38 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 	path := basePath
 
 	path2 := ""
-	if len(op.PathArgs) > 1 {
-		pathArg1 := op.PathArgs[1]
-		path, path2 = lcs.GetPathsForRenameVariant(basePath, "", pathArg1.Relation, r.Rand, cid, false)
-		if path == "" {
-			return calls, writeinfos, path2 // 该关系无匹配——不生成该 op（S16）
+	if op.CallName == "creat" || op.CallName == "mkdir" {
+		// Creation ops create a fresh child inside a directory base instead
+		// of operating on existing nodes: the pattern shape is about the
+		// directory-entry-level race, and a fresh target keeps it viable even
+		// when the base has no suitable existing children (e.g. readdir_creat
+		// no longer depends on the base having file children). If the base is
+		// a file or outside the tree (fresh path from the root preprocessing),
+		// keep it as the target.
+		if lcs != nil && lcs.FileTree != nil {
+			if node := lcs.FileTree.FindNode(basePath); node != nil && node.Type != NodeTypeFile {
+				path = r.freshChildPath(basePath, op.CallName)
+			}
 		}
+	} else if len(op.PathArgs) > 1 {
+		pathArg1 := op.PathArgs[1]
+		path, path2 = lcs.GetPathsForRenameVariant(basePath, "", pathArg1.Relation, r.Rand, false)
 	} else if len(op.PathArgs) == 1 {
 		pathArg := op.PathArgs[0]
-		path = lcs.FileTree.GetPathByRelation(basePath, "", pathArg.Relation, r.Rand, cid, false)
-		if path == "" {
+		constraint := callNameConstraint(op.CallName)
+		path = lcs.FileTree.GetPathByRelation(basePath, "", pathArg.Relation, r.Rand, false, constraint)
+		if path == "" && basePathCompatible(lcs.FileTree, basePath, constraint) {
 			path = basePath
 		}
+	}
+
+	if path == "" {
+		// No generatable path (rename relation miss, or a fallback that is
+		// incompatible with the op's target type): keep the node non-empty
+		// with a stat on the base path instead of dropping the op or running
+		// a doomed call.
+		calls = append(calls, r.generateStatCallWithPath(s, sCalls, basePath))
+		return calls, writeinfos, ""
 	}
 
 	openFlags := uint64(2)
@@ -2537,8 +2608,9 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 	}
 
 	// 根调用创建/删除语义预处理：mkdir/creat 生成新名（创建成功路径）、
-	// rmdir 选空目录（删除成功路径——ENOTEMPTY 否则必败）；变体保持
-	// PathRelation 原语义（打已有路径——并发冲突测试价值）。
+	// rmdir 选空目录（删除成功路径——ENOTEMPTY 否则必败）。
+	// 变体随后按各自语义生成：mkdir 变体按其几何位置建新名（见节点循环的
+	// freshChildPath 分支）；其余变体走关系路径 + 类型约束/保底。
 	if rootCallName == "mkdir" {
 		basePath = basePath + "/mut_dir_" + randomSuffix(r.Rand)
 	} else if rootCallName == "creat" {
@@ -2580,22 +2652,55 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 		p := &Prog{Target: r.target}
 		cid := hmcfg.Cids[nodeIdx]
 
-		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, !isDirPath(lcs.FileTree, basePath))
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, basePathIsFile(lcs.FileTree, rootCallName, basePath), basePath)
 		if variant == nil {
+			// No generatable variant for this base (e.g. no relation is
+			// currently available): keep the node slot with a stat call
+			// instead of dropping the node (the executor requires a
+			// program for every client).
+			ps = append(ps, r.fallbackStatNode(s, sCalls, basePath, seedType))
 			continue
 		}
 
 		concurrentPath := ""
 		concurrentPath2 := ""
-		if variant.CallName == "rename" {
-			concurrentPath, concurrentPath2 = lcs.GetPathsForRenameVariant(basePath, "", variant.PathRelation, r.Rand, cid, false)
-			if concurrentPath == "" {
-				continue // 该关系无匹配——跳过此节点（S16）
+		if variant.CallName == "mkdir" {
+			// mkdir as a variant follows its geometric position: Child
+			// creates a fresh child inside the base, Sibling a fresh sibling
+			// inside the parent, NoRel inside an unrelated directory (the new
+			// name is what makes these viable — an existing target would be
+			// EEXIST forever). Same/Parent target the existing directory
+			// itself and are handled by the generic relation path below.
+			switch variant.PathRelation {
+			case PathChild:
+				concurrentPath = r.freshChildPath(basePath, "mkdir")
+			case PathSibling:
+				concurrentPath = r.freshChildPath(GetParentDir(basePath), "mkdir")
+			case PathNoRel:
+				if dir := lcs.FileTree.getRandomUnrelatedPath(basePath, r.Rand, relTargetDir); dir != "" {
+					concurrentPath = r.freshChildPath(dir, "mkdir")
+				}
 			}
-		} else {
-			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, cid, false)
+		}
+		if variant.CallName == "rename" {
+			concurrentPath, concurrentPath2 = lcs.GetPathsForRenameVariant(basePath, "", variant.PathRelation, r.Rand, false)
 			if concurrentPath == "" {
+				// Not generatable after all (should not happen under
+				// relOK filtering): keep the slot with a stat call.
+				ps = append(ps, r.fallbackStatNode(s, sCalls, basePath, seedType))
+				continue
+			}
+		} else if concurrentPath == "" {
+			constraint := callNameConstraint(variant.CallName)
+			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, false, constraint)
+			if concurrentPath == "" && basePathCompatible(lcs.FileTree, basePath, constraint) {
 				concurrentPath = basePath
+			}
+			if concurrentPath == "" {
+				// No generatable path of the right type for this variant:
+				// keep the node slot with a stat call.
+				ps = append(ps, r.fallbackStatNode(s, sCalls, basePath, seedType))
+				continue
 			}
 		}
 
@@ -2627,12 +2732,35 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 	return ps
 }
 
+// fallbackStatNode builds a minimal single-call stat program on basePath so
+// that a node slot is never dropped during seed construction: the executor
+// requires a program (non-zero size) for every client.
+func (r *randGen) fallbackStatNode(s *state, sCalls *SpecialCalls, basePath string, seedType string) *Prog {
+	p := &Prog{Target: r.target}
+	p.Calls = append(p.Calls, r.generateStatCallWithPath(s, sCalls, basePath))
+	if seedType == "inodeops" {
+		p.IsInodeOps = true
+	} else {
+		p.IsFileOps = true
+	}
+	return p
+}
+
 func (r *randGen) chooseRootCallName(ct *ChoiceTable, bias int) string {
 	if ct == nil {
 		return ""
 	}
-	idx := ct.choose(r.Rand, bias)
-	return r.target.Syscalls[idx].CallName
+	// close is a legal bias source (it is in the sub table so that a bias
+	// from a close call introduced by fd self-contained sequences passes
+	// Enabled), but never a root result: retry with the same bias when
+	// close is picked. Bounded retries keep this from looping forever.
+	for attempt := 0; attempt < len(ct.calls)+1; attempt++ {
+		idx := ct.choose(r.Rand, bias)
+		if r.target.Syscalls[idx].CallName != "close" {
+			return r.target.Syscalls[idx].CallName
+		}
+	}
+	return ""
 }
 
 func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName string, path string, path2 string, cid string, ExistingFd *ResultArg, UseExistFd bool, fileSize uint64, flags uint64) []*Call {

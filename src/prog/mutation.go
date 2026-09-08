@@ -2507,7 +2507,7 @@ func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 	}
 	updates := []pathUpdate{{pos: resolveFdTarget(ps, anchor), newPath: newBasePath}}
 	for _, cc := range conc {
-		newPath := lcs.FileTree.GetPathByRelation(newBasePath, "", cc.Rel, r.Rand, "", false)
+		newPath := lcs.FileTree.GetPathByRelation(newBasePath, "", cc.Rel, r.Rand, false, relTargetAny)
 		if newPath == "" {
 			newPath = newBasePath
 		}
@@ -2779,8 +2779,14 @@ func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *
 			}
 		}
 	}
-	if len(pathCandidates) > 0 {
-		basePath = pathCandidates[r.Intn(len(pathCandidates))]
+	var matches []string
+	for _, pc := range pathCandidates {
+		if patternBaseMatches(lcs.FileTree, seedType, pc) {
+			matches = append(matches, pc)
+		}
+	}
+	if len(matches) > 0 {
+		basePath = matches[r.Intn(len(matches))]
 	}
 
 	if basePath == "" {
@@ -3389,10 +3395,11 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 		p := ps[nodeIdx]
 		cid := hmcfg.Cids[nodeIdx]
 
-		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, !isDirPath(lcs.FileTree, basePath))
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, basePathIsFile(lcs.FileTree, rootCallName, basePath), basePath)
 		if variant == nil {
+			// No usable variant for this base: skip this node's insertion for
+			// this round (ps is already full — no node is dropped).
 			continue
-			//TODO: continue 对吗？
 		}
 		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, *variant, r.Rand)
 
@@ -3412,15 +3419,42 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 		concurrentPath := ""
 
 		concurrentPath2 := ""
-		if variant.CallName == "rename" {
-			concurrentPath, concurrentPath2 = lcs.GetPathsForRenameVariant(basePath, "", variant.PathRelation, r.Rand, cid, false)
-			if concurrentPath == "" {
-				continue // 该关系无匹配——跳过此节点（S16）
+		if variant.CallName == "mkdir" {
+			// mkdir as a variant follows its geometric position: Child
+			// creates a fresh child inside the base, Sibling a fresh sibling
+			// inside the parent, NoRel inside an unrelated directory (the new
+			// name is what makes these viable — an existing target would be
+			// EEXIST forever). Same/Parent target the existing directory
+			// itself and are handled by the generic relation path below.
+			switch variant.PathRelation {
+			case PathChild:
+				concurrentPath = r.freshChildPath(basePath, "mkdir")
+			case PathSibling:
+				concurrentPath = r.freshChildPath(GetParentDir(basePath), "mkdir")
+			case PathNoRel:
+				if dir := lcs.FileTree.getRandomUnrelatedPath(basePath, r.Rand, relTargetDir); dir != "" {
+					concurrentPath = r.freshChildPath(dir, "mkdir")
+				}
 			}
-		} else {
-			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, cid, false)
+		}
+		if variant.CallName == "rename" {
+			concurrentPath, concurrentPath2 = lcs.GetPathsForRenameVariant(basePath, "", variant.PathRelation, r.Rand, false)
 			if concurrentPath == "" {
+				// Rename relation not generatable here (rare under relOK
+				// filtering): skip this node's variant insertion for this
+				// round (ps is full).
+				continue
+			}
+		} else if concurrentPath == "" {
+			constraint := callNameConstraint(variant.CallName)
+			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, false, constraint)
+			if concurrentPath == "" && basePathCompatible(lcs.FileTree, basePath, constraint) {
 				concurrentPath = basePath
+			}
+			if concurrentPath == "" {
+				// No generatable path of the right type: skip this node's
+				// variant insertion for this round (ps is already full).
+				continue
 			}
 		}
 		if IsFdRequiredCall(variant.CallName) {

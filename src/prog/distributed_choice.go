@@ -62,6 +62,7 @@ var FileopsSubCalls = []string{
 var InodeopsSubCalls = []string{
 	"mkdir", "rmdir", "creat", "unlink", "rename",
 	"chmod", "truncate", "stat",
+	"open", "getdents64", "close",
 }
 
 func IsDirOnlyCall(callName string) bool {
@@ -732,7 +733,79 @@ func (ft *FileTree) GetRandomNode(r *rand.Rand, cid string) *FileNode {
 	return nodes[r.Intn(len(nodes))]
 }
 
-func (ft *FileTree) GetPathByRelation(basePath string, basePath2 string, relation PathRelation, r *rand.Rand, cid string, isTwoPath bool) string {
+// Target-type constraint for variant path generation: file-only calls must
+// land on file paths, dir-only calls on directory paths, generic calls accept
+// either.
+const (
+	relTargetAny = iota
+	relTargetFile
+	relTargetDir
+)
+
+// callNameConstraint maps a call to the node type its variant path must have.
+func callNameConstraint(callName string) int {
+	if isFileOnlyCallByName(callName) {
+		return relTargetFile
+	}
+	if isDirOnlyCall(callName) {
+		return relTargetDir
+	}
+	return relTargetAny
+}
+
+func nodeMatchesConstraint(node *FileNode, constraint int) bool {
+	switch constraint {
+	case relTargetFile:
+		return node.Type == NodeTypeFile
+	case relTargetDir:
+		return node.Type != NodeTypeFile
+	}
+	return true
+}
+
+// basePathCompatible reports whether basePath's type matches the variant
+// call's target constraint (used before falling back to the base path when no
+// relation path could be produced).
+func basePathCompatible(ft *FileTree, basePath string, constraint int) bool {
+	switch constraint {
+	case relTargetFile:
+		return !isDirPath(ft, basePath)
+	case relTargetDir:
+		return isDirPath(ft, basePath)
+	}
+	return true
+}
+
+// patternBaseMatches reports whether an extracted base path suits the seed
+// type of a pattern insertion (fileops patterns operate on files, inodeops
+// ones on directories). Paths outside the tree are excluded: an unbuilt
+// target (e.g. a not-yet-created mkdir directory) would make creation ops
+// hit the directory path itself and fail.
+func patternBaseMatches(ft *FileTree, seedType, basePath string) bool {
+	node := ft.FindNode(basePath)
+	if node == nil {
+		return false
+	}
+	if seedType == "fileops" {
+		return node.Type == NodeTypeFile
+	}
+	return node.Type != NodeTypeFile
+}
+
+func filterNodesByConstraint(nodes []*FileNode, constraint int) []*FileNode {
+	if constraint == relTargetAny {
+		return nodes
+	}
+	filtered := make([]*FileNode, 0, len(nodes))
+	for _, n := range nodes {
+		if nodeMatchesConstraint(n, constraint) {
+			filtered = append(filtered, n)
+		}
+	}
+	return filtered
+}
+
+func (ft *FileTree) GetPathByRelation(basePath string, basePath2 string, relation PathRelation, r *rand.Rand, isTwoPath bool, constraint int) string {
 	var baseNode *FileNode = nil
 	//传入两条路径时，我们默认这两个路径权重相同，随机选取一个来基于relation获取路径，当然这只是基于从rename调用的两个路径来基于relation获取路径考虑的，还没考虑link和symlink
 	if isTwoPath {
@@ -746,7 +819,35 @@ func (ft *FileTree) GetPathByRelation(basePath string, basePath2 string, relatio
 	}
 
 	if baseNode == nil {
-		return ""
+		// basePath is outside the tree (e.g. a fresh mkdir/creat target):
+		// Same always works (the path itself); the other relations anchor on
+		// the parent directory when it is in the tree. A fresh base has no
+		// existing children, so Child can never be produced here.
+		switch relation {
+		case PathSelf, PathSelfTwo, PathSame:
+			return basePath
+		}
+		parent := ft.FindNode(GetParentDir(basePath))
+		if parent == nil {
+			return ""
+		}
+		switch relation {
+		case PathParent:
+			if constraint == relTargetFile {
+				return "" // a parent is always a directory
+			}
+			return parent.FullPath
+		case PathSibling:
+			children := filterNodesByConstraint(ft.GetChildren(parent), constraint)
+			if len(children) == 0 {
+				return ""
+			}
+			return children[r.Intn(len(children))].FullPath
+		case PathNoRel:
+			return ft.getRandomUnrelatedPath(basePath, r, constraint)
+		default:
+			return ""
+		}
 	}
 
 	switch relation {
@@ -754,48 +855,60 @@ func (ft *FileTree) GetPathByRelation(basePath string, basePath2 string, relatio
 		return basePath
 
 	case PathParent:
+		if constraint == relTargetFile {
+			return "" // a parent is always a directory
+		}
 		parent := ft.GetParent(baseNode)
 		if parent == nil {
 			return ""
 		}
 		return parent.FullPath
 	case PathChild:
-		children := ft.GetChildren(baseNode)
+		children := filterNodesByConstraint(ft.GetChildren(baseNode), constraint)
 		if len(children) == 0 {
 			return ""
 		}
 		return children[r.Intn(len(children))].FullPath
 	case PathSibling:
-		siblings := ft.GetSibling(baseNode)
+		siblings := filterNodesByConstraint(ft.GetSibling(baseNode), constraint)
 		if len(siblings) == 0 {
 			return ""
 		}
 		return siblings[r.Intn(len(siblings))].FullPath
 	case PathNoRel:
-		return ft.getRandomUnrelatedPath(basePath, r, cid)
+		return ft.getRandomUnrelatedPath(basePath, r, constraint)
 	default:
 		return ""
 	}
 }
 
-func (ft *FileTree) getRandomUnrelatedPath(excludePath string, r *rand.Rand, cid string) string {
-	//TODO: get random path without cid
+func (ft *FileTree) getRandomUnrelatedPath(excludePath string, r *rand.Rand, constraint int) string {
+	// NoRel is defined tree-geometrically and cid-independent: any node that
+	// is not the base path itself, not an ancestor/descendant (the Parent and
+	// Child lines) and not a sibling under the same parent directory counts
+	// as unrelated. Candidates are collected over the whole tree (the tree
+	// root itself is not a candidate).
 	ft.mu.RLock()
 	defer ft.mu.RUnlock()
 
-	nodes, ok := ft.NodesByCid[cid]
-	if !ok || len(nodes) == 0 {
-		return ""
-	}
-
+	excludeDir := GetParentDir(excludePath)
 	candidates := make([]*FileNode, 0)
-	for _, node := range nodes {
-		if node.FullPath != excludePath &&
-			!strings.HasPrefix(excludePath, node.FullPath+"/") &&
-			!strings.HasPrefix(node.FullPath, excludePath+"/") {
-			candidates = append(candidates, node)
+	var walk func(n *FileNode)
+	walk = func(n *FileNode) {
+		for _, child := range n.Children {
+			if nodeMatchesConstraint(child, constraint) {
+				fp := child.FullPath
+				if fp != excludePath &&
+					!strings.HasPrefix(excludePath, fp+"/") &&
+					!strings.HasPrefix(fp, excludePath+"/") &&
+					GetParentDir(fp) != excludeDir {
+					candidates = append(candidates, child)
+				}
+			}
+			walk(child)
 		}
 	}
+	walk(ft.Root)
 
 	if len(candidates) == 0 {
 		return ""
@@ -1206,7 +1319,7 @@ func (dct *DistributedChoiceTable) initDefaultConfig() {
 		rootCallNames = []string{"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate"}
 		variantCallNames = []string{"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate", "stat"}
 	} else {
-		rootCallNames = []string{"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "truncate", "stat"}
+		rootCallNames = []string{"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "truncate", "stat", "open", "getdents64"}
 		variantCallNames = []string{"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "truncate", "stat", "open", "getdents64", "write", "read", "pwrite64", "pread64"}
 	}
 	//TODO: root and variant call may need optimization
@@ -1267,21 +1380,23 @@ func (dct *DistributedChoiceTable) getInitialWeight(rootCall string, variant Cal
 	}
 
 	conflictPairs := map[string]map[string]int{
-		"mkdir":     {"rmdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15, "open": 20},
-		"rmdir":     {"mkdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15},
+		"mkdir":     {"rmdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15, "open": 20, "getdents64": 20},
+		"rmdir":     {"mkdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15, "getdents64": 25},
 		"creat":     {"unlink": 30, "rmdir": 20, "mkdir": 20, "creat": 25, "write": 25, "read": 25},
 		"unlink":    {"creat": 30, "mkdir": 15, "rmdir": 15, "write": 30, "read": 20},
 		"rename":    {"rename": 35, "unlink": 25, "creat": 20, "write": 20, "read": 20},
 		"chmod":     {"read": 15, "write": 15, "truncate": 20},
 		"truncate":  {"write": 25, "read": 20, "chmod": 20},
 		"stat":      {"write": 10, "read": 10},
-		"open":      {"read": 25, "write": 25, "truncate": 20, "pread64": 20, "pwrite64": 20},
+		"open":      {"read": 25, "write": 25, "truncate": 20, "pread64": 20, "pwrite64": 20, "unlink": 25, "rename": 20, "rmdir": 20},
 		"write":     {"read": 30, "write": 25, "truncate": 20, "unlink": 30, "creat": 25, "mkdir": 15, "rmdir": 15, "pread64": 25, "pwrite64": 25, "fsync": 20},
 		"read":      {"write": 30, "truncate": 15, "unlink": 20, "creat": 25, "mkdir": 15, "rmdir": 15, "pread64": 20, "pwrite64": 20},
 		"fsync":     {"write": 25, "read": 15, "truncate": 20},
 		"fdatasync": {"write": 25, "read": 15, "truncate": 20},
 		"pwrite64":  {"read": 25, "write": 25, "pread64": 20, "truncate": 20},
 		"pread64":   {"write": 30, "pwrite64": 20, "truncate": 15},
+		"getdents64": {"creat": 25, "rmdir": 25, "unlink": 20, "mkdir": 20, "rename": 20,
+			"write": 5, "read": 5, "pread64": 5, "pwrite64": 5, "fsync": 5, "fdatasync": 5},
 	}
 
 	if conflictGroup, ok := conflictPairs[rootCall]; ok {
@@ -1297,22 +1412,26 @@ func (dct *DistributedChoiceTable) ChooseVariant(rootCall string, r *rand.Rand) 
 	dct.mu.Lock()
 	defer dct.mu.Unlock()
 
-	return dct.chooseVariant(rootCall, r, false)
+	return dct.chooseVariant(rootCall, r, false, nil)
 }
 
-func (dct *DistributedChoiceTable) ChooseVariantFiltered(rootCall string, r *rand.Rand, baseIsFile bool) *CallVariant {
+func (dct *DistributedChoiceTable) ChooseVariantFiltered(rootCall string, r *rand.Rand, baseIsFile bool, relOKByType map[int]map[PathRelation]bool) *CallVariant {
 	dct.mu.Lock()
 	defer dct.mu.Unlock()
 
-	return dct.chooseVariant(rootCall, r, baseIsFile)
+	return dct.chooseVariant(rootCall, r, baseIsFile, relOKByType)
 }
 
 // chooseVariant picks a variant for rootCall. Direction 1: combos that never
 // produced signal (and are still within their exploration budget) are
 // preferred. Direction 2: the picked combo's consecutive no-yield counter is
 // bumped and it is down-weighted once the threshold is reached.
+// relOKByType (may be nil = all relations allowed) restricts the candidate
+// set per variant-call type (relTargetAny/File/Dir) to path relations that
+// can currently produce a path of a compatible type for the base, so the
+// picked combo is always generatable downstream.
 // The caller must hold dct.mu (write lock).
-func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, baseIsFile bool) *CallVariant {
+func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, baseIsFile bool, relOKByType map[int]map[PathRelation]bool) *CallVariant {
 	variants, ok := dct.Variants[rootCall]
 	if !ok || len(variants) == 0 {
 		return nil
@@ -1321,11 +1440,38 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 	weights := dct.Weights[rootCall]
 
 	eligible := func(cv CallVariant) bool {
-		if baseIsFile && isDirOnlyCall(cv.CallName) {
+		// mkdir as a variant creates a directory; its target follows the
+		// relation's geometric position: Same hits the base itself (rebuild
+		// timing race), Parent hits the parent (same treatment as Same),
+		// Child creates a fresh child inside the base, Sibling creates a
+		// fresh sibling inside the parent, NoRel creates inside an unrelated
+		// directory. Child/Sibling/NoRel build new names and need no existing
+		// nodes; Same/Child need a directory base; Parent/Sibling
+		// additionally need the parent to exist.
+		if cv.CallName == "mkdir" {
+			if baseIsFile {
+				return false
+			}
+			switch cv.PathRelation {
+			case PathSame, PathChild, PathNoRel:
+				return true
+			case PathParent, PathSibling:
+				return relOKByType == nil || relOKByType[relTargetDir][PathParent]
+			}
 			return false
 		}
-		if baseIsFile && (cv.PathRelation == PathChild || cv.PathRelation == PathSibling) {
+		// Same targets the base itself, so its type must match the call:
+		// dir-only calls on a file base are doomed. Other relations target
+		// elsewhere (parent/sibling/unrelated), whose types are handled by
+		// the per-type relOK sets and the downstream constraint filtering.
+		if baseIsFile && cv.PathRelation == PathSame && isDirOnlyCall(cv.CallName) {
 			return false
+		}
+		if relOKByType != nil {
+			callType := callNameConstraint(cv.CallName)
+			if !relOKByType[callType][cv.PathRelation] {
+				return false
+			}
 		}
 		if !baseIsFile && isFileOnlyVariantRel(cv) {
 			return false
@@ -1468,6 +1614,23 @@ func isFileOnlyCallByName(callName string) bool {
 func isFileOnlyVariantRel(cv CallVariant) bool {
 	return isFileOnlyCallByName(cv.CallName) &&
 		(cv.PathRelation == PathSelf || cv.PathRelation == PathSame || cv.PathRelation == PathParent)
+}
+
+// basePathIsFile decides whether the root call's base path is a file for
+// variant filtering purposes. The intent of the root call wins over the tree
+// state: mkdir/rmdir/getdents64 operate on directories (a fresh mkdir target
+// is a directory even though it is not in the tree yet); file-intent roots
+// (creat, truncate, read/write family, unlink) operate on files. Ambiguous
+// roots (open/stat/chmod/rename) fall back to the tree state.
+func basePathIsFile(ft *FileTree, rootCallName, basePath string) bool {
+	switch rootCallName {
+	case "mkdir", "rmdir", "getdents64":
+		return false
+	case "creat", "truncate", "read", "write", "pread64", "pwrite64",
+		"fsync", "fdatasync", "unlink":
+		return true
+	}
+	return !isDirPath(ft, basePath)
 }
 
 func isDirPath(ft *FileTree, path string) bool {
@@ -1654,9 +1817,77 @@ func (lcs *LayeredChoiceStrategy) ChooseConcurrentCall(rootCallName string, r *r
 	return dct.ChooseVariant(rootCallName, r)
 }
 
-func (lcs *LayeredChoiceStrategy) ChooseConcurrentCallFiltered(rootCallName string, r *rand.Rand, baseIsFile bool) *CallVariant {
+func (lcs *LayeredChoiceStrategy) ChooseConcurrentCallFiltered(rootCallName string, r *rand.Rand, baseIsFile bool, basePath string) *CallVariant {
 	dct := lcs.GetDCT()
-	return dct.ChooseVariantFiltered(rootCallName, r, baseIsFile)
+	relOKByType := lcs.availableRelationsForBase(basePath)
+	return dct.ChooseVariantFiltered(rootCallName, r, baseIsFile, relOKByType)
+}
+
+// countNodesByType counts file vs directory nodes in a candidate set
+// (dir = anything that is not a file node, consistent with
+// nodeMatchesConstraint).
+func countNodesByType(nodes []*FileNode) (files, dirs int) {
+	for _, n := range nodes {
+		if n.Type == NodeTypeFile {
+			files++
+		} else {
+			dirs++
+		}
+	}
+	return files, dirs
+}
+
+// availableRelationsForBase reports, per variant-call type
+// (relTargetAny/File/Dir), which path relations can currently produce a path
+// of a compatible type relative to basePath. The checks are deterministic (no
+// RNG consumption) and mirror the empty semantics of GetPathByRelation —
+// including the fresh-base parent anchoring — so a combo picked under these
+// sets is always generatable downstream. Same and NoRel are always available;
+// a parent is always a directory, so file-typed calls never get Parent;
+// Child/Sibling availability is type-aware (file-typed calls need existing
+// file children/siblings, dir-typed calls need directory ones).
+func (lcs *LayeredChoiceStrategy) availableRelationsForBase(basePath string) map[int]map[PathRelation]bool {
+	relOKByType := map[int]map[PathRelation]bool{
+		relTargetAny:  {PathSame: true, PathNoRel: true},
+		relTargetFile: {PathSame: true, PathNoRel: true, PathParent: false},
+		relTargetDir:  {PathSame: true, PathNoRel: true},
+	}
+	ft := lcs.FileTree
+	if ft == nil {
+		return relOKByType
+	}
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+
+	baseNode := ft.findNodeLocked(basePath)
+	if baseNode != nil {
+		hasParent := ft.GetParent(baseNode) != nil
+		relOKByType[relTargetAny][PathParent] = hasParent
+		relOKByType[relTargetDir][PathParent] = hasParent
+		// relTargetFile: PathParent stays false (parent is a directory).
+		files, dirs := countNodesByType(ft.GetChildren(baseNode))
+		relOKByType[relTargetAny][PathChild] = files+dirs > 0
+		relOKByType[relTargetFile][PathChild] = files > 0
+		relOKByType[relTargetDir][PathChild] = dirs > 0
+		sf, sd := countNodesByType(ft.GetSibling(baseNode))
+		relOKByType[relTargetAny][PathSibling] = sf+sd > 0
+		relOKByType[relTargetFile][PathSibling] = sf > 0
+		relOKByType[relTargetDir][PathSibling] = sd > 0
+		return relOKByType
+	}
+	// Fresh base (outside the tree): anchor on the parent directory.
+	parent := ft.findNodeLocked(GetParentDir(basePath))
+	if parent == nil {
+		return relOKByType // only Same and NoRel
+	}
+	relOKByType[relTargetAny][PathParent] = true
+	relOKByType[relTargetDir][PathParent] = true
+	// Child stays false for every type: a fresh base has no existing children.
+	files, dirs := countNodesByType(ft.GetChildren(parent))
+	relOKByType[relTargetAny][PathSibling] = files+dirs > 0
+	relOKByType[relTargetFile][PathSibling] = files > 0
+	relOKByType[relTargetDir][PathSibling] = dirs > 0
+	return relOKByType
 }
 
 // MarkYield propagates a yield signal (new DAG pair / new coverage) into the
@@ -1690,15 +1921,16 @@ func (lcs *LayeredChoiceStrategy) tscoffFor(nodeIdx int) int64 {
 	return lcs.tscoffs[len(lcs.tscoffs)-1]
 }
 
-func (lcs *LayeredChoiceStrategy) GetPathForVariant(basePath string, basePath2 string, variant CallVariant, r *rand.Rand, cid string, isTwoPath bool) string {
-	return lcs.FileTree.GetPathByRelation(basePath, basePath2, variant.PathRelation, r, cid, isTwoPath)
+func (lcs *LayeredChoiceStrategy) GetPathForVariant(basePath string, basePath2 string, variant CallVariant, r *rand.Rand, isTwoPath bool) string {
+	return lcs.FileTree.GetPathByRelation(basePath, basePath2, variant.PathRelation, r, isTwoPath, relTargetAny)
 }
 
-func (lcs *LayeredChoiceStrategy) GetPathsForRenameVariant(basePath string, basePath2 string, pathRelation PathRelation, r *rand.Rand, cid string, isTwoPath bool) (string, string) {
-	srcPath := lcs.FileTree.GetPathByRelation(basePath, basePath2, pathRelation, r, cid, isTwoPath)
+func (lcs *LayeredChoiceStrategy) GetPathsForRenameVariant(basePath string, basePath2 string, pathRelation PathRelation, r *rand.Rand, isTwoPath bool) (string, string) {
+	srcPath := lcs.FileTree.GetPathByRelation(basePath, basePath2, pathRelation, r, isTwoPath, relTargetAny)
 	if srcPath == "" {
-		// 该关系无匹配（无子/无兄弟/无父/无无关路径）——不产出（调用方跳过）——
-		// 关系语义保持（空路径 rename 恒 ENOENT 且退化会改变路径关系，S16）。
+		// 该关系无匹配（无子/无兄弟/无父/无无关路径）——不产出；处理方式由
+		// 调用方决定（种子构建侧保底 stat、变异插入侧跳过该节点）。关系语义
+		// 保持——空路径 rename 恒 ENOENT 且退化会改变路径关系。
 		return "", ""
 	}
 	srcPathExt := filepath.Ext(srcPath)
