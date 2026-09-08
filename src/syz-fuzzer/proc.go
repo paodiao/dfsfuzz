@@ -363,8 +363,18 @@ func (proc *Proc) loop() {
 			var ps []*prog.Prog
 			rand.Seed(time.Now().UnixNano())
 			if proc.fuzzer.config.DFSName == "hmdfs" {
-				// 按概率选择种子类型
-				seedType := rand.Intn(3)
+				// Seed-type probabilities follow form-space size: inodeops has
+				// the largest relation space and no self-bootstrap source
+				// (generation is its only entry -- 0.5); fileops is already
+				// bootstrapped (0.3); stash has the fewest distinct shapes (0.2).
+				r := rand.Intn(10)
+				seedType := 2 // inodeops
+				if r < 5 {
+					seedType = 1 // fileops
+				}
+				if r < 2 {
+					seedType = 0 // stash
+				}
 				switch seedType {
 				case 0:
 					ps = proc.fuzzer.target.GenerateProgsForHmdfsStash(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
@@ -472,6 +482,26 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 			return
 		}
 		log.Logf(3, "1 triaging input for %v (new signal=%v)", logCallName, newSignal.Len())
+	}
+	// Program-level dedup: corpusSignalDiff only compares against the signal
+	// set, so errno/execution-result fluctuations of an already-corpus program
+	// keep reporting "new signal" and run the whole triage->smash chain only
+	// to fail addInputToCorpus. Skip such inputs here (same sig computation as
+	// addInputToCorpus, so the check is exact).
+	var data [][]byte
+	var dataForHash []byte
+	for _, p := range item.ps {
+		prog := p.Serialize()
+		data = append(data, prog)
+		dataForHash = append(dataForHash, prog...)
+	}
+	sig := hash.Hash(dataForHash)
+	proc.fuzzer.corpusMu.RLock()
+	_, dup := proc.fuzzer.corpusHashes[sig]
+	proc.fuzzer.corpusMu.RUnlock()
+	if dup {
+		appendDiagLog("triage skip: program already in corpus %s", logCallName)
+		return
 	}
 	var SrvCover, CliCover cover.Cover
 	const (
@@ -589,15 +619,6 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		}
 	}
 
-	var data [][]byte
-	var dataForHash []byte
-	for _, p := range item.ps {
-		prog := p.Serialize()
-		data = append(data, prog)
-		dataForHash = append(dataForHash, prog...)
-	}
-	sig := hash.Hash(dataForHash)
-
 	log.Logf(2, "added new input for %v to corpus:\n%s", logCallName, dataForHash)
 	proc.fuzzer.sendInputToManager(rpctype.RPCInput{
 		Call:      callName,
@@ -628,7 +649,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		atomic.AddUint64(&proc.fuzzer.dagCorpusEntries, 1)
 	}
 
-	if item.flags&ProgSmashed == 0 {
+	if added && item.flags&ProgSmashed == 0 {
 		proc.fuzzer.workQueue.enqueue(&WorkSmash{item.ps, item.call, item.subNum})
 	}
 }
@@ -665,6 +686,8 @@ func getAllSignalAndCover(p *prog.Prog, info *ipc.ProgInfo) (signals signal.Sign
 	return
 }
 
+const smashIterations = 20 // was 25: smash mutations run long -- fewer iterations free main-loop time and bound backlog work
+
 func (proc *Proc) smashInput(item *WorkSmash) {
 	if proc.fuzzer.comparisonTracingEnabled && item.call != -1 {
 		proc.executeHintSeed(item.ps, item.call, item.subNum)
@@ -691,7 +714,7 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 	}
 
 	//Normal mutation
-	for i := 0; i < 25; i++ {
+	for i := 0; i < smashIterations; i++ {
 		ps := prog.Clones(item.ps)
 		/*
 		   Each time only mutate one sub-testcase because: If we do multiple mutations and only one of them trigger new

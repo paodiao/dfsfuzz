@@ -141,7 +141,54 @@ func compareSlices(slice1 []*Prog, slice2 []*Prog) bool {
 	return true
 }
 
+// argMinimizable reports whether simplifying this argument is worth its
+// verification executions: only variable-size content (arrays and data
+// blobs) reduces redundant mutation space. Fixed-size arguments (int/flag/
+// proc/len values, resource references, and path/name strings -- the
+// relation anchors of generated concurrent programs) are skipped entirely
+// (type-informed argument simplification, Guo et al., "Optimizing Input
+// Minimization in Kernel Fuzzing"). Pointers/structs/unions are classified
+// by their content.
+func argMinimizable(a Arg) bool {
+	switch ap := a.(type) {
+	case *PointerArg:
+		return ap.Res != nil && argMinimizable(ap.Res)
+	case *GroupArg:
+		if _, isArray := a.Type().(*ArrayType); isArray {
+			return true // element removal shrinks variable-length content
+		}
+		for _, inner := range ap.Inner {
+			if argMinimizable(inner) {
+				return true
+			}
+		}
+		return false
+	case *UnionArg:
+		return argMinimizable(ap.Option)
+	case *DataArg:
+		if bt, ok := a.Type().(*BufferType); ok {
+			// Paths/names (filename/string/glob) are relation anchors built
+			// by the generator -- minimization must not touch them even when
+			// coverage is equivalent; only data content (blob/text) shrinks.
+			switch bt.Kind {
+			case BufferBlobRand, BufferBlobRange, BufferText:
+				return true
+			default: // BufferString, BufferFilename, BufferGlob
+				return false
+			}
+		}
+		return true
+	case *ResultArg, *ConstArg:
+		return false // resource references and int/flag/proc/len values
+	default:
+		return true // conservative: keep current behavior for unknowns
+	}
+}
+
 func (ctx *minimizeArgsCtx) do(arg Arg, field, path string) bool {
+	if !argMinimizable(arg) {
+		return false
+	}
 	path += fmt.Sprintf("-%v", field)
 	if ctx.triedPaths[path] {
 		return false
