@@ -98,3 +98,50 @@ func TestDumpRefDiagnosisTags(t *testing.T) {
 		t.Errorf("diagnosis mutated consumer Res pointer")
 	}
 }
+
+// buildOutParamRefProg builds a program whose consumer references an
+// out-param ResultArg of an earlier call (not a Ret). The serializer
+// registers a var for any referenced out-param, so such a reference is
+// legitimate and must not be flagged as broken.
+func buildOutParamRefProg(t *testing.T, target *Target) (*Prog, *ResultArg) {
+	t.Helper()
+	var resType *ResourceType
+	for _, c := range target.Syscalls {
+		if rt, ok := c.Ret.(*ResourceType); ok {
+			resType = rt
+			break
+		}
+	}
+	if resType == nil {
+		t.Skip("no resource-returning syscall in target")
+	}
+
+	prod := &Call{Meta: &Syscall{Name: "mock_out_prod"}}
+	outParam := MakeResultArg(resType, DirOut, nil, 0x1234)
+	prod.Args = []Arg{outParam}
+
+	cons := &Call{Meta: &Syscall{Name: "mock_out_cons"}}
+	cons.Args = []Arg{MakeResultArg(resType, DirIn, outParam, 0)}
+
+	p := &Prog{Target: target, Calls: []*Call{prod, cons}}
+	return p, outParam
+}
+
+func TestOutParamReferenceNotBroken(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+
+	p, outParam := buildOutParamRefProg(t, target)
+	if p.HasBrokenRefs() {
+		t.Errorf("out-param reference misreported as broken")
+	}
+	out := p.DumpRefDiagnosis()
+	if strings.Contains(out, "DANGLING") || strings.Contains(out, "FORWARD") || strings.Contains(out, "USES-MISSING") {
+		t.Errorf("out-param reference misdiagnosed:\n%s", out)
+	}
+	if !strings.Contains(out, "[OK]") {
+		t.Errorf("out-param reference missing OK tag:\n%s", out)
+	}
+	if outParam.uses == nil || len(outParam.uses) != 1 {
+		t.Errorf("out-param uses not registered by MakeResultArg: %v", outParam.uses)
+	}
+}

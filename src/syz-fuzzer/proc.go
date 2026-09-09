@@ -1315,8 +1315,9 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		if p.HasBrokenRefs() {
 			log.Logf(0, "MUTATION-DEBUG: broken refs before execute, copy %d (stat=%v) lastMut=%s: aborting execution",
 				i, stat, prog.LastMutation())
+			refDiag := p.DumpRefDiagnosis()
 			appendDiagLog("MUTATION-DEBUG: broken refs copy %d stat=%d lastMut=%s meta: IsStash=%v IsDCache=%v IsFileOps=%v IsInodeOps=%v\n%s",
-				i, stat, prog.LastMutation(), ps[0].IsStash, ps[0].IsDCache, ps[0].IsFileOps, ps[0].IsInodeOps, p.DumpRefDiagnosis())
+				i, stat, prog.LastMutation(), ps[0].IsStash, ps[0].IsDCache, ps[0].IsFileOps, ps[0].IsInodeOps, refDiag)
 			return nil, nil, 0, fmt.Errorf("broken refs in program copy %d", i)
 		}
 	}

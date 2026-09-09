@@ -46,16 +46,30 @@ func (p *Prog) DumpRefDiagnosis() string {
 	type retInfo struct {
 		idx  int
 		name string
-		ret  *ResultArg
+		prov *ResultArg
 	}
 	owners := make(map[*ResultArg]retInfo)
+	register := func(i int, c *Call, a *ResultArg) {
+		owners[a] = retInfo{idx: i, name: c.Meta.Name, prov: a}
+	}
 	for i, c := range p.Calls {
-		owner := retInfo{idx: i, name: c.Meta.Name}
 		if c.Ret != nil {
-			owners[c.Ret] = owner
+			register(i, c, c.Ret)
 			fmt.Fprintf(&b, "[ref-diag] call[%d] %s: ret-uses=%d\n", i, c.Meta.Name, len(c.Ret.uses))
 		} else {
 			fmt.Fprintf(&b, "[ref-diag] call[%d] %s: no-ret\n", i, c.Meta.Name)
+		}
+		// Serializer vars are registered for any ResultArg with a value
+		// produced at this point in the text (a call's Ret or an out-param
+		// ResultArg), so out-params are valid cross-call reference targets
+		// too. Register them alongside Rets to keep the diagnosis aligned
+		// with the serializer's reference domain.
+		for _, arg := range c.Args {
+			ForeachSubArg(arg, func(a Arg, _ *ArgCtx) {
+				if ra, ok := a.(*ResultArg); ok && ra.Dir() != DirIn {
+					register(i, c, ra)
+				}
+			})
 		}
 	}
 
@@ -65,7 +79,7 @@ func (p *Prog) DumpRefDiagnosis() string {
 			return "DANGLING"
 		case ownerIdx >= refIdx:
 			return "FORWARD"
-		case !owner.ret.uses[referrer]:
+		case !owner.prov.uses[referrer]:
 			return "USES-MISSING"
 		default:
 			return "OK"
@@ -107,15 +121,27 @@ func (p *Prog) DumpRefDiagnosis() string {
 }
 
 // HasBrokenRefs reports whether any cross-call ResultArg reference is
-// dangling (the provider call is absent from the program) or forward (the
-// provider call appears at index >= the referrer). Either form panics at
+// dangling (the provider is absent from the program) or forward (the
+// provider appears at index >= the referrer). Either form panics at
 // Serialize ("no result") because serializer vars are registered in call
 // order. Used as a pre-execution guard after mutations.
+//
+// The provider domain mirrors the serializer's: both a call's Ret and its
+// out-param ResultArgs (Dir() != DirIn) can carry a value that later calls
+// may reference, so all of them are registered as legitimate owners.
 func (p *Prog) HasBrokenRefs() bool {
 	owners := make(map[*ResultArg]int)
+	register := func(i int, a *ResultArg) { owners[a] = i }
 	for i, c := range p.Calls {
 		if c.Ret != nil {
-			owners[c.Ret] = i
+			register(i, c.Ret)
+		}
+		for _, arg := range c.Args {
+			ForeachSubArg(arg, func(a Arg, _ *ArgCtx) {
+				if ra, ok := a.(*ResultArg); ok && ra.Dir() != DirIn {
+					register(i, ra)
+				}
+			})
 		}
 	}
 	for i, c := range p.Calls {
