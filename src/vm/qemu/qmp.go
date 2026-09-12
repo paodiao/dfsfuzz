@@ -67,6 +67,7 @@ func (inst *instance) qmpConnCheck() error {
 
 	var banner qmpBanner
 	if err := monDec.Decode(&banner); err != nil {
+		conn.Close()
 		return err
 	}
 
@@ -75,6 +76,7 @@ func (inst *instance) qmpConnCheck() error {
 	if _, err := inst.doQmp(&qmpCommand{Execute: "qmp_capabilities"}); err != nil {
 		inst.monEnc = nil
 		inst.monDec = nil
+		conn.Close()
 		return err
 	}
 	inst.mon = conn

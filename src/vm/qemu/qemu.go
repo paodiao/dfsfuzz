@@ -534,6 +534,7 @@ func (inst *instance) boot(index int) error {
 	if flockerr != nil {
 		log.Fatalf("open monarch-id file failed\n")
 	}
+	defer syscall.Close(lockfd)
 	flockerr = syscall.Flock(lockfd, syscall.LOCK_EX)
 	if flockerr != nil {
 		log.Fatalf("flock lock monarch-id file failed\n")
