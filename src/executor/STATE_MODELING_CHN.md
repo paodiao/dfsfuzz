@@ -1091,9 +1091,10 @@ triage成功仅入 corpus、不做任何静态归因——DCT 学习完全由动
 （见 `DAG_KNOWN_ISSUES.md` #20）。反馈回路如下：
 
 ```
-chooseVariant 选中 (root, variant) → NoYield++；未产出者优先；≥阈值降权
+insertCallFromDCT 记录本次插入的 (root, variant)；未产出者优先
 ChooseTemporal 选择组合的插入形态（并发/因果）→ 执行
-→ DAG 新对 → MarkExplored + MarkYield + 权重 +1
+→ 有新 DAG 反馈 → 对每个记录组合 MarkYield + 权重 +1（Explored = true）
+→ 无新 DAG 反馈 → 对每个记录组合 TickNoYield；≥阈值降权
 → pair 时态（CONCURRENT/HB）→ UpdateTemporalWeight（第二层，按形态）
 ```
 
@@ -1101,35 +1102,37 @@ ChooseTemporal 选择组合的插入形态（并发/因果）→ 执行
 
 | 方向 | 状态 | 实现 |
 |------|:--:|------|
-| 路径关系探索度追踪 | **已实现** | DCT 为每个 `(rootCall, variant)` 维护 `Explored` 表；`chooseVariant` 只从从未产出信号且仍在探索预算内（`NoYield < 20`）的组合中选取 |
-| 自适应权重下调 | **已实现** | DCT 为每个组合维护 `NoYield` 计数：选中时 +1，产出时（`MarkYield`，来自DAG新对）清零，连续20次无产出则权重 −5（下限1） |
-| 时态形态层 | **已实现** | 组合下的第二层：`TemporalWeights`（并发 vs 因果/HB 形态，默认 50/50）。`insertCallFromDCT` 按 `ChooseTemporal` 选形态；因果形态插入到 `firstBoundaryAfter`（root 完成后的最早边界，倾向 HB 对）。`feedbackDagPairs` 按实际产出的 pair 时态更新形态权重；**所有新颖 pair（并发或 HB）统一驱动方向 1/2**（`MarkYield`：组合按综合产出奖励，无论形态——见 `DAG_KNOWN_ISSUES.md` #16） |
+| 路径关系探索度追踪 | **已实现** | DCT 为每个 `(rootCall, variant)` 维护 `Explored` 表；`chooseVariant` 只从从未产出信号且仍在探索预算内（`NoYield < 10`）的组合中选取 |
+| 自适应权重下调 | **已实现** | DCT 为每个组合维护 `NoYield` 计数：插入后的执行无新 DAG 反馈时（`TickNoYield`）+1，产出时（`MarkYield`）清零，连续10次无产出则权重 −5（下限1） |
+| 时态形态层 | **已实现** | 组合下的第二层：`TemporalWeights`（并发 vs 因果/HB 形态，默认 50/50）。`insertCallFromDCT` 按 `ChooseTemporal` 选形态；因果形态插入到 `firstBoundaryAfter`（root 完成后的最早边界，倾向 HB 对）。`feedbackDagPairs` 按实际产出的 pair 时态更新形态权重；方向 1/2 的奖励由记录的组合单独驱动（`applyInsertFeedback`：执行有新反馈即奖励，无论产出形态——见 `DAG_KNOWN_ISSUES.md` #16） |
 | 指令性突变 | 推迟 | "我需要在深度3+的DIR上产生WRITE→READ的SAME_INODE HB对，但尚未见过" → 专门构造。需要合成器；评估前两个方向后再决定。更广泛的建模调研（并发/因果关系结构）见 `DAG_KNOWN_ISSUES.md` #17 |
 
-两个已实现方向共用同一个信号源：`feedbackDagPairs`（fuzzer侧将新DAG对映射为
-DCT组合）。
+两个已实现方向共用同一个信号源：`applyInsertFeedback`（fuzzer侧，每次执行后
+结算最近一次插入记录的组合：执行有新 DAG 反馈则奖励，否则记一次无产出）。
+`feedbackDagPairs` 保留形态层（`UpdateTemporalWeight`）。
 
 **方向1 — 路径关系探索度追踪（已实现）**
 
 - 机制：DCT 表为每个 `(rootCall, variant)` 维护 `Explored` 标志；
-  `chooseVariant` 收集"从未产出信号且仍在探索预算内（`NoYield < 20`）"的
+  `chooseVariant` 收集"从未产出信号且仍在探索预算内（`NoYield < 10`）"的
   组合，当该候选池非空时**只从池内选择**（独占式偏向——见
   `DAG_KNOWN_ISSUES.md` #7）。
-- 信号源：`MarkYield`（新DAG对经`feedbackDagPairs`）置 `Explored = true`。
-- 参数：探索预算 20（与方向2共用 `NoYield` 计数）。
+- 信号源：`MarkYield`（插入记录的组合经 `applyInsertFeedback`）置 `Explored = true`。
+- 参数：探索预算 10（与方向2共用 `NoYield` 计数）。
 - 实现：`distributed_choice.go`（`Explored`、`chooseVariant`）、`proc.go`
-  （`feedbackDagPairs`）、`dag.go`（`DagPairToVariant` 映射）。
+  （`applyInsertFeedback`）、`dag.go`（`DagPairToVariant` 映射）。
 - 粒度：DCT 组合（`callName` + `pathRel`），粗于 DAG 特征桶——偏向作用在
   生成/突变的组合选择层，而非 pair 空间本身。
 
 **方向2 — 自适应权重下调（已实现）**
 
-- 机制：每个组合维护 `NoYield` 计数（每次选中 +1）；达到 20 次连续无产出
-  时权重 −5（下限 1）、重算 `TotalWeights`、并重置计数（防止连续降权）。
+- 机制：每个组合维护 `NoYield` 计数（插入后执行无新 DAG 反馈时 +1）；达到 10 次
+  连续无产出时权重 −5（下限 1）、重算 `TotalWeights`、并重置计数（防止连续降权）。
 - 信号源：`MarkYield` 重置 `NoYield = 0`。
-- 参数：`noYieldThreshold = 20`、`noYieldDelta = 5`。
+- 参数：`noYieldThreshold = 10`、`noYieldDelta = 5`。
 - per-proc 语义：DCT 表每 proc 一份，计数与降权各自独立演化。
-- 实现：`distributed_choice.go`（`noYieldTick`、`MarkYield`）。
+- 实现：`distributed_choice.go`（`noYieldTick`、`MarkYield`、`TickNoYield`）、
+  `proc.go`（`applyInsertFeedback`）。
 
 **方向3 — 指令性突变（推迟）**
 
@@ -1306,7 +1309,7 @@ pickAnchor(ps, r, wantReadWrite)      从 ps[0] 随机选有路径+时间线的�
 
 - `MutateGroupPathDynamic`：锚迁移到新 base 路径（`pickNewBasePath`）；并发者按现场关系相对解析；fd 调用经 `resolveFdTarget` 回溯；非并发主干调用留在原地（无需第二遍跟随逻辑）。
 - `RemoveGroupDynamic`：删除锚及其全部并发者。
-- `RemoveOneInGroupDynamic`：删除集合中 fd 安全的一个调用（`AnalyzeProgFds`，保留故障注入伪调用）。
+- `RemoveReservoirDynamic`：水库式跨 prog 删除——随机起点环形遍历，每个 prog 至多删一个 fd 安全调用（`AnalyzeProgFds`，保留故障注入伪调用）；候选预筛为"有可删调用"的 prog，目标删除数达到即保底（存在可删调用即至少删 1 个）。
 - `MutateGroupDataDynamic`：锚必须是读写调用；集合内全部读写调用共享同一随机 offset（write 还共享 length，经 `updateWriteDataBuf`）——确定性对应被移除的插入侧概率 OffsetSame。范围取锚路径文件大小（无则 1MB 兜底）。
 
 **路径迁移保持相对关系（P1 决策）**：路径突变器把已验证模式推广到其他路径形状，不重塑关系——生成新 rel 组合是 `insertCallFromDCT`/`ChooseVariant` 的职责。重随机 rel 会 (a) 与生成机制重叠，(b) 拆散并发同路径对（hmdfs 冲突核心场景），(c) 污染 DCT 权重学习（路径维度反馈被归因到 rel 维度）。

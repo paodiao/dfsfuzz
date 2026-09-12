@@ -352,6 +352,7 @@ func autoConfig(cfg *mgrconfig.Config) {
 	if err != nil {
 		log.Fatalf("open monarch-id file failed\n")
 	}
+	defer syscall.Close(fd)
 	err = syscall.Flock(fd, syscall.LOCK_EX)
 	if err != nil {
 		log.Fatalf("flock lock monarch-id file failed\n")
@@ -978,7 +979,16 @@ func (mgr *Manager) runInstanceInner(index int, instanceName string) (*vm.Instan
 	if err != nil {
 		return nil, "", "", fmt.Errorf("failed to create instance: %v", err)
 	}
-	//defer inst.Close()
+	closeInst := inst
+	defer func() {
+		if closeInst != nil {
+			closeInst.Close()
+			if closeInst.Rpipe != nil {
+				closeInst.Rpipe.Close()
+				closeInst.Rpipe = nil
+			}
+		}
+	}()
 
 	fwdAddr, err := inst.Forward(mgr.serv.port)
 	if err != nil {
@@ -1022,6 +1032,7 @@ func (mgr *Manager) runInstanceInner(index int, instanceName string) (*vm.Instan
 		}
 	}
 
+	closeInst = nil
 	return inst, executorBin, fwdAddr, nil
 
 	/*

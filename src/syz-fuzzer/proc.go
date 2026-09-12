@@ -361,19 +361,21 @@ func (proc *Proc) loop() {
 			// Generate a new prog.
 			//tao modified
 			var ps []*prog.Prog
-			rand.Seed(time.Now().UnixNano())
 			if proc.fuzzer.config.DFSName == "hmdfs" {
-				// Seed-type probabilities follow form-space size: inodeops has
-				// the largest relation space and no self-bootstrap source
-				// (generation is its only entry -- 0.5); fileops is already
-				// bootstrapped (0.3); stash has the fewest distinct shapes (0.2).
-				r := rand.Intn(10)
-				seedType := 2 // inodeops
-				if r < 5 {
-					seedType = 1 // fileops
-				}
-				if r < 2 {
-					seedType = 0 // stash
+				// Seed-type probabilities follow form-space size and the
+				// hmdfsfuzz7 attribution: inodeops 0.65 (largest relation
+				// space, generation-only entry, ~85% of true-bug events at
+				// 50% share), fileops 0.25 (bootstrapped; workqueue-lock bug
+				// source), stash 0.10 (fewest shapes, lowest yield).
+				r := proc.rnd.Intn(20)
+				var seedType int
+				switch {
+				case r < 2:
+					seedType = 0 // stash: 10%
+				case r < 7:
+					seedType = 1 // fileops: 25%
+				default:
+					seedType = 2 // inodeops: 65%
 				}
 				switch seedType {
 				case 0:
@@ -399,7 +401,7 @@ func (proc *Proc) loop() {
 				subTsNum := proc.fuzzer.config.FuzzingVMs - proc.fuzzer.config.ServNum
 				var files map[string]bool
 				for idx := 0; idx < subTsNum; {
-					repeatNum := rand.Intn(subTsNum-idx) + 1
+					repeatNum := proc.rnd.Intn(subTsNum-idx) + 1
 					curIdx := proc.fuzzer.config.ServNum + idx
 					p, newFiles := proc.fuzzer.target.Generate(proc.rnd, prog.RecommendedCalls, ct, files, false,
 						proc.fuzzer.sCalls, proc.fuzzer.config.EnableC2san, &proc.hmcfg, curIdx)
@@ -693,7 +695,6 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 		proc.executeHintSeed(item.ps, item.call, item.subNum)
 	}
 	//
-	rand.Seed(time.Now().UnixNano())
 	fuzzerSnapshot := proc.fuzzer.snapshot()
 
 	{
@@ -767,11 +768,12 @@ func (proc *Proc) mutateHmdfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
 		if start >= len(ps) {
 			return
 		}
-		randIdx := rand.Intn(len(ps)-start) + start
+		randIdx := proc.rnd.Intn(len(ps)-start) + start
 		ps[randIdx].Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, corpus,
 			proc.fuzzer.sCalls, srvNum, ps[0].HasCrashFail || ps[0].HasNetFail,
 			proc.fuzzer.config.EnableC2san, &proc.hmcfg, randIdx)
-		log.Logf(1, "#%v: smash mutated %d-th subtestcase", proc.pid, randIdx)
+		prog.RefreshGeneralFailPos(ps, randIdx)
+		log.Logf(1, "#%v: fallback mutated %d-th subtestcase", proc.pid, randIdx)
 	}
 }
 
@@ -780,9 +782,9 @@ func (proc *Proc) mutateHmdfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
 //   - both concurrent and HB pairs update the temporal-form weights of the
 //     combo (the second layer: which insertion form actually produced the
 //     corresponding pair);
-//   - every novel pair — concurrent or HB — marks the (root, variant) combo
-//     as explored and resets its no-yield counter (direction 1/2): the combo
-//     is rewarded for its combined output, whatever form it took.
+//   - rewards for the combos recorded by the most recent insertion are
+//     resolved separately in applyInsertFeedback (insert-feedback
+//     attribution), after the execution that follows the insertion.
 func (proc *Proc) feedbackDagPairs(newPairs []prog.DAGPair) {
 	for _, p := range newPairs {
 		if p.Temporal == prog.TemporalHB {
@@ -796,8 +798,29 @@ func (proc *Proc) feedbackDagPairs(newPairs []prog.DAGPair) {
 		}
 		if lcs := proc.lcsForRootCall(root); lcs != nil {
 			lcs.UpdateTemporalWeight(root, variant, temporal)
-			lcs.MarkYield(root, variant)
 		}
+	}
+}
+
+// applyInsertFeedback resolves the combos recorded by the most recent
+// insertion mutation: if the execution produced new DAG feedback, every
+// recorded combo is rewarded (MarkYield); otherwise each combo records one
+// no-yield attempt. A failed execution clears the record without counting.
+func (proc *Proc) applyInsertFeedback(dagNew bool, executed bool) {
+	for _, lcs := range []*prog.LayeredChoiceStrategy{proc.lcsInodeops, proc.lcsFileops} {
+		if lcs == nil || len(lcs.PendingInserts) == 0 {
+			continue
+		}
+		if executed {
+			for _, ref := range lcs.PendingInserts {
+				if dagNew {
+					lcs.MarkYield(ref.Root, ref.Variant)
+				} else {
+					lcs.TickNoYield(ref.Root, ref.Variant)
+				}
+			}
+		}
+		lcs.PendingInserts = nil
 	}
 }
 
@@ -1140,7 +1163,9 @@ func (proc *Proc) useSrvCovNow() bool {
 	return true
 }
 
-func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTypes, stat Stat) []*ipc.ProgInfo {
+func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTypes, stat Stat) (infos []*ipc.ProgInfo) {
+	dagNew := false
+	defer func() { proc.applyInsertFeedback(dagNew, infos != nil) }()
 	if len(ps) == 0 {
 		return nil
 	}
@@ -1212,6 +1237,7 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 			}
 			newBits := proc.fuzzer.checkNewDagSignal(info.DagSignal)
 			if n := newBits.Len(); n > 0 {
+				dagNew = true
 				atomic.AddUint64(&proc.fuzzer.dagPairCount, uint64(n))
 				maxDag := proc.fuzzer.config.MaxDagCorpus
 				if maxDag == 0 || atomic.LoadUint64(&proc.fuzzer.dagCorpusEntries) < uint64(maxDag) {

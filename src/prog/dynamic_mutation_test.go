@@ -146,18 +146,30 @@ func TestRemoveGroupDynamicSmoke(t *testing.T) {
 	}
 }
 
-func TestRemoveOneInGroupDynamicSmoke(t *testing.T) {
+func TestRemoveReservoirDynamicSmoke(t *testing.T) {
 	target := smokeTarget(t)
 	ps := smokePs(target, false)
 	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
 
-	if !RemoveOneInGroupDynamic(ps, lcs, smokeRand()) {
-		t.Fatal("RemoveOneInGroupDynamic returned false")
+	if !RemoveReservoirDynamic(ps, lcs, smokeRand()) {
+		t.Fatal("RemoveReservoirDynamic returned false")
 	}
-	// Only the fd-safe pwrite64 of p1 is removable (p1's open has its fd in
-	// use); the anchor stays.
-	if len(ps[0].Calls) != 2 || len(ps[1].Calls) != 2 {
-		t.Fatalf("unexpected call counts: p0=%v p1=%v (want 2/2)", len(ps[0].Calls), len(ps[1].Calls))
+	// The opens that were fd-in-use at removal time (p0's and p1's) must
+	// survive; their fd users may themselves be removed, which clears
+	// Ret.uses, so check for existence only.
+	hasOpen := func(p *Prog) bool {
+		for _, c := range p.Calls {
+			if strings.Contains(c.Meta.Name, "open") {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasOpen(ps[0]) || !hasOpen(ps[1]) {
+		t.Fatal("an open call that was in use at removal time was removed")
+	}
+	if total := len(ps[0].Calls) + len(ps[1].Calls) + len(ps[2].Calls); total >= 6 {
+		t.Fatalf("nothing removed (total=%v, want < 6)", total)
 	}
 }
 
@@ -533,5 +545,229 @@ func TestInsertCallFromPatternBrokenRefs(t *testing.T) {
 		if hits > 0 && firstDiag != "" {
 			t.Logf("first hit diagnosis:\n%s", firstDiag)
 		}
+	}
+}
+
+// TestRefreshGeneralFailPos 验证通用突变后的 GeneralFailPos 重定位：sync 调用
+// 的实际位置变化应被同步写回 ps[0] 的条目。
+func TestRefreshGeneralFailPos(t *testing.T) {
+	target := smokeTarget(t)
+	sCalls := hmdfsSmokeSpecialCalls(t, target)
+	r := newRand(target, rand.NewSource(1))
+
+	var syncIdx uint64
+	s0 := r.genSyncCall(sCalls, &syncIdx, 1) // syncId 0 -> key 101
+	s1 := r.genSyncCall(sCalls, &syncIdx, 1) // syncId 1 -> key 102
+
+	p0 := &Prog{Target: target, GeneralFailPos: [][]int{{101, 0, 102, 0}}}
+	p1 := &Prog{Target: target, Calls: []*Call{
+		mkOpen(target, "merge_view/dirA/a"), s0,
+		mkOpen(target, "merge_view/dirB/b"), s1,
+	}}
+	ps := []*Prog{p0, p1}
+
+	RefreshGeneralFailPos(ps, 1)
+	if got := p0.GeneralFailPos[0][1]; got != 1 {
+		t.Fatalf("start entry = %v, want 1", got)
+	}
+	if got := p0.GeneralFailPos[0][3]; got != 3 {
+		t.Fatalf("end entry = %v, want 3", got)
+	}
+
+	// 前插一个调用再刷新：条目应跟着 sync 调用平移。
+	p1.Calls = append([]*Call{mkOpen(target, "merge_view/dirA/a")}, p1.Calls...)
+	RefreshGeneralFailPos(ps, 1)
+	if got := p0.GeneralFailPos[0][1]; got != 2 {
+		t.Fatalf("after insert: start entry = %v, want 2", got)
+	}
+	if got := p0.GeneralFailPos[0][3]; got != 4 {
+		t.Fatalf("after insert: end entry = %v, want 4", got)
+	}
+
+	// progIdx==0（窗口条目）与空表：不应 panic、不应改动。
+	RefreshGeneralFailPos(ps, 0)
+	RefreshGeneralFailPos([]*Prog{{Target: target}}, 1)
+}
+
+// TestMutateSrvFailPosConsistency 不变量：通用 Mutate（hasFail=true）后，
+// SrvFailPos 条目与 syz_failure_sync 调用一一对应（条目位置即 sync 调用索引）。
+// 通用突变只会平移/搬移调用（generateCall 不会生成 syz_failure*，removeCall
+// 跳过 syz_failure*），故对应关系必须保持。
+func TestMutateSrvFailPosConsistency(t *testing.T) {
+	target := smokeTarget(t)
+	sCalls := hmdfsSmokeSpecialCalls(t, target)
+	ct := target.DefaultChoiceTable()
+
+	for iter := 0; iter < 200; iter++ {
+		r := newRand(target, rand.NewSource(int64(iter+1)))
+		var syncIdx uint64
+		s0 := r.genSyncCall(sCalls, &syncIdx, 1)
+		s1 := r.genSyncCall(sCalls, &syncIdx, 1)
+		p := &Prog{
+			Target:     target,
+			HasNetFail: true,
+			Calls: []*Call{
+				mkOpen(target, "merge_view/dirA/a"), s0,
+				mkOpen(target, "merge_view/dirB/b"), s1,
+			},
+			SrvFailPos: [][]int{{1*100 + 1, 1}, {1*100 + 2, 3}},
+		}
+		p.Mutate(rand.NewSource(int64(1000+iter)), 20, ct, nil, sCalls, 0, true, false, &Hmdfs_config{}, 0)
+
+		syncPos := make(map[int]bool)
+		for i, c := range p.Calls {
+			if strings.Contains(c.Meta.Name, "syz_failure_sync") {
+				syncPos[i] = true
+			}
+		}
+		if len(syncPos) != len(p.SrvFailPos) {
+			t.Fatalf("iter %d: %d sync calls vs %d SrvFailPos entries", iter, len(syncPos), len(p.SrvFailPos))
+		}
+		used := make(map[int]bool)
+		for _, item := range p.SrvFailPos {
+			if !syncPos[item[1]] {
+				t.Fatalf("iter %d: SrvFailPos %v does not point at a sync call (sync calls at %v)",
+					iter, item, syncPos)
+			}
+			if used[item[1]] {
+				t.Fatalf("iter %d: duplicate SrvFailPos position %v", iter, item[1])
+			}
+			used[item[1]] = true
+		}
+	}
+}
+
+func srvPositions(p *Prog) []int {
+	out := make([]int, 0, len(p.SrvFailPos))
+	for _, item := range p.SrvFailPos {
+		out = append(out, item[1])
+	}
+	return out
+}
+
+func checkSrvPositions(t *testing.T, p *Prog, want ...int) {
+	t.Helper()
+	got := srvPositions(p)
+	if len(got) != len(want) {
+		t.Fatalf("positions = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("positions = %v, want %v", got, want)
+		}
+	}
+}
+
+// TestShiftSrvFailPos 验证 SrvFailPos 平移边界（含位置 0 与各类 no-op）。
+func TestShiftSrvFailPos(t *testing.T) {
+	p := &Prog{SrvFailPos: [][]int{{101, 2}, {102, 5}}}
+	shiftSrvFailPos(p, 3, 2)
+	checkSrvPositions(t, p, 2, 7)
+	shiftSrvFailPos(p, 2, -1)
+	checkSrvPositions(t, p, 1, 6)
+	shiftSrvFailPos(p, 0, 1)
+	checkSrvPositions(t, p, 2, 7)
+	if p.SrvFailPos[0][0] != 101 || p.SrvFailPos[1][0] != 102 {
+		t.Fatalf("keys changed: %v", p.SrvFailPos)
+	}
+
+	p0 := &Prog{SrvFailPos: [][]int{{101, 0}}}
+	shiftSrvFailPos(p0, 0, 1)
+	checkSrvPositions(t, p0, 1)
+
+	shiftSrvFailPos(p, -1, 1)
+	checkSrvPositions(t, p, 2, 7)
+	shiftSrvFailPos(&Prog{}, 0, 1)
+	shiftSrvFailPos(nil, 0, 1)
+}
+
+// TestMoveSrvFailPosEntry 验证搬移操作的区间平移（左右两向与边界）。
+func TestMoveSrvFailPosEntry(t *testing.T) {
+	left := &Prog{SrvFailPos: [][]int{{101, 2}, {102, 5}, {103, 7}}}
+	moveSrvFailPosEntry(left, 5, 1)
+	checkSrvPositions(t, left, 3, 1, 7)
+
+	right := &Prog{SrvFailPos: [][]int{{101, 2}, {102, 4}, {103, 7}}}
+	moveSrvFailPosEntry(right, 2, 6)
+	checkSrvPositions(t, right, 6, 3, 7)
+
+	down := &Prog{SrvFailPos: [][]int{{101, 0}, {102, 1}, {103, 2}, {104, 4}}}
+	moveSrvFailPosEntry(down, 0, 3)
+	checkSrvPositions(t, down, 3, 0, 1, 4)
+
+	up := &Prog{SrvFailPos: [][]int{{101, 0}, {102, 1}, {103, 3}, {104, 4}}}
+	moveSrvFailPosEntry(up, 3, 0)
+	checkSrvPositions(t, up, 1, 2, 0, 4)
+
+	noop := &Prog{SrvFailPos: [][]int{{101, 3}}}
+	moveSrvFailPosEntry(noop, 3, 3)
+	checkSrvPositions(t, noop, 3)
+	moveSrvFailPosEntry(&Prog{}, 0, 1)
+	moveSrvFailPosEntry(nil, 0, 1)
+}
+
+// TestGeneralFailPosSyncKeyMapping 端到端校验生成器与 RefreshGeneralFailPos 共同
+// 依赖的映射约定：prog 内 syz_failure_sync 的 id 0/1 对应键 progIdx*100+1/+2。
+func TestGeneralFailPosSyncKeyMapping(t *testing.T) {
+	target := smokeTarget(t)
+	sCalls := hmdfsSmokeSpecialCalls(t, target)
+	hmcfg := &Hmdfs_config{}
+	hmdfsSmokeConfig(hmcfg)
+
+	findEntry := func(table [][]int, key int) (int, bool) {
+		for _, row := range table {
+			for i := 0; i < len(row)-1; i++ {
+				if row[i] == key {
+					return row[i+1], true
+				}
+			}
+		}
+		return 0, false
+	}
+	assertMapping := func(t *testing.T, ps []*Prog) {
+		t.Helper()
+		if len(ps) < 2 {
+			return
+		}
+		for progIdx := 1; progIdx < len(ps); progIdx++ {
+			syncSeen := false
+			for callIdx, c := range ps[progIdx].Calls {
+				if !strings.Contains(c.Meta.Name, "syz_failure_sync") {
+					continue
+				}
+				syncSeen = true
+				id := extractSyncId(c)
+				if id != 0 && id != 1 {
+					t.Fatalf("prog %d call %d: unexpected sync id %d", progIdx, callIdx, id)
+				}
+				key := progIdx*100 + id + 1
+				pos, ok := findEntry(ps[0].GeneralFailPos, key)
+				if !ok {
+					t.Fatalf("prog %d: sync id %d has no table entry for key %d", progIdx, id, key)
+				}
+				if pos != callIdx {
+					t.Fatalf("prog %d call %d (id %d): entry %d = %d, want %d",
+						progIdx, callIdx, id, key, pos, callIdx)
+				}
+			}
+			if progIdx == 1 && !syncSeen {
+				t.Fatalf("prog 1 has no syz_failure_sync calls (generator changed?)")
+			}
+		}
+	}
+
+	for seed := int64(0); seed < 30; seed++ {
+		ps := target.GenerateProgsForHmdfsStash(rand.New(rand.NewSource(seed)), sCalls, hmcfg)
+		assertMapping(t, ps)
+
+		if len(ps) < 2 {
+			continue
+		}
+		// p1 在三种 mode 下都带 sync 对；做一次通用突变 + 重定位后再验。
+		ps2 := Clones(ps)
+		ps2[1].Mutate(rand.NewSource(seed+500), RecommendedCalls, target.DefaultChoiceTable(),
+			nil, sCalls, 0, true, false, hmcfg, 1)
+		RefreshGeneralFailPos(ps2, 1)
+		assertMapping(t, ps2)
 	}
 }

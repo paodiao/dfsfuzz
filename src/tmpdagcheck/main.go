@@ -18,7 +18,7 @@ func main() {
 	}
 
 	// 25 selections without any yield: the combo's weight must never grow,
-	// and if it was picked >= noYieldThreshold(20) times it must have been
+	// and if it was picked >= noYieldThreshold(10) times it must have been
 	// down-weighted by noYieldDelta(5).
 	combo := *v1
 	w0 := dct.WeightOf("mkdir", combo)

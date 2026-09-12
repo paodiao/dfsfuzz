@@ -66,38 +66,57 @@ func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus [][]*P
 		enableC2san: enableC2san,
 	}
 
-	log.Logf(0, "mutate testcase with failures\n")
+	log.Logf(0, "mutate testcase hasFail=%v\n", hasFail)
 
-	for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(3) {
-		switch {
-		case r.oneOf(5):
-			//log.Logf(0, "----- squashAny()")
-			// Not all calls have anything squashable,
-			// so this has lower priority in reality.
-			ok = ctx.squashAny()
-		case r.nOutOf(1, 100):
-			log.Logf(0, "----- splice()")
-			if hasFail {
+	if hasFail {
+		// 含故障的 prog：保留原有循环（splice 禁用以防破坏故障窗口，failpos 可用）。
+		for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(3) {
+			switch {
+			case r.oneOf(5):
+				//log.Logf(0, "----- squashAny()")
+				// Not all calls have anything squashable,
+				// so this has lower priority in reality.
+				ok = ctx.squashAny()
+			case r.nOutOf(1, 100):
+				log.Logf(0, "----- splice()")
 				ok = false
-			} else {
-				ok = ctx.splice()
-			}
-		case r.nOutOf(20, 31):
-			log.Logf(0, "----- insertCall()")
-			ok = ctx.insertCall()
-		case r.nOutOf(10, 11):
-			log.Logf(0, "----- mutateArg()")
-			ok = ctx.mutateArg()
-		case r.nOutOf(9, 10):
-			if hasFail {
+			case r.nOutOf(20, 31):
+				log.Logf(0, "----- insertCall()")
+				ok = ctx.insertCall()
+			case r.nOutOf(10, 11):
+				log.Logf(0, "----- mutateArg()")
+				ok = ctx.mutateArg()
+			case r.nOutOf(9, 10):
 				log.Logf(0, "----- mutateFailPos()")
 				ok = ctx.mutateFailPos()
-			} else {
-				ok = false
+			default:
+				log.Logf(0, "----- removeCall()")
+				ok = ctx.removeCall()
 			}
-		default:
-			log.Logf(0, "----- removeCall()")
-			ok = ctx.removeCall()
+		}
+	} else {
+		// 无故障的 prog：对齐上游 syzkaller——无 failpos 档，其预算全归
+		// removeCall（default 拿剩余全部，removeCall ≈2.55%）。
+		for stop, ok := false, false; !stop; stop = ok && len(p.Calls) != 0 && r.oneOf(3) {
+			switch {
+			case r.oneOf(5):
+				//log.Logf(0, "----- squashAny()")
+				// Not all calls have anything squashable,
+				// so this has lower priority in reality.
+				ok = ctx.squashAny()
+			case r.nOutOf(1, 100):
+				log.Logf(0, "----- splice()")
+				ok = ctx.splice()
+			case r.nOutOf(20, 31):
+				log.Logf(0, "----- insertCall()")
+				ok = ctx.insertCall()
+			case r.nOutOf(10, 11):
+				log.Logf(0, "----- mutateArg()")
+				ok = ctx.mutateArg()
+			default:
+				log.Logf(0, "----- removeCall()")
+				ok = ctx.removeCall()
+			}
 		}
 	}
 	p.sanitizeFix()
@@ -211,8 +230,10 @@ func (ctx *mutator) insertCall() bool {
 		return false
 	}
 	p.insertBefore(c, calls)
+	shiftSrvFailPos(p, idx, len(calls))
 	for len(p.Calls) > ctx.ncalls {
 		p.RemoveCall(idx)
+		shiftSrvFailPos(p, idx, -1)
 	}
 	return true
 }
@@ -238,6 +259,7 @@ func (ctx *mutator) removeCall() bool {
 		cnt += 1
 	}
 	p.RemoveCall(idx)
+	shiftSrvFailPos(p, idx, -1)
 	return true
 }
 
@@ -278,11 +300,14 @@ func (ctx *mutator) mutateArg() bool {
 			ok = false
 			continue
 		}
+		insertPos := idx
 		p.insertBefore(c, calls)
+		shiftSrvFailPos(p, insertPos, len(calls))
 		idx += len(calls)
 		for len(p.Calls) > ctx.ncalls {
 			idx--
 			p.RemoveCall(idx)
+			shiftSrvFailPos(p, idx, -1)
 		}
 		if idx < 0 || idx >= len(p.Calls) || p.Calls[idx] != c {
 			panic(fmt.Sprintf("wrong call index: idx=%v calls=%v p.Calls=%v ncalls=%v",
@@ -1019,6 +1044,7 @@ func (ctx *mutator) mutateFailPos() bool {
 				}
 				p.Calls = append(append(append(append(make([]*Call, 0), p.Calls[:insertPoint]...), p.Calls[idx]),
 					p.Calls[insertPoint:idx]...), p.Calls[idx+1:]...)
+				moveSrvFailPosEntry(p, idx, insertPoint)
 				log.Logf(0, "insert call %v at pos %v\n", idx, insertPoint)
 				stop = true
 			} else {
@@ -1029,6 +1055,7 @@ func (ctx *mutator) mutateFailPos() bool {
 				}
 				p.Calls = append(p.Calls[:idx], append(append(append(make([]*Call, 0),
 					p.Calls[idx+1:insertPoint+1]...), p.Calls[idx]), p.Calls[insertPoint+1:]...)...)
+				moveSrvFailPosEntry(p, idx, insertPoint)
 				log.Logf(0, "insert call %v at pos %v\n", idx, insertPoint)
 				stop = true
 			}
@@ -1988,6 +2015,31 @@ func updateGeneralFailPos(p *Prog, progIdx, syncId, newPos int) {
 	}
 }
 
+// RefreshGeneralFailPos 在通用突变（Prog.Mutate，含 hmdfs fallback）后，按被
+// 突变 prog 中 syz_failure_sync 调用的实际位置重定位（只更新已存在键）
+// GeneralFailPos 条目。表挂在 ps[0]；progIdx==0 的条目是失败窗口块（非 sync
+// 调用），不在此处理。
+// 约定：prog 内 syz_failure_sync 的 id 0/1 对应键 progIdx*100+1/+2（生成器每
+// prog 恰好一对 start/end；重复 id 时后者覆盖）。
+func RefreshGeneralFailPos(ps []*Prog, progIdx int) {
+	if len(ps) == 0 || progIdx <= 0 || progIdx >= len(ps) {
+		return
+	}
+	if len(ps[0].GeneralFailPos) == 0 {
+		return
+	}
+	for i, c := range ps[progIdx].Calls {
+		if c == nil || c.Meta == nil {
+			continue
+		}
+		if strings.Contains(c.Meta.Name, "syz_failure_sync") {
+			if id := extractSyncId(c); id >= 0 {
+				updateGeneralFailPos(ps[0], progIdx, id, i)
+			}
+		}
+	}
+}
+
 func mutateStashOpSequence(ps []*Prog, r *randGen, sCalls *SpecialCalls, ct *ChoiceTable) bool {
 	for _, p := range ps {
 		if !p.IsStash {
@@ -2139,6 +2191,41 @@ func shiftGeneralFailPos(p *Prog, progIdx, shiftPos, delta int) {
 				failPos[i+1] > 0 && failPos[i+1] >= shiftPos {
 				failPos[i+1] += delta
 			}
+		}
+	}
+}
+
+// shiftSrvFailPos 偏移 p 自己的 SrvFailPos 条目：位置 >= shiftPos 的条目偏移
+// delta（镜像 shiftGeneralFailPos，但表在被突变的 prog 上且位置可为 0，故无
+// progIdx 与 >0 守卫）。通用 Mutate 的插入/删除调用处调用。
+func shiftSrvFailPos(p *Prog, shiftPos, delta int) {
+	if p == nil || len(p.SrvFailPos) == 0 || shiftPos < 0 {
+		return
+	}
+	for _, item := range p.SrvFailPos {
+		if len(item) >= 2 && item[1] >= shiftPos {
+			item[1] += delta
+		}
+	}
+}
+
+// moveSrvFailPosEntry 记录一次调用搬移对 SrvFailPos 的影响：oldPos 处条目改为
+// newPos，区间内其它条目相应平移（供通用 mutateFailPos 使用）。
+func moveSrvFailPosEntry(p *Prog, oldPos, newPos int) {
+	if p == nil || oldPos == newPos {
+		return
+	}
+	for _, item := range p.SrvFailPos {
+		if len(item) < 2 {
+			continue
+		}
+		switch {
+		case item[1] == oldPos:
+			item[1] = newPos
+		case oldPos < newPos && item[1] > oldPos && item[1] <= newPos:
+			item[1]--
+		case newPos < oldPos && item[1] >= newPos && item[1] < oldPos:
+			item[1]++
 		}
 	}
 }
@@ -2567,29 +2654,65 @@ func callRemovable(ps []*Prog, pos GroupPosition) bool {
 	return true
 }
 
-// RemoveOneInGroupDynamic removes one fd-safe call from the anchor's
-// concurrent set.
-func RemoveOneInGroupDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
-	recordLastMutation("RemoveOneInGroupDynamic")
-	if lcs == nil {
-		return false
+// RemoveReservoirDynamic removes calls across a random subset of the program
+// group with a reservoir-style dynamic probability: the target number of
+// removals adapts to the number of programs that have a removable call, and
+// after each removal the probability for the remaining programs decreases
+// (remain/(C-k)). Each program loses at most one fd-safe call. The traversal
+// starts at a random program, so no position is systematically favored.
+// Candidates include every non-empty program (including ps[0]) that has at
+// least one fd-safe call; with pre-filtered candidates every probability hit
+// removes exactly one call, so the reservoir draw yields exactly the target
+// number of removals (>= 1 whenever a removable call exists).
+func RemoveReservoirDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
+	recordLastMutation("RemoveReservoirDynamic")
+
+	// Pre-filter to programs that actually have a removable (fd-safe) call,
+	// keeping their call indices. Without this, programs with no removable
+	// call would consume probability draws without advancing the reservoir
+	// (skewing the draw and occasionally yielding zero removals).
+	type candProg struct {
+		pi   int
+		idxs []int
 	}
-	anchor, anchorPath, ok := pickAnchor(ps, r, false)
-	if !ok {
-		return false
-	}
-	var candidates []GroupPosition
-	for _, cc := range findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs) {
-		if callRemovable(ps, cc.Pos) {
-			candidates = append(candidates, cc.Pos)
+	var cand []candProg
+	for i := 0; i < len(ps); i++ {
+		var idxs []int
+		for ci := range ps[i].Calls {
+			if callRemovable(ps, GroupPosition{ProgIdx: i, CallIdx: ci}) {
+				idxs = append(idxs, ci)
+			}
+		}
+		if len(idxs) > 0 {
+			cand = append(cand, candProg{pi: i, idxs: idxs})
 		}
 	}
-	if len(candidates) == 0 {
+	C := len(cand)
+	if C == 0 {
 		return false
 	}
-	pos := candidates[r.Intn(len(candidates))]
-	ps[pos.ProgIdx].RemoveCall(pos.CallIdx)
-	return true
+
+	// Target removals: uniform in [ceil(C/4), ceil(C/2)] (>= 1).
+	lo := (C + 3) / 4
+	if lo < 1 {
+		lo = 1
+	}
+	hi := (C + 1) / 2
+	remain := int(r.randRange(uint64(lo), uint64(hi)))
+
+	start := r.Intn(C)
+	removed := 0
+	for k := 0; k < C && remain > 0; k++ {
+		cp := cand[(start+k)%C]
+		// Reservoir probability remain/(C-k), drawn as an integer.
+		if r.Intn(C-k) >= remain {
+			continue
+		}
+		ps[cp.pi].RemoveCall(cp.idxs[r.Intn(len(cp.idxs))])
+		remain--
+		removed++
+	}
+	return removed > 0
 }
 
 // MutateGroupDataDynamic shares a random offset (and length for writes)
@@ -2668,19 +2791,21 @@ func MutateGroupDataDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 // heavy — they need to reach a size where modifier pairs exist at all),
 // large ones shrink (removal heavy — bounded execution cost, bounded pair
 // space). Weights are (insertion, remove-one, remove-group, path/data
-// mutation) out of 100:
+// mutation) out of 100; remove-one is the reservoir-style cross-program
+// deletion (RemoveReservoirDynamic), remove-group is the anchor-group
+// deletion (RemoveGroupDynamic):
 //
 //	1-3   (tiny):   85/ 5/ 0/10 — gather the first modifier pairs
-//	4-10  (grow):   60/10/ 5/25
-//	11-15 (peak):   35/25/10/30
-//	16-20 (shrink): 10/40/20/30
+//	4-11  (grow):   60/10/ 5/25
+//	12-16 (peak):   35/25/10/30
+//	17-20 (shrink): 10/40/20/30
 func mutateMixForSize(size int) (ins, removeOne, removeGroup, mutate int) {
 	switch {
 	case size < 4:
 		return 85, 5, 0, 10
-	case size < 11:
+	case size < 12:
 		return 60, 10, 5, 25
-	case size < 16:
+	case size < 17:
 		return 35, 25, 10, 30
 	default:
 		return 10, 40, 20, 30
@@ -2700,16 +2825,16 @@ func MutateInodeOpsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *
 	switch {
 	case roll < ins:
 		if len(ps[0].Calls) >= RecommendedCalls {
-			// At the size cap: fall back to removing a call instead of
+			// At the size cap: fall back to removing calls instead of
 			// wasting the round, so programs oscillate around the cap.
-			return RemoveOneInGroupDynamic(ps, lcs, r)
+			return RemoveReservoirDynamic(ps, lcs, r)
 		}
 		if lcs.ShouldUsePattern(r.Rand) {
 			return insertCallFromPattern(ps, r, sCalls, hmcfg, lcs, "inodeops")
 		}
 		return insertCallFromDCT(ps, r, ct, sCalls, hmcfg, lcs, "inodeops")
 	case roll < ins+removeOne:
-		return RemoveOneInGroupDynamic(ps, lcs, r)
+		return RemoveReservoirDynamic(ps, lcs, r)
 	case roll < ins+removeOne+removeGroup:
 		return RemoveGroupDynamic(ps, lcs, r)
 	default:
@@ -2733,16 +2858,16 @@ func MutateFileopsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *S
 	switch {
 	case roll < ins:
 		if len(ps[0].Calls) >= RecommendedCalls {
-			// At the size cap: fall back to removing a call instead of
+			// At the size cap: fall back to removing calls instead of
 			// wasting the round, so programs oscillate around the cap.
-			return RemoveOneInGroupDynamic(ps, lcs, r)
+			return RemoveReservoirDynamic(ps, lcs, r)
 		}
 		if lcs.ShouldUsePattern(r.Rand) {
 			return insertCallFromPattern(ps, r, sCalls, hmcfg, lcs, "fileops")
 		}
 		return insertCallFromDCT(ps, r, ct, sCalls, hmcfg, lcs, "fileops")
 	case roll < ins+removeOne:
-		return RemoveOneInGroupDynamic(ps, lcs, r)
+		return RemoveReservoirDynamic(ps, lcs, r)
 	case roll < ins+removeOne+removeGroup:
 		return RemoveGroupDynamic(ps, lcs, r)
 	default:
@@ -3487,6 +3612,9 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 			p.Calls = append(p.Calls, concurrentCalls...)
 		} else {
 			p.Calls = append(p.Calls[:ConcurrentInsertPos], append(concurrentCalls, p.Calls[ConcurrentInsertPos:]...)...)
+		}
+		if lcs != nil {
+			lcs.PendingInserts = append(lcs.PendingInserts, InsertedCombo{Root: rootCallName, Variant: *variant})
 		}
 	}
 

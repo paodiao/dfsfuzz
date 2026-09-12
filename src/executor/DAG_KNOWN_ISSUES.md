@@ -91,7 +91,7 @@
 
 **位置**：`src/prog/distributed_choice.go` `chooseVariant`
 
-**现象**：方向 1（探索度追踪）实现为：存在"未产出"组合（`!Explored && NoYield < 20`）时，**只在探索池内选择**，已产出（explored）组合完全不被选，直到探索池为空。池 = 全表 − 已产出组合，长期非空（总有新组合或未产出组合加入）。
+**现象**：方向 1（探索度追踪）实现为：存在"未产出"组合（`!Explored && NoYield < 10`）时，**只在探索池内选择**，已产出（explored）组合完全不被选，直到探索池为空。池 = 全表 − 已产出组合，长期非空（总有新组合或未产出组合加入）。
 
 **影响**：探索倾向是独占而非偏向——高产出组合在探索池非空时被完全压制。若实验发现高产出组合被长期压制、影响 DCT 收敛，需改为概率进入探索池（如 70% 走探索池、30% 正常加权）。
 
@@ -233,7 +233,7 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 - `pathRelBetween(anchorPath, concPath)`：路径几何关系分类（相同/父子/兄弟/无关）
 - `pickAnchor(ps, r, wantReadWrite)`：ps[0] 随机选有路径 + 执行时间线的调用（wantReadWrite 时限定读写调用）
 - `findConcurrentCalls(ps, anchor, tscoffs)`：跨 prog 执行窗口重叠判定（`s1<e2 && s2<e1`，tscoff 归一化全局域；同 prog 内串行无重叠）
-- 4 个动态突变：`MutateGroupPathDynamic`（锚迁新 basePath、并发者按现场 rel 解析、fd 回溯、主干不迁）、`RemoveGroupDynamic`（删锚+并发者）、`RemoveOneInGroupDynamic`（fd 安全单删）、`MutateGroupDataDynamic`（锚限定读写，集合内全部读写共享 offset/length——确定性对应插入路径的概率性 OffsetSame）
+- 4 个动态突变：`MutateGroupPathDynamic`（锚迁新 basePath、并发者按现场 rel 解析、fd 回溯、主干不迁）、`RemoveGroupDynamic`（删锚+并发者）、`RemoveReservoirDynamic`（水库式跨 prog 删，fd 安全）、`MutateGroupDataDynamic`（锚限定读写，集合内全部读写共享 offset/length——确定性对应插入路径的概率性 OffsetSame）
 - mutateHmdfs 分发：removeGroup 20% / removeOne 10% / path 10% / data 10% / insert 50%
 
 **删除**：`CallProps.GroupID/PathRel/IsFromDCT/OffsetRel/LengthRel`（5 个序列化 key）、`Prog.Groups/LastGroupID`、`GroupMeta/GroupSourceType`、`AllocGroupID/renumberGroups/GetGroupPositions/RemoveGroup/collectAll*/getDeletable*/findPrimaryDCTCall/MutateGroupData/MutateGroupPath/mutateGroupPathRandom/setGroupMeta/getNewPathRel/getSharedFileSize`、~55 处 SetGroupID 及属性设置点、`ChooseOffsetRel/ChooseLengthRel/getRootOffsetRel/getRootLengthRel/isOffsetSensitiveCall/isLengthSensitiveCall/dctOffsetWeights`（插入路径的 offset 概率选择随之移除，共享 offset 由 MutateGroupDataDynamic 定向提供）。
@@ -303,7 +303,7 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 ```
 - `findHBCalls(ps, anchor, anchorPath, tscoffs)`：遍历其它 prog，找 `Stime ≥ Etime(锚)`（归一化全局域）的调用中**每 prog Stime 最早的紧邻一个**——时间线上的直接因果边（与并发版"全取重叠"不同：组大小可控、语义精确——每条直接因果对）；
 - `findGroupCalls` = `findConcurrentCalls ∪ findHBCalls`（按位置去重）；
-- 4 个突变（`MutateGroupPathDynamic`/`RemoveGroupDynamic`/`RemoveOneInGroupDynamic`/`MutateGroupDataDynamic`）共用 `findGroupCalls`——**无新 case、无内部分流**——所有突变自动覆盖因果对：
+- 3 个组突变（`MutateGroupPathDynamic`/`RemoveGroupDynamic`/`MutateGroupDataDynamic`）共用 `findGroupCalls`；`RemoveReservoirDynamic` 为跨 prog 删除，不走组判定——**无新 case、无内部分流**——所有突变自动覆盖因果对：
   - 数据共享 → "顺序 write→read 同 offset"（一致性验证：HMDFS 异步写回下"写返回后读"应读到新数据）；
   - 路径迁移 → 因果链成员一起换路径（rel 现场算）；
   - 删除 → 因果成员一起删 / fd 安全单删。
@@ -522,6 +522,41 @@ if proc.fuzzer.config.EnableDagScheduleFb &&
 |---|---|---|---|
 | P2 | setattr 反馈盲区：`callNameOfFunc` 无 `FuncSetattr`——truncate/chmod 组合在 `DagPairToVariant` 恒 ok=false——DCT 无产出信用（#22 补注） | dag.go:341-366 | 方向 1 探索池永不枯竭（放大 #7）——需顶点携带调用名（结构性改动） |
 | P5 | **writepage 未建立到 write 系统调用的映射**：路径解析仅靠 post-exec fsMd 的 `inoToPath`（rename 前的事件无法回退到旧路径）；且无 CallName——不参与 `DagPairToVariant`（写回维度不进 DCT 反馈、不指导突变） | dag.go:200-219 | rename 场景路径错（罕见）+ 写回维度 DCT 学习缺失。映射需同 ino+时间关联——但异步写回跨轮（write 在上轮、完成在下轮）导致匹配不可靠——**暂不实施**（异步语义与同步函数不同，待后续评估） |
-| P6 | DCT 归因模糊：任何新颖对都归因到 (root, variant)——不区分是否本执行插入的组合产生 | proc.go:682-690 | 系统性设计近似（#20/#21 已讨论） |
+| P6 | ~~DCT 归因模糊：任何新颖对都归因到 (root, variant)——不区分是否本执行插入的组合产生~~ **已修（#28 插入反馈归因）** | proc.go | 由"插入记录 + 执行级归因"替代（原系统性近似） |
 | P9 | write/pwrite64 归因坍缩：FuncWrite → "write"——pwrite64 组合收不到产出信用 | dag.go:353-355 | 与 P2 同因（顶点无调用名） |
 | P10-P20 | 其余低危：MaxDagCorpus gate 非原子、pair 哈希 32 位截断碰撞、同调用多事件成对噪声、O(n²) 全对遍历、schedule 哈希折叠、perf 时钟域未验证、统计口径（#3）等 | — | 观察即可 |
+
+---
+
+## 28. 插入反馈归因（已实施——替代"选择即计"与"映射清零"）
+
+**动机**：两处归因错位——① 选择即计：`chooseVariant` 每次选中 `NoYield++`（含未成功插入/未执行）；② 映射清零：`feedbackDagPairs` 把新颖对映射到 (root, variant) 后 `MarkYield`（P6：不区分是否本次插入产生——可能白捡清零/错误归因）。
+
+**改动**：
+- `insertCallFromDCT` 成功插入时记录 (root, variant) 到 `lcs.PendingInserts`（每个成功节点一条）；
+- `execute` 返回前（defer——覆盖全部返回路径）由 `applyInsertFeedback` 结算：本次执行有任意新 DAG 反馈 → 对记录的全部组合 `MarkYield`（加权）；无新反馈 → 每个组合 `TickNoYield`（累加，到阈值降权）；**执行失败（infos==nil）→ 仅清空不计**；结算后清空记录；
+- **删除**：`chooseVariant` 的选中即计（`noYieldTick`）；`feedbackDagPairs` 的映射级 `MarkYield`（保留 `UpdateTemporalWeight` 形态层与 hb/cc 统计）。
+
+**语义**：tick/yield 触发从"选中时"移到"执行结果"；归因粒度 = 插入级（执行有任何新反馈即奖励记录组合，粗归因）。代价：组合的 `Explored` 标记变粗（可能因同次执行的无关新反馈被标记）——消除映射错位的取舍。
+
+**阈值调整（2026-09）**：`noYieldThreshold` 20 → 10（`noYieldDelta = 5` 不变）。理由：归因改造后 tick 语义从"选中"变为"真实失败插入尝试"（无噪声），20 次 tick 等价于旧机制约 10 次真实尝试——维持 20 会使降权实际过慢；且中后期高权重组合产新率下降，需要更及时的清扫。该阈值同时界定未探索组合的探索预算（10 次失败尝试内保持优先探索）——加速"独占探索"阶段向"全池利用"阶段的切换。
+
+---
+
+## 29. 通用 Mutate 分支拆分与故障位置表维护（已实施）
+
+**位置**：`src/prog/mutation.go`（`Prog.Mutate`/`insertCall`/`removeCall`/`mutateArg`/`mutateFailPos`/`RefreshGeneralFailPos`/`shiftSrvFailPos`/`moveSrvFailPosEntry`）、`src/syz-fuzzer/proc.go`（`mutateHmdfs` fallback）
+
+**动机**：
+1. 通用 `Mutate` 的 failpos 档（`mutateFailPos`）对无故障 prog 是空转重抽（`ok=false`）——浪费且语义不明；hasFail/!hasFail 两种形态混在一个循环里。
+2. 通用突变（insertCall/mutateArg/removeCall/mutateFailPos）会平移/搬移调用位置，但不更新故障位置表：`GeneralFailPos`（挂 ps[0] 的 client 条目）与 `SrvFailPos`（每-prog，server 故障同步条目）——后续 stash/dcache 突变与 `InsertablePos` 会读到陈旧位置。
+
+**改动**：
+- `Prog.Mutate` 拆两分支：hasFail=true 保留原循环（splice 禁用、failpos 可用）；hasFail=false 对齐上游 syzkaller——去掉 failpos 档、其预算全归 `removeCall`（squashAny 20% / splice 0.8% / insertCall 51.10% / mutateArg 25.55% / removeCall 2.55%）。**刻意与 back 基线的差异**：Monarch 原实现的有效 removeCall 仅 0.26%（failpos 档吃掉 90%），本改动只作用于 !hasFail 的 generic 路径（hmdfs 上为 inode/file fallback 与非 hmdfs 主路径；stash 走 hasFail 分支不受影响），换取卡满时更快的容量释放。
+- `RefreshGeneralFailPos(ps, progIdx)`：通用突变后扫描被突变 prog 的 `syz_failure_sync` 调用，按实际索引重定位 `GeneralFailPos` 条目；`mutateHmdfs` fallback 调用。progIdx==0 的窗口条目（非 sync 调用）不动。
+- SrvFailPos 事件驱动维护：新增 `shiftSrvFailPos`（插/删调用平移，镜像 `shiftGeneralFailPos` 但无 progIdx 与 >0 守卫——位置可为 0）与 `moveSrvFailPosEntry`（搬移同步条目）；hook 进 `insertCall`/`removeCall`/`mutateArg`/`mutateFailPos`。
+- 安全性依据：`removeCall` 显式跳过 `syz_failure*`；`insertCall`/`mutateArg` 裁剪只删刚插入的调用（入口 `ncalls ≥ len(p.Calls)`）；`generateCall` 重抽跳过 `syz_failure*`（rand.go:677）；splice 仅 !hasFail 且 sync 只随故障出现——故 sync 调用不会被删，表项只需重定位。
+
+**范围**：`GeneralFailPos` 路径作用于 hmdfs stash fallback；`SrvFailPos` 仅非 hmdfs（带 server 的 DFS；hmdfs srvNum=0 时恒空——`RandomInsertFailure` 提前返回、`genNodeCombs(0)/genEdgeCombs(0,·)` 为空）。
+
+**测试**：`TestRefreshGeneralFailPos`（位置重建）与 `TestMutateSrvFailPosConsistency`（hasFail=true 多次 Mutate 后条目与 sync 调用一一对应的不变量）。

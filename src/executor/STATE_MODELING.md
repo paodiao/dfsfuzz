@@ -1242,9 +1242,10 @@ learning is driven exclusively by the dynamic pair feedback (see
 `DAG_KNOWN_ISSUES.md` #20). The feedback loop is:
 
 ```
-chooseVariant picks (root, variant) → NoYield++；unexplored combos preferred；≥ threshold → down-weight
+insertCallFromDCT records the inserted (root, variant) → unexplored combos preferred
 ChooseTemporal picks the combo's insertion form (concurrent / causal) → execute
-→ novel DAG pair → MarkExplored + MarkYield + weight +1
+→ new DAG feedback → MarkYield for every recorded combo + weight +1 (Explored = true)
+→ no new DAG feedback → TickNoYield per recorded combo；≥ threshold → down-weight
 → pair temporal (CONCURRENT/HB) → UpdateTemporalWeight (second layer, per form)
 ```
 
@@ -1253,42 +1254,47 @@ are implemented and one is deferred:
 
 | Direction | Status | Implementation |
 |-----------|:--:|------|
-| Path-relation exploration tracking | **Implemented** | DCT keeps an `Explored` map per `(rootCall, variant)`; `chooseVariant` picks exclusively from combos that never produced signal and are still within their exploration budget (`NoYield < 20`). |
-| Adaptive weight damping | **Implemented** | DCT keeps a `NoYield` counter per combo: each selection bumps it, a yield (`MarkYield` from novel DAG pairs) resets it, and reaching 20 consecutive no-yield selections drops the weight by 5 (floor 1). |
-| Temporal form layer | **Implemented** | A second layer per combo: `TemporalWeights` (concurrent vs causal/HB form, 50/50 start). `insertCallFromDCT` picks the form (`ChooseTemporal`); the causal form inserts at `firstBoundaryAfter` (after the root finishes, favoring HB pairs). `feedbackDagPairs` updates the weights by the actually produced pair temporal; every novel pair — concurrent or HB — also drives direction 1/2 (`MarkYield`: the combo is rewarded for its combined output, whatever form it took; see `DAG_KNOWN_ISSUES.md` #16). |
+| Path-relation exploration tracking | **Implemented** | DCT keeps an `Explored` map per `(rootCall, variant)`; `chooseVariant` picks exclusively from combos that never produced signal and are still within their exploration budget (`NoYield < 10`). |
+| Adaptive weight damping | **Implemented** | DCT keeps a `NoYield` counter per combo: an insertion follow-up with no new DAG feedback (`TickNoYield`) bumps it, a yield (`MarkYield`) resets it, and reaching 10 consecutive no-yield attempts drops the weight by 5 (floor 1). |
+| Temporal form layer | **Implemented** | A second layer per combo: `TemporalWeights` (concurrent vs causal/HB form, 50/50 start). `insertCallFromDCT` picks the form (`ChooseTemporal`); the causal form inserts at `firstBoundaryAfter` (after the root finishes, favoring HB pairs). `feedbackDagPairs` updates the weights by the actually produced pair temporal; direction 1/2 rewards are driven separately by the recorded insertion combos (`applyInsertFeedback`), whatever form the produced pairs took (see `DAG_KNOWN_ISSUES.md` #16). |
 | Targeted mutation | Deferred | "I need a WRITE→READ SAME_INODE HB pair on a depth-3+ DIR but haven't seen one" → construct it specifically. Requires a synthesiser; revisit after evaluating the first two directions. See also `DAG_KNOWN_ISSUES.md` #17 for the broader modeling research (structure for concurrent/causal relations). |
 
-Both implemented directions use the same signal source: `feedbackDagPairs`
-(fuzzer-side mapping of novel DAG pairs to DCT combos).
+Both implemented directions share one signal source: `applyInsertFeedback`
+(fuzzer-side, after each execution: the combos recorded by the most recent
+insertion are rewarded when the execution yields new DAG feedback, and tick
+one no-yield attempt otherwise). `feedbackDagPairs` keeps the temporal-form
+layer.
 
 **Direction 1 — Path-relation exploration tracking (implemented)**
 
 - Mechanism: the DCT table keeps an `Explored` flag per `(rootCall, variant)`;
   `chooseVariant` collects the combos that never produced signal and are
-  still within their exploration budget (`NoYield < 20`) and, when this pool
+  still within their exploration budget (`NoYield < 10`) and, when this pool
   is non-empty, picks **only from it** (exclusive bias — see
   `DAG_KNOWN_ISSUES.md` #7).
-- Signal source: `MarkYield` (from novel DAG pairs via `feedbackDagPairs`)
-  sets `Explored = true`.
-- Parameters: exploration budget 20 (shared `NoYield` counter with
+- Signal source: `MarkYield` (from the recorded insertion combos via
+  `applyInsertFeedback`) sets `Explored = true`.
+- Parameters: exploration budget 10 (shared `NoYield` counter with
   Direction 2).
 - Implementation: `distributed_choice.go` (`Explored`, `chooseVariant`),
-  `proc.go` (`feedbackDagPairs`), `dag.go` (`DagPairToVariant` mapping).
+  `proc.go` (`applyInsertFeedback`), `dag.go` (`DagPairToVariant` mapping).
 - Granularity: DCT combos (`callName` + `pathRel`), coarser than the DAG
   feature buckets — the bias acts on generation/mutation combo selection,
   not on the pair space itself.
 
 **Direction 2 — Adaptive weight damping (implemented)**
 
-- Mechanism: a `NoYield` counter per combo (bumped on every selection);
-  reaching 20 consecutive no-yield selections drops the weight by 5
+- Mechanism: a `NoYield` counter per combo (bumped once per execution that
+  follows an insertion of the combo and produces no new DAG feedback);
+  reaching 10 consecutive no-yield attempts drops the weight by 5
   (floor 1), recomputes `TotalWeights`, and resets the counter (to avoid
   continuous downgrades).
 - Signal source: `MarkYield` resets `NoYield = 0`.
-- Parameters: `noYieldThreshold = 20`, `noYieldDelta = 5`.
+- Parameters: `noYieldThreshold = 10`, `noYieldDelta = 5`.
 - Per-proc semantics: DCT tables are per-proc, so counters and downgrades
   evolve independently per worker.
-- Implementation: `distributed_choice.go` (`noYieldTick`, `MarkYield`).
+- Implementation: `distributed_choice.go` (`noYieldTick`, `MarkYield`,
+  `TickNoYield`), `proc.go` (`applyInsertFeedback`).
 
 **Direction 3 — Targeted mutation (deferred)**
 
@@ -1507,8 +1513,12 @@ path migrate 10% / data mutate 10% / insert 50%):
   fd-required calls backtrack via `resolveFdTarget`; the non-concurrent
   backbone stays in place (no second-pass follower logic needed).
 - `RemoveGroupDynamic`: deletes the anchor and its whole concurrent set.
-- `RemoveOneInGroupDynamic`: deletes one fd-safe call of the set
-  (`AnalyzeProgFds`, failure-injection pseudo calls kept).
+- `RemoveReservoirDynamic`: reservoir-style cross-program deletion — each
+  selected program loses at most one fd-safe call (`AnalyzeProgFds`,
+  failure-injection pseudo calls kept). Candidates are pre-filtered to
+  programs that have a removable call, so the target number of removals
+  (scaling with their count) is always achieved; at least one call is
+  removed whenever a removable call exists.
 - `MutateGroupDataDynamic`: the anchor must be a read/write call; all
   read/write calls of the set share one random offset (and one write length
   with `updateWriteDataBuf`) - the deterministic counterpart of the removed

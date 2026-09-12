@@ -1083,7 +1083,7 @@ func (r *randGen) RandSet(startRange, endRange, setSize int) (set []int) {
 	if setSize > valRange {
 		panic(fmt.Sprintf("setSize > valRange: startRange %v, endRange %v, setSize %v", startRange, endRange, setSize))
 	}
-	for _, val := range rand.Perm(valRange) {
+	for _, val := range r.Rand.Perm(valRange) {
 		if len(set) >= setSize {
 			break
 		}
@@ -1099,7 +1099,7 @@ func (r *randGen) RandSetExcept(startRange, endRange, setSize, except int) (set 
 	if setSize > valRange {
 		panic(fmt.Sprintf("setSize > valRange: startRange %v, endRange %v, setSize %v", startRange, endRange, setSize))
 	}
-	for _, val := range rand.Perm(valRange) {
+	for _, val := range r.Rand.Perm(valRange) {
 		if len(set) >= setSize {
 			break
 		}

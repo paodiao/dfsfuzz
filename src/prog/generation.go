@@ -336,7 +336,7 @@ func (target *Target) GenerateProgsForHmdfsFileops(rs rand.Source, sCalls *Speci
 
 // expandWithDCT inserts further root+variant groups (via insertCallFromDCT)
 // until the average number of calls across all progs in ps reaches a
-// per-seed target (4-8, randomized for corpus diversity) or the round cap.
+// per-seed target (7-10, randomized for corpus diversity) or the round cap.
 // Shared by both the DCT and the pattern generation entry points: fresh-path
 // mkdir/creat preprocessing, fd lifecycle handling and time-aligned variants
 // are inherited from insertCallFromDCT.
@@ -345,14 +345,14 @@ func (r *randGen) expandWithDCT(ps []*Prog, sCalls *SpecialCalls, hmcfg *Hmdfs_c
 	if len(ps) == 0 {
 		return
 	}
-	target := 6 + r.Intn(4) // 6-9
+	target := 7 + r.Intn(4) // 7-10
 	failed := 0
-	for round := 0; round < 6 && failed < 2; round++ {
+	for round := 0; round < 9 && failed < 3; round++ {
 		if avgCalls(ps) >= target {
 			break
 		}
 		if !insertCallFromDCT(ps, r, nil, sCalls, hmcfg, lcs, seedType) {
-			failed++ // ct is a dead parameter (unused inside); stop after 2 consecutive failures
+			failed++ // ct is a dead parameter (unused inside); stop after 3 consecutive failures
 			continue
 		}
 		failed = 0

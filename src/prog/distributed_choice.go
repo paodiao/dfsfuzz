@@ -1270,8 +1270,8 @@ type DistributedChoiceTable struct {
 	// causal (HB) form is to produce the corresponding DAG pair. Initialized
 	// lazily to 50/50; updated by feedback from the actually produced pair
 	// temporal (see UpdateTemporalWeight). Independent of the direction-1/2
-	// mechanisms: HB pairs only update these weights, they never mark a combo
-	// explored.
+	// mechanisms: produced pairs only update these weights (and pair
+	// statistics); they never drive direction 1/2.
 	TemporalWeights map[string]map[CallVariant]TemporalWeight
 
 	seedType string
@@ -1286,12 +1286,14 @@ type TemporalWeight struct {
 
 const temporalInitWeight = 1
 
-// Direction-2 parameters: after noYieldThreshold consecutive selections
-// without yielding new signal, a combo loses noYieldDelta weight (only while
-// its weight exceeds noYieldDelta, so the effective floor is noYieldDelta+1).
-// maxComboWeight caps the MarkYield reward (defensive symmetric counterpart).
+// Direction-2 parameters: after noYieldThreshold consecutive failed
+// insertion attempts without new DAG feedback, a combo loses noYieldDelta
+// weight (only while its weight exceeds noYieldDelta, so the effective floor
+// is noYieldDelta+1). The same threshold bounds a never-explored combo's
+// exploration budget in chooseVariant. maxComboWeight caps the MarkYield
+// reward (defensive symmetric counterpart).
 const (
-	noYieldThreshold = 20
+	noYieldThreshold = 10
 	noYieldDelta     = 5
 	maxComboWeight   = 100
 )
@@ -1521,7 +1523,6 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 		}
 	}
 
-	dct.noYieldTick(rootCall, *picked)
 	return picked
 }
 
@@ -1759,6 +1760,19 @@ type LayeredChoiceStrategy struct {
 	// Per-VM TSC offsets for normalizing call timing across VMs when
 	// aligning concurrent insertions by execution time.
 	tscoffs []int64
+
+	// PendingInserts records the (root, variant) combos of the most recent
+	// insertion mutation. The fuzzer resolves them after the following
+	// execution (reward when the execution yields new DAG feedback, one
+	// no-yield attempt otherwise) and then clears the list.
+	PendingInserts []InsertedCombo
+}
+
+// InsertedCombo is one (root, variant) DCT combo actually inserted by the
+// most recent insertion mutation(s).
+type InsertedCombo struct {
+	Root    string
+	Variant CallVariant
 }
 
 func NewLayeredChoiceStrategy(seedType string, hmcfg *Hmdfs_config, target *Target) *LayeredChoiceStrategy {
@@ -1895,6 +1909,16 @@ func (lcs *LayeredChoiceStrategy) availableRelationsForBase(basePath string) map
 // reset.
 func (lcs *LayeredChoiceStrategy) MarkYield(rootCallName string, variant CallVariant) {
 	lcs.GetDCT().MarkYield(rootCallName, variant)
+}
+
+// TickNoYield records one no-yield attempt for the combo (bumps the
+// consecutive counter, down-weights at the threshold). Called by the fuzzer
+// after an execution with no new DAG feedback for the pending combos.
+func (lcs *LayeredChoiceStrategy) TickNoYield(rootCallName string, variant CallVariant) {
+	dct := lcs.GetDCT()
+	dct.mu.Lock()
+	defer dct.mu.Unlock()
+	dct.noYieldTick(rootCallName, variant)
 }
 
 // UpdateTemporalWeight propagates the actually produced pair temporal into the

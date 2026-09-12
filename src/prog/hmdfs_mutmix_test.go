@@ -15,14 +15,16 @@ func TestMutateMixForSize(t *testing.T) {
 		// Tiny band (1-3): insertion dominates, group removal disabled.
 		{1, 85, 5, 0, 10},
 		{3, 85, 5, 0, 10},
-		// Grow band (4-10).
+		// Grow band (4-11).
 		{4, 60, 10, 5, 25},
 		{10, 60, 10, 5, 25},
-		// Peak band (11-15).
-		{11, 35, 25, 10, 30},
+		{11, 60, 10, 5, 25},
+		// Peak band (12-16).
+		{12, 35, 25, 10, 30},
 		{15, 35, 25, 10, 30},
-		// Shrink band (16+, up to the cap of 20).
-		{16, 10, 40, 20, 30},
+		{16, 35, 25, 10, 30},
+		// Shrink band (17+, up to the cap of 20).
+		{17, 10, 40, 20, 30},
 		{20, 10, 40, 20, 30},
 		// Beyond the cap (defensive: callers clamp via fallback).
 		{21, 10, 40, 20, 30},
