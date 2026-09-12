@@ -328,7 +328,7 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 }
 
 func (proc *Proc) loop() {
-	generatePeriod := 100
+	generatePeriod := 20
 	if proc.fuzzer.config.Flags&ipc.FlagSignal == 0 {
 		// If we don't have real coverage signal, generate programs more frequently
 		// because fallback signal is weak.
@@ -688,7 +688,7 @@ func getAllSignalAndCover(p *prog.Prog, info *ipc.ProgInfo) (signals signal.Sign
 	return
 }
 
-const smashIterations = 20 // was 25: smash mutations run long -- fewer iterations free main-loop time and bound backlog work
+const smashIterations = 25 // upstream-aligned (pkg/fuzzer smashJob iters=25)
 
 func (proc *Proc) smashInput(item *WorkSmash) {
 	if proc.fuzzer.comparisonTracingEnabled && item.call != -1 {

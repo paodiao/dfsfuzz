@@ -560,3 +560,12 @@ if proc.fuzzer.config.EnableDagScheduleFb &&
 **范围**：`GeneralFailPos` 路径作用于 hmdfs stash fallback；`SrvFailPos` 仅非 hmdfs（带 server 的 DFS；hmdfs srvNum=0 时恒空——`RandomInsertFailure` 提前返回、`genNodeCombs(0)/genEdgeCombs(0,·)` 为空）。
 
 **测试**：`TestRefreshGeneralFailPos`（位置重建）与 `TestMutateSrvFailPosConsistency`（hasFail=true 多次 Mutate 后条目与 sync 调用一一对应的不变量）。
+
+---
+
+## 30. 上游对齐：生成周期与 smash 轮数（已实施）
+
+**位置**：`src/syz-fuzzer/proc.go`
+**改动**：`generatePeriod` 100 → 20（生成占比 1% → 5%；弱信号 `=2` 覆盖保留）；`smashIterations` 20 → 25。
+**依据**：上游 2024 重构后 `pkg/fuzzer/fuzzer.go` `genFuzz()` 用 `mutateRate = 0.95`（≡ 1/20）；`pkg/fuzzer/job.go` `smashJob.run` `const iters = 25`；且上游 smash 同样只对新增 corpus 条目触发（`ProgSmashed` 门），与本仓库 `added && !ProgSmashed` 同构。
+**A/B**：back 基线为 generatePeriod=100、smash=100 且每个 triage 条目都砸——本改动属我们侧"上游对齐"批次，已计入与 back 的刻意差异清单。
