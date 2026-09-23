@@ -10,6 +10,20 @@ import fault_model
 from utils import zero_terminiated_str,check_W_perm,check_R_perm
 from checker import _print_hex
 
+
+def _check_emul_size(end):
+    """Abort the round instead of materializing an over-sized emulated file.
+
+    A fuzzed program can issue pwrite/truncate/fallocate at multi-GiB offsets.
+    The real file system stores that as a sparse file, but this emulator keeps
+    file contents as flat strings; materializing such a file would exhaust
+    memory and stall the checker.  The raised exception is caught by
+    monarch_emul.py, which exits 0 so the Go side skips the check.
+    """
+    if end > c.MAX_EMUL_FILE_SIZE:
+        raise c.EmulationTooLarge(end)
+
+
 # ERROR CODE
 ERR_ARG = 0x01
 ERR_OBJ = 0x02
@@ -1698,6 +1712,8 @@ str(inode.name)))
             print("[-] error in offset or length")
         return 1
 
+    _check_emul_size(offset + length)
+
     if default: # POSIX
         if offset + length > inode.size:
             old_size = inode.size
@@ -2072,6 +2088,8 @@ buf_var, c.BUF_SIZE))
 nbyte, buf_var, inode.name))
         return 0
 
+    _check_emul_size(cur_offset + nbyte)
+
     if nbyte > buf_size:
         # when nbyte is larger than the size of buffer,
         # the contents of buffer will be first written to the file (beginning
@@ -2184,6 +2202,8 @@ buf_var))
             print("[+] Pwrote {0} bytes from buffer {1} to offset {2} of file {3}"\
 .format(nbyte, buf_var, offset, inode.name))
         return 0
+
+    _check_emul_size(offset + nbyte)
 
     if nbyte > buf_size:
         # when nbyte is larger than the size of buffer,
@@ -2376,6 +2396,8 @@ def truncate(argv):
             print("[-] Cannot truncate non-regular file {0}".format(path))
         return 1
 
+    _check_emul_size(length)
+
     _unsync_inode_by_id(id)
 
     inode = c.MEM[id]
@@ -2445,6 +2467,8 @@ str(inode.name)))
         return 1
 
     length = int(argv[1])
+
+    _check_emul_size(length)
 
     _unsync_inode_by_id(inode.id)
 

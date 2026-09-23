@@ -180,15 +180,36 @@ def check_symlink(inode, entry, ret_on_err=0, print_err=1):
 
 def check_data(inode, entry, ret_on_err=0, print_err=1):
     global BTRFS_ERRSTR
-    if int(entry[c.IDX_FTYPE]) == c.FILE:
+    # Pre-existing inodes (initial file tree) have unknown contents: only the
+    # subset's metadata is materialized, so their data is not comparable (same
+    # rationale as the is_init skips in the read/getdents handlers).
+    if getattr(inode, "is_init", 0):
         return 0
-    if inode.size > len(inode.datablock.data):
-        effective_data = inode.datablock.data + "\x00"*(len(inode.datablock.data) - inode.size)
-    else:
-        effective_data = inode.datablock.data
+    # Only regular files carry a content checksum in the runtime snapshot: the
+    # executor computes the CRC for S_ISREG only, so directories, symlinks and
+    # fifos always report 0 and must not be compared here. (IDX_FTYPE holds
+    # conc-fs.go's type_converted: 1=REG, 2=DIR, 3=LNK, 4=FIFO.)
+    if entry[c.IDX_FTYPE] != "1":
+        return 0
+    # Skip files at or beyond the emulation size cap: checksumming them is not
+    # worth the memory/time, and the runtime-side checksum still covers
+    # content integrity for the cross-node check.
+    if inode.size > c.MAX_EMUL_FILE_SIZE or len(inode.datablock.data) > c.MAX_EMUL_FILE_SIZE:
+        if c.verbose:
+            print("skip data check for large file", inode.name, inode.size)
+        return 0
 
-    crc_emul = binascii.crc32(effective_data.encode()) & 0xFFFFFFFF
-    datahex = map(lambda c: hex(ord(c)), effective_data)
+    data = inode.datablock.data
+    crc_emul = binascii.crc32(data.encode()) & 0xFFFFFFFF
+    # Zero-fill up to the emulated size without materializing the padding
+    # (files can be sparse); feed crc32 in bounded chunks.
+    pad = inode.size - len(data)
+    if pad > 0:
+        zeros = b"\x00" * min(pad, 1 << 20)
+        while pad > 0:
+            n = min(pad, len(zeros))
+            crc_emul = binascii.crc32(zeros[:n], crc_emul)
+            pad -= n
     try:
         crc_crash = int(entry[c.IDX_DATACHKSUM])
     except IndexError:

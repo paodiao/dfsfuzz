@@ -8,6 +8,18 @@ import common as c
 
 (_ROOT, _DEPTH, _BREADTH) = range(3)
 
+# Cap on emulated file materialization: beyond this, symsc aborts the round
+# instead of materializing huge sparse files (e.g., pwrite at a multi-GiB
+# offset), which would otherwise exhaust memory and stall the checker.
+MAX_EMUL_FILE_SIZE = 64 << 20  # 64 MiB
+# Watchdog budget for a single symsc run (seconds); see monarch_emul.py.
+SYMSC_TIME_BUDGET_SEC = 120
+
+
+class EmulationTooLarge(Exception):
+    pass
+
+
 class Node:
     '''
     tup: (inode id, inode name)

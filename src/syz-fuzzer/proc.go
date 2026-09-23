@@ -1247,6 +1247,14 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				newPairs := filterNewDagPairs(info, newBits)
 				proc.feedbackDagPairs(newPairs)
 				proc.countDagDepth(newPairs)
+				var newRetCombos [6][6]int
+				for _, p := range newPairs {
+					if p.A != nil && p.B != nil {
+						newRetCombos[int(p.A.RetBucket)][int(p.B.RetBucket)]++
+					}
+				}
+				appendDiagLog("hmdfs dag novel: idx=%d bits=%d pairs=%d newRet=[%s]",
+					idx, n, len(newPairs), dagRetComboString(newRetCombos))
 			}
 			if proc.fuzzer.config.EnableDagScheduleFb &&
 				proc.fuzzer.checkNewDagSchedule(info.DagScheduleBit) > 0 {
@@ -1417,7 +1425,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			proc.fuzzer.config.InitIp, testdirIno, proc.hmcfg.FileTree)
 		if !csanPassed {
 			log.Logf(0, "Concurrent semantic checker detects a bug")
-			proc.saveCsanBug(ps, output, csanDiffs, fsMds, stat)
+			proc.saveCsanBug(ps, output, csanDiffs, fsMds, stat, infos)
 			// The file tree across nodes is now inconsistent; continuing to
 			// fuzz on it would poison later executions. Exit cleanly so that
 			// the manager stops all VMs and restarts the whole group — qemu
@@ -1437,7 +1445,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		}
 		if clientIdx >= proc.fuzzer.config.ServNum {
 			ownerMap := collectCreateCallOwners(ps, infos, proc.hmcfg.Cids, &proc.hmcfg)
-			prog.SyncFileTreeFromFsMd(fsMds[clientIdx], ownerMap, &proc.hmcfg)
+			prog.SyncFileTreeFromFsMd(prog.CanonicalizeFsMd(fsMds[clientIdx]), ownerMap, &proc.hmcfg)
 		}
 	}
 
@@ -1470,6 +1478,10 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			dagDiag.MatchDistIn, dagDiag.MatchDistOut, prog.MfTolTicks(),
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
 			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
+		appendDiagLog("hmdfs dag marg: ret=%v err=[%s] dep=%v off=%v persist=%v type=%v retFunc=[%s] pairRet=[%s]",
+			dagDiag.RetHist, dagErrHistString(dagDiag.ErrHist), dagDiag.DepthHist, dagDiag.OffHist,
+			dagDiag.PersistHist, dagDiag.TypeHist,
+			dagRetFuncString(dagDiag.RetByFunc), dagRetComboString(dagDiag.PairRetCombos))
 		if len(dagDiag.MFSamples) > 0 {
 			samples := ""
 			for i, s := range dagDiag.MFSamples {
@@ -1517,11 +1529,65 @@ func appendDiagLog(format string, args ...interface{}) {
 		time.Now().Format("2006/01/02 15:04:05"), fmt.Sprintf(format, args...))
 }
 
+// dagErrHistString renders the negative-ret histogram (index = -ret-1) as
+// ascending "-errno:count" entries, zero cells omitted ("" when all zero).
+func dagErrHistString(h [64]int) string {
+	s := ""
+	for i, c := range h {
+		if c == 0 {
+			continue
+		}
+		if s != "" {
+			s += ","
+		}
+		s += fmt.Sprintf("-%d:%d", i+1, c)
+	}
+	return s
+}
+
+// dagRetFuncString renders nonzero (funcID x retBucket):count entries in
+// ascending func/ret order ("" when none).
+func dagRetFuncString(m [16][6]int) string {
+	s := ""
+	for f := range m {
+		for r := range m[f] {
+			c := m[f][r]
+			if c == 0 {
+				continue
+			}
+			if s != "" {
+				s += ","
+			}
+			s += fmt.Sprintf("%dx%d:%d", f, r, c)
+		}
+	}
+	return s
+}
+
+// dagRetComboString renders nonzero (retA x retB):count pair-combo entries in
+// ascending order ("" when none).
+func dagRetComboString(m [6][6]int) string {
+	s := ""
+	for a := range m {
+		for b := range m[a] {
+			c := m[a][b]
+			if c == 0 {
+				continue
+			}
+			if s != "" {
+				s += ","
+			}
+			s += fmt.Sprintf("%dx%d:%d", a, b, c)
+		}
+	}
+	return s
+}
+
 // saveCsanBug dumps everything needed to locate/reproduce/analyze a
 // consistency failure: the seeds of all nodes, the raw executor output, the
 // differences and the involved files' full metadata.
 func (proc *Proc) saveCsanBug(ps []*prog.Prog, output []byte, diffs []string,
-	fsMds []map[string]prog.FileMetadata, stat Stat) {
+	fsMds []map[string]prog.FileMetadata, stat Stat, infos []*ipc.ProgInfo) {
 	log.Logf(0, "==== CSAN BUG detected (stat=%v) ====", stat)
 	log.Logf(0, "HasNetFail=%v HasCrashFail=%v", ps[0].HasNetFail, ps[0].HasCrashFail)
 	for i, p := range ps {
@@ -1549,6 +1615,15 @@ func (proc *Proc) saveCsanBug(ps []*prog.Prog, output []byte, diffs []string,
 	for i, p := range ps {
 		progData = append(progData, fmt.Sprintf("node %d:\n", i)...)
 		progData = append(progData, p.Serialize()...)
+		if i < len(infos) && infos[i] != nil {
+			for j, ci := range infos[i].Calls {
+				name := ""
+				if j < len(p.Calls) {
+					name = p.Calls[j].Meta.Name
+				}
+				progData = append(progData, fmt.Sprintf("  call[%d] %s errno=%d flags=%d\n", j, name, ci.Errno, ci.Flags)...)
+			}
+		}
 	}
 	outData = output
 	for _, d := range diffs {
@@ -1578,6 +1653,47 @@ func (proc *Proc) saveCsanBug(ps []*prog.Prog, output []byte, diffs []string,
 			log.Logf(0, "saveCsanBug: write %v failed: %v", name, err)
 		}
 	}
+	cfg := proc.fuzzer.config
+	var wg sync.WaitGroup
+	for i := 0; i < cfg.FuzzingVMs && i < len(cfg.Executor); i++ {
+		fields := strings.Fields(cfg.Executor[i])
+		hostIdx := -1
+		for k, f := range fields {
+			if strings.Contains(f, "@") && !strings.HasPrefix(f, "-") &&
+				!strings.Contains(f, "/") {
+				hostIdx = k
+				break
+			}
+		}
+		if hostIdx < 0 {
+			continue
+		}
+		prefix := fields[:hostIdx+1]
+		captures := []struct {
+			name string
+			cmd  string
+		}{
+			{fmt.Sprintf("node%d-agent.log", i), "cat /home/hmdfs_agent/hmdfs_agent.log"},
+			{fmt.Sprintf("node%d-dmesg.txt", i), "dmesg | grep -i hmdfs | tail -n 300"},
+		}
+		for _, c := range captures {
+			c, prefix := c, prefix
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				args := append(append([]string{}, prefix[1:]...), c.cmd)
+				out, err := osutil.RunCmd(15*time.Second, "", prefix[0], args...)
+				if err != nil {
+					log.Logf(0, "saveCsanBug: capture %s failed: %v", c.name, err)
+					return
+				}
+				if err := osutil.WriteFile(filepath.Join(dir, c.name), out); err != nil {
+					log.Logf(0, "saveCsanBug: write %s failed: %v", c.name, err)
+				}
+			}()
+		}
+	}
+	wg.Wait()
 	log.Logf(0, "saveCsanBug: saved to %v", dir)
 }
 

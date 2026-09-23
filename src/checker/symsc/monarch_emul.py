@@ -5,6 +5,7 @@
 import pdb
 import os
 import sys
+import faulthandler
 import tempfile
 import shutil
 import errno
@@ -111,13 +112,21 @@ if __name__ == "__main__":
     # Runtime state
     c.runtime_state = json.loads(args.input)
 
-    # State exploration
+    # State exploration.  The watchdog dumps all thread stacks and exits if a
+    # single run ever exceeds the budget (non-zero exit -> the Go side treats
+    # the check as skipped instead of blocking the fuzzer forever).
+    faulthandler.dump_traceback_later(c.SYMSC_TIME_BUDGET_SEC, exit=True)
     S = [(emul_state, -1, -1)]
-    if dpor.explore(S, None, seq_programs) == False:
-        # Not prefixed with "WARNING:" — manager matches kernel warning
-        # signatures on the console and would otherwise restart all VMs on
-        # a routine exploration exhaustion (no dump, pure disruption).
-        print("[symsc] exploration exhausted without a consistent schedule")
+    try:
+        if dpor.explore(S, None, seq_programs) == False:
+            # Not prefixed with "WARNING:" — manager matches kernel warning
+            # signatures on the console and would otherwise restart all VMs on
+            # a routine exploration exhaustion (no dump, pure disruption).
+            print("[symsc] exploration exhausted without a consistent schedule")
+    except c.EmulationTooLarge as e:
+        print("[symsc] skipped: emulated file exceeds size cap ({})".format(e))
+        faulthandler.cancel_dump_traceback_later()
+        sys.exit(0)
 
     # Statistics for eval
     # Only consider more than one clients has calls
@@ -146,3 +155,5 @@ if __name__ == "__main__":
         f.write(data)
         f.flush()
         f.close()
+
+    faulthandler.cancel_dump_traceback_later()

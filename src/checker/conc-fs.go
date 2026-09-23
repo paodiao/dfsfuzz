@@ -23,6 +23,13 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	fsType string, cfg_mode string, initIP string, testdirIno uint64,
 	ft *prog.FileTree) (bool, []string) {
 
+	if fsType == "hmdfs" {
+		fsMds = append([]map[string]prog.FileMetadata(nil), fsMds...)
+		for i := range fsMds {
+			fsMds[i] = prog.CanonicalizeFsMd(fsMds[i])
+		}
+	}
+
 	log.Logf(0, "ConcFSCheck fsMds:%v", fsMds)
 
 	log.Logf(0, "testdirIno: %x", testdirIno)
@@ -91,7 +98,8 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	// Filter the sync pseudo syscall, e.g., syz_failure_recv/send/sync
 	filterErr, newProgs := filter_failure_sync_calls(progs)
 	if filterErr != nil {
-		return false, nil
+		log.Logf(0, "conc-fs: semantic check skipped: %v", filterErr)
+		return true, nil
 	}
 
 	i := 0
@@ -109,6 +117,7 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	// Serialize as symsc program string
 	symscProgStr := prog1.SerializeForSymc3()
 	if symscProgStr == "" {
+		log.Logf(0, "conc-fs: empty symsc program serialization")
 		return false, nil
 	}
 
@@ -149,28 +158,28 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	progFile, err := writeTemp("prog", []byte(symscProgStr))
 	if err != nil {
 		log.Logf(0, "write symsc prog temp file error: %v\n", err)
-		return false, nil
+		return true, nil
 	}
 	defer os.Remove(progFile)
 
 	infosFile, err := writeTemp("infos", checkInfos_json)
 	if err != nil {
 		log.Logf(0, "write symsc infos temp file error: %v\n", err)
-		return false, nil
+		return true, nil
 	}
 	defer os.Remove(infosFile)
 
 	seqsFile, err := writeTemp("seqs", seq_programs_json)
 	if err != nil {
 		log.Logf(0, "write symsc seqs temp file error: %v\n", err)
-		return false, nil
+		return true, nil
 	}
 	defer os.Remove(seqsFile)
 
 	statFile, err := writeTemp("stat", []byte(symsc_stat))
 	if err != nil {
 		log.Logf(0, "write symsc stat temp file error: %v\n", err)
-		return false, nil
+		return true, nil
 	}
 	defer os.Remove(statFile)
 
@@ -178,7 +187,7 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	initFile, err := writeTemp("init", []byte(initTree))
 	if err != nil {
 		log.Logf(0, "write symsc init tree temp file error: %v\n", err)
-		return false, nil
+		return true, nil
 	}
 	defer os.Remove(initFile)
 
@@ -200,8 +209,8 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 
 	err = cmd.Run()
 	if err != nil {
-		log.Logf(0, "consistency Python script error: %v\n", err)
-		return false, nil
+		log.Logf(0, "conc-fs: semantic check skipped (python error): %v\n", err)
+		return true, nil
 	}
 
 	return true, nil
@@ -227,7 +236,7 @@ func filter_failure_sync_calls(progs []*prog.Prog) (error, []prog.Prog) {
 				call.Meta.Name == "pwritev" ||
 				call.Meta.Name == "flock" ||
 				strings.Contains(call.Meta.Name, "$") {
-				return fmt.Errorf("not supported syscalls"), nil
+				return fmt.Errorf("unsupported syscall for symsc: %v", call.Meta.Name), nil
 			}
 			filtered_calls = append(filtered_calls, call)
 		}

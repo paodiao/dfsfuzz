@@ -1112,6 +1112,109 @@ static void wait_hmdfs_agent_ready() {
 #endif
 }
 
+#define HMDFS_DEVICE_VIEW_PATH "/mnt/hmdfs/100/non_account/device_view"
+#define HMDFS_CID_MAX 128
+#define HMDFS_STAGGER_MS 3000
+#define HMDFS_STARTUP_EXTRA_MS 30000
+// Post-online settle: the kernel runs its async online callbacks (stash
+// prepare/restore) after a fixed async_cb_delay (default 2s); give it margin
+// before the first program starts.
+#define HMDFS_SETTLE_MS 3000
+
+static int64_t hmdfs_startup_timeout_ms(void) {
+  if (vm_count <= 1)
+    return HMDFS_STARTUP_EXTRA_MS;
+  return (int64_t)(vm_count - 1) * HMDFS_STAGGER_MS + HMDFS_STARTUP_EXTRA_MS;
+}
+
+static bool hmdfs_device_view_has(const char *cid) {
+  DIR *dp = opendir(HMDFS_DEVICE_VIEW_PATH);
+  if (!dp)
+    return false;
+  bool found = false;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL) {
+    if (!strcmp(de->d_name, cid)) {
+      found = true;
+      break;
+    }
+  }
+  closedir(dp);
+  return found;
+}
+
+static void wait_hmdfs_peers_ready(void) {
+  if (strcmp(dfs_name, "hmdfs"))
+    return;
+  if (vm_count <= 1 || vm_count > 64)
+    return;
+  if (!dfs_setup_params) {
+    fprintf(stderr, "executor %lld: no dfs_setup_params for hmdfs peers check\n",
+            executor_index);
+    return;
+  }
+
+  char params[4096];
+  snprintf(params, sizeof(params), "%s", dfs_setup_params);
+  char *sp = strchr(params, ' ');
+  if (!sp) {
+    fprintf(stderr,
+            "executor %lld: cannot parse cids from dfs_setup_params\n",
+            executor_index);
+    return;
+  }
+  char *cids = sp + 1;
+
+  char peers[64][HMDFS_CID_MAX];
+  int npeers = 0;
+  int idx = 0;
+  char *p = cids;
+  while (p && *p && idx < 64) {
+    char *semi = strchr(p, ';');
+    size_t len = semi ? (size_t)(semi - p) : strlen(p);
+    if ((uint64_t)idx != executor_index) {
+      if (len >= HMDFS_CID_MAX)
+        len = HMDFS_CID_MAX - 1;
+      memcpy(peers[npeers], p, len);
+      peers[npeers][len] = 0;
+      npeers++;
+    }
+    idx++;
+    p = semi ? semi + 1 : NULL;
+  }
+  if (npeers == 0) {
+    fprintf(stderr, "executor %lld: no peer cids parsed from dfs_setup_params\n",
+            executor_index);
+    return;
+  }
+
+  if (vm_count - 1 > executor_index)
+    usleep((unsigned int)((vm_count - 1 - executor_index) * HMDFS_STAGGER_MS *
+                          1000));
+
+  for (int round = 0; round < 3; round++) {
+    char missing[1024] = {0};
+    int nmissing = 0;
+    for (int i = 0; i < npeers; i++) {
+      if (!hmdfs_device_view_has(peers[i])) {
+        nmissing++;
+        if (strlen(missing) + strlen(peers[i]) + 2 < sizeof(missing))
+          snprintf(missing + strlen(missing),
+                   sizeof(missing) - strlen(missing), " %s", peers[i]);
+      }
+    }
+    if (nmissing == 0)
+      return;
+    if (round < 2)
+      sleep(3);
+    else
+      fprintf(stderr,
+              "executor %lld: hmdfs peers not ready after 3 checks "
+              "(device_view=%s), missing:%s\n",
+              executor_index, HMDFS_DEVICE_VIEW_PATH, missing);
+  }
+}
+
 void reconfigure_dfs() {
 
 // wait servers before current node are already setupped
@@ -1319,6 +1422,30 @@ void receive_handshake() {
   fprintf(stderr, "executor %lld before receiving handshake request\n", executor_index);
 #endif
 
+  bool hmdfs_barrier =
+      !strcmp(dfs_name, "hmdfs") && vm_count > 1 && vm_count <= 64;
+  uint64_t all_mask = 0;
+  if (hmdfs_barrier)
+    all_mask = vm_count == 64 ? ~((uint64_t)0)
+                              : ((((uint64_t)1) << vm_count) - 1);
+  int64_t sync_timeout_ms = hmdfs_startup_timeout_ms();
+  if (hmdfs_barrier) {
+    sync_lock();
+    execCtl->srvSetupBit |= ((uint64_t)1) << executor_index;
+    sync_unlock();
+    int64_t waited = 0;
+    while ((execCtl->srvSetupBit & all_mask) != all_mask) {
+      usleep(1000);
+      if (++waited >= sync_timeout_ms) {
+        fprintf(stderr,
+                "executor %lld: startup barrier all-set timeout, "
+                "srvSetupBit=%llx\n",
+                executor_index, (unsigned long long)execCtl->srvSetupBit);
+        break;
+      }
+    }
+  }
+
   // mount dfs and chdir
   // For hmdfs every node runs the config script (it mounts its own hmdfs
   // instance and starts the local agent), and the node index is passed so the
@@ -1347,6 +1474,30 @@ void receive_handshake() {
   // Agent (hmdfs) was started in the background by the config script; wait
   // for it to finish starting before the fuzzer begins executing programs.
   wait_hmdfs_agent_ready();
+
+  if (hmdfs_barrier) {
+    wait_hmdfs_peers_ready();
+    // Kernel post-online async phase (stash prepare/restore) runs after a
+    // fixed async_cb_delay (default 2s).  Only the highest-index executor
+    // waits here; the all-clear wait below holds everyone else, so the group
+    // starts after the settle without N redundant sleeps.
+    if (executor_index == vm_count - 1)
+      usleep(HMDFS_SETTLE_MS * 1000);
+    sync_lock();
+    execCtl->srvSetupBit &= ~(((uint64_t)1) << executor_index);
+    sync_unlock();
+    int64_t waited = 0;
+    while (execCtl->srvSetupBit & all_mask) {
+      usleep(1000);
+      if (++waited >= sync_timeout_ms) {
+        fprintf(stderr,
+                "executor %lld: startup barrier all-clear timeout, "
+                "srvSetupBit=%llx\n",
+                executor_index, (unsigned long long)execCtl->srvSetupBit);
+        break;
+      }
+    }
+  }
 
   // change to work dir
   // server:/root, client:/root/dfs-client

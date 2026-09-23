@@ -396,6 +396,12 @@ func main() {
 		log.Logf(0, "fetching corpus: %v, signal %v/%v/%v (executing program)",
 			len(fuzzer.corpus), len(fuzzer.corpusCliSignal), len(fuzzer.corpusSrvSignal), len(fuzzer.maxSignal))
 	}
+	// Dedup-set sync check: after the corpus pump (each Poll delivers up to
+	// 2000 global DAG bits) and before any Proc starts, record how many bits
+	// the local maxDagSignal holds. Offline, compare with the manager's
+	// dagPairs at the same time: localMax ~= dagPairs proves the local set was
+	// fully synced before the first execution (no restart double counting).
+	appendDiagLog("dag sync: localMax=%d corpus=%d", fuzzer.maxDagSignal.Len(), len(fuzzer.corpus))
 
 	/*
 			tmp := 1

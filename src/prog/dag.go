@@ -137,6 +137,16 @@ type DagDiag struct {
 	CCPairs         int // produced concurrent pairs
 	// ComputeFeedback.
 	PairBitsUnique int // deduplicated pair hash count
+	// Feature marginals of matched vertices / produced pairs (per execution),
+	// emitted to dag.log for offline feature-coverage analysis.
+	RetHist       [6]int     // matched vertices per RetBucket (0..5)
+	ErrHist       [64]int    // negative rets: index = -ret-1 (-1..-64)
+	DepthHist     [4]int     // matched vertices per depth bucket 0..3
+	OffHist       [5]int     // matched vertices per offset bucket 0..4
+	PersistHist   [2]int     // 0 = non-persistence path, 1 = under hmcfg.Persistence_dir
+	TypeHist      [2]int     // 0 = file, 1 = dir
+	RetByFunc     [16][6]int // matched vertices per (FuncID, RetBucket)
+	PairRetCombos [6][6]int  // produced hb+cc pairs per (A.RetBucket, B.RetBucket)
 }
 
 type renameEvent struct {
@@ -371,6 +381,29 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		if int(v.FuncID) < len(diag.PerFuncVertices) {
 			diag.PerFuncVertices[v.FuncID]++
 		}
+		// Feature marginals (see DagDiag), matched vertices only.
+		rb := int(v.RetBucket)
+		if rb >= 0 && rb < len(diag.RetHist) {
+			diag.RetHist[rb]++
+			if int(v.FuncID) < len(diag.RetByFunc) {
+				diag.RetByFunc[v.FuncID][rb]++
+			}
+		}
+		if ev.Ret < 0 && ev.Ret >= -int32(len(diag.ErrHist)) {
+			diag.ErrHist[-ev.Ret-1]++
+		}
+		diag.DepthHist[int(DepthBucketOf(v.Path))]++
+		diag.OffHist[int(offsetBucketOf(&v))]++
+		if v.IsDir {
+			diag.TypeHist[1]++
+		} else {
+			diag.TypeHist[0]++
+		}
+		if hmcfg != nil && hmcfg.Persistence_dir != "" && strings.HasPrefix(v.Path, hmcfg.Persistence_dir) {
+			diag.PersistHist[1]++
+		} else {
+			diag.PersistHist[0]++
+		}
 		vertices = append(vertices, v)
 		if diag.PerNodeVertices == nil {
 			diag.PerNodeVertices = make([]int, len(ps))
@@ -438,6 +471,19 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 	}
 	diag.HBPairs = len(hbPairs)
 	diag.CCPairs = len(ccPairs)
+	// Ret-bucket combos of produced pairs (the set fed into ComputeFeedback).
+	for i := range hbPairs {
+		p := &hbPairs[i]
+		if p.A != nil && p.B != nil {
+			diag.PairRetCombos[int(p.A.RetBucket)][int(p.B.RetBucket)]++
+		}
+	}
+	for i := range ccPairs {
+		p := &ccPairs[i]
+		if p.A != nil && p.B != nil {
+			diag.PairRetCombos[int(p.A.RetBucket)][int(p.B.RetBucket)]++
+		}
+	}
 	return
 }
 

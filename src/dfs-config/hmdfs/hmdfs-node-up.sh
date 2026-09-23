@@ -7,6 +7,8 @@ node_cnt=${params%% *}
 cids=${params#* }
 cur_idx=$executor_index
 
+sleep $(( ${executor_index:-0} * 3 ))
+
 # 定义源目录和目标挂载点
 SOURCE_DIR="/data/service/el2/100/non_account"
 MOUNT_POINT="/mnt/hmdfs/100/non_account"
