@@ -18,18 +18,17 @@ func Clones(ps []*Prog) []*Prog {
 
 func (p *Prog) Clone() *Prog {
 	p1 := &Prog{
-		Target:   p.Target,
-		Calls:    make([]*Call, len(p.Calls)),
+		Target: p.Target,
+		Calls:  make([]*Call, len(p.Calls)),
 		//IsForSrv: p.IsForSrv,
-		SyncIdx:  p.SyncIdx,
+		SyncIdx:      p.SyncIdx,
 		HasCrashFail: p.HasCrashFail,
-		HasNetFail: p.HasNetFail,
-		IsStash:  p.IsStash,
-		IsDCache: p.IsDCache,
-		IsFileOps: p.IsFileOps,
-		IsInodeOps: p.IsInodeOps,
-		BarrierIdx: p.BarrierIdx,
-		C2test:  p.C2test,
+		HasNetFail:   p.HasNetFail,
+		IsStash:      p.IsStash,
+		IsDCache:     p.IsDCache,
+		IsFsops:      p.IsFsops,
+		BarrierIdx:   p.BarrierIdx,
+		C2test:       p.C2test,
 	}
 
 	//p1.SrvFailPos = [][]int

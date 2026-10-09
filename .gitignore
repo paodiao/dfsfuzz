@@ -13,3 +13,16 @@ fuzzing-dir/beegfs
 dimage-kernel-org
 
 .descriptions
+
+/Monarch-master-bak/
+/hmdfsfuzz*/
+/backbugs/
+/backnewbugs/
+/checker-bak/
+/initialdir/
+/0
+/*.pdf
+/docs/paper-draft.md
+/docs/paper-plan-v1.md
+/docs/seed-optimization-plan.md
+/docs/figs/

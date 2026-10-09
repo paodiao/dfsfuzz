@@ -2,28 +2,31 @@
 
 ## Overview
 
-Monarch uses **eBPF kretprobes** to capture the invocation timeline of all
-merge-view VFS operations inside HMDFS at the **internal function level**,
-plus a **perf tracepoint** (`hmdfs_writepage_cb_exit`) for the asynchronous
-writeback completion path. This provides a behaviour-level feedback signal
-distinct from traditional code coverage, enabling grey-box fuzzing of the
-distributed filesystem's causal structure.
+Monarch uses **eBPF kretprobes plus paired entry kprobes** to capture the
+invocation timeline of all merge-view VFS operations inside HMDFS at the
+**internal function level**, plus a **perf tracepoint**
+(`hmdfs_writepage_cb_exit`) for the asynchronous writeback completion path.
+This provides a behaviour-level feedback signal distinct from traditional
+code coverage, enabling grey-box fuzzing of the distributed filesystem's
+causal structure.
 
 ```
-                         ┌─── BPF handler (kretprobe) ───┐
-                         │  capture:                      │
-  merge_view operation   │    timestamp (TSC ns)         │
-  ────────────────────▶  │    func_id   (which op)       │
+                         ┌─── BPF handlers ──────────────┐
+                         │  entry kprobe (15 funcs):     │
+  merge_view operation   │    pos/size/ino/i_mode        │
+  ────────────────────▶  │    dentry ptr for mkdir/      │
+                         │    create/rename/lookup       │
+  e.g. mkdir, write,     │  kretprobe:                   │
+  open, unlink, ...      │    timestamp (TSC ns)         │
+                         │    func_id   (which op)       │
                          │    ret       (success/fd/errno)│
-  e.g. mkdir, write,     │    ino       (target inode)   │
-  open, unlink, ...      │    args[6]   (raw registers)  │
-                         │    off       (ki_pos/ia_size) │
+                         │    + entry-state map fields   │
                          └──────────┬─────────────────────┘
                                     │
                          ┌──────────▼─────────────────────┐
                          │   BPF ring buffer (256 KB)      │
-                         │   lock-free, per-CPU, ~3200     │
-                         │   events capacity (80 B each)   │
+                         │   lock-free, per-CPU, ~2500     │
+                         │   events capacity (104 B each)  │
                          └──────────┬─────────────────────┘
                                     │
                          ┌──────────▼─────────────────────┐
@@ -44,38 +47,63 @@ distributed filesystem's causal structure.
 
 | ID | Function | Source | Description |
 |:--:|----------|--------|-------------|
-| 0  | hmdfs_mkdir_merge       | BPF kretprobe | Create directory |
-| 1  | hmdfs_create_merge      | BPF kretprobe | Create regular file |
-| 2  | hmdfs_rmdir_merge       | BPF kretprobe | Remove directory |
-| 3  | hmdfs_unlink_merge      | BPF kretprobe | Remove regular file |
-| 4  | hmdfs_rename_merge      | BPF kretprobe | Rename file/directory |
-| 5  | hmdfs_merge_write_iter  | BPF kretprobe | Write data |
-| 6  | hmdfs_merge_read_iter   | BPF kretprobe | Read data |
-| 7  | hmdfs_file_open_merge   | BPF kretprobe | Open regular file |
-| 8  | hmdfs_dir_open_merge    | BPF kretprobe | Open directory |
-| 9  | hmdfs_getattr_merge     | BPF kretprobe | Get file attributes (stat) |
-| 10 | hmdfs_setattr_merge     | BPF kretprobe | Set file attributes (truncate, chmod) |
-| 11 | hmdfs_fsync_local       | BPF kretprobe | Flush file data (called by merge) |
-| 12 | hmdfs_file_release_local| BPF kretprobe | Close file (called by merge) |
-| 13 | hmdfs_lookup_merge      | BPF kretprobe | Lookup directory entry |
-| 14 | hmdfs_iterate_merge     | BPF kretprobe | Read directory entries (getdents) |
+| 0  | hmdfs_mkdir_merge       | BPF kretprobe + entry kprobe | Create directory (entry dentry) |
+| 1  | hmdfs_create_merge      | BPF kretprobe + entry kprobe | Create regular file (entry dentry) |
+| 2  | hmdfs_rmdir_merge       | BPF kretprobe + entry kprobe | Remove directory |
+| 3  | hmdfs_unlink_merge      | BPF kretprobe + entry kprobe | Remove regular file |
+| 4  | hmdfs_rename_merge      | BPF kretprobe + entry kprobe | Rename file/directory (new dentry) |
+| 5  | hmdfs_merge_write_iter  | BPF kretprobe + entry kprobe | Write data (entry pos/size) |
+| 6  | hmdfs_merge_read_iter   | BPF kretprobe + entry kprobe | Read data (entry pos/size) |
+| 7  | hmdfs_file_open_merge   | BPF kretprobe + entry kprobe | Open regular file |
+| 8  | hmdfs_dir_open_merge    | BPF kretprobe + entry kprobe | Open directory |
+| 9  | hmdfs_getattr_merge     | BPF kretprobe + entry kprobe | Get file attributes (stat) |
+| 10 | hmdfs_setattr_merge     | BPF kretprobe + entry kprobe | Set file attributes (truncate, chmod; entry size) |
+| 11 | hmdfs_fsync_local       | BPF kretprobe + entry kprobe | Flush file data (called by merge) |
+| 12 | hmdfs_file_release_local| BPF kretprobe + entry kprobe | Close file (called by merge) |
+| 13 | hmdfs_lookup_merge      | BPF kretprobe + entry kprobe | Lookup directory entry (child dentry) |
+| 14 | hmdfs_iterate_merge     | BPF kretprobe + entry kprobe | Read directory entries (getdents) |
 | 15 | *(writepage_cb)*        | **perf tracepoint** `hmdfs_writepage_cb_exit` | **Async writeback completion** (not a kretprobe) |
 
-### Captured Fields per Event (80 bytes total)
+### Captured Fields per Event (112 bytes total)
 
 | Field     | Size  | Source                  | Description                              |
 |-----------|:-----:|-------------------------|-------------------------------------------|
-| timestamp | u64   | bpf_ktime_get_ns()      | TSC nanoseconds, cross-VM comparable      |
+| timestamp | u64   | bpf_ktime_get_ns()      | TSC nanoseconds at return (window end), cross-VM comparable |
+| entry_ts  | u64   | entry kprobe, bpf_ktime_get_ns() | The event's own execution window is `[entry_ts, timestamp]`; 0 when the entry state was lost |
 | func_id   | u32   | predefined enum         | Which VFS function fired                  |
 | ret       | s32   | PT_REGS_RC (rax)        | Return value: 0=success, <0=-errno, >0=fd |
-| ino       | u64   | BPF_CORE_READ from args | Target inode number (for fsMd matching)   |
-| args[6]   | u64×6 | PT_REGS_PARM1..6        | Raw argument registers (rdi..r9)          |
-| off       | u64   | kiocb->ki_pos / iattr->ia_size | write/read offset; 0 otherwise     |
+| ino       | u64   | entry kprobe            | Target inode read at entry; for mkdir/create/rename/lookup it is the parent (old parent) directory |
+| args[6]   | u64×6 | reserved                | Always 0 — argument registers are not valid at kretprobe time |
+| off       | u64   | entry kprobe            | **START** position: write/read entry ki_pos (O_APPEND resolved to EOF), truncate ia_size; 0 otherwise |
+| size      | u64   | entry kprobe            | **entry-time** file size for write/read/truncate; 0 otherwise |
+| entry_ino | u64   | entry dentry ptr → read at return | The operation's own entry inode: mkdir/create dentry, rename OLD dentry (the moved source inode), lookup child; 0 otherwise |
+| i_mode    | u32   | entry kprobe / entry dentry ptr → read at return | Entry inode mode (raw `i_mode`; the fuzzer masks with `S_IFMT`); 0 when unknown (negative lookup or dropped dentry). For rename the entry value is the **source** inode's type (a rename preserves the type; a fresh destination has no upper inode until VFS's post-rename `d_move`, which runs after the kretprobe), overwritten from `new_dentry` when one is attached |
 
-`off` is captured for `FUNC_WRITE_ITER`/`FUNC_READ_ITER` (kiocb `ki_pos`)
-and `FUNC_SETATTR` (iattr `ia_size` when `ATTR_SIZE` set). It feeds the DAG
-`offsetBucketOf` semantics (same-position vs different-position concurrent
-writes). The struct layout must stay in sync between
+**Why everything is captured at entry.** A kretprobe handler's `pt_regs`
+holds the registers the function body left behind at its return — the kernel
+return trampoline saves the return-time state (`arch/x86/kernel/rethook.c`,
+`kernel/kprobes.c:__kretprobe_trampoline_handler`), so `PT_REGS_PARMx` there
+are leftovers, not arguments. Reading them produced all-zero `entry_ino` and
+fallback offset buckets on the test VM regardless of the kernel's
+`ZERO_CALL_USED_REGS` setting. Therefore every argument-derived field is
+captured by a paired entry kprobe and handed to the return handler through an
+`entry_state` hash map keyed by `(pid_tgid, func_id)` (both values are not
+register-derived at return; func_id is a compile-time constant). The return
+handler uses only the return value (`PT_REGS_RC`), the map, and for
+mkdir/create/rename/lookup a dentry POINTER stored at entry: the operation's
+own entry inode is created (`d_add` in `do_create_merge`/`do_mkdir_merge`) or
+spliced (`d_splice_alias` in `hmdfs_lookup_merge`) during the call, so it is
+read through the stored pointer *after* the function has run. There are no
+inode (`entry_ino`) fallbacks — a missed pairing yields zeros, which the
+`inoFunc` diagnostic in
+`dag marg` reports (`zeroOK` is the capture-failure alarm for successful
+create/mkdir). **Rename stores the old dentry**: its inode still exists at
+kretprobe time (VFS `d_move` runs *after* `hmdfs_rename_merge` returns), so
+`entry_ino` is the moved source inode — the identity the rename vertex needs;
+storing `new_dentry` would have yielded 0 for a fresh destination and the
+replaced (destroyed) inode for an overwrite. The entry kprobe also fills
+`i_mode` from the source dentry, so the event carries the exact type. The
+struct layout must stay in sync between
 `hmdfs_trace.bpf.c` (`struct merge_trace_event`), `hmdfs_trace.cc`
 (`struct hmdfs_event`) and `ipc.go` (`prog.HmdfsTraceEvent`).
 
@@ -155,11 +183,21 @@ layers:
    `client_writeback.c`) → remote `F_WRITEPAGE` → completion callback.
    Small writes may stay in the page cache; writeback is deferred by design.
 
-**Cross-round latency note**: writeback is scheduled with a delay, so a
-completion event may arrive *after* the current round's
-`stop_collect_hmdfs_trace()` — it will be drained (and attributed) in a
-later round. Writepage vertices are built without call-window matching
-(`dag.go`), so the impact of such mis-attribution is limited.
+**Capture-window and CPU scope (corrected 2026-09-28)**: the perf event is
+disabled in `stop_collect_hmdfs_trace` (`PERF_EVENT_IOC_DISABLE`) and only
+re-enabled in `start_hmdfs_trace`, so writeback completions that occur while
+disabled are **lost**, not drained in a later round. The event is opened with
+`pid=-1, cpu=0`, and perf trace/kprobe events are enqueued on the per-CPU
+hlist of their event CPU (`perf_trace_add` → `this_cpu_ptr`; delivery reads
+`this_cpu_ptr(event_call->perf_events)`), so **only CPU0 completions are
+sampled**. The 15 BPF kprobes are unaffected: their programs attach to
+`tp_event->prog_array` (`perf_event_attach_bpf_prog`) and run before the
+per-CPU hlist gate (`kprobe_perf_func` / `kretprobe_perf_func`), i.e. on all
+CPUs. Making writepage all-CPU would require attaching a BPF program to the
+tracepoint instead of raw perf sampling (not implemented). Writepage vertices
+are built without call-window matching (`dag.go`), and writepage does not feed
+DCT/coverage-board/generation (see DAG_KNOWN_ISSUES P7 supplement), so these
+limits affect observation statistics only.
 
 ---
 
@@ -217,7 +255,7 @@ target builds `hmdfs_trace.skel.h` automatically (requires `tools/vmlinux.h`).
 ### `hmdfs_trace.cc` / `hmdfs_trace.h`
 
 ```c
-void init_hmdfs_trace(void);       // load BPF skeleton + attach 15 kretprobes + open writepage perf event
+void init_hmdfs_trace(void);       // load BPF skeleton + attach 15 kretprobes + 15 entry kprobes + open writepage perf event
 void start_hmdfs_trace(void);      // reset collected_count + enable perf event (forked child)
 void stop_collect_hmdfs_trace(void);// drain ring buffers + write count+events + reset for next round (parent)
 ```
@@ -235,8 +273,13 @@ start_hmdfs_trace();                       // ~executor.cc:1705
 stop_collect_hmdfs_trace();                // ~executor.cc:1592
 ```
 
-Serialization (per round, after fsMd): `u32 count` + per event
-`u64 ts, u32 fid, u32 ret, u64 ino, u64 args[6], u64 off` (80 B/event).
+Serialization (per round, after fsMd): header
+`u64 ratio, u64 tsc_offset, u64 best_gap, u32 count`, then per event
+`u64 ts, u32 fid, u32 ret, u64 ino, u64 args[6], u64 off, u64 size,
+u64 entry_ino, u32 i_mode, u64 entry_ts` (108 B/event on the wire; the
+in-kernel event structure is 112 B with padding). `best_gap` is the accepted
+calibration's smallest TSC read gap — an independent bound on the clock
+conversion error, logged by the parser to `parse-dbg.log`.
 
 ---
 
@@ -246,14 +289,17 @@ Serialization (per round, after fsMd): `u32 count` + per event
 
 ```go
 func parseHmdfsTraceEvents(data *[]byte) []prog.HmdfsTraceEvent {
-    // count (u32) prefix, then per event:
-    //   u64 ts, u32 fid, u32 ret, u64 ino, u64 args[6], u64 off
+    // ratio/offset/gap (u64 each) + count (u32) prefix, then per event:
+    //   u64 ts, u32 fid, u32 ret, u64 ino, u64 args[6], u64 off,
+    //   u64 size, u64 entry_ino, u32 i_mode, u64 entry_ts
 }
 ```
 
-`prog.HmdfsTraceEvent` mirrors the 80-byte layout (Timestamp/FuncID/Ret/Ino/
-Args[6]/Off) plus `ProgIdx` filled on the Go side. The parser must stay
-aligned with `stop_collect_hmdfs_trace`'s write order — including `off`.
+`prog.HmdfsTraceEvent` mirrors the 108-byte wire layout (Timestamp/
+FuncID/Ret/Ino/Args[6]/Off/Size/EntryIno/Mode/EntryTs) plus `ProgIdx` filled
+on the Go side. The parser must stay aligned with `stop_collect_hmdfs_trace`'s
+write order. `Args` is reserved and always 0 (arguments are captured before
+the call, not at return).
 
 ### `func_id` → Operation Name Mapping
 
@@ -275,10 +321,15 @@ TSC clocksource, this is derived from the hardware TSC. All QEMU VMs on the
 same host share the same TSC frequency (via `+invtsc` CPU flag).
 
 Each VM has a per-instance TSC offset (read from KVM debugfs at boot),
-passed to the executor as `-TSCOFF` (argv[15]). The executor's
-`tsc_ns_to_global()` converts event timestamps (and per-call window
-timestamps) into one global raw-TSC domain. For happens-before ordering,
-only the relative ordering within the same frequency domain matters.
+passed to the executor as `-TSCOFF` (argv[15]). The offset is fixed for one
+QEMU lifetime and the manager re-reads it on every fuzzer launch; there is no
+in-process refresh. The executor's `tsc_ns_to_global()` (re-anchored every
+round) converts event timestamps — including `entry_ts` — into the global
+raw-TSC domain; call windows stay in raw guest TSC and the Go side subtracts
+the same per-node tscoff set. The perf writepage event explicitly selects
+`CLOCK_MONOTONIC` (`use_clockid`) so both streams share one clock. For
+happens-before ordering, only the relative ordering within the same frequency
+domain matters.
 
 ---
 
@@ -287,6 +338,7 @@ only the relative ordering within the same frequency domain matters.
 | Metric          | Estimate                     |
 |-----------------|------------------------------|
 | Per kretprobe   | ~300-500 ns (BPF handler + ring buffer submit) |
+| Per entry kprobe| ~150-300 ns (comm check + map update), all 15 functions |
 | Per schedule    | ~0.05-0.25 ms (100-500 trace events) |
 | Schedule length | ~1-10 ms typical             |
 | Overhead ratio  | 5-20% of schedule time       |
@@ -341,12 +393,12 @@ dmesg | tail -30 | grep -i "bpf\|kprobe\|trace"
 
 | File | Purpose |
 |------|---------|
-| `src/executor/hmdfs_trace.bpf.c` | BPF program — 15 kretprobe handlers (80 B events incl. `off`) |
+| `src/executor/hmdfs_trace.bpf.c` | BPF program — 15 kretprobe handlers + 15 entry kprobes (104 B events) |
 | `tools/vmlinux.h` | Generated: kernel BTF type definitions (export once) |
 | `src/executor/hmdfs_trace.skel.h` | Generated: libbpf skeleton for executor |
 | `src/executor/hmdfs_trace.cc` / `.h` | Executor-side load/control/collect logic (BPF ring + perf writepage) |
 | `src/executor/executor.cc` | Integration: init/start/stop call sites |
-| `src/pkg/ipc/ipc.go` | Fuzzer-side: `parseHmdfsTraceEvents` (80 B layout) |
-| `src/prog/prog.go` | `HmdfsTraceEvent` struct (incl. `Off`) |
+| `src/pkg/ipc/ipc.go` | Fuzzer-side: `parseHmdfsTraceEvents` (104 B layout) |
+| `src/prog/prog.go` | `HmdfsTraceEvent` struct (incl. `Off`/`Size`/`EntryIno`/`Mode`) |
 | `src/prog/dag.go` | DAG timeline construction, writepage vertices, offset buckets |
 | `src/executor/EBPF_TRACE.md` | This document |

@@ -1,6 +1,7 @@
 package prog
 
 import (
+	"fmt"
 	"math/rand"
 	"testing"
 )
@@ -19,18 +20,30 @@ func hmdfsSmokeTarget(t *testing.T) *Target {
 	return target
 }
 
+// hmdfsSmokeCids is shared by the smoke file tree and config so tree lookups
+// by hmcfg.Cids[0] actually hit (a mismatch would silently disable the fresh
+// FileTree branches in the tests).
+func hmdfsSmokeCids() []string {
+	return []string{
+		"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+		"c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+		"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+	}
+}
+
 func hmdfsSmokeFileTree() *FileTree {
+	cids := hmdfsSmokeCids()
 	ft := NewFileTree()
 	ft.InitFromHmdfsConfig(&Hmdfs_config{
 		Init_dir: map[string][]string{
-			"c1": {"merge_view/dirA", "merge_view/dirB"},
-			"c2": {"merge_view/dirA", "merge_view/dirB"},
-			"c3": {"merge_view/dirA", "merge_view/dirB"},
+			cids[0]: {"merge_view/dirA", "merge_view/dirB"},
+			cids[1]: {"merge_view/dirA", "merge_view/dirB"},
+			cids[2]: {"merge_view/dirA", "merge_view/dirB"},
 		},
 		Init_file: map[string][]string{
-			"c1": {"merge_view/dirA/a", "merge_view/dirA/b", "merge_view/dirB/c"},
-			"c2": {"merge_view/dirA/a", "merge_view/dirA/b", "merge_view/dirB/c"},
-			"c3": {"merge_view/dirA/a", "merge_view/dirA/b", "merge_view/dirB/c"},
+			cids[0]: {"merge_view/dirA/a", "merge_view/dirA/b", "merge_view/dirB/c"},
+			cids[1]: {"merge_view/dirA/a", "merge_view/dirA/b", "merge_view/dirB/c"},
+			cids[2]: {"merge_view/dirA/a", "merge_view/dirA/b", "merge_view/dirB/c"},
 		},
 	})
 	return ft
@@ -115,11 +128,7 @@ func hmdfsSmokeSpecialCalls(t *testing.T, target *Target) *SpecialCalls {
 
 func hmdfsSmokeConfig(hmcfg *Hmdfs_config) {
 	hmcfg.Node_num = 3
-	hmcfg.Cids = []string{
-		"c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
-		"c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
-		"c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
-	}
+	hmcfg.Cids = hmdfsSmokeCids()
 	hmcfg.InitIp = "192.168.0.5"
 	hmcfg.FileTree = hmdfsSmokeFileTree()
 }
@@ -187,11 +196,8 @@ func TestHmdfsGenNoOverlap(t *testing.T) {
 		{"dcache", func() []*Prog {
 			return target.GenerateProgsForHmdfsDcache(rand.New(rand.NewSource(2)), sc, hmcfg)
 		}},
-		{"inodeops", func() []*Prog {
-			return target.GenerateProgsForHmdfsInodeops(rand.New(rand.NewSource(3)), sc, hmcfg)
-		}},
-		{"fileops", func() []*Prog {
-			return target.GenerateProgsForHmdfsFileops(rand.New(rand.NewSource(4)), sc, hmcfg)
+		{"fsops", func() []*Prog {
+			return target.GenerateProgsForHmdfsFsops(rand.New(rand.NewSource(3)), sc, hmcfg)
 		}},
 	}
 	for _, g := range gens {
@@ -221,13 +227,17 @@ func TestHmdfsMutateNoOverlap(t *testing.T) {
 		{"dcache",
 			func(rs rand.Source) []*Prog { return target.GenerateProgsForHmdfsDcache(rs, sc, hmcfg) },
 			func(ps []*Prog, rs rand.Source) bool { return MutateDcacheProg(ps, rs, nil, sc, hmcfg) }},
-		{"inodeops",
-			func(rs rand.Source) []*Prog { return target.GenerateProgsForHmdfsInodeops(rs, sc, hmcfg) },
-			func(ps []*Prog, rs rand.Source) bool { return MutateInodeOpsProg(ps, rs, nil, sc, hmcfg) }},
-		{"fileops",
-			func(rs rand.Source) []*Prog { return target.GenerateProgsForHmdfsFileops(rs, sc, hmcfg) },
-			func(ps []*Prog, rs rand.Source) bool { return MutateFileopsProg(ps, rs, nil, sc, hmcfg) }},
+		{"fsops",
+			func(rs rand.Source) []*Prog { return target.GenerateProgsForHmdfsFsops(rs, sc, hmcfg) },
+			func(ps []*Prog, rs rand.Source) bool {
+				lcs := NewLayeredChoiceStrategy(hmcfg, target)
+				return MutateFsopsWithDCT(ps, rs, sc, hmcfg, lcs)
+			}},
 	}
+	// The structured mutators consult the global coverage board; reset it so
+	// the sweep is deterministic (static DCT path, no Direction 3 bias).
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
 	for _, g := range gens {
 		t.Run("mutate_"+g.name, func(t *testing.T) {
 			for i := 0; i < 10; i++ {
@@ -235,6 +245,13 @@ func TestHmdfsMutateNoOverlap(t *testing.T) {
 				ps := g.gen(rs)
 				g.mut(ps, rs)
 				validateNoOverlap(t, ps)
+				for _, p := range ps {
+					if p.HasBrokenRefs() {
+						t.Fatalf("%s iter %d: broken refs after mutation (last %q):\n%s",
+							g.name, i, LastMutation(), p.DumpRefDiagnosis())
+					}
+					assertSerializeSafe(t, fmt.Sprintf("%s iter %d", g.name, i), p)
+				}
 			}
 		})
 	}

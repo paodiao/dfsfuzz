@@ -51,43 +51,39 @@
 
 **伪关系示例**：A: `creat X`，B: `rename Y→X`，有序 A→B。严格应比 `A.post(X) vs B.pre(Y)` → 无关系；但全组合里 `A.post(X) == B.post(X)` → 误判 SAME_PATH。实际是两个不同 inode 先后占据同一路径位置。
 
-**影响边界**：仅当配对中至少一方是 rename（pre ≠ post）时全组合才有别于单组合；SAME_INODE 独立按 ino 判断不受影响；配对方向由 HB/并发时间序决定、不由 PathRel 决定，故伪关系不会造成方向性错误。"先后占据同一路径"在路径占用语义下也有一定意义。
+**影响边界**：仅当配对中至少一方是 rename（pre ≠ post）时全组合才有别于单组合；SAME_INODE 独立按 ino 判断不受影响；配对方向由 HB/并发时间序决定、不由 PathRel 决定。"先后占据同一路径"在路径占用语义下也有一定意义。
 
-**不修理由**：影响面窄、收益边际，且修改后需要重新验证配对行为。
+**下游修正（2026-10-01，P2-#6）**：原先 `dagRelToDctRel` 只用 post 路径判定 Parent/Child 方向，关系靠 pre 成立的 rename 对（变体 rename+Parent、根 rename+Child、rename×rename 的 Parent/Child）被判 false 丢弃，导致覆盖板 found/势能不闭环。已修：`dagRelToDctRel` 改用与本函数相同的 `{post, pre}` 路径基（Child 优先，再 Parent）；cell 的 depth/persist 仍取 B.post，其正确性依赖"生成的 rename dst 与 src 同父"不变量。本节的**提取层**过近似保持不变。
 
-**将来修复**：`ordered == true` 时只比较 `A.Path × prePath(B)`；并发对保留全组合。
+**不修理由（提取层仍保留）**：影响面窄、收益边际，且修改 `ordered` 语义会改变 pair 位空间/novelty。
 
----
-
-## 5. `newDagSignal` / `newDagSchedSignal` 集合未被消费
-
-**位置**：`src/syz-fuzzer/fuzzer.go`（Fuzzer 结构体字段 + `checkNewDagSignal`/`checkNewDagSchedule` 内 Merge）
-
-**现象**：`newDag*Signal` 两个集合只增不减，实际统计上报走的是原子计数器 `dagPairCount`/`dagSchedCount`（poll 时 `Swap` 清零）。集合是镜像 `maxSignal`/`newSignal` 模式保留的，从未被任何代码读取。
-
-**影响**：仅内存增长（与 `maxDagSignal` 同规模，几万到几十万条 uint32 键）。
-
-**不修理由**：删除需动 4 处字段 + 2 处 Merge；保留可作为将来跨 fuzzer 同步 DAG 信号的基础。
-
-**将来修复**：做跨 fuzzer DAG 去重同步时（`PollArgs`/`PollRes` 增加 `MaxDagSignal` 字段），正好消费这两个集合。
+**将来修复（提取层）**：`ordered == true` 时只比较 `A.Path × prePath(B)`；并发对保留全组合。
 
 ---
 
-## 6. BPF 注释/日志写 "15 functions" 与实际 16 不符
+## 5. `newDagSignal` / `newDagSchedSignal` 跨 fuzzer 同步（原"未被消费"结论已反转，2026-10-02 更正）
 
-**位置**：`src/executor/hmdfs_trace.bpf.c` 文件头注释；`hmdfs_trace.cc` `init_hmdfs_trace` 日志（"15 kretprobes attached"）
+**位置**：`src/syz-fuzzer/fuzzer.go`（`grabNewDagSignal`/`grabNewDagSchedSignal` + `poll()`）、`src/syz-manager/rpc.go`、`src/pkg/rpctype`（`MaxDagSignal`/`MaxDagSchedSignal` 字段）
 
-**现象**：功能编号 0–15 共 16 个 kretprobe（15 个 VFS 合并函数 + writepage_cb），注释与日志仍写 15。早期设计为 15 个，后加 `FUNC_WRITEPAGE_CB` 时未同步。
+**现状（已消费）**：两个集合在 `poll()` 中取走并序列化上报——`fuzzer.go:654-655` 的 `MaxDagSignal`/`MaxDagSchedSignal` 调用 `grabNewDagSignal()`/`grabNewDagSchedSignal()`（取走后置 nil，并非"只增不减"）；manager 侧 `rpc.go:434-460` 做 `Diff`/`Merge` 后经 `PollRes` 分发回各 fuzzer（`rpctype` 字段在 `:81-82`/`:94-95`）。统计上报仍走原子计数器 `dagPairCount`/`dagSchedCount`（poll 时 `Swap` 清零），这一半描述成立。
 
-**影响**：纯文档/日志文字问题，无功能影响。
-
-**不修理由**：零风险文本改动，但易在修改时漏改其他引用处；集中记录避免再犯。
-
-**将来修复**：下次 touch 该文件时统一为 "16"，并顺带检查 `STATE_MODELING.md`/`EBPF_TRACE.md` 中的函数数量表述。
+**结论**：原"从未被任何代码读取/仅内存增长"不成立；该通道是跨 fuzzer DAG 信号去重同步的基础设施，已接线。
 
 ---
 
-## 7. 方向 1 探索度偏向是"独占式"的
+## 6. BPF 函数计数表述（原"15 vs 16"结论反转，2026-10-02 更正）
+
+**位置**：`src/executor/hmdfs_trace.bpf.c` 文件头注释；`hmdfs_trace.cc` 启动日志；`EBPF_TRACE.md`
+
+**现状**：func_id 共 **16 个类型** = **15 个 kretprobe**（`FUNC_MKDIR_MERGE`..`FUNC_ITERATE`；`DEFINE_MERGE_KRETPROBE` 恰好 15 个调用点 + 1 个宏定义）+ 1 个 **writepage perf tracepoint**（`FUNC_WRITEPAGE_CB=15`，**不是** kretprobe）。`.bpf.c:5-7` 明写 "15 kretprobes … plus 15 paired entry kprobes. (func_id 15/writepage is an async perf tracepoint …)"；启动日志 "15 kretprobes + 15 kprobes attached"（`hmdfs_trace.cc:345`）**正确**。
+
+**结论**：原"实际 16 个 kretprobe、注释/日志写 15 不符"是误判——16 是 func_id/类型总数，kretprobe 确为 15；无需改文案。`EBPF_TRACE.md:46` 的 "Tracked Functions (16 func_ids)" 与此一致。
+
+---
+
+## 7. 方向 1 探索度偏向是"独占式"的（机制已随 Phase 3 移除，2026-10-02）
+
+> **状态更新**：`Explored`/`NoYield`/explore-first 独占池已随 Phase 3 整体移除（`src/prog/distributed_choice.go:1535`/`:1612`："the weight dynamics and explore-first pool are gone"）。当前选择 = `directedBiasProb=0.75` 的 coverage-board 未覆盖 cell 潜力轮盘 + 25% 静态初始权重采样。以下为历史记录。
 
 **位置**：`src/prog/distributed_choice.go` `chooseVariant`
 
@@ -117,7 +113,7 @@
 
 ## 9. 时间对齐用"前驱 Etime"近似新调用的实际开始时刻
 
-**位置**：`src/prog/mutation.go` `TimeAlignedInsertPos`/`timeAlignedInRange`、`insertCallFromDCT`/`insertCallFromPattern` 的 `refTime` 计算
+**位置**：`src/prog/mutation.go` `TimeAlignedInsertPos`/`timeAlignedInRange`、`insertCallFromDCT` 的 `refTime` 计算（休眠的 `insertCallFromPattern` 已于 P2-#12 删除）
 
 **现象**：时间对齐的参考时间取"插入位置前一个调用的 `Etime`"（前驱结束时新调用开始执行），对齐目标同样用各 prog 调用边界的 `Etime`。实际执行中新调用在调度后才会真正开始（有调度延迟），且跨 VM 比较精度依赖 `tsc_offset` 的正确性（`raw rdtsc - tscoff` 是否真的全局可比）。
 
@@ -233,8 +229,8 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 - `pathRelBetween(anchorPath, concPath)`：路径几何关系分类（相同/父子/兄弟/无关）
 - `pickAnchor(ps, r, wantReadWrite)`：ps[0] 随机选有路径 + 执行时间线的调用（wantReadWrite 时限定读写调用）
 - `findConcurrentCalls(ps, anchor, tscoffs)`：跨 prog 执行窗口重叠判定（`s1<e2 && s2<e1`，tscoff 归一化全局域；同 prog 内串行无重叠）
-- 4 个动态突变：`MutateGroupPathDynamic`（锚迁新 basePath、并发者按现场 rel 解析、fd 回溯、主干不迁）、`RemoveGroupDynamic`（删锚+并发者）、`RemoveReservoirDynamic`（水库式跨 prog 删，fd 安全）、`MutateGroupDataDynamic`（锚限定读写，集合内全部读写共享 offset/length——确定性对应插入路径的概率性 OffsetSame）
-- mutateHmdfs 分发：removeGroup 20% / removeOne 10% / path 10% / data 10% / insert 50%
+- 4 个动态突变：`MutateGroupPathDynamic`（锚迁新 basePath、统一组成员按现场 rel 解析、fd 回溯、非组成员不迁）、`RemoveGroupDynamic`（删统一组的 fd 安全子集；open/creat 有组外使用者则保留）、`RemoveReservoirDynamic`（水库式跨 prog 删，fd 安全）、`MutateGroupDataDynamic`（锚限定读/写/truncate，集合内全部调用共享 offset/length——确定性对应插入路径的概率性 OffsetSame）；另有 board 引导的统计定向臂 `MutateGroupPathDirected`（目标 rel+depth：锚点可动、选中成员按目标 rel 重写、其余保持原 rel）与 `MutateGroupDataDirected`（目标 OffB 桶：pread/pwrite 用显式 offset、truncate 用 length 落桶）
+- mutateHmdfs 分发（2026-10-02 更正）：预算由 `mutateMixForSize` 按调用数分带 85/5/0/10、60/10/5/25、35/25/10/30、10/40/20/30（ins/removeOne/removeGroup/mutPathData），组内 path:data=70:30
 
 **删除**：`CallProps.GroupID/PathRel/IsFromDCT/OffsetRel/LengthRel`（5 个序列化 key）、`Prog.Groups/LastGroupID`、`GroupMeta/GroupSourceType`、`AllocGroupID/renumberGroups/GetGroupPositions/RemoveGroup/collectAll*/getDeletable*/findPrimaryDCTCall/MutateGroupData/MutateGroupPath/mutateGroupPathRandom/setGroupMeta/getNewPathRel/getSharedFileSize`、~55 处 SetGroupID 及属性设置点、`ChooseOffsetRel/ChooseLengthRel/getRootOffsetRel/getRootLengthRel/isOffsetSensitiveCall/isLengthSensitiveCall/dctOffsetWeights`（插入路径的 offset 概率选择随之移除，共享 offset 由 MutateGroupDataDynamic 定向提供）。
 
@@ -246,9 +242,11 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 
 ---
 
-## 16. Temporal 归因错位与形态层（第二层）建模（已修复）
+## 16. Temporal 归因错位与形态层（第二层）建模（归因修复有效；形态学习已随 Phase 3 移除，2026-10-02）
 
-**位置**：`src/prog/dag.go`（`DagPairToVariant`）、`src/prog/distributed_choice.go`（`TemporalWeights`/`ChooseTemporal`/`UpdateTemporalWeight`）、`src/prog/mutation.go`（`firstBoundaryAfter`）、`src/syz-fuzzer/proc.go`（`feedbackDagPairs`）
+> **状态更新**：归因修复（`DagPairToVariant` 返回 `p.Temporal`）仍然有效；但"形态权重层"（`TemporalWeights`/`UpdateTemporalWeight`/`MarkYield`/`applyInsertFeedback`/`PendingInserts`）已随 Phase 3 移除。当前 Temporal 以 coverage board 的 cell 维度（`coverage_board.go`）+ Phase 2b 定向计划（`directed_plan.go` 的 HB 放置）承担；选择/执行记账为 `noteDirectedPick`/`recordPairs` 与 `PendingDirected`/`ResolveDirectedPending`。以下为历史记录。
+
+**位置**：`src/prog/dag.go`（`DagPairToVariant`）、`src/prog/distributed_choice.go`（历史：`TemporalWeights`/`UpdateTemporalWeight` 已删；现为 `ChooseTemporal` 静态先验）、`src/prog/mutation.go`（`firstBoundaryAfter`）、`src/syz-fuzzer/proc.go`（`feedbackDagPairs`）
 
 **现象（原 bug）**：`DagPairToVariant` 原本不读 `p.Temporal`——HB pair（因果对）与并发 pair 归因到同一 (root, variant) 组合 → HB pair 的新颖性错误触发 `MarkYield`（方向 1 探索预算被偶然 HB 截断、方向 2 该降权组合被续命）。且 HB pair 没有任何生成机制定向构造（pattern/DCT/动态突变全以并发为核心）——"半边探索"：反馈算 HB 新颖性、生成侧无回应。
 
@@ -272,11 +270,13 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 
 ## 17. 并发/因果建模结构调研（后续研究项）
 
+> **状态更新（2026-10-02）**：文中引用的 `TemporalWeights` 已删除；"现有形态层（#16）"改由 coverage board temporal cell + Phase 2b 定向计划承担。以下 α/β/γ 调研方向仍未实施。
+
 **位置**：全系统（生成/反馈/突变三侧）
 
 **问题本质**：`Temporal`（并发/因果）是**执行时间线的派生属性**，不是操作对的固有属性——同一 (A,B) 在不同执行中可为 CONCURRENT 或 HB。因此三维张量 `Weights[root][variant][temporal]` 不成立：**Temporal 不是生成器的可控输入**——生成只能构造"倾向"（时间对齐 → 倾向并发；顺序锚定 → 倾向因果），实际时序由执行决定。张量的第三维是虚的。
 
-**现有形态层（#16）的定位**：`TemporalWeights` 双权重（并发/因果形态各一权重）是"意图→结果分布"的**粗糙近似**——按结果无条件奖励、交叉统计自均衡、无意图追踪。它验证了"生成侧可以定向构造因果对"（因果形态 = `firstBoundaryAfter`），但学习能力有限。
+**现有形态层（#16）的定位（历史）**：`TemporalWeights` 双权重（已删）是"意图→结果分布"的**粗糙近似**——按结果无条件奖励、交叉统计自均衡、无意图追踪。它验证了"生成侧可以定向构造因果对"（因果形态 = `firstBoundaryAfter`，现由 Phase 2b 定向计划使用），但学习能力有限。
 
 **调研方向**：
 - **α：分层双通道（完整版）**——组合选择器（现有 DCT 矩阵）+ 时序形态选择器（学习"意图形态 → 实际时序"的转移概率，而非单权重）——在现有形态层基础上增强；
@@ -287,7 +287,7 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 
 **实验输入**：`hb pair signal`/`cc pair signal` 占比（新颖 pair 中因果对 vs 并发对）、形态权重数据（因果形态构造有效性）——支撑调研取舍。
 
-**前置条件**：先跑一轮实验收集上述数据（形态层已就位，`hb pair signal`/`cc pair signal` 已上线观测）。
+**前置条件**：先跑一轮实验收集上述数据（历史形态层已移除；`hb pair signal`/`cc pair signal` 观测已上线）。
 
 ---
 
@@ -362,7 +362,7 @@ if emulate_dents != op_runtime_stat['Dents']: # 与实际返回对比
 2. **count=0**：`getdents64(fd, dirp, 0)` 空读不触发真实目录读取，且模拟器 buf=";" vs 实际空返回 → "dents differ" 误报。**已改固定 4096**（buf 与 count 一致；`randBufLen` 不适合——~11% 返回 0、多数 0-511 小值落入截断边界）；
 3. **定位**：getdents64 是**测试调用**（触发 dcache 目录读取路径），非验证调用——目录内容验证由 stat/symsc 承担（"dents differ" 检查保留，大 count 下目录条目少时两边读全、无截断差异；条目多时的截断差异是 checker 的 dirent 大小近似（`10+len(name)` vs 实际 padding）误报，记录待 checker 层改进）。
 
-**保留**：`generateGetdents64Calls`（rand.go，count 已修 4096）——当前死代码，作为未来 dcache 生成接入 getdents64 测试调用的起点。
+**保留**：`generateGetdents64Calls`（rand.go，count 已修 4096）——**（2026-10-02 更正）非"当前死代码"**：已被 Phase 2b 定向计划调用（`directed_plan.go:1888` 的 getdents64 分支），不再是"未来 dcache 接入起点"。
 
 ---
 
@@ -376,9 +376,9 @@ if emulate_dents != op_runtime_stat['Dents']: # 与实际返回对比
 
 **方案**：删除静态归因机制——`DCTInfo` 结构/字段/函数/构造块全部移除（22 处）；triage 成功仅入 corpus、不做归因——DCT 方向 1/2 学习完全由动态 `feedbackDagPairs` 驱动（#16 设计）；"清除时机"问题随机制消失。
 
-**验证**：全仓零残留（grep `DCTInfo`/`DistributedChoiceInfo`/`ConcurrentCallInfo`/`UpdateDCTFromFeedback`/`ClearDCTInfo` 无匹配）；全目标构建通过；rand.go 与备份 diff 36 行删除全部为 DCTInfo 相关（无误删）。
+**验证**：非文档代码零残留（grep `DCTInfo`/`DistributedChoiceInfo`/`ConcurrentCallInfo`/`UpdateDCTFromFeedback`/`ClearDCTInfo` 在 `src/**/*.go` 无匹配；本文件与 `STATE_MODELING*.md` 仍保留历史文字）；全目标构建通过；rand.go 与备份 diff 36 行删除全部为 DCTInfo 相关（无误删）。
 
-**增补（权重奖励恢复）**：#20 删除 DCTInfo 归因时，`UpdateWeight`（权重 +1）的调用点被连带删除，DCT 权重一度只剩降权路径（只减不加）。已恢复：**正向奖励并入 `MarkYield`**——每次新颖 pair 产出 → 组合权重 +1（上限 `maxComboWeight=100`，防御性；自然上限是组合对应 pair 类型空间）；`Explored=true` + `NoYield=0` 不变。同时清理冗余的 `TotalWeights` 字段（只写不读——`chooseVariant` 现场累加）与 `UpdateWeight` 函数（含 LCS 封装）。降权下限语义：`w > noYieldDelta` 渐进 −5；`w ∈ (1, noYieldDelta]` 再次触发降权时**一步到 1**（消除中间冻结态）；`w=1` 为最终下限（产出后 MarkYield +1 可回升）。
+**增补（权重奖励恢复，历史——机制已随 Phase 3 移除）**：#20 删除 DCTInfo 归因时，`UpdateWeight`（权重 +1）的调用点被连带删除，DCT 权重一度只剩降权路径（只减不加）。当时恢复为 **正向奖励并入 `MarkYield`**（`maxComboWeight=100`、`Explored=true`、`NoYield=0`、`TotalWeights`/`UpdateWeight` 清理等）。**2026-10-02 更正**：`MarkYield`/`NoYield`/`Explored`/`TemporalWeights` 等随后已随 Phase 3 整体删除，DCT 权重现为静态初始权重（初始化后无写入）；反馈只进 coverage board。
 
 **增补（反馈按 pair 类型计数）**：`filterNewDagPairs` 增加**按哈希去重**——同特征（同哈希）的多对调用只保留一条。语义：反馈（`MarkYield` 权重 +1、形态层加权、hb/cc 统计、深度桶统计）按**新颖 pair 类型**计数而非实例数——与新颖位集合（newBits）和 `dag pair signal`（按 newBits.Len()）的集合语义统一（去重前 hb/cc 计数与 pair signal 口径不一致：实例数 vs 类型数）。量级说明：程序规模（`RecommendedCalls=30`/节点）约束下，同类型对实例数个位数到十几——按类型计数后进一步收敛为 ret 桶/时序/路径关系的真实类型多样性（各类型产出各 +1，合理）。
 
@@ -424,20 +424,33 @@ NA（无偏移语义——mkdir/rmdir/rename/unlink/stat/chmod/getdents64/fsync�
 - HMDFS 写回显式三分支（file_remote.c `hmdfs_get_writecount`：`pos >= size → count=0` / `size < pos+PAGE_SIZE → count = size−pos`（最后不满页）/ 整页写）——**offset 桶直接对应内核行为**
 - 尾部边界 = 块对齐点（`size − (size % 4096)`）——`size % 4096 == 0` 时尾部自然消失（无最后不满页）——无任意常数
 
-**采集链路**（已验证）：
-- write/read/pwrite64/pread64（都走 merge_write_iter/read_iter，file_merge.c:537/542 传 `&iocb->ki_pos`）：`BPF_CORE_READ(kiocb, ki_pos)`（args[0]）
-- truncate（setattr）：`BPF_CORE_READ(iattr, ia_size)`（args[2]）——**仅当 `ia_valid & ATTR_SIZE`**（chmod/utime 的 ia_size 无效——eBPF 侧检查消除垃圾值噪声）
-- 事件结构 +8 字节（72→80）；`DAGVertex.Size` 构建时从 post-exec fsMd 填充（分桶参照，**不进特征向量**）
+**采集链路**（2026-09-26 起为**入口语义**，见下方补注）：
+- write/read/pwrite64/pread64（都走 merge_write_iter/read_iter，file_merge.c:564/569 传 `&iocb->ki_pos`）：入口 kprobe 记录**入口** `kiocb->ki_pos`（O_APPEND 时解析为入口 i_size）与入口 `i_size`；返回 kretprobe 消费/删除（2026-09-27 起不再有 miss 兜底，未配对事件记 0，见 #31）
+- truncate（setattr）：入口 kprobe 读 `iattr->ia_valid/ia_size`（2026-09-27 起；此前在返回时经 args 读，返回时寄存器已不可靠）——**仅当 `ia_valid & ATTR_SIZE`**（chmod/utime 的 ia_size 无效——eBPF 侧检查消除垃圾值噪声）；`size` 由入口 kprobe 记录入口 i_size
+- 事件结构 80→104 字节（新增 `size`/`entry_ino`/`i_mode`）；`DAGVertex.Size` 取事件入口 size（不再用 post-exec fsMd），`entry_ino`/`i_mode` 修复 mkdir/create/rename/lookup 的父目录 inode 与终态类型偏斜
+- 事件结构 +24 字节（80→104）；`DAGVertex.Size` 取事件入口 size（见补注）
 
 **已知近似**：
-1. **kretprobe 读到结束偏移**：VFS 标准推进 `*ppos += written`（file_local.c:145 vfs_iter_write）——ki_pos 在返回时 = 起始 + 长度——多数情况与起始同桶（粗分桶）；**跨 size 边界时恰好捕捉"扩展"语义**（pos+len ≥ size 落入越界桶——对应文件扩展行为）；
-2. **truncate 与 chmod 共用 FuncSetattr**（FuncID 层已合并）——ia_valid 检查已排除非 truncate 的 setattr，但其 `off=0` 在 Go 侧被 `isOffsetFunc(FuncSetattr)=true` 判为真实偏移 → 落入 **Zero 桶**——与真实 `truncate@0` 在 offset 维混叠（低影响：FuncID 层本就合并，offset 桶对 setattr 的细分是近似）。
+1. ~~**kretprobe 读到结束偏移**~~ **已修（2026-09-26）**：配对入口 kprobe 后 `off` 是**入口** ki_pos（写读的起始位置），不再是返回时的结束位置；`size` 也是入口时大小，不再依赖程序末 fsMd。旧行为下"多数情况与起始同桶、跨 size 边界恰好捕捉扩展"的近似不再适用，分桶 = 入口位置 × 入口大小（对应 hmdfs_get_writecount 在写入时刻的 pos/size 关系）；
+2. **truncate 与 chmod 共用 FuncSetattr**（FuncID 层已合并，2026-09-26 起按调用名细分）——ia_valid 检查已排除非 truncate 的 setattr；Go 侧 `offsetBucketOf` 增加调用名门（`isOffsetCall`，contains write/read/truncate），chmod/utime 的 `off=0` 不再被当作真实偏移，统一落 **NA**（此前落 Zero、与 `truncate@0` 在 offset 维混叠）。事件 `off` 字段本身仍为 0（采集协议不变）；`featuresOf`/pair bit、cellKey、`off=`/`offCall=` 统计随之一致。
+
+**补注（2026-09-26）——入口语义 + 特征实体修复（观测口径波）**：
+- 事件新增 `size`/`entry_ino`/`i_mode`；配对入口 kprobe（write/read/setattr）提供入口 pos/size；`Off`/`Size` 现在描述**操作开始时刻**的状态，不再依赖返回时刻与程序末 fsMd；
+- `i_mode` 让 `DAGVertex.IsDir` 变为**事件时**类型（mode → FuncID 明确类型 → nodeType 兜底），修掉 rmdir 目录被终态 fsMd 记成 file、类型变更路径取终态的问题；
+- `entry_ino` 让 mkdir/create/rename/lookup 的顶点 inode 变成**条目自身**（不再用父目录/旧父目录 inode），修掉 `determinePathRel` 里"同父目录的命名空间操作被误判 SameInode"；路径解析（lookupPath/deletePathAt/writepage）继续用原 `Ino` 字段，不受影响；
+- `dag marg` 新增 `rel=[samePath,sameInode,parentChild,sameParent,none]` 五桶直方图，用于验证 SameInode 下降、SameParent 上升；
+- `dag marg` 追加三段直证：`offCall=`（write/read/pwrite64/pread64/truncate/chmod 各自 NA/zero/mid/tail/beyond 的入口 offset 桶；chmod 自 2026-09-26 起按调用名归一为 NA；2026-09-27 起行只统计携带 offset 语义的事件函数，lookup 侧事件不再污染 truncate/chmod 行）、`typeFunc=`（MKDIR/CREATE/RMDIR/UNLINK/RENAME/DIR_OPEN/ITERATE/LOOKUP 的 dir/file，验证事件时类型）、`inoFunc=`（MKDIR/CREATE/RENAME/LOOKUP 的 zero/zeroOK/ne/eq，验证 entry_ino 采集：zeroOK=0、eq≈0、ne 为主；zeroOK 为第十一轮修复加入的失败报警列）；
+- **2026-09-27 修正（第十一轮）**：上述"入口 kprobe + 返回时 `PT_REGS_PARMx`"混合采集经 12h back 实测证明不成立——kretprobe 的 `pt_regs` 是返回时刻快照，`PT_REGS_PARMx`/返回时指针 key 全部失效（成功 CREATE/MKDIR 的 EntryIno 全 0、write 全落 beyond）。现改为 15 函数全部入口捕获 + `{pid_tgid, func_id}` key，详见 #31。
+- **2026-09-27 追加（配对语义）**：`determinePathRel` 的 SameInode 加同节点门（`A.ProgIdx == B.ProgIdx`）——ino 是节点内标识，跨节点不同文件撞号会被误判为同文件，且该判定先于 parentChild/sameParent 会抢占分类；同文件的跨节点关系由 `samePath` 覆盖，不丢真关系。单测 `TestExtractPairsRelHist` 增加"同节点同号 → SameInode、跨节点同号 → SameParent"两组断言。
+- 本波改变 pair bit 语义 → 必须全新 workdir；fuzzer 指纹随之更新（executor 需重建/更新 VM 镜像）。
+- **2026-09-28 随 R 批（rename 变体双路径）**：rename 入口 kprobe 增加**源 dentry `i_mode` 兜底**——fresh-dst 成功时上层 `new_dentry` 在 kretprobe 时刻仍无 inode（VFS 的 post-rename `d_move` 更晚），事件因此拿到源类型（rename 保留类型），kretprobe 仍以 dst inode 覆盖（B/E 形态）。因此 RENAME 的 `inoFunc` 列里 `zeroOK`（EntryIno==0 且成功）对 fresh-dst 成功是**合法非零**，不是采集故障；`i_mode`/`typeFunc` 事件时精确。wire/结构不变（仅入口写入已有字段）。
+- **2b 后续项**：9 条 2b 已知限制（NoRel 口径、found/depths 模型、TOCTOU 复算、planFail 语义、性能早退、HB 启发式、PendingDirected 覆盖、TmpDir 统一、Cids 防御）及其对 pair 位空间/DAG 反馈/观测统计的影响与部署时机，见 `docs/seed-optimization-plan.md` §3.9 "2b 后续项 / 已知限制"小节。**2026-09-28 收尾批**：#4/#9、#3、#5a、#2、#1-board 已实施（见该文档 §8 第十二轮）；#8 改判为说明性（tmpdir 已不作为目标，策略差异非缺陷）；#7 记录 2b2 前提（一轮多计划时 `PendingDirected` 升级列表）；#5 仅外提（早退待 benchmark）；#1-pair 已评估无必要（背景无关对不检验共享元数据）；#6 等主批数据；writepage 保持现状（采集口径见本文 P7 补充）。
 
 **类型空间增长估算**：offset 维使读写调用参与的 pair 类型 ×4（0/中/尾/越界）——读写-读写对 ×16、读写-其他 ×4、整体 ×2-3——需实验验证新颖性收敛速度（与深度分桶并行观测）。
 
 **实验验证计划**：对比 offset 维加入前后——`dag pair signal` 收敛曲线、`dag depth 1/2/3` 分布、bug 发现率（尤其同 offset 并发写场景）。
 
-**补注（2026-08）——setattr 反馈盲区**：`callNameOfFunc`（dag.go:341-366）无 `FuncSetattr` 分支——truncate/chmod/utime 事件产出的 pair 在 `DagPairToVariant` 恒 `ok=false`——这些组合在 DCT 中**永远收不到产出信用**（MarkYield/形态学习）——方向 1 探索池永不枯竭（放大 #7）。修复需顶点携带调用名（结构性改动）——记录待办（#27-P2）。
+**补注（2026-08，已修 2026-09）——setattr 反馈盲区**：此前 `callNameOfFunc`（dag.go:341-366）无 `FuncSetattr` 分支——truncate/chmod/utime 事件产出的 pair 在 `DagPairToVariant` 恒 `ok=false`——这些组合在 DCT 中**永远收不到产出信用**（MarkYield/形态学习）——方向 1 探索池永不枯竭（放大 #7）。现修复为顶点携带调用名：`BuildVertices` 填 `v.CallName`（dag.go:336），`DagPairToVariant` 优先取调用名、仅在为空时回退 `callNameOfFunc`（dag.go:631-651）；pwrite64/pread64/fdatasync 等同理恢复。事件流仍不携带 has-offset 标记（协议不变），chmod 的 offset 语义在 Go 侧按调用名判 NA（见 #22 已知近似 2）。
 
 ---
 
@@ -512,7 +525,13 @@ if proc.fuzzer.config.EnableDagScheduleFb &&
 
 **P4（相邻窗口边界翻转）**：`A.Etime == B.Stime` 时 `overlap`（双向 `<=`）为真——走并发分支——不落 default——default 只在 B 完全先于 A（`A.Stime > B.Etime`）时走——方向正确。
 
-**P7（BPF ring 跨轮 writepage 混入）**：BPF ring 只有 15 个 merge 函数的 kretprobe（func_id 0-14）——**不含 writepage**（func_id 15 是 perf drain 时标记的，hmdfs_trace.cc:246）——轮间残留（同步函数）被 `matchEventToCall` 窗口过滤丢弃；perf ring 轮间 DISABLED（上轮 stop 的 `PERF_EVENT_IOC_DISABLE`）——不采集——无 writepage 残留。
+**P7（BPF ring 跨轮 writepage 混入）**：BPF ring 只有 15 个 merge 函数的 kretprobe（func_id 0-14）——**不含 writepage**（func_id 15 是 perf drain 时标记的，`hmdfs_trace.cc:340`）——轮间残留（同步函数）被 `matchEventToCall` 窗口过滤丢弃；perf ring 轮间 DISABLED（上轮 stop 的 `PERF_EVENT_IOC_DISABLE`）——不采集——无 writepage 残留。
+
+**P7 补充（2026-09-28，writepage 采集口径核查——结论：不混轮成立，但采集面窄）**：
+- 根因：writepage 走裸 perf 采样（`perf_event_open(-1, cpu=0)` + `PERF_SAMPLE_RAW`），内核投递走 per-CPU hlist（`perf_trace_add` 默认 `this_cpu_ptr` 入列；`include/trace/perf.h` 按当前 CPU 取 head）——**只有 CPU0 上的完成事件会被采到**；且仅在程序窗口 enable，`PERF_EVENT_IOC_DISABLE` 窗口内的事件**直接丢失**（非延后采集）。
+- 对比：15 个同步函数用 `PERF_EVENT_IOC_SET_BPF`，程序挂到 `tp_event->prog_array`（`perf_event_attach_bpf_prog`），在 `kprobe/kretprobe_perf_func` 中**先于** per-CPU hlist 执行——**全 CPU 触发**，无此盲区。
+- 影响边界：writepage 参与采集/顶点/配对（`isModifierFunc` 含 `FuncWritepage`，`RetWritepageDone` 视为成功）/`pairBits` 与 novelty 统计；**不参与** DCT 时序权重、coverage board/cell、2b 定向与生成（`callNameOfFunc` 对 writepage 返回 "" → `DagPairToVariant` ok=false；`FsopsSubCalls` 无 writeback）。故该盲区只影响统计口径，不影响反馈/构造闭环（与 P5 一致）。
+- 备选修法（未实施）：给 tracepoint 挂 BPF（`raw_tracepoint/hmdfs_writepage_cb_exit`）写同一 ringbuf——全 CPU、共用窗口；代价是与模块 TP 格式耦合。
 
 ---
 
@@ -520,15 +539,19 @@ if proc.fuzzer.config.EnableDagScheduleFb &&
 
 | # | 问题 | 位置 | 影响 |
 |---|---|---|---|
-| P2 | setattr 反馈盲区：`callNameOfFunc` 无 `FuncSetattr`——truncate/chmod 组合在 `DagPairToVariant` 恒 ok=false——DCT 无产出信用（#22 补注） | dag.go:341-366 | 方向 1 探索池永不枯竭（放大 #7）——需顶点携带调用名（结构性改动） |
-| P5 | **writepage 未建立到 write 系统调用的映射**：路径解析仅靠 post-exec fsMd 的 `inoToPath`（rename 前的事件无法回退到旧路径）；且无 CallName——不参与 `DagPairToVariant`（写回维度不进 DCT 反馈、不指导突变） | dag.go:200-219 | rename 场景路径错（罕见）+ 写回维度 DCT 学习缺失。映射需同 ino+时间关联——但异步写回跨轮（write 在上轮、完成在下轮）导致匹配不可靠——**暂不实施**（异步语义与同步函数不同，待后续评估） |
+| P2 | ~~setattr 反馈盲区：`callNameOfFunc` 无 `FuncSetattr`——truncate/chmod 组合在 `DagPairToVariant` 恒 ok=false~~ **已修（2026-09，顶点 CallName 优先）** | dag.go:336, 631-651 | 原影响（方向 1 探索池永不枯竭）已消除 |
+| P5 | **writepage 未建立到 write 系统调用的映射**：路径解析仅靠 post-exec fsMd 的 `inoToPath`（rename 前的事件无法回退到旧路径）；且无 CallName——不参与 `DagPairToVariant`（写回维度不进 DCT 反馈、不指导突变） | dag.go:271-299 | rename 场景路径错（罕见）+ 写回维度 DCT 学习缺失。映射需同 ino+时间关联——但异步写回跨轮（write 在上轮、完成在下轮）导致匹配不可靠——**暂不实施**（异步语义与同步函数不同，待后续评估）。**部分修复（R19，2026-10-03）**：删除文件改走节点内 delete 时间线（低 32 位 `inoKey` 键、先于合并表；delete 派生路径不再套 `renamePathAt`，`hmdfs_trace.cc` perf ring 同步改为类型/回绕安全解析）；rename 回退与 write 映射仍未实施；低 32 位口径的跨设备/同节点 ino 复用歧义保留 |
 | P6 | ~~DCT 归因模糊：任何新颖对都归因到 (root, variant)——不区分是否本执行插入的组合产生~~ **已修（#28 插入反馈归因）** | proc.go | 由"插入记录 + 执行级归因"替代（原系统性近似） |
-| P9 | write/pwrite64 归因坍缩：FuncWrite → "write"——pwrite64 组合收不到产出信用 | dag.go:353-355 | 与 P2 同因（顶点无调用名） |
+| P9 | ~~write/pwrite64 归因坍缩：FuncWrite → "write"——pwrite64 组合收不到产出信用~~ **已修（2026-09，顶点 CallName 优先）** | dag.go:336, 631-651 | 与 P2 同因、同修 |
 | P10-P20 | 其余低危：MaxDagCorpus gate 非原子、pair 哈希 32 位截断碰撞、同调用多事件成对噪声、O(n²) 全对遍历、schedule 哈希折叠、perf 时钟域未验证、统计口径（#3）等 | — | 观察即可 |
+
+> **状态更新（2026-10-02）**：表中 P2/P6/P9 的行文引用"方向 1 探索池 / 插入反馈归因（#28）"——这些机制（`Explored`/`NoYield`/`MarkYield`/`applyInsertFeedback`/`PendingInserts`）已随 Phase 3 移除；对应条目仅作历史记录。当前反馈 = coverage board（`RecordCoveragePairs`）+ `PendingDirected`/`ResolveDirectedPending`。
 
 ---
 
-## 28. 插入反馈归因（已实施——替代"选择即计"与"映射清零"）
+## 28. 插入反馈归因（已实施——替代"选择即计"与"映射清零"；机制后随 Phase 3 移除，2026-10-02）
+
+> **状态更新**：本节机制（`applyInsertFeedback`/`PendingInserts`/`MarkYield`/`TickNoYield`/`noYieldTick`）已随 Phase 3 整体移除；当前执行后结算只有 Phase 2b 的 `resolveDirectedPending`（`PendingDirected`，`proc.go:1166-1168`）。以下为历史记录。
 
 **动机**：两处归因错位——① 选择即计：`chooseVariant` 每次选中 `NoYield++`（含未成功插入/未执行）；② 映射清零：`feedbackDagPairs` 把新颖对映射到 (root, variant) 后 `MarkYield`（P6：不区分是否本次插入产生——可能白捡清零/错误归因）。
 
@@ -569,3 +592,94 @@ if proc.fuzzer.config.EnableDagScheduleFb &&
 **改动**：`generatePeriod` 100 → 20（生成占比 1% → 5%；弱信号 `=2` 覆盖保留）；`smashIterations` 20 → 25。
 **依据**：上游 2024 重构后 `pkg/fuzzer/fuzzer.go` `genFuzz()` 用 `mutateRate = 0.95`（≡ 1/20）；`pkg/fuzzer/job.go` `smashJob.run` `const iters = 25`；且上游 smash 同样只对新增 corpus 条目触发（`ProgSmashed` 门），与本仓库 `added && !ProgSmashed` 同构。
 **A/B**：back 基线为 generatePeriod=100、smash=100 且每个 triage 条目都砸——本改动属我们侧"上游对齐"批次，已计入与 back 的刻意差异清单。
+
+## 31. kretprobe 返回时参数寄存器不可用——观测字段全部改入口捕获（已修复）
+
+**位置**：`src/executor/hmdfs_trace.bpf.c`（main/back 同修）。
+
+**问题**（12h back 运行实证，2026-09-27）：kretprobe handler 的 `pt_regs` 是**函数返回时刻**的寄存器快照（内核返回 trampoline 保存，见 `arch/x86/kernel/rethook.c` 与 `kernel/kprobes.c:__kretprobe_trampoline_handler`），不再是入口参数——`PT_REGS_PARMx` 在返回时拿到的是函数体遗留值。旧实现有两处依赖它：
+- `entry_ino`/`i_mode`/`ino` 直接读 `PT_REGS_PARMx` 指针：测试 VM 上全部为 0——成功 CREATE 299、MKDIR 9、RENAME 1 的 `inoFunc` 全为 `zero`（内核源码保证成功路径 `d_add` 已实例化，`hmdfs_create_lower_dentry` 的 `update_inode_attr(d_inode(d_child),…)` 若为 NULL 会空指针崩，而 12h 无崩）；
+- `entry_state` map 用返回时读到的 `iocb`/`iattr` 指针做 key：必然 miss，write/read 兜底 `off=ki_pos−ret` 且指针读 0 → 成功写全落 beyond（472/475）、真实 truncate 全落 zero（`ia_valid` 读 0）；`off=` 无 mid/tail。
+- 该 VM `CONFIG_ZERO_CALL_USED_REGS` **未开**：不是编译器清零，而是返回时寄存器不再持有参数，`bpf_probe_read` 失败后返回 0。
+
+**修复**：15 个函数全部加配对入口 kprobe，入口捕获 `ino/mode/off/size`，map key 改为 `{pid_tgid, func_id}`（不再依赖返回时指针）；kretprobe 只用返回值（`PT_REGS_RC`）+ map；mkdir/create/rename/lookup 在入口存 dentry 指针、返回时经该指针读 `d_inode->i_ino/i_mode`（inode 在调用过程中经 `d_add`/`d_splice_alias` 挂上，只能返回后读）。删除 `args[]` 填充（两仓无消费方）与所有兜底下溢逻辑。
+
+**验证**（smoke 门槛，长跑前必查）：**硬门槛** = `dag marg` 的 `inoFunc` 中成功 CREATE/MKDIR 的 `zeroOK=0` 且 `ne>0`；另可选加 `offCall` 的 write 行至少出现一个非 beyond 桶（fresh-fd 首写入口 pos=0 必落 zero）；chmod 仍应为 NA。`offCall` 的 write mid/tail、pwrite64 四桶、`off=` mid/tail 取决于生成器分布（mid/tail 需"覆盖已有文件内部"才会出现），**只作观察项，不作门槛**。
+
+**诊断配套**：`recordCallTypeIno` 的 offCall 行加 `isOffsetFunc` 过滤（lookup 侧事件不再进 truncate/chmod 行）；`InoByFunc` 扩为 `zero/zeroOK/ne/eq` 四列，`zeroOK` 即"成功却无 entry_ino"的报警计数。
+
+---
+
+## 32. R22-R25 状态更新（2026-10-03）
+
+**顶点时间与匹配（R22）**：BPF 新增入口时间 `entry_ts`，顶点 `stime/etime` 改为事件自身的 `[entry kprobe, return probe]` 窗口（缺失/非法回退 syscall 窗口）；`matchEventToCall` 改为双端点 containment（tol 60µs 不变——executorlog 实测标定 gap 0.65–1.29µs）。`creat` 的 create→file_open 因此成为真实 **HB**，§31 之后登记的"同调用多事件成对噪声（CC）"由此解决；writepage 仍为点时间。
+
+**采集语义（R22）**：LOOKUP 返回值按 `IS_ERR` 归一（此前 `int` 截断 dentry 指针，别名查找的 RetBucket 随地址随机）；RENAME 改存 `old_dentry`，`EntryIno` 为被移动的源 inode（此前 fresh dst 为 0、覆盖 dst 为被删目标 inode）；perf writepage 显式 `CLOCK_MONOTONIC`；`tsc_ns_to_global` 下溢 clamp；`entry_state` 上限 1024→8192；trace 头新增 `best_gap`（parse-dbg 落盘）。
+
+**P5/P7 关联**：writepage 路径（R19）+ 逐事件窗口（R22）使 writepage 顶点的时间/路径口径一致；write↔writepage 的映射建模仍未实施（异步跨轮语义，见 P5）。perf writepage 采集面仍 CPU0-only（P7 未变）。`refreshTscOffsets` 死机制已删除（R25；executor 输出的是 argv 回声，`tscoffs refreshed` 全期间 0 次）。
+
+**板子/路径（R23-R25）**：D1（板子学习被全局去重位门控）与 `noteDirectedHit` 退役已修（R23，依据 hmdfsfuzz8 三天 114 次重启）；board 记录全部本地观测 pair、按 shape/cell 首见去重（不按 32 位 novelty 位——孪生 combo 与截断碰撞会同一位异 cell 而漏学）；`lookupPath` 根父/EntryIno 正查找/rename 双分量已修（R24，LOOKUP 占顶点 ~28%）；persist 目录判定改用路径成分边界（R25）。
+
+---
+
+## 33. R26-R27 状态更新（2026-10-03，R22-R25 全面 review 修复）
+
+**R26（executor fallback 标定 gap 作用域）**：`calibrate_tsc` 的最终 fallback（两轮都不一致）在轮循环外引用循环体内声明的 `best_gap` → x86_64 下 C 编译失败（R22 引入；Windows 端只跑 Go 构建，未覆盖 C++，Ubuntu 构建因此阻塞）。fallback 候选改为随 `fb_ratio/fb_t/fb_ts` 一并保存 `fb_gap`，循环外 `tsc_best_gap = fb_gap`。
+
+**R27（lookupPath rename 双候选 + 父侧门控）**：R24 的"正=old、负=new"单符号规则在非 happy-path 下错标：
+- 定向 ENOENT 批次（`variantKindAllowed` 的 root unlink + Same）源查找为负 → 被标 newP，pair 关系从 `PathSamePath` 误为 `SameParent`，目标 `(unlink,rename,Same,ENOENT)` cell 永不命中；
+- 正查找中间分量（如 `dirA`）被无差别标成 oldP，Path/IsDir/Depth 全错；
+- 覆盖 dst 的正查找同样歧义。tracer 只挂 `hmdfs_lookup_merge`（dcache 命中的源查找无事件），单事件无法用符号/序号精确区分源/目标。
+
+现改为**父侧门控 + 双候选**：解 `parentPath` 后，异父用父 inode 精确判源/目标（含 root-parent 的 `merge_view` 父）；同父终分量返回 `(oldP,newP)`/`(newP,oldP)`；正查找先走 `childOnCall` 分量解析（修中间分量）；`lookupPath` 返回 `(path, alt)`，`v.OldPath=alt`，`prePath` 对非空 `OldPath` 一律返回（关系分类 Cartesian 兜底；`hashPair` 不含路径，novelty 位不受影响）；`rootParent` 收紧为 `ino==6 && !ok`。用例：`LookupPathRenameMissingSource`（unlink→lookup 必须 `PathSamePath`）、`LookupPathRenameIntermediate`、`LookupPathRenameCrossParent`、`LookupPathRenamePosDst`。
+
+**R23 孪生口径核实（非回归）**：板子 shape 为事件级（`hashPair==hashShape`，不含 call name），write/pwrite64 共享 shape 属既有设计；R23 全量记录与旧 novelty 位门控产生相同 `knownShapes` 集（仅 32 位截断碰撞例外），不改语义。
+
+---
+
+## 34. 第四次全面 review 不改项记录（V4-4/V4-6/V4-8，2026-10-05）
+
+**V4-4（DCT/定向插入的 open 旗标恒 O_RDWR）**：fd 兜底新建的 open 用硬编码 `flags=2`（`mutation.go` 的 `concurrentFlags := uint64(2)`；`directed_plan.go:1881` 同默认），不镜像种子侧 O_RDONLY/O_RDWR 分布，错向 I/O 组合经该通道产不出。裁定不改：VFS 基本行为、测试价值低。
+
+**V4-6（FileTree 锁外读）**：`findGroupCalls`/`groupProviders` 无锁读 `lcs.FileTree`，`SyncFileTreeFromFsMd` 写它；procs=1（`manager.go` autoConfig 强制）且 pollLoop 不触 FileTree ⇒ 当前无并发路径。登记为 procs>1 才触发的已知项；procs=1 下唯一真实竞争是 R21 corpus 长度（已修）。
+
+**V4-8（cell 级 2b 退休不设树态松弛）**：`cellUnreachable` 连续 8 次"计划已执行未命中"置位（`coverage_board.go`），只在真观测（`markDiscoveredLocked`/`noteDirectedHit`）或 `reset()` 解除。裁定不改：
+- 计划只在当前树有见证时生成（`planDirectedCells` + `validateDirectedPlanLive`），miss 成因是时序/运行期路径失效，不是"树没长出来"；
+- 2a/Direction3 势能（`uncoveredPotentials`）不看 cell 级退休，命中即自动解除（有自愈路径）；
+- 树每轮 `SyncFileTreeFromFsMd` 都结构变化，"树变即清"的 epoch 松弛会每轮清空退休账本（8 次阈值失效、反复重试时序死格）；`depths` 域 init 固定，新节点大多不改模型；
+- 已知误 miss 来源：V4-1 HB 插入时序（接受）；P2-a 空变体执行仍记 miss（整轮 `observed` 连坐：`ResolveDirectedPending` 只看全轮归因，不看变体自身是否出手；延后，若批后 `cellUnreach` 居高再单独修 executed 判定）。
+
+---
+
+## 35. 三路代码冷读 review 遗留与决定（2026-10-05）
+
+**范围**：对种子构造链路三块（从零生成/插入原语、DCT+覆盖板+定向突变臂、2b 定向批）做独立冷读与交叉复核。已修复项见本节末；下列为裁定不改/延后项与语义决定。
+
+### 语义决定（保持现状）
+
+- **FreshSame `(creat,creat)` 的 HB cell 可被同一次 creat 内部的 create→file_open 对命中**（R22 起即真实 HB）。接受为语义：`recordPairs` 本就会发现该 cell，pending 不排除同调用顶点对。
+- **组合级 discovery 不重置该 combo 其他 cell 的 `cellAttempts`**：细胞级"连续 8 次"各自独立（`noteDirectedMiss`/`markDiscoveredLocked` 只重置命中的那个 cell）；F1 只管组合级 D3 退休账目。
+- **`destructiveHBDoomed`/`destructiveCCExclusive` 是 planner 侧"可构造性"取舍，不是可观测性断言**（目标弱一致视图下陈旧条目可能仍在）；相关注释已补（`destructiveSameRoot`、`variantKindsFor`）。
+
+### 登记不改（P3 尾项）
+
+- **死代码保留（决定不删）**：FileTree 更新层（`AddCreatedFile/AddCreatedDir/RemoveFile/RenameFile/UpdateHmdfsConfig` 等）、未调用 API（`ChooseConcurrentCall/ChoosePathRelation/GetVariants/IsRootCall/IsFileOrDirCall`）、`generateCallByName` 的 close 分支、`randGetdentsBufSize` 等。
+- **P3-9**：`insertCallFromDCT` 在"根已插入、所有变体被跳过"时仍 `return true`；`expandWithDCT` 的失败计数不反映变体缺失（程序趋于根密集）。
+- **P3-11**：D3 在 `chooseVariant` 返回前 `noteDirectedPick`（选择即记账），此后插入失败仍累计组合级退休窗口。
+- **P3-12**：`callRemovable`（`AnalyzeProgFds` 第二遍只看 `Args[0]`）与 `callRemovableInSet`（`Ret.uses`）双判据；当前 fsops 调用域 fd 恒在 `Args[0]`、两者等价，仅对未来调用形状 latent。
+- **P3-13**：`usedDst` 预留不含 `batch.BaseA/BaseA2` 与物化 FreshB；目前靠"E 目标取自现存节点 + 随机后缀"隐式安全。
+- **P3-15**：`GenerateProgsForHmdfsFsops`/`generateFromDistributedChoiceTable` 缺 `insertCallFromDCT` 式 cfg 守卫（生产由 proc.go 节点数校验兜底，仅测试/裁剪 target 面）。
+- **P3-16**：板子喂给受 `EnableDagFb` 门控（proc.go:1271，默认 true），而 `PickDirectedBatch` 派发只看 `CoverageBoardReady()`；flag 关闭时计划照插、板子不学习（生产恒开）。
+- **P3-17**：`destructiveSameRoot` 不含 rmdir 根 → `destructiveCCExclusive` 的 rmdir 分支不可达；rmdir 根下的 HB/CC 形态是否同门处理，留待语义定夺。
+- **P3-18**：`uncoveredOffPots` 按 variant 名跨全部 root/深度/类型/persist 聚合，data 臂只改 offset/length → 部分势能按其组内实际边距不可实现（仅随机臂兜底）；治本需按组内路径边距过滤。
+- **P3-19**：`shapeCovered` 以该 cell 首个枚举代表计划的 A 语境决定整格取舍（近似，已在注释说明）。
+
+### 残留备注
+
+- 路径两臂（`MutateGroupPathDynamic` fallback / `mutateGroupPathDirected`）为"部分应用"语义：锚点/成员失败可能留下半迁移组；返回值已诚实反映"是否有任何改写"（P3-10），但不回滚。
+- `recordLastMutation` 在回退臂入口先记，回退最终 false 时诊断仍显示 `MutateGroupPathDynamic`（既有诊断口径）。
+- 模型把 RetA 钉死 Success：迟端成功、早端失败的观测对只进 `discovered`、不进 `found`（`computeProducibleLocked` 注释已述）。
+
+### 本轮已修复（存档）
+
+P3-1 种子 rename 目的名走 `freshRenameDst`；P3-2 `uncoveredCellFlags` 补 `cellInModel`（`cellUncovered` 同步对齐）；P3-3 插入前断言 HB ⇒ modifier 根；P3-7 `renamePlaceholder` 三处合一（含合成 sibling 目标剥离旧后缀）；P3-8 truncate realizer 合一并接受子页 Tail；偏移 realizer 合一（size0 Beyond 确定性、Tail size0 去下溢）；P3-10 `updateCallPathInProg` 返回 bool；P3-14 `PendingDirected` 覆盖守卫；P3-19 注释。另：truncate loser 竞态实化为当前 size、mkdir 增 `planEffectCreate`（P2-3）；`destructiveSameRoot`/`variantKindsFor` 注释修正（P2-2）。

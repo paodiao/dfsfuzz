@@ -49,8 +49,9 @@ type Proc struct {
 	freqCov               int32
 	cltTick               chan bool
 	hmcfg                 prog.Hmdfs_config
-	lcsInodeops           *prog.LayeredChoiceStrategy
-	lcsFileops            *prog.LayeredChoiceStrategy
+	lcsFsops              *prog.LayeredChoiceStrategy
+	tscoffs               []int64 // per-proc copy; only the owning goroutine reads/writes it
+	lastDCTBoardLog       time.Time
 }
 
 func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
@@ -117,6 +118,13 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		}
 		if nodeNum != fuzzer.config.FuzzingVMs {
 			return nil, fmt.Errorf("node num(%d) does not match fuzzing_vms(%d)", nodeNum, fuzzer.config.FuzzingVMs)
+		}
+		// Degenerate configs would make the execution batch exceed the
+		// executor count (e.g. generateProgsForConcurrentRW always emits two
+		// programs), which the length guards then reject every round. Fail at
+		// startup instead: hmdfs needs at least one server and one client.
+		if nodeNum < 2 {
+			return nil, fmt.Errorf("hmdfs requires at least 2 nodes (server + client), got %d", nodeNum)
 		}
 
 		for i, id := range cids {
@@ -295,16 +303,27 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		}
 	}
 
+	// The execution protocol is one program per executor; the manager builds
+	// exactly FuzzingVMs executor commands and hc.Node_num is validated
+	// against FuzzingVMs above. A mismatch here is a config/loader corruption
+	// that would panic on the first batch, so fail cleanly at startup.
+	if hc.DfsName == "hmdfs" && len(fuzzer.config.Executor) != hc.Node_num {
+		return nil, fmt.Errorf("executor count %d does not match Node_num %d",
+			len(fuzzer.config.Executor), hc.Node_num)
+	}
+
 	hc.FileTree = prog.NewFileTree()
 	hc.FileTree.InitFromHmdfsConfig(&hc)
 
-	var lcsInodeops, lcsFileops *prog.LayeredChoiceStrategy
+	// Per-proc TSC offsets: seeded from the immutable fuzzer config slice and
+	// refreshed in place from this proc's own exec report (see executeRaw).
+	procTsc := append([]int64(nil), fuzzer.tscoffs...)
+	var lcsFsops *prog.LayeredChoiceStrategy
 	if hc.DfsName == "hmdfs" {
-		lcsInodeops = prog.NewLayeredChoiceStrategy("inodeops", &hc, fuzzer.target)
-		lcsFileops = prog.NewLayeredChoiceStrategy("fileops", &hc, fuzzer.target)
-		lcsInodeops.SetTscOffsets(fuzzer.tscoffs)
-		lcsFileops.SetTscOffsets(fuzzer.tscoffs)
-		appendDiagLog("tscoffs=%v", fuzzer.tscoffs)
+		lcsFsops = prog.NewLayeredChoiceStrategy(&hc, fuzzer.target)
+		lcsFsops.SetTscOffsets(procTsc)
+		prog.InitCoverageBoard(&hc)
+		appendDiagLog("tscoffs=%v", procTsc)
 	}
 
 	proc := &Proc{
@@ -321,8 +340,8 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		freqCov:               freqCov,
 		cltTick:               cltTick,
 		hmcfg:                 hc,
-		lcsInodeops:           lcsInodeops,
-		lcsFileops:            lcsFileops,
+		lcsFsops:              lcsFsops,
+		tscoffs:               procTsc,
 	}
 	return proc, nil
 }
@@ -362,39 +381,19 @@ func (proc *Proc) loop() {
 			//tao modified
 			var ps []*prog.Prog
 			if proc.fuzzer.config.DFSName == "hmdfs" {
-				// Seed-type probabilities follow form-space size and the
-				// hmdfsfuzz7 attribution: inodeops 0.65 (largest relation
-				// space, generation-only entry, ~85% of true-bug events at
-				// 50% share), fileops 0.25 (bootstrapped; workqueue-lock bug
-				// source), stash 0.10 (fewest shapes, lowest yield).
-				r := proc.rnd.Intn(20)
-				var seedType int
-				switch {
-				case r < 2:
-					seedType = 0 // stash: 10%
-				case r < 7:
-					seedType = 1 // fileops: 25%
-				default:
-					seedType = 2 // inodeops: 65%
-				}
-				switch seedType {
-				case 0:
+				// Seed mix: stash 10% (fault-window orchestration) and the
+				// merged fsops type 90% (single DCT/pattern generator).
+				if proc.rnd.Intn(10) < 1 {
 					ps = proc.fuzzer.target.GenerateProgsForHmdfsStash(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
-				case 1:
-					ps = proc.fuzzer.target.GenerateProgsForHmdfsFileops(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
-				case 2:
-					ps = proc.fuzzer.target.GenerateProgsForHmdfsInodeops(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
-				//case 3:
-				//ps = proc.fuzzer.target.GenerateProgsForHmdfsDcache(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
-				default:
-					//ps = r.Generate(...)  // 原有的随机生成
+				} else {
+					ps = proc.fuzzer.target.GenerateProgsForHmdfsFsops(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
 				}
 				proc.execute(proc.execOpts, ps, ProgNormal, StatGenerate)
 			} else {
 				//Generate empty subtestcase for servers
 				for idx := 0; idx < proc.fuzzer.config.ServNum; idx++ {
 					p, _ := proc.fuzzer.target.Generate(proc.rnd, 0, nil, nil, true, proc.fuzzer.sCalls,
-						proc.fuzzer.config.EnableC2san, &proc.hmcfg, idx)
+						proc.fuzzer.config.EnableC2san, &proc.hmcfg)
 					ps = append(ps, p)
 				}
 				//Generate subtestcases for clients
@@ -402,9 +401,8 @@ func (proc *Proc) loop() {
 				var files map[string]bool
 				for idx := 0; idx < subTsNum; {
 					repeatNum := proc.rnd.Intn(subTsNum-idx) + 1
-					curIdx := proc.fuzzer.config.ServNum + idx
 					p, newFiles := proc.fuzzer.target.Generate(proc.rnd, prog.RecommendedCalls, ct, files, false,
-						proc.fuzzer.sCalls, proc.fuzzer.config.EnableC2san, &proc.hmcfg, curIdx)
+						proc.fuzzer.sCalls, proc.fuzzer.config.EnableC2san, &proc.hmcfg)
 					log.Logf(0, "%v", newFiles)
 					files = newFiles
 					ps = append(ps, p)
@@ -447,7 +445,7 @@ func (proc *Proc) loop() {
 						if idx >= proc.fuzzer.config.ServNum {
 							p.Mutate(proc.rnd, prog.RecommendedCalls, ct, fuzzerSnapshot.corpus,
 								proc.fuzzer.sCalls, proc.fuzzer.config.ServNum,
-								seedPS[0].HasCrashFail || seedPS[0].HasNetFail, proc.fuzzer.config.EnableC2san, &proc.hmcfg, idx)
+								seedPS[0].HasCrashFail || seedPS[0].HasNetFail, proc.fuzzer.config.EnableC2san, &proc.hmcfg)
 						} else {
 						}
 						ps = append(ps, p)
@@ -485,11 +483,13 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		}
 		log.Logf(3, "1 triaging input for %v (new signal=%v)", logCallName, newSignal.Len())
 	}
-	// Program-level dedup: corpusSignalDiff only compares against the signal
-	// set, so errno/execution-result fluctuations of an already-corpus program
-	// keep reporting "new signal" and run the whole triage->smash chain only
-	// to fail addInputToCorpus. Skip such inputs here (same sig computation as
-	// addInputToCorpus, so the check is exact).
+	// Program-level dedup, stage 1 (pre-minimization prefilter):
+	// corpusSignalDiff only compares against the signal set, so errno/execution-
+	// result fluctuations of an already-corpus program keep reporting "new
+	// signal" and run the whole triage->smash chain only to fail
+	// addInputToCorpus. This check uses the as-received bytes; the authoritative
+	// check runs again after prog.Minimize (stage 2), against the bytes that are
+	// actually sent to the manager and stored in corpus.
 	var data [][]byte
 	var dataForHash []byte
 	for _, p := range item.ps {
@@ -587,6 +587,28 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		return
 	}
 
+	// Stage 2 dedup: prog.Minimize may have rewritten item.ps, so recompute the
+	// serialized payload and hash for the bytes actually sent to the manager
+	// and stored in corpus (the pre-minimization data/sig would mismatch the
+	// minimized program and its timings). A minimized program already in corpus
+	// is skipped here, before the coverage runs.
+	preSig := sig
+	data = data[:0]
+	dataForHash = dataForHash[:0]
+	for _, p := range item.ps {
+		ser := p.Serialize()
+		data = append(data, ser)
+		dataForHash = append(dataForHash, ser...)
+	}
+	sig = hash.Hash(dataForHash)
+	proc.fuzzer.corpusMu.RLock()
+	_, dup = proc.fuzzer.corpusHashes[sig]
+	proc.fuzzer.corpusMu.RUnlock()
+	if dup {
+		appendDiagLog("triage skip: minimized program already in corpus %s", logCallName)
+		return
+	}
+
 	//Merge server coverage
 	var inputCliSignal, inputSrvSignal signal.Signal
 	srvNum := proc.fuzzer.config.ServNum
@@ -629,6 +651,7 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		SrvSignal: inputSrvSignal.Serialize(),
 		SrvCover:  SrvCover.Serialize(),
 		CliCover:  CliCover.Serialize(),
+		Timings:   prog.ProgTimings(item.ps),
 	})
 
 	if item.call != -1 {
@@ -640,12 +663,22 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		atomic.AddUint64(&proc.fuzzer.dagCorpusCount, 1)
 	}
 	added := proc.fuzzer.addInputToCorpus(item.ps, inputCliSignal, inputSrvSignal, sig)
+	if preSig != sig {
+		// Keep the pre-minimization key for early-skip of re-delivered
+		// candidates (the set has no 1:1 entry invariant).
+		proc.fuzzer.corpusMu.Lock()
+		proc.fuzzer.corpusHashes[preSig] = struct{}{}
+		proc.fuzzer.corpusMu.Unlock()
+	}
+	proc.fuzzer.corpusMu.RLock()
+	corpusLen := len(proc.fuzzer.corpus)
+	proc.fuzzer.corpusMu.RUnlock()
 	{
 		total := 0
 		for _, p := range item.ps {
 			total += len(p.Calls)
 		}
-		appendDiagLog("triage success: %s added=%v corpus=%d total=%d dag=%v", logCallName, added, len(proc.fuzzer.corpus), total, item.triageDag)
+		appendDiagLog("triage success: %s added=%v corpus=%d total=%d dag=%v", logCallName, added, corpusLen, total, item.triageDag)
 	}
 	if item.triageDag && added {
 		atomic.AddUint64(&proc.fuzzer.dagCorpusEntries, 1)
@@ -704,8 +737,8 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 			calls[i] = len(p.Calls)
 			total += len(p.Calls)
 		}
-		appendDiagLog("smash begin: inode=%v file=%v stash=%v dcache=%v calls=%v total=%d",
-			item.ps[0].IsInodeOps, item.ps[0].IsFileOps, item.ps[0].IsStash, item.ps[0].IsDCache,
+		appendDiagLog("smash begin: fsops=%v stash=%v dcache=%v calls=%v total=%d",
+			item.ps[0].IsFsops, item.ps[0].IsStash, item.ps[0].IsDCache,
 			calls, total)
 	}
 
@@ -737,21 +770,18 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 }
 
 // mutateHmdfs mutates a hmdfs testcase: seeds go through their type-specific
-// structured mutator (stash/dcache/inodeops/fileops); the inode/file-op ones
-// are DCT-based (root call inserted into ps[0], concurrent calls spread over
-// the other nodes). Everything falls back to the standard per-client Mutate.
+// structured mutator (stash/dcache/fsops); the fsops one is DCT-based (root
+// call inserted into ps[0], concurrent calls spread over the other nodes).
+// Everything falls back to the standard per-client Mutate.
 func (proc *Proc) mutateHmdfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
 	if len(ps) == 0 {
 		return
 	}
 	srvNum := proc.fuzzer.config.ServNum
 	mutated := false
-	if ps[0].IsInodeOps {
-		mutated = prog.MutateInodeOpsWithDCT(ps, proc.rnd, proc.fuzzer.choiceTable,
-			proc.fuzzer.sCalls, &proc.hmcfg, proc.lcsInodeops)
-	} else if ps[0].IsFileOps {
-		mutated = prog.MutateFileopsWithDCT(ps, proc.rnd, proc.fuzzer.choiceTable,
-			proc.fuzzer.sCalls, &proc.hmcfg, proc.lcsFileops)
+	if ps[0].IsFsops {
+		mutated = prog.MutateFsopsWithDCT(ps, proc.rnd,
+			proc.fuzzer.sCalls, &proc.hmcfg, proc.lcsFsops)
 	} else if ps[0].IsStash {
 		mutated = prog.MutateStashProg(ps, proc.rnd, proc.fuzzer.choiceTable,
 			proc.fuzzer.sCalls, &proc.hmcfg)
@@ -759,32 +789,38 @@ func (proc *Proc) mutateHmdfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
 		mutated = prog.MutateDcacheProg(ps, proc.rnd, proc.fuzzer.choiceTable,
 			proc.fuzzer.sCalls, &proc.hmcfg)
 	}
-	//修改：这里要保留原始突变策略吗？
+	// Fallback: the structured mutators all declined, so give every client
+	// prog a pass of the standard mutator instead of a single random one.
+	// ps[0] is skipped only when it carries failure/barrier bookkeeping:
+	// GeneralFailPos/GeneralBarrierPos live on ps[0] and there is no refresh
+	// path for index 0 (see mutation.go RefreshGeneralFailPos), so a generic
+	// Mutate would leave those positions stale. A clean seed has no such
+	// tables and ps[0] is an ordinary node, so it is included.
 	if !mutated && len(ps) > srvNum {
 		start := srvNum
-		if proc.fuzzer.config.DFSName == "hmdfs" && srvNum == 0 {
-			start = 1 // hmdfs 的 ps[0] 是主 prog（故障窗口/位置表/同步结构）——普通 Mutate 不动它
+		if proc.fuzzer.config.DFSName == "hmdfs" && srvNum == 0 &&
+			(ps[0].HasCrashFail || ps[0].HasNetFail ||
+				len(ps[0].GeneralFailPos) > 0 || len(ps[0].GeneralBarrierPos) > 0) {
+			start = 1
 		}
-		if start >= len(ps) {
-			return
+		if start < len(ps) {
+			hasFail := ps[0].HasCrashFail || ps[0].HasNetFail
+			n := 0
+			for idx := start; idx < len(ps); idx++ {
+				ps[idx].Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, corpus,
+					proc.fuzzer.sCalls, srvNum, hasFail,
+					proc.fuzzer.config.EnableC2san, &proc.hmcfg)
+				prog.RefreshGeneralFailPos(ps, idx)
+				n++
+			}
+			appendDiagLog("fallback mutate: progs=%d range=[%d,%d) hasFail=%v", n, start, len(ps), hasFail)
+			log.Logf(1, "#%v: fallback mutated %d subtestcases", proc.pid, n)
 		}
-		randIdx := proc.rnd.Intn(len(ps)-start) + start
-		ps[randIdx].Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, corpus,
-			proc.fuzzer.sCalls, srvNum, ps[0].HasCrashFail || ps[0].HasNetFail,
-			proc.fuzzer.config.EnableC2san, &proc.hmcfg, randIdx)
-		prog.RefreshGeneralFailPos(ps, randIdx)
-		log.Logf(1, "#%v: fallback mutated %d-th subtestcase", proc.pid, randIdx)
 	}
 }
 
-// feedbackDagPairs feeds novel DAG pairs (already filtered by novelty) back
-// into the DCT tables. Two layers:
-//   - both concurrent and HB pairs update the temporal-form weights of the
-//     combo (the second layer: which insertion form actually produced the
-//     corresponding pair);
-//   - rewards for the combos recorded by the most recent insertion are
-//     resolved separately in applyInsertFeedback (insert-feedback
-//     attribution), after the execution that follows the insertion.
+// feedbackDagPairs accounts the novel DAG pairs (already filtered by novelty)
+// in the HB/CC counters. The board is fed separately, from every observation.
 func (proc *Proc) feedbackDagPairs(newPairs []prog.DAGPair) {
 	for _, p := range newPairs {
 		if p.Temporal == prog.TemporalHB {
@@ -792,36 +828,44 @@ func (proc *Proc) feedbackDagPairs(newPairs []prog.DAGPair) {
 		} else {
 			atomic.AddUint64(&proc.fuzzer.dagCcPairCount, 1)
 		}
-		root, variant, temporal, ok := prog.DagPairToVariant(&p)
-		if !ok {
-			continue
-		}
-		if lcs := proc.lcsForRootCall(root); lcs != nil {
-			lcs.UpdateTemporalWeight(root, variant, temporal)
-		}
 	}
 }
 
-// applyInsertFeedback resolves the combos recorded by the most recent
-// insertion mutation: if the execution produced new DAG feedback, every
-// recorded combo is rewarded (MarkYield); otherwise each combo records one
-// no-yield attempt. A failed execution clears the record without counting.
-func (proc *Proc) applyInsertFeedback(dagNew bool, executed bool) {
-	for _, lcs := range []*prog.LayeredChoiceStrategy{proc.lcsInodeops, proc.lcsFileops} {
-		if lcs == nil || len(lcs.PendingInserts) == 0 {
+// resolveDirectedPending settles the Phase 2b pending batch from the last
+// directed insertion using the full (not only novel) DAG pairs of this
+// execution. "Executed" means the DAG pipeline attributed the execution
+// (DagComputed set: at least one event matched with a resolvable path, even
+// with zero pairs, which is a genuine miss); rounds without attribution (no
+// trace events, pipeline all-miss, triage/minimize, executor error) clear
+// the pending without counting a miss.
+func (proc *Proc) resolveDirectedPending(infos []*ipc.ProgInfo) {
+	lcs := proc.lcsFsops
+	if lcs == nil || len(lcs.PendingDirected) == 0 {
+		return
+	}
+	pairs, observed := dagPairsObserved(infos)
+	lcs.ResolveDirectedPending(pairs, proc.hmcfg.Persistence_dir, observed)
+}
+
+// dagPairsObserved extracts the execution's DAG pair payload and reports
+// whether the DAG pipeline attributed this execution. DagComputed is set on
+// the designated client info whenever at least one event was matched with a
+// resolvable path (even with zero pairs), so an execution that produced no
+// pair at all still resolves pending cells as genuine misses instead of being
+// mistaken for "no evidence".
+func dagPairsObserved(infos []*ipc.ProgInfo) (pairs []prog.DAGPair, observed bool) {
+	for _, info := range infos {
+		if info == nil {
 			continue
 		}
-		if executed {
-			for _, ref := range lcs.PendingInserts {
-				if dagNew {
-					lcs.MarkYield(ref.Root, ref.Variant)
-				} else {
-					lcs.TickNoYield(ref.Root, ref.Variant)
-				}
-			}
+		if info.DagComputed {
+			observed = true
 		}
-		lcs.PendingInserts = nil
+		if pairs == nil && info.DagPairs != nil {
+			pairs = info.DagPairs
+		}
 	}
+	return pairs, observed
 }
 
 // filterNewDagPairs returns the novel DAG pair types: pairs whose novelty
@@ -861,18 +905,6 @@ func (proc *Proc) countDagDepth(newPairs []prog.DAGPair) {
 			proc.fuzzer.countDagDepthBucket(prog.DepthBucketOf(p.B.Path))
 		}
 	}
-}
-
-// lcsForRootCall picks the LayeredChoiceStrategy whose DCT table has the
-// given root call.
-func (proc *Proc) lcsForRootCall(rootCallName string) *prog.LayeredChoiceStrategy {
-	if proc.lcsInodeops != nil && proc.lcsInodeops.GetDCT().HasRoot(rootCallName) {
-		return proc.lcsInodeops
-	}
-	if proc.lcsFileops != nil && proc.lcsFileops.GetDCT().HasRoot(rootCallName) {
-		return proc.lcsFileops
-	}
-	return nil
 }
 
 /*
@@ -1037,6 +1069,10 @@ func (proc *Proc) failCall(ps []*prog.Prog, call int, subNum int) {
 
 func (proc *Proc) executeHintSeed(ps []*prog.Prog, call int, subNum int) {
 	log.Logf(1, "#%v: collecting comparisons on call %d", proc.pid, call)
+	// Operate on a private clone: the hint run replaces CheckInfo pointers
+	// (ipc) and writes ProcId through them (conc-fs), while the live corpus
+	// entry is cloned and read concurrently by other procs.
+	ps = prog.Clones(ps)
 	// First execute the original program to dump comparisons from KCOV.
 	infos := proc.execute(proc.execOptsComps, ps, ProgNormal, StatSeed)
 	if infos == nil {
@@ -1149,6 +1185,7 @@ func (proc *Proc) triageFailure(ps []*prog.Prog, infos []*ipc.ProgInfo) {
 		SrvSignal: inputSrvSignal.Serialize(),
 		SrvCover:  SrvCover.Serialize(),
 		CliCover:  CliCover.Serialize(),
+		Timings:   prog.ProgTimings(ps),
 	})
 
 	_ = proc.fuzzer.addInputToCorpus(ps, inputCliSignal, inputSrvSignal, sig)
@@ -1164,8 +1201,9 @@ func (proc *Proc) useSrvCovNow() bool {
 }
 
 func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTypes, stat Stat) (infos []*ipc.ProgInfo) {
-	dagNew := false
-	defer func() { proc.applyInsertFeedback(dagNew, infos != nil) }()
+	defer func() {
+		proc.resolveDirectedPending(infos)
+	}()
 	if len(ps) == 0 {
 		return nil
 	}
@@ -1214,7 +1252,7 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 
 	//(1). With failures, exploit server feedback
 	//(2). Client doesn't have feedback for a while
-		if proc.fuzzer.config.EnableSrvFb && ((!clientHasNew && proc.useSrvCovNow()) || ps[0].HasNetFail || ps[0].HasCrashFail) {
+	if proc.fuzzer.config.EnableSrvFb && ((!clientHasNew && proc.useSrvCovNow()) || ps[0].HasNetFail || ps[0].HasCrashFail) {
 		log.Logf(0, "----- no new client coverage: %v, %v", clientHasNew, proc.fuzzer.config.EnableEval)
 		for idx, info := range infos[:servNum] {
 			_, extra := proc.fuzzer.checkNewSignal(nil, info)
@@ -1232,12 +1270,20 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 	//feed back into the DCT tables (exploration tracking + yield reset).
 	if proc.fuzzer.config.EnableDagFb && proc.fuzzer.config.DFSName == "hmdfs" {
 		for idx, info := range infos {
-			if idx < servNum || info == nil || len(info.DagSignal) == 0 {
+			if idx < servNum || info == nil {
+				continue
+			}
+			// Board learning is decoupled from the globally deduped novelty
+			// bits (the manager pre-seeds them on restart): offer every
+			// observed pair, the board's own first-sighting ledgers count it.
+			if len(info.DagPairs) > 0 {
+				prog.RecordCoveragePairs(info.DagPairs)
+			}
+			if len(info.DagSignal) == 0 {
 				continue
 			}
 			newBits := proc.fuzzer.checkNewDagSignal(info.DagSignal)
 			if n := newBits.Len(); n > 0 {
-				dagNew = true
 				atomic.AddUint64(&proc.fuzzer.dagPairCount, uint64(n))
 				maxDag := proc.fuzzer.config.MaxDagCorpus
 				if maxDag == 0 || atomic.LoadUint64(&proc.fuzzer.dagCorpusEntries) < uint64(maxDag) {
@@ -1337,6 +1383,19 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		log.Fatalf("dedup cover is not enabled")
 	}
 
+	// The hmdfs execution model is one program per executor: a batch of any
+	// other length means a producer regression (or a corrupted executor
+	// config), which would otherwise panic inside ipc.parseOutputs. Record
+	// the producing context and abort the round as a clean execution error.
+	if proc.fuzzer.config.DFSName == "hmdfs" {
+		if want := len(proc.fuzzer.config.Executor); len(ps) != want {
+			err := fmt.Errorf("hmdfs batch has %d programs, want %d (executors)", len(ps), want)
+			log.Logf(0, "MUTATION-DEBUG: %v (stat=%v lastMut=%s)", err, stat, prog.LastMutation())
+			appendDiagLog("MUTATION-DEBUG: %v stat=%d lastMut=%s", err, stat, prog.LastMutation())
+			return nil, nil, 0, err
+		}
+	}
+
 	for _, p := range ps {
 		proc.fuzzer.checkDisabledCalls(p)
 	}
@@ -1350,8 +1409,8 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			log.Logf(0, "MUTATION-DEBUG: broken refs before execute, copy %d (stat=%v) lastMut=%s: aborting execution",
 				i, stat, prog.LastMutation())
 			refDiag := p.DumpRefDiagnosis()
-			appendDiagLog("MUTATION-DEBUG: broken refs copy %d stat=%d lastMut=%s meta: IsStash=%v IsDCache=%v IsFileOps=%v IsInodeOps=%v\n%s",
-				i, stat, prog.LastMutation(), ps[0].IsStash, ps[0].IsDCache, ps[0].IsFileOps, ps[0].IsInodeOps, refDiag)
+			appendDiagLog("MUTATION-DEBUG: broken refs copy %d stat=%d lastMut=%s meta: IsStash=%v IsDCache=%v IsFsops=%v\n%s",
+				i, stat, prog.LastMutation(), ps[0].IsStash, ps[0].IsDCache, ps[0].IsFsops, refDiag)
 			return nil, nil, 0, fmt.Errorf("broken refs in program copy %d", i)
 		}
 	}
@@ -1361,8 +1420,9 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	defer proc.fuzzer.gate.Leave(ticket)
 
 	if ps[0].HasCrashFail || ps[0].HasNetFail || proc.fuzzer.config.EnableCsan {
-		opts.Flags &= ^ipc.FlagCollide
-		opts.Flags &= ^ipc.FlagThreaded
+		local := *opts
+		local.Flags &^= ipc.FlagCollide | ipc.FlagThreaded
+		opts = &local
 		log.Logf(0, "disable threaded and collide")
 	}
 
@@ -1378,9 +1438,8 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	var testdirIno uint64
 	var hmdfsTraceEvents []prog.HmdfsTraceEvent
 	var tscRatio float64
-	var tscOffsets []int64
 
-	output, infos, hanged, err, fsMds, testdirIno, hmdfsTraceEvents, tscRatio, tscOffsets = proc.env.Exec(opts, ps)
+	output, infos, hanged, err, fsMds, testdirIno, hmdfsTraceEvents, tscRatio, _ = proc.env.Exec(opts, ps)
 
 	// Execution errors (executor crash/hang/parse failure) bubble up instead
 	// of killing the fuzzer: the executor is restarted on the next Exec
@@ -1395,23 +1454,12 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 
 	prog.SetMfTolTicksFromRatio(tscRatio)
 
-	// VM restarts change the executor's global-domain tsc_offset (argv[15]),
-	// while the fuzzer's tscoffs are configured once at startup. Without a
-	// refresh the event conversion (new offset) and the call-window offset
-	// (stale tscoffs) diverge after every restart, skewing matches by ms.
-	// The LCS shares the same slice, so in-place updates propagate there too.
-	if len(tscOffsets) > 0 {
-		refreshed := false
-		for i, off := range tscOffsets {
-			if i < len(proc.fuzzer.tscoffs) && off != 0 && proc.fuzzer.tscoffs[i] != off {
-				proc.fuzzer.tscoffs[i] = off
-				refreshed = true
-			}
-		}
-		if refreshed {
-			appendDiagLog("tscoffs refreshed: %v", proc.fuzzer.tscoffs)
-		}
-	}
+	// The VM's KVM tsc_offset is fixed for one QEMU lifetime: the manager
+	// injects it per fuzzer launch (config.TSCOFF), each Proc keeps a private
+	// copy for matchEventToCall, and the executor converts events with the
+	// same argv value. There is no in-process refresh path: a Go-side-only
+	// update would desynchronize the call windows from the events the
+	// executor already converted with its own copy.
 
 	csanPassed, csanDiffs := true, []string(nil)
 	// Triage/minimize rounds judge candidates purely by coverage/signal
@@ -1455,10 +1503,27 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	// Does not depend on csan/fsMds: call-window matching needs neither, and
 	// ino-based resolution (writepage/lookup) degrades gracefully without fsMd.
 	log.Logf(0, "hmdfs trace events=%d csanPassed=%v", len(hmdfsTraceEvents), csanPassed)
-	appendDiagLog("hmdfs trace events=%d csanPassed=%v stat=%d tscRatio=%f", len(hmdfsTraceEvents), csanPassed, stat, tscRatio)
+	failHit, failSkip := prog.FailShapeStats()
+	directedPicks, directedScore := prog.DirectedPickStats()
+	dcPlans, dcHits, dcMisses, dcNoPlans, dcInsertFails := prog.DirectedCellStats()
+	dcBatches := prog.DirectedBatchStats()
+	appendDiagLog("hmdfs trace events=%d csanPassed=%v stat=%d tscRatio=%f dataMiss=%d anchorMiss=%d alignMiss=%d failShape=%d/%d directed=%d/%d directCell=%d/%d/%d/%d/%d dcBatch=%d cfgErr=%d",
+		len(hmdfsTraceEvents), csanPassed, stat, tscRatio, prog.DataMutateMissCount(), prog.AnchorMissCount(), prog.TimingAlignMissCount(), failHit, failSkip,
+		directedPicks, directedScore, dcPlans, dcHits, dcMisses, dcNoPlans, dcInsertFails, dcBatches, prog.DirectedCfgErrCount())
+	if proc.fuzzer.config.DFSName == "hmdfs" && proc.lcsFsops != nil {
+		if now := time.Now(); now.Sub(proc.lastDCTBoardLog) >= dctBoardLogInterval {
+			proc.lastDCTBoardLog = now
+			covFound, covTarget := prog.CoverageStats()
+			appendDiagLog("dct pool: cover=%d/%d unreach=%d cellUnreach=%d", covFound, covTarget, prog.UnreachableComboCount(), prog.CellUnreachableCount())
+		}
+	}
 	if stat != StatTriage && stat != StatMinimize && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
-		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.fuzzer.tscoffs)
+		// DAG vertices intentionally use RAW fsMds (no CanonicalizeFsMd):
+		// conflict/remote-directory suffixes are kernel-visible truth here,
+		// and DAG paths never flow back into generation. The FileTree sync
+		// above and the checker canonicalize instead.
+		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.tscoffs)
 		hbPairs, ccPairs := prog.ExtractPairs(vertices, dagDiag)
 		allPairs := append(hbPairs, ccPairs...)
 		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg, dagDiag)
@@ -1478,10 +1543,13 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			dagDiag.MatchDistIn, dagDiag.MatchDistOut, prog.MfTolTicks(),
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
 			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
-		appendDiagLog("hmdfs dag marg: ret=%v err=[%s] dep=%v off=%v persist=%v type=%v retFunc=[%s] pairRet=[%s]",
+		appendDiagLog("hmdfs dag marg: ret=%v err=[%s] dep=%v off=%v persist=%v type=%v retFunc=[%s] pairRet=[%s] rel=[%s] offCall=[%s] typeFunc=[%s] inoFunc=[%s]",
 			dagDiag.RetHist, dagErrHistString(dagDiag.ErrHist), dagDiag.DepthHist, dagDiag.OffHist,
 			dagDiag.PersistHist, dagDiag.TypeHist,
-			dagRetFuncString(dagDiag.RetByFunc), dagRetComboString(dagDiag.PairRetCombos))
+			dagRetFuncString(dagDiag.RetByFunc), dagRetComboString(dagDiag.PairRetCombos),
+			dagRelHistString(dagDiag.RelHist),
+			dagOffCallString(dagDiag.OffByCall), dagTypeFuncString(dagDiag.TypeByFunc),
+			dagInoFuncString(dagDiag.InoByFunc))
 		if len(dagDiag.MFSamples) > 0 {
 			samples := ""
 			for i, s := range dagDiag.MFSamples {
@@ -1493,14 +1561,24 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			log.Logf(0, "hmdfs mf samples: %v", samples)
 			appendDiagLog("hmdfs mf samples: %v", samples)
 		}
-		if len(pairBits) > 0 {
+		// The DAG pipeline attributed this execution (at least one event
+		// matched a call with a resolvable path): mark the designated client
+		// info even when no pair formed, so the 2b pending resolver can tell
+		// "observed, nothing produced" (a genuine miss) from "not observed at
+		// all" (pipeline failure: zero usable vertices -> clear without a
+		// miss).
+		if len(vertices) > 0 {
 			for _, info := range infos[proc.fuzzer.config.ServNum:] {
-				if info != nil {
+				if info == nil {
+					continue
+				}
+				info.DagComputed = true
+				if len(pairBits) > 0 {
 					info.DagSignal = pairBits
 					info.DagScheduleBit = schedBit
 					info.DagPairs = allPairs
-					break
 				}
+				break
 			}
 		}
 	}
@@ -1509,6 +1587,9 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 }
 
 // Temporary DAG/triage-pipeline diagnostic log on the host (hardcoded path;
+// dctBoardLogInterval throttles the periodic coverage-board snapshot in dag.log.
+const dctBoardLogInterval = 5 * time.Minute
+
 // remove after the DAG feedback / corpus growth issues are diagnosed).
 var dagDiagLog *os.File
 var dagDiagMu sync.Mutex
@@ -1566,6 +1647,93 @@ func dagRetFuncString(m [16][6]int) string {
 
 // dagRetComboString renders nonzero (retA x retB):count pair-combo entries in
 // ascending order ("" when none).
+// dagRelHistString renders the produced-pair PathRel histogram as
+// "name:count" entries in enum order, zero cells omitted ("" when all
+// zero). Used to observe geometric-relation coverage and to verify the
+// entry-ino fix (sameInode should only reflect real same-inode pairs).
+func dagRelHistString(h [5]int) string {
+	names := [5]string{"samePath", "sameInode", "parentChild", "sameParent", "none"}
+	s := ""
+	for i, c := range h {
+		if c == 0 {
+			continue
+		}
+		if s != "" {
+			s += " "
+		}
+		s += fmt.Sprintf("%s:%d", names[i], c)
+	}
+	return s
+}
+
+// dagOffCallString renders the per-offset-call bucket histogram as
+// "call:NA/zero/mid/tail/beyond" rows in the fixed OffByCall order, all-zero
+// rows omitted ("" when none). Verifies the entry-position semantics:
+// sequential write/read after a fresh open should land in the zero bucket,
+// while pwrite64/pread64 explicit offsets reach every bucket.
+func dagOffCallString(m [6][5]int) string {
+	s := ""
+	for r := range m {
+		sum := 0
+		for _, c := range m[r] {
+			sum += c
+		}
+		if sum == 0 {
+			continue
+		}
+		if s != "" {
+			s += " "
+		}
+		s += fmt.Sprintf("%s:%d/%d/%d/%d/%d", prog.OffCallNames[r],
+			m[r][0], m[r][1], m[r][2], m[r][3], m[r][4])
+	}
+	return s
+}
+
+// dagTypeFuncString renders the event-time type (dir/file) of the
+// type-sensitive functions, nonzero rows only ("" when none). Verifies the
+// i_mode fix: namespace-op types come from the event, not from the
+// post-execution tree state.
+func dagTypeFuncString(m [16][2]int) string {
+	fids := []uint32{prog.FuncMkdir, prog.FuncCreate, prog.FuncRmdir, prog.FuncUnlink,
+		prog.FuncRename, prog.FuncDirOpen, prog.FuncIterate, prog.FuncLookup}
+	s := ""
+	for _, fid := range fids {
+		d, f := m[fid][1], m[fid][0]
+		if d == 0 && f == 0 {
+			continue
+		}
+		if s != "" {
+			s += " "
+		}
+		s += fmt.Sprintf("%s:%d/%d", prog.HmdfsFuncName[fid], d, f)
+	}
+	return s
+}
+
+// dagInoFuncString renders the entry-ino capture mode of the namespace
+// functions as "call:zero/zeroOK/ne/eq" (EntryIno==0, EntryIno==0 while the
+// operation succeeded, EntryIno!=Ino, EntryIno==Ino), nonzero rows only ("").
+// Verifies the entry_ino fix: eq should stay ~0 and ne should dominate, while
+// zeroOK is the capture-failure alarm — a successful create/mkdir must have
+// produced an entry inode, so zeroOK>0 for them means the capture is broken
+// (LOOKUP zeroOK is legitimate: negative lookups return no dentry).
+func dagInoFuncString(m [16][4]int) string {
+	fids := []uint32{prog.FuncMkdir, prog.FuncCreate, prog.FuncRename, prog.FuncLookup}
+	s := ""
+	for _, fid := range fids {
+		if m[fid][0] == 0 && m[fid][1] == 0 && m[fid][2] == 0 && m[fid][3] == 0 {
+			continue
+		}
+		if s != "" {
+			s += " "
+		}
+		s += fmt.Sprintf("%s:%d/%d/%d/%d", prog.HmdfsFuncName[fid],
+			m[fid][0], m[fid][1], m[fid][2], m[fid][3])
+	}
+	return s
+}
+
 func dagRetComboString(m [6][6]int) string {
 	s := ""
 	for a := range m {

@@ -13,7 +13,7 @@ import (
 // whether it is equal to the original program or not. If it is equivalent then
 // the simplification attempt is committed and the process continues.
 func Minimize(ps0 []*Prog, callIndex0 int, subNum int, crash bool, srvNum int,
-															pred0 func([]*Prog, int) bool,) ([]*Prog, int) {
+	pred0 func([]*Prog, int) bool) ([]*Prog, int) {
 	pred := func(ps []*Prog, callIndex int) bool {
 		for _, p := range ps {
 			p.sanitizeFix()
@@ -69,13 +69,19 @@ func Minimize(ps0 []*Prog, callIndex0 int, subNum int, crash bool, srvNum int,
 
 func removeCalls(ps0 []*Prog, CallIndex0 int, subNum int, crash bool, srvNum int, pred func([]*Prog, int) bool) ([]*Prog, int) {
 
-	for j, _ := range ps0 {
+	for j := range ps0 {
 		if j < srvNum {
 			continue
 		}
 		for i := len(ps0[j].Calls) - 1; i >= 0; i-- {
+			// Failure/barrier injections are structural: the coverage
+			// predicate cannot judge their removal (dcache barriers sync
+			// every client prog).
+			if strings.Contains(ps0[j].Calls[i].Meta.Name, "syz_failure") {
+				continue
+			}
 			if j == subNum {
-				if i == CallIndex0 || strings.Contains(ps0[j].Calls[i].Meta.Name, "syz_failure") {
+				if i == CallIndex0 {
 					continue
 				}
 				CallIndex := CallIndex0

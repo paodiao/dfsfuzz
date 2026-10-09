@@ -117,7 +117,7 @@ func TestCallSetRandom(t *testing.T) {
 	ct := target.DefaultChoiceTable()
 	for i := 0; i < iters; i++ {
 		const ncalls = 10
-		p, _ := target.Generate(rs, ncalls, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, ncalls, ct, nil, false, nil, false, &Hmdfs_config{})
 		calls0 := make(map[string]struct{})
 		for _, c := range p.Calls {
 			calls0[c.Meta.Name] = struct{}{}
@@ -353,7 +353,7 @@ func TestSerializeDeserializeRandom(t *testing.T) {
 		data0 := make([]byte, ExecBufferSize)
 		data1 := make([]byte, ExecBufferSize)
 		for i := 0; i < iters; i++ {
-			p0, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+			p0, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 			if ok, _, _ := testSerializeDeserialize(t, p0, data0, data1); ok {
 				continue
 			}
@@ -507,11 +507,10 @@ func TestSerializeMetaRoundTrip(t *testing.T) {
 		}{
 			{"stash", func(p *Prog) { p.IsStash = true }},
 			{"dcache", func(p *Prog) { p.IsDCache = true }},
-			{"fileops", func(p *Prog) { p.IsFileOps = true }},
-			{"inodeops", func(p *Prog) { p.IsInodeOps = true }},
+			{"fsops", func(p *Prog) { p.IsFsops = true }},
 		}
 		for _, m := range markers {
-			p0, _ := target.Generate(rs, 10, target.DefaultChoiceTable(), nil, false, nil, false, &Hmdfs_config{}, 0)
+			p0, _ := target.Generate(rs, 10, target.DefaultChoiceTable(), nil, false, nil, false, &Hmdfs_config{})
 			m.apply(p0)
 			data := p0.Serialize()
 			if !bytes.Contains(data, []byte("# prog-meta:")) {
@@ -528,10 +527,8 @@ func TestSerializeMetaRoundTrip(t *testing.T) {
 				got = p1.IsStash
 			case "dcache":
 				got = p1.IsDCache
-			case "fileops":
-				got = p1.IsFileOps
-			case "inodeops":
-				got = p1.IsInodeOps
+			case "fsops":
+				got = p1.IsFsops
 			}
 			if !got {
 				t.Fatalf("marker %v lost in round-trip\nprog:\n%s", m.name, data)

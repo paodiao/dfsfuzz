@@ -60,20 +60,18 @@ func (p *Prog) serialize(verbose bool) []byte {
 // only when at least one marker is set, so plain progs keep the legacy text
 // format unchanged.
 type progMeta struct {
-	IsStash    bool `json:"is_stash"`
-	IsDCache   bool `json:"is_dcache"`
-	IsFileOps  bool `json:"is_file_ops"`
-	IsInodeOps bool `json:"is_inode_ops"`
+	IsStash  bool `json:"is_stash"`
+	IsDCache bool `json:"is_dcache"`
+	IsFsops  bool `json:"is_fsops"`
 }
 
 func (p *Prog) metaLine() string {
 	m := progMeta{
-		IsStash:    p.IsStash,
-		IsDCache:   p.IsDCache,
-		IsFileOps:  p.IsFileOps,
-		IsInodeOps: p.IsInodeOps,
+		IsStash:  p.IsStash,
+		IsDCache: p.IsDCache,
+		IsFsops:  p.IsFsops,
 	}
-	if !m.IsStash && !m.IsDCache && !m.IsFileOps && !m.IsInodeOps {
+	if !m.IsStash && !m.IsDCache && !m.IsFsops {
 		return ""
 	}
 	data, err := json.Marshal(m)
@@ -338,8 +336,7 @@ func (p *parser) parseProg() (*Prog, error) {
 				if err := json.Unmarshal([]byte(strings.TrimPrefix(p.comment, "prog-meta:")), &m); err == nil {
 					prog.IsStash = m.IsStash
 					prog.IsDCache = m.IsDCache
-					prog.IsFileOps = m.IsFileOps
-					prog.IsInodeOps = m.IsInodeOps
+					prog.IsFsops = m.IsFsops
 				}
 				p.comment = ""
 			}

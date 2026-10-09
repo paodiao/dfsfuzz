@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Maximum length of generated binary blobs inserted into the program.
@@ -47,11 +48,10 @@ func LastMutation() string {
 // ct:      ChoiceTable for syscalls.
 // corpus:  The entire corpus, including original program p.
 func (p *Prog) Mutate(rs rand.Source, ncalls int, ct *ChoiceTable, corpus [][]*Prog, sCalls *SpecialCalls,
-	srvNum int, hasFail bool, enableC2san bool, hmcfg *Hmdfs_config, idx int) {
+	srvNum int, hasFail bool, enableC2san bool, hmcfg *Hmdfs_config) {
 	recordLastMutation("standardMutate")
 	r := newRand(p.Target, rs)
 	r.hmcfg = hmcfg
-	r.curIdx = idx
 	if ncalls < len(p.Calls) {
 		ncalls = len(p.Calls)
 	}
@@ -1711,21 +1711,23 @@ func mutateStashWriteParams(ps []*Prog, r *randGen, sCalls *SpecialCalls) bool {
 		switch mutType {
 		//TODO: 这里的问题就是设置的值的突变范围合不合理
 		case 0:
-			return mutateWriteOffset(ps, call, r)
+			return mutateWriteOffset(ps, p, call, r)
 		case 1:
-			return mutateWriteLength(ps, call, r)
+			return mutateWriteLength(ps, p, call, r)
 		case 2:
-			return mutateWriteData(ps, call, r)
+			return mutateWriteData(ps, p, call, r)
 		}
 	}
 	return false
 }
 
 // syncStashReadVerification keeps the read-verification calls in sync with a
-// mutated write: every pread64 that reads the old (offset, length) region is
-// moved to the new region (count, out-buffer size and offset), so the
-// write-fault-read loop stays closed. Reads of other regions are untouched.
-func syncStashReadVerification(ps []*Prog, oldOff, oldLen, newOff, newLen uint64) {
+// mutated write: every pread64 that reads the old (offset, length) region of
+// the same file is moved to the new region (count, out-buffer size and
+// offset), so the write-fault-read loop stays closed. Reads of other regions
+// and other files are untouched; an unknown writePath ("") skips the file
+// check (legacy behaviour).
+func syncStashReadVerification(ps []*Prog, writePath string, oldOff, oldLen, newOff, newLen uint64) {
 	for _, p := range ps {
 		for _, c := range p.Calls {
 			if !strings.Contains(c.Meta.Name, "pread64") {
@@ -1745,6 +1747,11 @@ func syncStashReadVerification(ps []*Prog, oldOff, oldLen, newOff, newLen uint64
 			if posArg.Val != oldOff || cntArg.Val != oldLen {
 				continue
 			}
+			if writePath != "" {
+				if cPath := openPathBehindFdCall(p, c); cPath != "" && cPath != writePath {
+					continue
+				}
+			}
 			posArg.Val = newOff
 			cntArg.Val = newLen
 			if ptrArg, ok := c.Args[1].(*PointerArg); ok {
@@ -1760,11 +1767,16 @@ func syncStashReadVerification(ps []*Prog, oldOff, oldLen, newOff, newLen uint64
 // 消除 copyin 越界覆盖（原分配区按旧长度——data 变长后越界，L7）。
 // 必须在主 prog 的 state（stateFromProg）上分配，否则独立 newState 从地址 0
 // 重新分配，与主 prog 已有数据重叠（L9）。
-func reassignDataArg(p *Prog, call *Call, r *randGen, newData []byte) bool {
-	if len(call.Args) < 2 {
+// reassignDataArgAt replaces the DataArg behind call.Args[argIdx] with a
+// freshly allocated buffer in p's address space. An in-place rewrite can
+// outgrow the pointer's 64-byte-granule reservation and spill into the next
+// argument's copyin region (the L6 class), so path/buffer rewrites must go
+// through here.
+func reassignDataArgAt(p *Prog, call *Call, argIdx int, r *randGen, newData []byte) bool {
+	if p == nil || call == nil || argIdx < 0 || len(call.Args) <= argIdx {
 		return false
 	}
-	ptrArg, ok := call.Args[1].(*PointerArg)
+	ptrArg, ok := call.Args[argIdx].(*PointerArg)
 	if !ok {
 		return false
 	}
@@ -1772,14 +1784,63 @@ func reassignDataArg(p *Prog, call *Call, r *randGen, newData []byte) bool {
 	if !ok {
 		return false
 	}
+	// Require a flat DataArg pointee (path/buffer rewrites always have one):
+	// a non-data pointee must not be silently replaced by a data buffer.
+	// Preserve the buffer's own direction: write buffers are DirIn, read
+	// buffers (buffer[out]) are DirOut. MakePointerArg forces DirIn on the
+	// pointer itself, so the old data arg is the only source of truth;
+	// forcing DirIn here would flip a read buffer and drop its copyout.
+	// Output buffers need MakeOutDataArg: MakeDataArg panics on DirOut.
+	old, ok := ptrArg.Res.(*DataArg)
+	if !ok {
+		return false
+	}
+	dir := old.Dir()
 	s := stateFromProg(p)
-	newDataArg := MakeDataArg(ptrType.Elem, DirIn, newData)
+	var newDataArg *DataArg
+	if dir == DirOut {
+		newDataArg = MakeOutDataArg(ptrType.Elem, DirOut, uint64(len(newData)))
+	} else {
+		newDataArg = MakeDataArg(ptrType.Elem, DirIn, newData)
+	}
 	newPtr := r.allocAddr(s, ptrType, DirIn, newDataArg.Size(), newDataArg)
-	ptrArg.Res = newPtr
+	// Replace the pointer's fields (new address + flat DataArg pointee).
+	// Assigning ptrArg.Res = newPtr would nest a PointerArg under the old
+	// pointer: the pointee must be ptrType.Elem, not another pointer.
+	*ptrArg = *newPtr
 	return true
 }
 
-func mutateWriteOffset(ps []*Prog, call *Call, r *randGen) bool {
+// reassignDataArg is the write-buffer helper (call.Args[1]).
+func reassignDataArg(p *Prog, call *Call, r *randGen, newData []byte) bool {
+	return reassignDataArgAt(p, call, 1, r, newData)
+}
+
+// openPathBehindFdCall returns the path of the open/creat call that produced an
+// fd-taking call's fd, or "" when the producer is not in owner. Stash progs
+// open each file once, so the path is the file identity that keeps writes and
+// their verification reads on the same file.
+func openPathBehindFdCall(owner *Prog, call *Call) string {
+	if owner == nil || call == nil || len(call.Args) == 0 {
+		return ""
+	}
+	fdArg, ok := call.Args[0].(*ResultArg)
+	if !ok || fdArg.Res == nil {
+		return ""
+	}
+	for _, c := range owner.Calls {
+		if c == nil || c.Ret == nil {
+			continue
+		}
+		name := c.Meta.Name
+		if (strings.Contains(name, "open") || strings.Contains(name, "creat")) && c.Ret == fdArg.Res {
+			return extractPathFromCall(c)
+		}
+	}
+	return ""
+}
+
+func mutateWriteOffset(ps []*Prog, owner *Prog, call *Call, r *randGen) bool {
 	if len(call.Args) < 4 {
 		return false
 	}
@@ -1805,11 +1866,11 @@ func mutateWriteOffset(ps []*Prog, call *Call, r *randGen) bool {
 	}
 	posArg.Val = uint64(newVal)
 
-	syncStashReadVerification(ps, oldOff, oldLen, posArg.Val, oldLen)
+	syncStashReadVerification(ps, openPathBehindFdCall(owner, call), oldOff, oldLen, posArg.Val, oldLen)
 	return true
 }
 
-func mutateWriteLength(ps []*Prog, call *Call, r *randGen) bool {
+func mutateWriteLength(ps []*Prog, owner *Prog, call *Call, r *randGen) bool {
 	if len(call.Args) < 4 {
 		return false
 	}
@@ -1836,28 +1897,30 @@ func mutateWriteLength(ps []*Prog, call *Call, r *randGen) bool {
 	if newLen > 8192 {
 		newLen = 8192
 	}
+	ptrArg, ok := call.Args[1].(*PointerArg)
+	if !ok {
+		return false
+	}
+	dataArg, ok := ptrArg.Res.(*DataArg)
+	if !ok {
+		return false
+	}
+	oldData := dataArg.Data()
+	newData := make([]byte, newLen)
+	copy(newData, oldData)
+	for i := len(oldData); i < int(newLen); i++ {
+		newData[i] = byte(r.Intn(256))
+	}
+	if !reassignDataArg(owner, call, r, newData) {
+		return false
+	}
 	countArg.Val = uint64(newLen)
 
-	if len(call.Args) >= 2 {
-		if ptrArg, ok := call.Args[1].(*PointerArg); ok {
-			if dataArg, ok := ptrArg.Res.(*DataArg); ok {
-				oldData := dataArg.Data()
-				newData := make([]byte, newLen)
-				copy(newData, oldData)
-				for i := len(oldData); i < int(newLen); i++ {
-					newData[i] = byte(r.Intn(256))
-				}
-				dataArg.data = newData
-				reassignDataArg(ps[0], call, r, newData) // 重分配——新地址新尺寸（L7）
-			}
-		}
-	}
-
-	syncStashReadVerification(ps, oldOff, oldLen, oldOff, countArg.Val)
+	syncStashReadVerification(ps, openPathBehindFdCall(owner, call), oldOff, oldLen, oldOff, countArg.Val)
 	return true
 }
 
-func mutateWriteData(ps []*Prog, call *Call, r *randGen) bool {
+func mutateWriteData(ps []*Prog, owner *Prog, call *Call, r *randGen) bool {
 	if len(call.Args) < 4 {
 		return false
 	}
@@ -1890,11 +1953,15 @@ func mutateWriteData(ps []*Prog, call *Call, r *randGen) bool {
 	oldLen := countArg.Val
 
 	data = mutateData(r, data, 1, 8192)
-	dataArg.data = data
+	// Failure is unreachable here (Args[1] was checked to be a *PtrType
+	// pointer above), so the in-place mutateData cannot leave a partial
+	// mutation behind.
+	if !reassignDataArg(owner, call, r, data) {
+		return false
+	}
 	countArg.Val = uint64(len(data))
-	reassignDataArg(ps[0], call, r, data) // 重分配——新地址新尺寸（L7）
 
-	syncStashReadVerification(ps, oldOff, oldLen, oldOff, countArg.Val) // 读验证同步（L7）
+	syncStashReadVerification(ps, openPathBehindFdCall(owner, call), oldOff, oldLen, oldOff, countArg.Val) // 读验证同步（L7）
 	return true
 }
 
@@ -2041,7 +2108,7 @@ func RefreshGeneralFailPos(ps []*Prog, progIdx int) {
 }
 
 func mutateStashOpSequence(ps []*Prog, r *randGen, sCalls *SpecialCalls, ct *ChoiceTable) bool {
-	for _, p := range ps {
+	for i, p := range ps {
 		if !p.IsStash {
 			continue
 		}
@@ -2051,7 +2118,7 @@ func mutateStashOpSequence(ps []*Prog, r *randGen, sCalls *SpecialCalls, ct *Cho
 		case 0:
 			return insertStashCall(ps, p, r, sCalls, ct)
 		case 1:
-			return removeStashCall(p, r)
+			return removeStashCall(ps, i, r)
 		}
 	}
 	return false
@@ -2081,14 +2148,15 @@ func insertStashCall(ps []*Prog, p *Prog, r *randGen, sCalls *SpecialCalls, ct *
 		if fd == nil {
 			continue
 		}
-		closemeta := r.target.Syscalls[sCalls.CloseId]
-		closefdtype := closemeta.Args[0].Type.(*ResourceType)
-		fdarg := MakeResultArg(closefdtype, DirIn, fd, 0)
+		// The close lookup must compare against the original open return
+		// object (usesFd compares arg.Res): a fresh wrapper never matches and
+		// silently extends the insertion window past the real close, letting
+		// an fd call land after its close (EBADF).
 		correspondingClose := -1
 		for _, closeIdx := range closeCalls {
 			if closeIdx > openIdx {
 				closeCall := p.Calls[closeIdx]
-				if usesFd(closeCall, fdarg) {
+				if usesFd(closeCall, fd) {
 					correspondingClose = closeIdx
 					break
 				}
@@ -2135,22 +2203,43 @@ func insertStashCall(ps []*Prog, p *Prog, r *randGen, sCalls *SpecialCalls, ct *
 
 	// 故障窗口区间（p0 的 recv/down/send/recv/up/send 6 调用块）——插入不能
 	// 落入窗口内部（窗口变长后 moveFailCalls 的 6 块移动会拆散 recv/send 对，
-	// 否则死锁）；窗口前插入时同步更新表项
+	// 否则死锁）；窗口前插入时同步更新表项。
+	// GeneralFailPos 不参与序列化：corpus 往返后的 stash prog 表丢失，此时
+	// 用 net_down 反推块位置（recv, net_down, send, recv, net_up, send）。
 	failStart, failEnd := -1, -1
 	if len(p.GeneralFailPos) > 0 && len(p.GeneralFailPos[0]) >= 4 {
 		failStart = p.GeneralFailPos[0][1]
 		failEnd = p.GeneralFailPos[0][3]
+	} else if downs := findCallsByName(p, "syz_failure_net_down"); len(downs) > 0 {
+		if nd := downs[0]; nd-1 >= 0 && nd+4 < len(p.Calls) &&
+			strings.Contains(p.Calls[nd+3].Meta.Name, "net_up") {
+			failStart, failEnd = nd-1, nd+4
+		}
 	}
 
 	type interval struct{ start, end int }
 	var slots []interval
-	if failStart > validStart && failStart < validEnd {
-		slots = append(slots, interval{validStart, failStart})
-	}
-	if failEnd+1 >= validStart && failEnd+1 < validEnd {
-		slots = append(slots, interval{failEnd + 1, validEnd})
-	}
-	if len(slots) == 0 {
+	if failStart >= 0 {
+		// The window interior (failStart, failEnd] is forbidden; positions
+		// <= failStart stay insertable (the window shifts right afterwards).
+		preEnd := failStart + 1
+		if preEnd > validEnd {
+			preEnd = validEnd
+		}
+		if validStart < preEnd {
+			slots = append(slots, interval{validStart, preEnd})
+		}
+		postStart := failEnd + 1
+		if postStart < validStart {
+			postStart = validStart
+		}
+		if postStart < validEnd {
+			slots = append(slots, interval{postStart, validEnd})
+		}
+		if len(slots) == 0 {
+			return false
+		}
+	} else {
 		slots = append(slots, interval{validStart, validEnd})
 	}
 
@@ -2159,9 +2248,15 @@ func insertStashCall(ps []*Prog, p *Prog, r *randGen, sCalls *SpecialCalls, ct *
 
 	p.Calls = append(p.Calls[:insertPos], append([]*Call{newCall}, p.Calls[insertPos:]...)...)
 
-	if failStart >= 0 && insertPos <= failStart {
-		p.GeneralFailPos[0][1]++
-		p.GeneralFailPos[0][3]++
+	pidx := -1
+	for i := range ps {
+		if ps[i] == p {
+			pidx = i
+			break
+		}
+	}
+	if pidx >= 0 {
+		shiftGeneralFailPos(ps[0], pidx, insertPos, 1)
 	}
 
 	// A freshly inserted write has no read verification: add a matching
@@ -2170,7 +2265,11 @@ func insertStashCall(ps []*Prog, p *Prog, r *randGen, sCalls *SpecialCalls, ct *
 	if callType == "pwrite64" && len(newCall.Args) >= 4 {
 		if offArg, ok := newCall.Args[3].(*ConstArg); ok {
 			if lenArg, ok := newCall.Args[2].(*ConstArg); ok {
-				addStashReadVerification(ps, p, r, sCalls, offArg.Val, lenArg.Val)
+				writerPath := ""
+				if chosenRange.openIdx >= 0 && chosenRange.openIdx < len(p.Calls) {
+					writerPath = extractPathFromCall(p.Calls[chosenRange.openIdx])
+				}
+				addStashReadVerification(ps, p, writerPath, r, sCalls, offArg.Val, lenArg.Val)
 			}
 		}
 	}
@@ -2232,8 +2331,14 @@ func moveSrvFailPosEntry(p *Prog, oldPos, newPos int) {
 
 // addStashReadVerification inserts a pread64 reading the (offset, length)
 // region of a freshly inserted write into another stash read prog, so the
-// write is actually verified.
-func addStashReadVerification(ps []*Prog, writer *Prog, r *randGen, sCalls *SpecialCalls, offset, length uint64) {
+// write is actually verified. writerPath is the open path behind the write's
+// own fd: multi-file stash seeds hold one open per file, so the verification
+// must use the reader's open of the same file (the previous first-open pick
+// could verify a file the write never touched).
+func addStashReadVerification(ps []*Prog, writer *Prog, writerPath string, r *randGen, sCalls *SpecialCalls, offset, length uint64) {
+	if writerPath == "" {
+		return
+	}
 	var readers []*Prog
 	var readersIdx []int
 	for qIdx, q := range ps {
@@ -2255,40 +2360,19 @@ func addStashReadVerification(ps []*Prog, writer *Prog, r *randGen, sCalls *Spec
 	reader := readers[chosen]
 	readerIdx := readersIdx[chosen]
 
-	// The reader's open on the same file as the writer's (multi-file stash
-	// seeds have one open per file; mismatched fds would silently void the
-	// verification). Falls back to any open fd when no path matches.
-	writerPath := ""
-	for _, idx := range findCallsByName(writer, "open") {
-		if idx < len(writer.Calls) {
-			if p := extractPathFromCall(writer.Calls[idx]); p != "" {
-				writerPath = p
-				break
-			}
-		}
-	}
+	// Match the writer's file exactly: a mismatched fd would silently void
+	// the verification, so no fallback to an arbitrary open.
 	var fd *ResultArg
 	for _, idx := range findCallsByName(reader, "open") {
 		if idx >= len(reader.Calls) {
 			continue
 		}
-		if writerPath != "" && extractPathFromCall(reader.Calls[idx]) != writerPath {
+		if extractPathFromCall(reader.Calls[idx]) != writerPath {
 			continue
 		}
 		if f := extractFdFromCall(reader.Calls[idx]); f != nil {
 			fd = f
 			break
-		}
-	}
-	if fd == nil {
-		for _, idx := range findCallsByName(reader, "open") {
-			if idx >= len(reader.Calls) {
-				continue
-			}
-			if f := extractFdFromCall(reader.Calls[idx]); f != nil {
-				fd = f
-				break
-			}
 		}
 	}
 	if fd == nil {
@@ -2325,7 +2409,8 @@ func genPreadCallWithFdAt(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultA
 	bufArg := MakeOutDataArg(bufPtrType.Elem, DirOut, length)
 	bufPtr := r.allocAddr(s, bufPtrType, DirOut, bufArg.Size(), bufArg)
 	args := make([]Arg, len(meta.Args))
-	args[0] = fd
+	fdArg := MakeResultArg(meta.Args[0].Type.(*ResourceType), DirIn, fd, 0)
+	args[0] = fdArg
 	args[1] = bufPtr
 	args[2] = MakeConstArg(countType, DirIn, length)
 	args[3] = MakeConstArg(posType, DirIn, offset)
@@ -2375,7 +2460,8 @@ func genPwriteCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultAr
 	bufPtr := r.allocAddr(s, bufPtrType, DirIn, bufArg.Size(), bufArg)
 
 	args := make([]Arg, len(meta.Args))
-	args[0] = fd
+	fdArg := MakeResultArg(meta.Args[0].Type.(*ResourceType), DirIn, fd, 0)
+	args[0] = fdArg
 	args[1] = bufPtr
 	args[2] = MakeConstArg(countType, DirIn, uint64(bufSize))
 	args[3] = MakeConstArg(posType, DirIn, uint64(r.randInt(64)))
@@ -2429,16 +2515,16 @@ func pathOfCall(ps []*Prog, pos GroupPosition) string {
 }
 
 // pickAnchor selects a random call in ps[0] that has a resolvable path and
-// execution timing; wantReadWrite restricts the anchor to read/write calls
-// (required by the data mutation, whose whole point is sharing offsets).
-func pickAnchor(ps []*Prog, r *randGen, wantReadWrite bool) (GroupPosition, string, bool) {
+// execution timing; wantData restricts the anchor to data-carrying calls
+// (write/read/truncate), whose whole point is sharing offsets and lengths.
+func pickAnchor(ps []*Prog, r *randGen, wantData bool) (GroupPosition, string, bool) {
 	if len(ps) == 0 || len(ps[0].Calls) == 0 {
 		return GroupPosition{}, "", false
 	}
 	for attempt := 0; attempt < 8; attempt++ {
 		idx := r.Intn(len(ps[0].Calls))
 		call := ps[0].Calls[idx]
-		if wantReadWrite && !isWriteCall(call) && !isReadCall(call) {
+		if wantData && !isWriteCall(call) && !isReadCall(call) && !isTruncateCall(call) {
 			continue
 		}
 		pos := GroupPosition{ProgIdx: 0, CallIdx: idx}
@@ -2561,13 +2647,254 @@ func findGroupCalls(ps []*Prog, anchor GroupPosition, anchorPath string, tscoffs
 	return res
 }
 
+// pathOwnerCapClass classifies the path type an open/creat call can serve from
+// its flags: O_DIRECTORY only opens directories, a write-capable access mode
+// (O_WRONLY/O_RDWR) only opens files (VFS rejects write opens on dirs), and a
+// read-only or non-open path owner accepts both.
+func pathOwnerCapClass(target *Target, owner *Call) int {
+	if owner == nil {
+		return relTargetAny
+	}
+	switch cap := fdCapOf(target, owner); {
+	case cap&fdCapDir != 0:
+		return relTargetDir
+	case cap&fdCapWrite != 0:
+		return relTargetFile
+	}
+	return relTargetAny
+}
+
+func intersectPathConstraint(a, b int) (int, bool) {
+	switch {
+	case a == relTargetAny:
+		return b, true
+	case b == relTargetAny:
+		return a, true
+	case a == b:
+		return a, true
+	}
+	return relTargetAny, false
+}
+
+// ownerPathConstraint intersects the path class allowed by the owner's own
+// flags with every same-prog fd user's call constraint: a moved path must
+// keep all of them valid (an O_RDONLY open used by read is file-only, a
+// getdents64 user pins it to a directory, close/fsync impose nothing).
+func ownerPathConstraint(p *Prog, owner *Call) (int, bool) {
+	if p == nil || owner == nil {
+		return relTargetAny, false
+	}
+	kind := pathOwnerCapClass(p.Target, owner)
+	if owner.Ret == nil {
+		return kind, true
+	}
+	for _, c := range p.Calls {
+		if c == nil || c.Meta == nil {
+			continue
+		}
+		uses := false
+		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
+			if ra, ok := arg.(*ResultArg); ok && ra.Res == owner.Ret {
+				uses = true
+			}
+		})
+		if !uses {
+			continue
+		}
+		k := callNameConstraint(c.Meta.Name)
+		if strings.Contains(c.Meta.Name, "fsync") || strings.Contains(c.Meta.Name, "fdatasync") {
+			// fsync accepts any regular-file or directory fd (capNeeded == 0).
+			k = relTargetAny
+		}
+		var ok bool
+		kind, ok = intersectPathConstraint(kind, k)
+		if !ok {
+			return relTargetAny, false
+		}
+	}
+	return kind, true
+}
+
+// memberPathConstraint returns the path-type constraint for a group member:
+// its own call constraint intersected with what the owned fd can serve (all
+// of the owner's same-prog users included). ok=false means the classes
+// conflict, so the member must not move.
+func memberPathConstraint(ps []*Prog, opPos GroupPosition) (int, bool) {
+	if opPos.ProgIdx < 0 || opPos.ProgIdx >= len(ps) {
+		return relTargetAny, false
+	}
+	p := ps[opPos.ProgIdx]
+	if opPos.CallIdx < 0 || opPos.CallIdx >= len(p.Calls) {
+		return relTargetAny, false
+	}
+	op := p.Calls[opPos.CallIdx]
+	opKind := callNameConstraint(op.Meta.Name)
+	owner := op
+	if rp := resolveFdTarget(ps, opPos); rp != opPos {
+		if rp.ProgIdx < 0 || rp.ProgIdx >= len(ps) ||
+			rp.CallIdx < 0 || rp.CallIdx >= len(ps[rp.ProgIdx].Calls) {
+			return relTargetAny, false
+		}
+		owner = ps[rp.ProgIdx].Calls[rp.CallIdx]
+	}
+	ownerKind, ok := ownerPathConstraint(p, owner)
+	if !ok {
+		return relTargetAny, false
+	}
+	return intersectPathConstraint(opKind, ownerKind)
+}
+
+// pathSatisfiesType reports whether an existing tree path's node matches a
+// member constraint (GetPathByRelation's PathSame ignores the constraint, so
+// the result must be re-checked).
+func pathSatisfiesType(ft *FileTree, path string, constraint int) bool {
+	if ft == nil {
+		return false
+	}
+	node := ft.FindNode(path)
+	if node == nil {
+		return false
+	}
+	return nodeMatchesConstraint(node, constraint)
+}
+
 // MutateGroupPathDynamic migrates the dynamic concurrent set of a random
 // anchor call to a new base path, keeping the relative path relations between
 // the anchor and its concurrent peers ("same pattern, new location"). Calls
 // that did not overlap the anchor (the non-concurrent backbone) stay in place.
 func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
-	recordLastMutation("MutateGroupPathDynamic")
 	if lcs == nil || lcs.FileTree == nil {
+		return false
+	}
+	if CoverageBoardReady() && r.Float64() < directedBiasProb {
+		if mutateGroupPathDirected(ps, lcs, r) {
+			return true
+		}
+	}
+	recordLastMutation("MutateGroupPathDynamic")
+	anchor, anchorPath, ok := pickAnchor(ps, r, false)
+	if !ok {
+		return false
+	}
+	conc := findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs)
+	if len(conc) == 0 {
+		return false
+	}
+
+	anchorConstraint, ok := memberPathConstraint(ps, anchor)
+	if !ok {
+		return false
+	}
+	// Migration means a different path: the pick excludes the anchor's
+	// current path so the weighted sampler cannot return a no-op edit.
+	newBasePath := pickNewBasePath(lcs.FileTree, anchorConstraint, -1, r.Rand, "", pathOfCall(ps, anchor))
+	if newBasePath == "" || !pathSatisfiesType(lcs.FileTree, newBasePath, anchorConstraint) {
+		return false
+	}
+
+	// Merge the group entries by resolved owner: several ops can share one
+	// open, and each owner's path is written once with the intersection of
+	// all their constraints (last-write-wins would void a stricter user).
+	type ownerGroup struct {
+		pos  GroupPosition
+		rel  PathRelation
+		kind int
+		ok   bool
+	}
+	ownerIdx := map[GroupPosition]int{}
+	var owners []ownerGroup
+	for _, cc := range conc {
+		rp := resolveFdTarget(ps, cc.Pos)
+		i, seen := ownerIdx[rp]
+		if !seen {
+			i = len(owners)
+			ownerIdx[rp] = i
+			owners = append(owners, ownerGroup{pos: rp, rel: cc.Rel, kind: relTargetAny, ok: true})
+		}
+		if !owners[i].ok {
+			continue
+		}
+		kind, ok := memberPathConstraint(ps, cc.Pos)
+		if !ok {
+			owners[i].ok = false
+			continue
+		}
+		owners[i].kind, owners[i].ok = intersectPathConstraint(owners[i].kind, kind)
+	}
+
+	type pathUpdate struct {
+		pos     GroupPosition
+		newPath string
+	}
+	updates := []pathUpdate{{pos: resolveFdTarget(ps, anchor), newPath: newBasePath}}
+	for _, og := range owners {
+		if !og.ok {
+			continue
+		}
+		newPath := lcs.FileTree.GetPathByRelation(newBasePath, "", og.rel, r.Rand, false, og.kind)
+		if newPath == "" || !pathSatisfiesType(lcs.FileTree, newPath, og.kind) {
+			// Keep the member on its old path unless the new base itself is a
+			// valid target (causal successors with no derivable relation).
+			if !pathSatisfiesType(lcs.FileTree, newBasePath, og.kind) {
+				continue
+			}
+			newPath = newBasePath
+		}
+		updates = append(updates, pathUpdate{pos: og.pos, newPath: newPath})
+	}
+	applied := false
+	for _, u := range updates {
+		if updateCallPathInProg(ps[u.pos.ProgIdx], u.pos.CallIdx, u.newPath, r) {
+			applied = true
+		}
+	}
+	if !applied {
+		return false
+	}
+	return true
+}
+
+// pathAnchorBucket returns the anchor depth bucket used to realize a member at
+// targetDepth for the relation (0 = unrealizable). The hints favor anchors
+// that satisfy the member-bucket filter inside the picked bucket:
+// Child T=2 uses depth-1 anchors (exact), T=3 uses depth-5+ anchors (every
+// child is then in bucket 3); Parent T=1/2 use bucket-2 anchors, T=3 uses
+// depth-6+ anchors (bucket 3). The member-bucket retry filter rejects the
+// anchors that do not land the member in the target bucket.
+func pathAnchorBucket(rel PathRelation, targetDepth int) int {
+	switch rel {
+	case PathChild:
+		switch targetDepth {
+		case 1:
+			return 0 // no depth-0 parent exists
+		case 2:
+			return 1 // anchor depth 1 -> member depth 2
+		default:
+			return 3 // anchor depth >=5 -> member depth >=6 (all bucket 3)
+		}
+	case PathParent:
+		switch targetDepth {
+		case 1:
+			return 2 // anchor depth 2 -> member depth 1
+		case 2:
+			return 2 // anchor depth 3/4 -> member depth 2/3
+		default:
+			return 3 // anchor depth >=6 -> member depth >=5
+		}
+	default: // Same / Sibling
+		return targetDepth
+	}
+}
+
+// mutateGroupPathDirected steers path mutation toward an uncovered
+// (relation, depth-bucket) cell margin. The whole group moves with the anchor
+// (cell DepthB belongs to B), but only the selected member is re-derived with
+// the targeted relation; the other members keep their previous relation to
+// the new anchor. The target is statistical: ExtractPairs orders a CC pair by
+// program index, so the ps[0] anchor is normally A and the selected member B
+// (where DepthB lives); an HB pair in the reverse direction is a blind spot.
+func mutateGroupPathDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
+	if lcs == nil || lcs.FileTree == nil || !CoverageBoardReady() {
 		return false
 	}
 	anchor, anchorPath, ok := pickAnchor(ps, r, false)
@@ -2578,35 +2905,179 @@ func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 	if len(conc) == 0 {
 		return false
 	}
-
-	seedType := "fileops"
-	if isDirPath(lcs.FileTree, anchorPath) {
-		seedType = "inodeops"
+	anchorCall := ps[anchor.ProgIdx].Calls[anchor.CallIdx]
+	anchorName := anchorCall.Meta.CallName
+	if anchorName == "" {
+		return false
 	}
-	newBasePath := pickNewBasePath(lcs.FileTree, seedType, r.Rand, "")
-	if newBasePath == "" {
+	anchorKind, ok := memberPathConstraint(ps, anchor)
+	if !ok {
 		return false
 	}
 
-	type pathUpdate struct {
-		pos     GroupPosition
-		newPath string
+	type memberCand struct {
+		pos    GroupPosition
+		opName string
+		kind   int
 	}
-	updates := []pathUpdate{{pos: resolveFdTarget(ps, anchor), newPath: newBasePath}}
+	anchorPos := resolveFdTarget(ps, anchor)
+	ownerIdx := map[GroupPosition]int{}
+	ownerHasUser := map[GroupPosition]bool{}
+	ownerPrefAny := map[GroupPosition]bool{}
+	var owners []memberCand
+	var ownerOK []bool
+	var ownerRel []PathRelation
 	for _, cc := range conc {
-		newPath := lcs.FileTree.GetPathByRelation(newBasePath, "", cc.Rel, r.Rand, false, relTargetAny)
-		if newPath == "" {
-			newPath = newBasePath
+		rp := resolveFdTarget(ps, cc.Pos)
+		if rp == anchorPos {
+			continue
 		}
-		updates = append(updates, pathUpdate{pos: resolveFdTarget(ps, cc.Pos), newPath: newPath})
+		opName := ps[cc.Pos.ProgIdx].Calls[cc.Pos.CallIdx].Meta.CallName
+		if opName == "" {
+			continue
+		}
+		i, seen := ownerIdx[rp]
+		if !seen {
+			i = len(owners)
+			ownerIdx[rp] = i
+			owners = append(owners, memberCand{pos: rp, opName: opName, kind: relTargetAny})
+			ownerOK = append(ownerOK, true)
+			ownerRel = append(ownerRel, cc.Rel)
+			ownerHasUser[rp] = cc.Pos != rp
+			ownerPrefAny[rp] = callNameConstraint(opName) == relTargetAny
+		} else if cc.Pos != rp && callNameConstraint(opName) != relTargetAny &&
+			(!ownerHasUser[rp] || ownerPrefAny[rp]) {
+			// Prefer a typed consumer op over the owner open and over an
+			// untyped close for the combo key.
+			owners[i].opName = opName
+			ownerHasUser[rp] = true
+			ownerPrefAny[rp] = false
+		}
+		if !ownerOK[i] {
+			continue
+		}
+		kind, ok := memberPathConstraint(ps, cc.Pos)
+		if !ok {
+			ownerOK[i] = false
+			continue
+		}
+		owners[i].kind, ownerOK[i] = intersectPathConstraint(owners[i].kind, kind)
 	}
-	for _, u := range updates {
-		updateCallPathInProg(ps[u.pos.ProgIdx], u.pos.CallIdx, u.newPath, r)
+	var members []memberCand
+	for i := range owners {
+		if ownerOK[i] {
+			members = append(members, owners[i])
+		}
 	}
-	return true
+	if len(members) == 0 {
+		return false
+	}
+
+	// Candidate (member, relation) pairs, geometry-filtered: Child needs a
+	// directory anchor, Parent needs a directory member (GetPathByRelation
+	// returns "" otherwise, so such picks would only waste the round).
+	rels := []PathRelation{PathSame, PathChild, PathParent, PathSibling}
+	var pots []int
+	var pickMember []memberCand
+	var pickRel []PathRelation
+	for _, m := range members {
+		mKind := m.kind
+		for _, rel := range rels {
+			if rel == PathChild && anchorKind == relTargetFile {
+				continue
+			}
+			if rel == PathParent && mKind == relTargetFile {
+				continue
+			}
+			if rel == PathSame {
+				// Same shares one path, so the member's constraint must accept
+				// the anchor's path type (Sibling/Child/Parent generate the
+				// member path under its own constraint instead).
+				if anchorKind == relTargetFile && mKind == relTargetDir {
+					continue
+				}
+				if anchorKind == relTargetDir && mKind == relTargetFile {
+					continue
+				}
+			}
+			pot := CoveragePotential(anchorName, m.opName, rel)
+			if pot <= 0 {
+				continue
+			}
+			pots = append(pots, pot)
+			pickMember = append(pickMember, m)
+			pickRel = append(pickRel, rel)
+		}
+	}
+	idx := pickWeightedIndex(pots, r.Rand)
+	if idx < 0 {
+		return false
+	}
+	member, rel := pickMember[idx], pickRel[idx]
+
+	// Depth target from the same (primary) ordering; bucket 0 is outside the
+	// merge-view domain.
+	depths := covBoard.uncoveredDepthPots(anchorName, member.opName, rel)
+	depths[0] = 0
+	targetDepth := pickWeightedIndex(depths[:], r.Rand)
+	if targetDepth <= 0 {
+		return false
+	}
+	anchorBucket := pathAnchorBucket(rel, targetDepth)
+	if anchorBucket == 0 {
+		return false
+	}
+	baseKind := anchorKind
+	mKind := member.kind
+	switch {
+	case rel == PathChild && baseKind == relTargetAny:
+		baseKind = relTargetDir
+	case rel == PathSame && baseKind == relTargetAny && mKind != relTargetAny:
+		// Same shares the path: an Any anchor is pinned to the member's type.
+		baseKind = mKind
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		newBase := pickNewBasePath(lcs.FileTree, baseKind, anchorBucket, r.Rand, "", pathOfCall(ps, anchorPos))
+		if newBase == "" {
+			return false
+		}
+		memberPath := lcs.FileTree.GetPathByRelation(newBase, "", rel, r.Rand, false, mKind)
+		if memberPath == "" || DepthBucketOf(memberPath) != uint64(targetDepth) ||
+			!pathSatisfiesType(lcs.FileTree, memberPath, mKind) {
+			continue
+		}
+		if !updateCallPathInProg(ps[anchorPos.ProgIdx], anchorPos.CallIdx, newBase, r) {
+			return false
+		}
+		// The anchor rewrite above is already a real edit; the member and the
+		// owners stay best-effort (their derivation gates above skip
+		// unrealizable ones).
+		updateCallPathInProg(ps[member.pos.ProgIdx], member.pos.CallIdx, memberPath, r)
+		for i := range owners {
+			rp := owners[i].pos
+			if rp == anchorPos || rp == member.pos || !ownerOK[i] {
+				continue
+			}
+			constraint := owners[i].kind
+			p := lcs.FileTree.GetPathByRelation(newBase, "", ownerRel[i], r.Rand, false, constraint)
+			if p == "" || !pathSatisfiesType(lcs.FileTree, p, constraint) {
+				if !pathSatisfiesType(lcs.FileTree, newBase, constraint) {
+					continue
+				}
+				p = newBase
+			}
+			updateCallPathInProg(ps[rp.ProgIdx], rp.CallIdx, p, r)
+		}
+		recordLastMutation("MutateGroupPathDirected")
+		return true
+	}
+	return false
 }
 
-// RemoveGroupDynamic deletes the anchor and its whole concurrent set.
+// RemoveGroupDynamic deletes the fd-safe subset of the anchor's group
+// (concurrent set + causal successors): open/creat calls whose fd users all
+// fall inside the same removal set go too, while an anchor/provider with a
+// surviving external user is kept. Returns false when nothing is removable.
 func RemoveGroupDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
 	recordLastMutation("RemoveGroupDynamic")
 	if lcs == nil {
@@ -2621,19 +3092,72 @@ func RemoveGroupDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool
 		return false
 	}
 
-	byProg := make(map[int][]int)
+	// Decide the removal set on call pointers before deleting anything: an
+	// open/creat is removable only when every fd user of it is also in the
+	// set, otherwise RemoveCall would rewrite the surviving users to a
+	// constant fd 0 (a silently voided call).
+	removeSet := make(map[*Call]bool, len(conc)+1)
+	removeSet[ps[anchor.ProgIdx].Calls[anchor.CallIdx]] = true
 	for _, cc := range conc {
-		byProg[cc.Pos.ProgIdx] = append(byProg[cc.Pos.ProgIdx], cc.Pos.CallIdx)
+		removeSet[ps[cc.Pos.ProgIdx].Calls[cc.Pos.CallIdx]] = true
 	}
-	// Delete from the end of each prog so earlier indices stay valid.
-	for progIdx, callIdxs := range byProg {
-		sort.Ints(callIdxs)
-		for i := len(callIdxs) - 1; i >= 0; i-- {
-			ps[progIdx].RemoveCall(callIdxs[i])
+	owner := make(map[Arg]*Call)
+	for _, p := range ps {
+		for _, c := range p.Calls {
+			if removeSet[c] {
+				ForeachArg(c, func(a Arg, _ *ArgCtx) { owner[a] = c })
+			}
 		}
 	}
-	ps[anchor.ProgIdx].RemoveCall(anchor.CallIdx)
-	return true
+
+	// Fixed point: a candidate may be dropped by the filter while one of its
+	// fd users is also a candidate that gets dropped (the user is itself
+	// non-removable), so re-check until the removal set is closed under the
+	// "all users removed too" rule.
+	removal := make(map[*Call]bool, len(removeSet))
+	for c := range removeSet {
+		removal[c] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for c := range removal {
+			if !callRemovableInSet(c, removal, owner) {
+				delete(removal, c)
+				changed = true
+			}
+		}
+	}
+
+	byProg := make(map[int]map[int]bool)
+	addPos := func(pos GroupPosition) {
+		if byProg[pos.ProgIdx] == nil {
+			byProg[pos.ProgIdx] = make(map[int]bool)
+		}
+		byProg[pos.ProgIdx][pos.CallIdx] = true
+	}
+	for _, cc := range conc {
+		if removal[ps[cc.Pos.ProgIdx].Calls[cc.Pos.CallIdx]] {
+			addPos(cc.Pos)
+		}
+	}
+	if removal[ps[anchor.ProgIdx].Calls[anchor.CallIdx]] {
+		addPos(anchor)
+	}
+
+	removed := 0
+	for progIdx, callIdxs := range byProg {
+		idxs := make([]int, 0, len(callIdxs))
+		for idx := range callIdxs {
+			idxs = append(idxs, idx)
+		}
+		sort.Ints(idxs)
+		// Delete from the end of each prog so earlier indices stay valid.
+		for i := len(idxs) - 1; i >= 0; i-- {
+			ps[progIdx].RemoveCall(idxs[i])
+			removed++
+		}
+	}
+	return removed > 0
 }
 
 // callRemovable reports whether the call can be removed without breaking an
@@ -2654,6 +3178,29 @@ func callRemovable(ps []*Prog, pos GroupPosition) bool {
 	return true
 }
 
+// callRemovableInSet is the group-removal counterpart of callRemovable: an
+// open/creat may be removed together with the given removal set only when
+// every fd user of its Ret is itself in the set. Removing it with surviving
+// users would make RemoveCall rewrite them to a constant fd 0 (a silently
+// voided call), not a dangling reference.
+func callRemovableInSet(c *Call, removal map[*Call]bool, owner map[Arg]*Call) bool {
+	if strings.Contains(c.Meta.Name, "syz_failure") {
+		return false
+	}
+	if !strings.Contains(c.Meta.Name, "open") && !strings.Contains(c.Meta.Name, "creat") {
+		return true
+	}
+	if c.Ret == nil {
+		return true
+	}
+	for u := range c.Ret.uses {
+		if o := owner[u]; o == nil || !removal[o] {
+			return false
+		}
+	}
+	return true
+}
+
 // RemoveReservoirDynamic removes calls across a random subset of the program
 // group with a reservoir-style dynamic probability: the target number of
 // removals adapts to the number of programs that have a removable call, and
@@ -2664,7 +3211,7 @@ func callRemovable(ps []*Prog, pos GroupPosition) bool {
 // least one fd-safe call; with pre-filtered candidates every probability hit
 // removes exactly one call, so the reservoir draw yields exactly the target
 // number of removals (>= 1 whenever a removable call exists).
-func RemoveReservoirDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
+func RemoveReservoirDynamic(ps []*Prog, r *randGen) bool {
 	recordLastMutation("RemoveReservoirDynamic")
 
 	// Pre-filter to programs that actually have a removable (fd-safe) call,
@@ -2692,13 +3239,13 @@ func RemoveReservoirDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 		return false
 	}
 
-	// Target removals: uniform in [ceil(C/4), ceil(C/2)] (>= 1).
-	lo := (C + 3) / 4
+	// Target removals: uniform in [ceil(C/3), C] (>= 1). C=3 -> {1,2,3}
+	// (mean 2); the per-program cap of one call bounds remain naturally.
+	lo := (C + 2) / 3
 	if lo < 1 {
 		lo = 1
 	}
-	hi := (C + 1) / 2
-	remain := int(r.randRange(uint64(lo), uint64(hi)))
+	remain := int(r.randRange(uint64(lo), uint64(C)))
 
 	start := r.Intn(C)
 	removed := 0
@@ -2721,12 +3268,18 @@ func RemoveReservoirDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 // anchor itself must be a read/write call, so the set always contains
 // something to mutate.
 func MutateGroupDataDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
-	recordLastMutation("MutateGroupDataDynamic")
 	if lcs == nil {
 		return false
 	}
+	if CoverageBoardReady() && r.Float64() < directedBiasProb {
+		if mutateGroupDataDirected(ps, lcs, r) {
+			return true
+		}
+	}
+	recordLastMutation("MutateGroupDataDynamic")
 	anchor, anchorPath, ok := pickAnchor(ps, r, true)
 	if !ok {
+		atomic.AddUint64(&anchorMissCount, 1)
 		return false
 	}
 
@@ -2740,66 +3293,254 @@ func MutateGroupDataDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 	hasOffset := false
 	sharedLength := uint64(0)
 	hasLength := false
+	fileSize := uint64(0)
+	sizeKnown := false
 	for _, pos := range positions {
 		call := ps[pos.ProgIdx].Calls[pos.CallIdx]
-		if !isWriteCall(call) && !isReadCall(call) {
+		if !isWriteCall(call) && !isReadCall(call) && !isTruncateCall(call) {
 			continue
 		}
+		if !sizeKnown && lcs.FileTree != nil {
+			// Resolve the anchor file's size once: a real size 0 is a valid
+			// outcome and must not be re-queried on later positions.
+			fileSize = getFileSizeByPath(ps, pos, lcs.FileTree)
+			sizeKnown = true
+		}
 		if !hasOffset && len(call.Args) >= 4 {
-			if lcs.FileTree != nil {
-				if sz := getFileSizeByPath(ps, pos, lcs.FileTree); sz > 0 {
-					sharedOffset = r.randRange(0, sz+4096)
-				}
-			}
-			if sharedOffset == 0 {
-				sharedOffset = r.randRange(0, 1024*1024)
-			}
+			sharedOffset = r.randHmdfsOffset(fileSize)
 			hasOffset = true
 		}
-		if !hasLength && isWriteCall(call) && len(call.Args) >= 3 {
-			sharedLength = pickMutationLength(r)
+		if !hasLength && ((isWriteCall(call) && len(call.Args) >= 3) ||
+			(isReadCall(call) && len(call.Args) >= 3) ||
+			(isTruncateCall(call) && len(call.Args) >= 2)) {
+			sharedLength = pickMutationLength(r, fileSize)
 			hasLength = true
 		}
 	}
-	if !hasOffset && !hasLength {
-		return false
+	if hasOffset && hasLength {
+		// Keep the shared offset/length pair consistent with the offset
+		// bucket semantics (tail writes cross EOF, mid stays inside).
+		sharedLength = clampLenToBucket(fileSize, sharedOffset, sharedLength,
+			bucketOfOffset(fileSize, sharedOffset))
 	}
+	applyGroupDataValues(ps, positions, sharedOffset, hasOffset, sharedLength, hasLength, r)
+	return true
+}
 
+// applyGroupDataValues writes the shared offset/length pair into every data
+// call of the group (offset only where the call carries one explicitly,
+// length into the count/length argument) and rebuilds the derived sizes.
+func applyGroupDataValues(ps []*Prog, positions []GroupPosition, sharedOffset uint64, hasOffset bool, sharedLength uint64, hasLength bool, r *randGen) {
 	for _, pos := range positions {
 		call := ps[pos.ProgIdx].Calls[pos.CallIdx]
-		if !isWriteCall(call) && !isReadCall(call) {
+		if !isWriteCall(call) && !isReadCall(call) && !isTruncateCall(call) {
 			continue
 		}
-		if len(call.Args) >= 4 {
+		if hasOffset && (isWriteCall(call) || isReadCall(call)) && len(call.Args) >= 4 {
 			if posArg, ok := call.Args[3].(*ConstArg); ok {
 				posArg.Val = sharedOffset
 			}
 		}
-		if isWriteCall(call) && len(call.Args) >= 3 {
-			if countArg, ok := call.Args[2].(*ConstArg); ok {
-				countArg.Val = sharedLength
-				updateWriteDataBuf(ps[pos.ProgIdx], call, sharedLength, r)
+		if hasLength {
+			switch {
+			case isWriteCall(call) && len(call.Args) >= 3:
+				if updateCallDataBuf(ps[pos.ProgIdx], call, sharedLength, r) {
+					if countArg, ok := call.Args[2].(*ConstArg); ok {
+						countArg.Val = sharedLength
+					}
+				}
+			case isReadCall(call) && len(call.Args) >= 3:
+				// read has no input payload: only the receive buffer is resized;
+				// count (len[buf]) is recomputed by assignSizesCall below. A
+				// failed resize is intentionally ignored: the old buffer is
+				// kept and the count follows it.
+				updateCallDataBuf(ps[pos.ProgIdx], call, sharedLength, r)
+			case isTruncateCall(call) && len(call.Args) >= 2:
+				if lenArg, ok := call.Args[1].(*ConstArg); ok {
+					lenArg.Val = sharedLength
+				}
 			}
 		}
 		r.target.assignSizesCall(call)
 	}
+}
+
+// mutateGroupDataDirected targets an uncovered OffB bucket: it collects the
+// group's offset-capable call names (pread64/pwrite64 carry an explicit
+// offset, truncate realizes the bucket through its length; read/write are
+// sequential and cannot steer it), picks a bucket by uncovered potential and
+// realizes the shared offset/length pair accordingly. The bucket choice is
+// statistical: the group's roles (which call ends up as pair A/B) follow the
+// execution order, so the mutation only biases the distribution.
+func mutateGroupDataDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
+	if lcs == nil || lcs.FileTree == nil || !CoverageBoardReady() {
+		return false
+	}
+	anchor, anchorPath, ok := pickAnchor(ps, r, true)
+	if !ok {
+		return false
+	}
+	var positions []GroupPosition
+	positions = append(positions, anchor)
+	for _, cc := range findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs) {
+		positions = append(positions, cc.Pos)
+	}
+
+	var variants []string
+	seenVar := make(map[string]bool)
+	fileSize := uint64(0)
+	sizeKnown := false
+	hasExplicitOffset := false
+	hasTruncate := false
+	for _, pos := range positions {
+		call := ps[pos.ProgIdx].Calls[pos.CallIdx]
+		if !isWriteCall(call) && !isReadCall(call) && !isTruncateCall(call) {
+			continue
+		}
+		if !sizeKnown {
+			fileSize = getFileSizeByPath(ps, pos, lcs.FileTree)
+			sizeKnown = true
+		}
+		name := call.Meta.CallName
+		switch {
+		case (isWriteCall(call) || isReadCall(call)) && len(call.Args) >= 4:
+			hasExplicitOffset = true
+			if name != "" && !seenVar[name] {
+				seenVar[name] = true
+				variants = append(variants, name)
+			}
+		case isTruncateCall(call) && len(call.Args) >= 2:
+			hasTruncate = true
+			if name != "" && !seenVar[name] {
+				seenVar[name] = true
+				variants = append(variants, name)
+			}
+		}
+	}
+	if len(variants) == 0 {
+		return false
+	}
+	pots := covBoard.uncoveredOffPots(variants)
+	bucket := pickWeightedIndex(pots[:], r.Rand)
+	if bucket < offsetBucketZero || bucket > offsetBucketBeyond {
+		return false
+	}
+
+	sharedOffset := uint64(0)
+	hasOffset := false
+	sharedLength := uint64(0)
+	hasLength := false
+	switch {
+	case hasExplicitOffset:
+		off, ok := realizeDirectedOffset(r, fileSize, uint64(bucket))
+		if !ok {
+			return false
+		}
+		sharedOffset, hasOffset = off, true
+		sharedLength = clampLenToBucket(fileSize, off, pickMutationLength(r, fileSize), uint64(bucket))
+		hasLength = true
+	case hasTruncate:
+		l, ok := realizeDirectedTruncateLen(r, fileSize, uint64(bucket))
+		if !ok {
+			return false
+		}
+		sharedLength, hasLength = l, true
+	default:
+		return false
+	}
+	applyGroupDataValues(ps, positions, sharedOffset, hasOffset, sharedLength, hasLength, r)
+	recordLastMutation("MutateGroupDataDirected")
 	return true
 }
 
-// mutateMixForSize returns the mutation mix weights for the inodeops/fileops
-// DCT mutators, banded by len(ps[0].Calls): tiny programs grow (insertion
-// heavy — they need to reach a size where modifier pairs exist at all),
-// large ones shrink (removal heavy — bounded execution cost, bounded pair
-// space). Weights are (insertion, remove-one, remove-group, path/data
-// mutation) out of 100; remove-one is the reservoir-style cross-program
-// deletion (RemoveReservoirDynamic), remove-group is the anchor-group
-// deletion (RemoveGroupDynamic):
+// realizeDirectedOffset samples an offset that lands in bucket on a file of
+// the given size, verifying via bucketOfOffset. Single source for the 2b
+// parameter realizer and the data-mutation arm. At size 0 the Beyond sampler
+// can draw EOF itself (0, which is the Zero bucket), so that degenerate case
+// is realized deterministically instead of relying on retries (degenerate
+// sizes otherwise make a bucket unrealizable; the caller falls back).
+func realizeDirectedOffset(r *randGen, size, bucket uint64) (uint64, bool) {
+	if bucket == offsetBucketBeyond && size == 0 {
+		return 4096, true
+	}
+	off := r.randOffsetInBucket(size, bucket)
+	if bucketOfOffset(size, off) != bucket {
+		return 0, false
+	}
+	return off, true
+}
+
+// realizeDirectedTruncateLen samples a truncate length that lands in bucket
+// on a file of the given size (truncate carries no offset argument: its
+// offset bucket is computed from the new length).
+func realizeDirectedTruncateLen(r *randGen, size, bucket uint64) (uint64, bool) {
+	for attempt := 0; attempt < 8; attempt++ {
+		var l uint64
+		switch bucket {
+		case offsetBucketZero:
+			l = 0
+		case offsetBucketBeyond:
+			l = size + 1 + uint64(r.Intn(4096))
+		case offsetBucketMid:
+			// No mid region when the file has no tail page (size 0 or below
+			// one page). The tb==0 check also protects the size-1 subtraction
+			// from unsigned underflow (which would wrap to MaxUint64 and let
+			// the hi<1 guard below pass, ending in r.Intn(-1) panic).
+			tb := tailBeginOf(size)
+			if tb == 0 {
+				return 0, false
+			}
+			hi := size - 1
+			if tb < size {
+				hi = tb - 1
+			}
+			if hi < 1 {
+				return 0, false
+			}
+			l = 1 + uint64(r.Intn(int(hi)))
+		case offsetBucketTail:
+			// Sub-page files have no separate tail page: tailBeginOf is 0 and
+			// every length in [1, size-1] classifies as Tail (bucketOfOffset),
+			// so the region starts at 1 there. The lo >= size guard also
+			// protects the size-lo subtraction from underflow.
+			lo := tailBeginOf(size)
+			if lo == 0 {
+				lo = 1
+			}
+			if lo >= size {
+				return 0, false
+			}
+			l = lo + uint64(r.Intn(int(size-lo)))
+		default:
+			return 0, false
+		}
+		if bucketOfOffset(size, l) == bucket {
+			return l, true
+		}
+	}
+	return 0, false
+}
+
+// mutateMixForSize returns the mutation mix weights for the fsops DCT
+// mutator, banded by len(ps[0].Calls). Weights out of 100 are (insertion,
+// remove-one, remove-group, path/data group mutation). The reservoir
+// insertion was removed (2026-09-28): its budget folded back into the single
+// insertion share, restoring the pre-merge distribution. The insertion share
+// now dispatches entirely to the Phase 2b directed batch with the weighted
+// 2a DCT insertion as its fallback (patterns are no longer used by the
+// mutation path). remove-one is RemoveReservoirDynamic (cross-program
+// subset deletion) and remove-group is RemoveGroupDynamic. The original
+// syzkaller Mutate is NOT part of this mix: it remains the fallback used by
+// mutateHmdfs when the typed mutator declines. The path/data weight
+// (mutPathData) is split internally 70/30 in favor of the path mutator
+// (dataMutateProb=30); a data miss degrades to the path mutator in the same
+// round.
 //
-//	1-3   (tiny):   85/ 5/ 0/10 — gather the first modifier pairs
+//	1-3   (tiny):   85/ 5/ 0/10
 //	4-11  (grow):   60/10/ 5/25
 //	12-16 (peak):   35/25/10/30
 //	17-20 (shrink): 10/40/20/30
-func mutateMixForSize(size int) (ins, removeOne, removeGroup, mutate int) {
+func mutateMixForSize(size int) (ins, removeOne, removeGroup, mutPathData int) {
 	switch {
 	case size < 4:
 		return 85, 5, 0, 10
@@ -2812,7 +3553,146 @@ func mutateMixForSize(size int) (ins, removeOne, removeGroup, mutate int) {
 	}
 }
 
-func MutateInodeOpsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy) bool {
+// failShapeProb is the probability that a DCT insertion's root target is
+// rewritten into a failure shape from the reachability whitelist (see
+// applyFailureShape).
+const failShapeProb = 0.25
+
+var (
+	failShapeHitCount  uint64
+	failShapeSkipCount uint64
+)
+
+// FailShapeStats returns (hit, skip): root targets actually rewritten into a
+// reachable failure shape, and attempts skipped because no constructible
+// target existed (atomic; shared by all Procs).
+func FailShapeStats() (uint64, uint64) {
+	return atomic.LoadUint64(&failShapeHitCount), atomic.LoadUint64(&failShapeSkipCount)
+}
+
+// dataMutateProb is the probability (out of 100) that the group-mutation
+// budget of MutateFsopsWithDCT goes to the data mutator instead of the path
+// mutator: data only rewrites offset/length values while path changes file
+// identity, so the split is biased 70/30 towards path. A data miss (no data
+// anchor or no offset/length candidate) degrades to the path mutator in the
+// same round; the miss count is exported for offline tuning.
+const dataMutateProb = 30
+
+var dataMutateMissCount uint64
+
+// DataMutateMissCount returns the cumulative number of data-branch misses
+// that were redirected to the path mutator (atomic; shared by all Procs).
+func DataMutateMissCount() uint64 {
+	return atomic.LoadUint64(&dataMutateMissCount)
+}
+
+var anchorMissCount uint64
+
+// AnchorMissCount returns the cumulative number of data-branch misses caused
+// by pickAnchor (no data-carrying call with timing info in ps[0]); it is a
+// subset of DataMutateMissCount.
+func AnchorMissCount() uint64 {
+	return atomic.LoadUint64(&anchorMissCount)
+}
+
+var timingAlignMissCount uint64
+
+// TimingAlignMissCount returns the cumulative number of temporal alignments
+// that could not use timing (refTime < 0 or no CheckInfo anchor in the target
+// prog) and fell back to index alignment. Freshly generated/grown progs and
+// seeds whose corpus timeline was not restored both count here, so use it as
+// a trend metric together with the fuzzer's timings=applied/total line.
+// Atomic; shared by all Procs.
+func TimingAlignMissCount() uint64 {
+	return atomic.LoadUint64(&timingAlignMissCount)
+}
+
+// applyFailureShape rewrites the root target paths of an insertion into a
+// shape whose error can reach the traced hmdfs function (source-verified
+// reachability table):
+//   - rmdir on a non-empty directory -> hmdfs_rmdir_merge negative ret;
+//   - rename of a directory onto a non-empty directory -> hmdfs_rename_merge
+//     negative ret (EPERM when the parents differ, lower ENOTEMPTY otherwise).
+//
+// VFS-level short-circuits (bad open flags, missing paths, fd errors, ...)
+// are deliberately not attempted: they never fire the kretprobes.
+func applyFailureShape(lcs *LayeredChoiceStrategy, rootCallName, basePath, basePath2 string, r *randGen) (string, string) {
+	if lcs == nil || lcs.FileTree == nil {
+		return basePath, basePath2
+	}
+	switch rootCallName {
+	case "rmdir":
+		if dir := pickNonEmptyDir(lcs.FileTree, r, basePath); dir != "" {
+			atomic.AddUint64(&failShapeHitCount, 1)
+			return dir, basePath2
+		}
+		atomic.AddUint64(&failShapeSkipCount, 1)
+	case "rename":
+		if dst := pickNonEmptyDir(lcs.FileTree, r, ""); dst != "" {
+			if src := pickRenameSrcDir(lcs.FileTree, r, dst); src != "" {
+				atomic.AddUint64(&failShapeHitCount, 1)
+				return src, dst
+			}
+		}
+		atomic.AddUint64(&failShapeSkipCount, 1)
+	}
+	return basePath, basePath2
+}
+
+// pickNonEmptyDir returns a plain directory with at least one child (the
+// non-empty rmdir/rename target of the failure shapes), "" if none exists.
+func pickNonEmptyDir(ft *FileTree, r *randGen, exclude string) string {
+	ft.mu.RLock()
+	var cands []*FileNode
+	for _, dirs := range ft.DirsByCid {
+		for _, n := range dirs {
+			if n.Type != NodeTypeDir || len(n.Children) == 0 {
+				continue
+			}
+			if n.FullPath == exclude {
+				continue
+			}
+			cands = append(cands, n)
+		}
+	}
+	ft.mu.RUnlock()
+	if len(cands) == 0 {
+		return ""
+	}
+	return cands[r.Intn(len(cands))].FullPath
+}
+
+// pickRenameSrcDir returns a directory sibling of dstPath (same parent — the
+// hard hmdfs requirement: cross-parent renames return EPERM before the trace
+// point, so they would never produce an event), "" if none exists. The source
+// is a variant-side path, so a TmpDir sibling qualifies (nodeIsDir); the
+// non-TmpDir rule applies to the destination only (see pickNonEmptyDir).
+func pickRenameSrcDir(ft *FileTree, r *randGen, dstPath string) string {
+	parent := GetParentDir(dstPath)
+	if parent == "" {
+		return ""
+	}
+	ft.mu.RLock()
+	var cands []*FileNode
+	for _, dirs := range ft.DirsByCid {
+		for _, n := range dirs {
+			if !nodeIsDir(n) {
+				continue
+			}
+			if n.Parent == nil || n.Parent.FullPath != parent || n.FullPath == dstPath {
+				continue
+			}
+			cands = append(cands, n)
+		}
+	}
+	ft.mu.RUnlock()
+	if len(cands) == 0 {
+		return ""
+	}
+	return cands[r.Intn(len(cands))].FullPath
+}
+
+func MutateFsopsWithDCT(ps []*Prog, rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy) bool {
 	if len(ps) == 0 || lcs == nil {
 		return false
 	}
@@ -2827,214 +3707,60 @@ func MutateInodeOpsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *
 		if len(ps[0].Calls) >= RecommendedCalls {
 			// At the size cap: fall back to removing calls instead of
 			// wasting the round, so programs oscillate around the cap.
-			return RemoveReservoirDynamic(ps, lcs, r)
+			return RemoveReservoirDynamic(ps, r)
 		}
-		if lcs.ShouldUsePattern(r.Rand) {
-			return insertCallFromPattern(ps, r, sCalls, hmcfg, lcs, "inodeops")
+		// Pattern-based insertion was removed from the mutation path
+		// (2026-09-28; the dormant insertCallFromPattern and its broken-ref
+		// test were deleted later, P2-#12), and the reservoir insertion was
+		// removed later the same day (its budget folded back into this
+		// insertion share): the budget always dispatches as follows.
+		//
+		// Phase 2b dispatch: the outer roll splits the insertion budget
+		// between an exact directed batch and the 2a-based regular insertion
+		// (whose inner Direction 3 is disabled to avoid a double bias).
+		// Anything that never executed is accounted by cause (noPlan /
+		// insertFail / cfgErr), never as a cell miss, and falls back within
+		// this same round.
+		if CoverageBoardReady() && r.Float64() < directedBiasProb {
+			batch, status := PickDirectedBatch(ps, lcs, hmcfg, r)
+			switch {
+			case batch != nil:
+				if insertDirectedBatch(ps, r, sCalls, hmcfg, lcs, batch) {
+					recordLastMutation("insertDirectedBatch")
+					return true
+				}
+				NoteDirectedInsertFail()
+			case status == directedPlanCfgErr:
+				NoteDirectedCfgErr()
+			default:
+				NoteDirectedNoPlan()
+			}
 		}
-		return insertCallFromDCT(ps, r, ct, sCalls, hmcfg, lcs, "inodeops")
+		return insertCallFromDCT(ps, r, sCalls, hmcfg, lcs, false)
 	case roll < ins+removeOne:
-		return RemoveReservoirDynamic(ps, lcs, r)
+		return RemoveReservoirDynamic(ps, r)
 	case roll < ins+removeOne+removeGroup:
-		return RemoveGroupDynamic(ps, lcs, r)
+		if RemoveGroupDynamic(ps, lcs, r) {
+			return true
+		}
+		// The fd-safe filter can decline (every provider in the group has an
+		// fd user outside it); keep the round productive by degrading to the
+		// one-call reservoir removal.
+		return RemoveReservoirDynamic(ps, r)
 	default:
-		if r.bin() {
+		// Path/data split of the group-mutation budget: path changes file
+		// identity, data only offset/length values, so bias to path (70/30).
+		// A data miss degrades to the path mutator in the same round instead
+		// of dropping to the generic fallback.
+		if r.Intn(100) >= dataMutateProb {
 			return MutateGroupPathDynamic(ps, lcs, r)
 		}
-		return MutateGroupDataDynamic(ps, lcs, r)
+		if MutateGroupDataDynamic(ps, lcs, r) {
+			return true
+		}
+		atomic.AddUint64(&dataMutateMissCount, 1)
+		return MutateGroupPathDynamic(ps, lcs, r)
 	}
-}
-
-func MutateFileopsWithDCT(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy) bool {
-	if len(ps) == 0 || lcs == nil {
-		return false
-	}
-
-	r := newRand(ps[0].Target, rs)
-	r.hmcfg = hmcfg
-
-	ins, removeOne, removeGroup, _ := mutateMixForSize(len(ps[0].Calls))
-	roll := r.Intn(100)
-	switch {
-	case roll < ins:
-		if len(ps[0].Calls) >= RecommendedCalls {
-			// At the size cap: fall back to removing calls instead of
-			// wasting the round, so programs oscillate around the cap.
-			return RemoveReservoirDynamic(ps, lcs, r)
-		}
-		if lcs.ShouldUsePattern(r.Rand) {
-			return insertCallFromPattern(ps, r, sCalls, hmcfg, lcs, "fileops")
-		}
-		return insertCallFromDCT(ps, r, ct, sCalls, hmcfg, lcs, "fileops")
-	case roll < ins+removeOne:
-		return RemoveReservoirDynamic(ps, lcs, r)
-	case roll < ins+removeOne+removeGroup:
-		return RemoveGroupDynamic(ps, lcs, r)
-	default:
-		if r.bin() {
-			return MutateGroupPathDynamic(ps, lcs, r)
-		}
-		return MutateGroupDataDynamic(ps, lcs, r)
-	}
-}
-
-func insertCallFromPattern(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seedType string) bool {
-	recordLastMutation("insertCallFromPattern:" + seedType)
-	pattern := lcs.PredefinedPatterns.GetRandomPattern(seedType, r.Rand)
-	if pattern == nil || pattern.ClientCount > len(ps) {
-		return false
-	}
-
-	var basePath string
-	p0 := ps[0]
-	var pathCandidates []string
-	for _, call := range p0.Calls {
-		if call.Meta.Name == "rename" {
-			p1, p2 := extractRenamePaths(call)
-			if p1 != "" {
-				pathCandidates = append(pathCandidates, p1)
-			}
-			if p2 != "" {
-				pathCandidates = append(pathCandidates, p2)
-			}
-		} else {
-			p := extractPathFromCall(call)
-			if p != "" {
-				pathCandidates = append(pathCandidates, p)
-			}
-		}
-	}
-	var matches []string
-	for _, pc := range pathCandidates {
-		if patternBaseMatches(lcs.FileTree, seedType, pc) {
-			matches = append(matches, pc)
-		}
-	}
-	if len(matches) > 0 {
-		basePath = matches[r.Intn(len(matches))]
-	}
-
-	if basePath == "" {
-		//TODO: 目前是种子本身有操作文件就使用已操作文件，否则就选一个新的
-		if seedType == "fileops" {
-			fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
-			if fileNode == nil {
-				return false
-			}
-			basePath = fileNode.FullPath
-		} else {
-			dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
-			//TODO: 对于 inodeops 其实不一定要是 dir 吧，只不过有一些操作只能对 dir 操作
-			if dirNode == nil {
-				return false
-			}
-			basePath = dirNode.FullPath
-		}
-	}
-
-	sharedOffset := uint64(0)
-	if pattern.OffsetRel == OffsetSame {
-		node := lcs.FileTree.FindNode(basePath)
-		if node != nil && node.Size > 0 && r.nOutOf(4, 5) {
-			sharedOffset = r.randRange(0, node.Size+4096)
-		} else {
-			sharedOffset = r.randInt(64)
-		}
-	}
-
-	referenceInsertPos := -1
-	refTime := int64(-1) // 参考时间（全局 TSC 域），-1 表示尚无参考
-
-	for nodeIdx, ops := range pattern.Operations {
-		if nodeIdx >= len(ps) {
-			break
-		}
-
-		p := ps[nodeIdx]
-		cid := hmcfg.Cids[nodeIdx]
-
-		var insertPos int
-		var ExistingFd *ResultArg
-		var useExistingFd bool
-		first := referenceInsertPos < 0
-		if seedType == "fileops" {
-			insertPos, ExistingFd = findInsertPosition(p, r, 1, sCalls, refTime, lcs.tscoffFor(nodeIdx))
-			useExistingFd = true
-		} else {
-			insertPos, ExistingFd = findInsertPosition(p, r, 2, sCalls, refTime, lcs.tscoffFor(nodeIdx))
-			useExistingFd = true
-		}
-		if ExistingFd == nil {
-			insertPos, _ = findInsertPosition(p, r, 0, sCalls, refTime, lcs.tscoffFor(nodeIdx))
-			useExistingFd = false
-		}
-		if first {
-			referenceInsertPos = insertPos
-			// Reference time for the other progs: 0 = program-start
-			// alignment (root inserted at the beginning); the end of the
-			// call before insertPos when it has timing info; -1 (no
-			// reference) otherwise, so others fall back to index alignment.
-			refTime = int64(-1)
-			if insertPos == 0 {
-				refTime = 0
-			} else if p.Calls[insertPos-1].CheckInfo != nil {
-				refTime = int64(p.Calls[insertPos-1].CheckInfo.Etime) - lcs.tscoffFor(nodeIdx)
-			}
-		}
-		for _, op := range ops {
-			// 根节点（node 0）的创建/删除类 op 预处理与生成侧对齐：mkdir/creat
-			// 打新建路径、rmdir 打空目录——变异插入也能产生真实的创建/删除竞争。
-			if nodeIdx == 0 {
-				var ok bool
-				basePath, ok = r.preprocessPatternRootOp(basePath, cid, op.CallName, lcs.FileTree)
-				if !ok {
-					return false // 无空目录——跳过本次插入（调用方 fallback 标准 Mutate）
-				}
-			}
-			calls, _, _ := r.generateCallFromPatternOp(stateFromProg(p), sCalls, op, basePath, cid, lcs, ExistingFd, useExistingFd, pattern.OffsetRel, sharedOffset)
-			for _, c := range calls {
-				if insertPos >= len(p.Calls) {
-					p.Calls = append(p.Calls, c)
-				} else {
-					p.Calls = append(p.Calls[:insertPos], append([]*Call{c}, p.Calls[insertPos:]...)...)
-				}
-				insertPos++
-			}
-		}
-	}
-
-	// Fill remaining nodes with verification calls at the time-aligned position
-	for nodeIdx := len(pattern.Operations); nodeIdx < len(ps); nodeIdx++ {
-		p := ps[nodeIdx]
-		cid := hmcfg.Cids[nodeIdx]
-		verInsertPos := TimeAlignedInsertPos(p, refTime, lcs.tscoffFor(nodeIdx))
-		if verInsertPos < 0 {
-			verInsertPos = referenceInsertPos
-		}
-		if verInsertPos < 0 || verInsertPos > len(p.Calls) {
-			verInsertPos = len(p.Calls)
-		}
-		flags := uint64(2)
-		if lcs.FileTree != nil {
-			node := lcs.FileTree.FindNode(basePath)
-			if node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir) {
-				flags = r.target.GetConst("O_DIRECTORY")
-			}
-		}
-		calls := r.generateVerificationCalls(stateFromProg(p), sCalls, basePath, cid, seedType, nil, flags)
-		for _, c := range calls {
-			if verInsertPos >= len(p.Calls) {
-				p.Calls = append(p.Calls, c)
-			} else {
-				p.Calls = append(p.Calls[:verInsertPos], append([]*Call{c}, p.Calls[verInsertPos:]...)...)
-			}
-			verInsertPos++
-		}
-	}
-
-	//TODO: 没有记录插入索引
-
-	return true
 }
 
 type GroupPosition struct {
@@ -3042,15 +3768,45 @@ type GroupPosition struct {
 	CallIdx int
 }
 
+// rootBaseConstraint returns the tree-type constraint of a root call that
+// operates directly on its base path. ok=false for roots that rewrite the
+// base path themselves (mkdir picks a container, creat appends a fresh name)
+// or accept either type, so no check is needed.
+func rootBaseConstraint(call string) (int, bool) {
+	switch call {
+	case "mkdir", "creat":
+		return relTargetAny, false
+	}
+	switch kind := callNameConstraint(call); kind {
+	case relTargetFile, relTargetDir:
+		return kind, true
+	}
+	return relTargetAny, false
+}
+
+// nodeKindMatches reports whether a tree node satisfies a root constraint.
+func nodeKindMatches(n *FileNode, kind int) bool {
+	switch kind {
+	case relTargetFile:
+		return n.Type == NodeTypeFile
+	case relTargetDir:
+		return n.Type == NodeTypeDir || n.Type == NodeTypeEmptyDir
+	}
+	return true
+}
+
 func resolveFdTarget(ps []*Prog, pos GroupPosition) GroupPosition {
 	call := ps[pos.ProgIdx].Calls[pos.CallIdx]
 	callName := call.Meta.CallName
 
+	// Path-taking calls operate on their own path argument. getdents64 is
+	// deliberately absent: its arg0 is an fd, so it resolves to the embedded
+	// open (same as read/write) instead of being a silent no-op.
 	if callName == "open" || callName == "creat" ||
 		callName == "truncate" || callName == "chmod" ||
 		callName == "mkdir" || callName == "rmdir" ||
 		callName == "rename" || callName == "stat" ||
-		callName == "unlink" || callName == "getdents64" {
+		callName == "unlink" {
 		return pos
 	}
 
@@ -3074,9 +3830,13 @@ func resolveFdTarget(ps []*Prog, pos GroupPosition) GroupPosition {
 	return pos
 }
 
-func pickNewBasePath(ft *FileTree, seedType string, r *rand.Rand, excludeCid string) string {
+// pickNewBasePath picks a new anchor path for the path-mutation group. A
+// bucket in [1,3] forces that depth bucket (one-hot, used by the directed
+// arm); -1 keeps the DepthBucketWeights sampling.
+func pickNewBasePath(ft *FileTree, kind int, bucket int, r *rand.Rand, excludeCid, excludePath string) string {
 	var candidates []*FileNode
-	if seedType == "fileops" {
+	switch kind {
+	case relTargetFile:
 		candidates = ft.GetAllFileNodesExcluding(excludeCid)
 		if len(candidates) == 0 {
 			node := ft.GetRandomFile(r, "")
@@ -3084,7 +3844,7 @@ func pickNewBasePath(ft *FileTree, seedType string, r *rand.Rand, excludeCid str
 				candidates = append(candidates, node)
 			}
 		}
-	} else {
+	case relTargetDir:
 		candidates = ft.GetAllNonTmpDirNodesExcluding(excludeCid)
 		if len(candidates) == 0 {
 			node := ft.GetRandomDir(r, "", true)
@@ -3092,28 +3852,89 @@ func pickNewBasePath(ft *FileTree, seedType string, r *rand.Rand, excludeCid str
 				candidates = append(candidates, node)
 			}
 		}
+	default:
+		candidates = append(candidates, ft.GetAllFileNodesExcluding(excludeCid)...)
+		candidates = append(candidates, ft.GetAllNonTmpDirNodesExcluding(excludeCid)...)
+		if len(candidates) == 0 {
+			if node := ft.GetRandomFile(r, ""); node != nil {
+				candidates = append(candidates, node)
+			}
+			if node := ft.GetRandomDir(r, "", true); node != nil {
+				candidates = append(candidates, node)
+			}
+		}
+	}
+	if excludePath != "" {
+		kept := candidates[:0]
+		for _, n := range candidates {
+			if n.FullPath != excludePath {
+				kept = append(kept, n)
+			}
+		}
+		candidates = kept
 	}
 	if len(candidates) == 0 {
 		return ""
 	}
 
+	// Stage 1: pick a depth bucket by DepthBucketWeights (non-empty groups);
+	// a forced bucket takes that group directly.
+	var groups [4][]*FileNode
+	for _, n := range candidates {
+		b := int(DepthBucketOf(n.FullPath))
+		if b < 1 || b > 3 {
+			b = 1
+		}
+		groups[b] = append(groups[b], n)
+	}
+	pool := candidates
+	if bucket >= 1 && bucket <= 3 {
+		if len(groups[bucket]) == 0 {
+			return ""
+		}
+		pool = groups[bucket]
+	} else {
+		total := 0.0
+		var ws [4]float64
+		for b := 1; b <= 3; b++ {
+			if len(groups[b]) > 0 {
+				ws[b] = DepthBucketWeights[b-1]
+				total += ws[b]
+			}
+		}
+		if total > 0 {
+			x := r.Float64() * total
+			cum := 0.0
+			for b := 1; b <= 3; b++ {
+				cum += ws[b]
+				if ws[b] > 0 && x < cum {
+					pool = groups[b]
+					break
+				}
+			}
+		}
+	}
+
+	// Stage 2: node-size/depth weight inside the chosen bucket.
 	totalWeight := 0.0
-	weights := make([]float64, len(candidates))
-	for i, node := range candidates {
+	weights := make([]float64, len(pool))
+	for i, node := range pool {
 		w := calculateNodeWeight(node)
 		weights[i] = w
 		totalWeight += w
 	}
-
+	if totalWeight <= 0 {
+		return pool[r.Intn(len(pool))].FullPath
+	}
 	x := r.Float64() * totalWeight
 	cumSum := 0.0
 	for i, w := range weights {
 		cumSum += w
 		if x < cumSum {
-			return candidates[i].FullPath
+			return pool[i].FullPath
 		}
 	}
-	return candidates[len(candidates)-1].FullPath
+	return pool[len(pool)-1].FullPath
 }
 
 func getLengthBucket(l int) int {
@@ -3173,30 +3994,25 @@ func calculateNodeWeight(node *FileNode) float64 {
 	return w
 }
 
-func updateCallPathInProg(p *Prog, callIdx int, newPath string, r *randGen) {
+// updateCallPathInProg rewrites the path-carrying argument of callIdx to
+// newPath. Returns true when the source path was actually rewritten; the
+// rename destination follow-up stays best-effort.
+func updateCallPathInProg(p *Prog, callIdx int, newPath string, r *randGen) bool {
 	if callIdx < 0 || callIdx >= len(p.Calls) {
-		return
+		return false
 	}
 	call := p.Calls[callIdx]
-	if len(call.Args) == 0 {
-		return
+	if !reassignDataArgAt(p, call, 0, r, []byte(newPath+"\x00")) {
+		return false
 	}
-	ptrArg, ok := call.Args[0].(*PointerArg)
-	if !ok {
-		return
-	}
-	dataArg, ok := ptrArg.Res.(*DataArg)
-	if !ok {
-		return
-	}
-	dataArg.data = []byte(newPath + "\x00")
 	r.target.assignSizesCall(call)
 
 	// rename 的目标路径跟随源迁移（L25）：目标基于旧源派生
 	// （源._renamed_xxx）——源迁移后目标同步重新派生（对齐 L9 的 rename 处理）。
 	if strings.Contains(call.Meta.Name, "rename") {
-		updateCallPathByArgIdx(call, 1, newPath+"._renamed_"+randomSuffix(r.Rand), r)
+		updateCallPathByArgIdx(p, call, 1, newPath+"._renamed_"+randomSuffix(r.Rand), r)
 	}
+	return true
 }
 
 var lengthBuckets = []struct{ len, weight int }{
@@ -3220,7 +4036,35 @@ var lenBucketRanges = [][2]int{
 	{16385, 65536},
 }
 
-func pickMutationLength(r *randGen) uint64 {
+// pickMutationLength picks the shared length of a data-group mutation. With a
+// known file size it uses the size-relative / page-boundary / ranges / free
+// layers; without one it keeps the legacy boundary-weighted table.
+func pickMutationLength(r *randGen, size uint64) uint64 {
+	if size == 0 {
+		return pickMutationLengthLegacy(r)
+	}
+	switch r.rollByProbs(hmdfsMutLenProbs[:]) {
+	case 0: // size-relative
+		cands := [...]uint64{size - 1, size, size + 1, size / 2, 2 * size}
+		v := cands[r.Intn(len(cands))]
+		if v > lenBoundaryCap {
+			v = lenBoundaryCap
+		}
+		if v == 0 {
+			v = 1
+		}
+		return v
+	case 1: // page boundaries
+		return []uint64{512, 4096, 8192}[r.Intn(3)]
+	case 2: // legacy random ranges
+		rr := lenBucketRanges[r.Intn(len(lenBucketRanges))]
+		return uint64(r.Intn(rr[1]-rr[0]+1) + rr[0])
+	default: // free random
+		return uint64(r.Intn(65536) + 1)
+	}
+}
+
+func pickMutationLengthLegacy(r *randGen) uint64 {
 	buckets := lengthBuckets
 	totalWeight := 0
 	for _, b := range buckets {
@@ -3253,37 +4097,47 @@ func pickMutationLength(r *randGen) uint64 {
 	return uint64(r.Intn(4096) + 1)
 }
 
-func updateWriteDataBuf(p *Prog, call *Call, newLen uint64, r *randGen) {
+// updateCallDataBuf resizes the data/receive buffer at arg[1] to newLen.
+// For writes (buffer[in]) the new tail is filled with random bytes; for reads
+// (buffer[out]) the content is irrelevant (the kernel overwrites it), the
+// resize itself is what drives the count len[buf] via assignSizesCall.
+func updateCallDataBuf(p *Prog, call *Call, newLen uint64, r *randGen) bool {
 	if len(call.Args) < 2 {
-		return
+		return false
 	}
 	ptrArg, ok := call.Args[1].(*PointerArg)
 	if !ok {
-		return
+		return false
 	}
 	dataArg, ok := ptrArg.Res.(*DataArg)
 	if !ok {
-		return
+		return false
 	}
-	oldData := dataArg.Data()
 	newData := make([]byte, newLen)
-	copy(newData, oldData)
-	for i := uint64(len(oldData)); i < newLen; i++ {
-		newData[i] = byte(r.Intn(256))
+	if dataArg.Dir() != DirOut {
+		// Data() panics on output buffers; reads have no payload to preserve
+		// anyway (the kernel overwrites the receive buffer).
+		oldData := dataArg.Data()
+		copy(newData, oldData)
+		for i := uint64(len(oldData)); i < newLen; i++ {
+			newData[i] = byte(r.Intn(256))
+		}
 	}
-	reassignDataArg(p, call, r, newData)
+	return reassignDataArg(p, call, r, newData)
 }
 
+// getFdFilePathForCall resolves the file/dir path a call operates on:
+// path-taking calls report their own path argument; fd-taking calls
+// (including getdents64, whose arg0 is an fd) backtrack to the open/creat
+// that produced the fd. The extraction-first order is deliberate: a
+// call-name whitelist here drifted from the actual argument shapes and made
+// getdents64 silently unresolvable (extractPathFromCall returns "" for an
+// fd arg), skipping the backtrack that resolveFdTarget already uses.
 func getFdFilePathForCall(ps []*Prog, pos GroupPosition) string {
 	call := ps[pos.ProgIdx].Calls[pos.CallIdx]
-	callName := call.Meta.CallName
 
-	if callName == "open" || callName == "creat" ||
-		callName == "truncate" || callName == "chmod" ||
-		callName == "mkdir" || callName == "rmdir" ||
-		callName == "rename" || callName == "stat" ||
-		callName == "unlink" || callName == "getdents64" {
-		return extractPathFromCall(call)
+	if path := extractPathFromCall(call); path != "" {
+		return path
 	}
 
 	if len(call.Args) < 1 {
@@ -3318,7 +4172,7 @@ func getFileSizeByPath(ps []*Prog, pos GroupPosition, ft *FileTree) uint64 {
 	return 0
 }
 
-func findOpenFdForPath(p *Prog, filePath string, beforeIdx int) *ResultArg {
+func findOpenFdForPath(p *Prog, filePath string, beforeIdx int, want uint8) *ResultArg {
 	for i := 0; i < beforeIdx && i < len(p.Calls); i++ {
 		call := p.Calls[i]
 		if !strings.Contains(call.Meta.Name, "open") && !strings.Contains(call.Meta.Name, "creat") {
@@ -3326,6 +4180,11 @@ func findOpenFdForPath(p *Prog, filePath string, beforeIdx int) *ResultArg {
 		}
 		path := extractPathFromCall(call)
 		if path != filePath {
+			continue
+		}
+		if want != 0 && fdCapOf(p.Target, call)&want != want {
+			// The fd cannot serve the call (e.g. a read-only fd for a write):
+			// the kernel would fail it at the VFS layer without reaching hmdfs.
 			continue
 		}
 		fd := extractFdFromCall(call)
@@ -3346,9 +4205,86 @@ func findOpenFdForPath(p *Prog, filePath string, beforeIdx int) *ResultArg {
 	return nil
 }
 
-func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seedType string) bool {
-	recordLastMutation("insertCallFromDCT:" + seedType)
+// freshPathKindsBefore scans the calls before the root insertion slot and
+// records the type each in-program creation will produce (mkdir -> dir,
+// creat -> file, rename destination -> the source's type, resolved through
+// the hint first and the tree second). The FileTree is synced only after
+// execution, so a fresh path invented earlier in the same program is not
+// queryable there; this local hint restores the type gate for the same-batch
+// cases without writing the tree. A path created by both kinds (pathological)
+// is treated as unknown.
+func freshPathKindsBefore(p *Prog, ft *FileTree, end int) map[string]int {
+	if p == nil {
+		return nil
+	}
+	if end > len(p.Calls) {
+		end = len(p.Calls)
+	}
+	m := make(map[string]int)
+	set := func(path string, kind int) {
+		if path == "" {
+			return
+		}
+		if prev, ok := m[path]; ok && prev != kind {
+			delete(m, path)
+			return
+		}
+		m[path] = kind
+	}
+	kindOf := func(path string) (int, bool) {
+		if k, ok := m[path]; ok {
+			return k, true
+		}
+		if ft == nil {
+			return 0, false
+		}
+		if n := ft.FindNode(path); n != nil {
+			if n.Type == NodeTypeFile {
+				return relTargetFile, true
+			}
+			return relTargetDir, true
+		}
+		return 0, false
+	}
+	for i := 0; i < end; i++ {
+		c := p.Calls[i]
+		if c == nil || c.Meta == nil {
+			continue
+		}
+		switch c.Meta.CallName {
+		case "mkdir":
+			set(extractPathFromCall(c), relTargetDir)
+		case "creat":
+			set(extractPathFromCall(c), relTargetFile)
+		case "rename":
+			src, dst := extractRenamePaths(c)
+			if k, ok := kindOf(src); ok {
+				set(dst, k)
+			}
+		}
+	}
+	return m
+}
+
+// basePathIsFileHinted is basePathIsFile with the in-program creation hint
+// taking precedence over the unknown-path fallback.
+func basePathIsFileHinted(ft *FileTree, rootCallName, basePath string, freshKinds map[string]int) bool {
+	if h, ok := freshKinds[basePath]; ok {
+		return h == relTargetFile
+	}
+	return basePathIsFile(ft, rootCallName, basePath)
+}
+
+func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, allowDirected bool) bool {
+	recordLastMutation("insertCallFromDCT")
 	if len(ps) == 0 {
+		return false
+	}
+	// Config guard: the planner classifies a nil lcs/FileTree/hmcfg or a
+	// Cids/ps length mismatch as directedPlanCfgErr, yet the caller falls
+	// back to this insertion. Without the guard the fallback would index
+	// hmcfg.Cids[0] / Cids[nodeIdx] out of range and panic the Proc instead.
+	if lcs == nil || lcs.FileTree == nil || hmcfg == nil || len(hmcfg.Cids) < len(ps) {
 		return false
 	}
 
@@ -3360,9 +4296,9 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 	// basePath 路线：多数沿用 p0 已有路径上下文（fd 可复用、跨组路径关联），
 	// 部分直接 FileTree 新选（fd 必然新开、操作面更广）。生成与变异统一生效。
 	useFreshPath := r.Rand.Float64() < 0.30
+	var pathCandidates []string
 	if !useFreshPath {
 		// Collect all file paths from p0's calls, pick one randomly
-		var pathCandidates []string
 		for _, call := range p0.Calls {
 			if call.Meta.Name == "rename" {
 				p1, p2 := extractRenamePaths(call)
@@ -3392,44 +4328,90 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 	}
 
 	var subCt *ChoiceTable
-	if seedType == "fileops" && lcs != nil {
-		subCt = lcs.FileopsChoiceTable
-	} else if lcs != nil {
-		subCt = lcs.InodeopsChoiceTable
+	if lcs != nil {
+		subCt = lcs.FsopsChoiceTable
 	}
 	rootCallName := r.chooseRootCallName(subCt, biasCall)
 	if rootCallName == "" {
 		return false
 	}
 
+	// In-program creations are absent from the FileTree (it is synced only
+	// after execution), so a fresh path's type is unknown there. Scan the
+	// calls before the root slot for the creating call (mkdir/creat) and use
+	// its intent as a local hint: a hinted mismatch is treated like a tree
+	// mismatch below, without writing the tree.
+	freshKinds := freshPathKindsBefore(p0, lcs.FileTree, insertPos)
+
+	// The candidate-derived basePath was chosen before the root was known, so
+	// a file-only/dir-only root may land on a mismatched type (EISDIR/ENOTDIR
+	// at execution, a wasted round). Re-pick a compatible candidate; with none
+	// the type-aware FileTree selection below takes over.
+	if basePath != "" && lcs != nil && lcs.FileTree != nil {
+		if kind, ok := rootBaseConstraint(rootCallName); ok {
+			node := lcs.FileTree.FindNode(basePath)
+			mismatch := false
+			if node != nil {
+				mismatch = !nodeKindMatches(node, kind)
+			} else if h, ok := freshKinds[basePath]; ok && h != kind {
+				mismatch = true
+			}
+			if mismatch {
+				basePath = ""
+				var compatible []string
+				for _, cand := range pathCandidates {
+					if n := lcs.FileTree.FindNode(cand); n != nil {
+						if nodeKindMatches(n, kind) {
+							compatible = append(compatible, cand)
+						}
+						continue
+					}
+					if h, ok := freshKinds[cand]; ok && h == kind {
+						compatible = append(compatible, cand)
+					}
+				}
+				if len(compatible) > 0 {
+					basePath = compatible[r.Intn(len(compatible))]
+				}
+			}
+		}
+	}
+
+	// The mount root is never a legal base for the destructive roots: rmdir
+	// on it returns EBUSY before the hmdfs trace, and a rename/creat derives
+	// sibling names outside the mount (merge_view._creat_*, merge_view._renamed_*).
+	// The candidate path comes from p0, so keep the invariant explicit and
+	// fall back to the type-aware non-root selection below.
+	if basePath != "" && lcs != nil && lcs.FileTree != nil && basePath == lcs.FileTree.Root.FullPath {
+		basePath = ""
+	}
+
 	if basePath == "" {
-		if seedType == "fileops" {
+		if IsDirOnlyCall(rootCallName) {
+			dirNode := lcs.FileTree.GetRandomDir(r.Rand, cid0, true)
+			if dirNode == nil {
+				return false
+			}
+			basePath = dirNode.FullPath
+		} else if IsFileOnlyCall(rootCallName) {
 			fileNode := lcs.FileTree.GetRandomFile(r.Rand, cid0)
 			if fileNode == nil {
 				return false
 			}
 			basePath = fileNode.FullPath
 		} else {
-			if IsDirOnlyCall(rootCallName) {
+			if r.bin() {
+				fileNode := lcs.FileTree.GetRandomFile(r.Rand, cid0)
+				if fileNode != nil {
+					basePath = fileNode.FullPath
+				}
+			}
+			if basePath == "" {
 				dirNode := lcs.FileTree.GetRandomDir(r.Rand, cid0, true)
 				if dirNode == nil {
 					return false
 				}
 				basePath = dirNode.FullPath
-			} else {
-				if r.bin() {
-					fileNode := lcs.FileTree.GetRandomFile(r.Rand, cid0)
-					if fileNode != nil {
-						basePath = fileNode.FullPath
-					}
-				}
-				if basePath == "" {
-					dirNode := lcs.FileTree.GetRandomDir(r.Rand, cid0, true)
-					if dirNode == nil {
-						return false
-					}
-					basePath = dirNode.FullPath
-				}
 			}
 		}
 	}
@@ -3438,12 +4420,12 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 	// 产生新建路径竞争（dirtype/双 creat 等形态，root 与 PathSame 变体
 	// 通过 GetPathByRelation 的空值 fallback 对齐到同一新路径）。
 	if rootCallName == "mkdir" {
-		// mkdir 需在树内目录下建新目录：basePath 是文件则取其父目录，
-		// 不在树内（被删/树外路径）则随机选一个目录。
+		// mkdir 需在树内目录下建新目录（TmpDir 也算目录）：basePath 是文件
+		// 则取其父目录，不在树内（被删/树外路径）则随机选一个目录。
 		if lcs != nil && lcs.FileTree != nil {
 			node := lcs.FileTree.FindNode(basePath)
 			switch {
-			case node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir):
+			case nodeIsDir(node):
 				// 树内目录——就地拼（D/mut_dir_x）
 			case node != nil:
 				// 树内文件——取其父目录（在该文件所在目录建新目录）
@@ -3469,14 +4451,19 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 	var ExistingFd *ResultArg = nil
 	useExistFd := false
 	if IsFdRequiredCall(rootCallName) {
-		ExistingFd = findOpenFdForPath(p0, basePath, insertPos)
+		ExistingFd = findOpenFdForPath(p0, basePath, insertPos, capNeeded(rootCallName))
 		if ExistingFd != nil {
 			useExistFd = true
 		}
 	}
 
 	if rootCallName == "rename" {
-		basePath2 = basePath + "._renamed" + randomSuffix(r.Rand)
+		basePath2 = lcs.pickRenameDst(basePath, r.Rand)
+	}
+	// Failure-shape whitelist: with failShapeProb, rewrite the root target
+	// into a shape whose error actually reaches a traced hmdfs function.
+	if r.Rand.Float64() < failShapeProb {
+		basePath, basePath2 = applyFailureShape(lcs, rootCallName, basePath, basePath2, r)
 	}
 	rootFileSize := uint64(0)
 	if lcs != nil {
@@ -3487,12 +4474,16 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 	}
 	rootFlags := uint64(2)
 	if lcs != nil && lcs.FileTree != nil {
-		node := lcs.FileTree.FindNode(basePath)
-		if node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir) {
+		if nodeIsDir(lcs.FileTree.FindNode(basePath)) || freshKinds[basePath] == relTargetDir {
 			rootFlags = r.target.GetConst("O_DIRECTORY")
 		}
 	}
 	rootCalls := r.generateCallByName(stateFromProg(p0), sCalls, rootCallName, basePath, basePath2, cid0, ExistingFd, useExistFd, rootFileSize, rootFlags)
+	if len(rootCalls) == 0 || hasNilCall(rootCalls) {
+		// A nil call would panic at Serialize; a clean abort leaves ps
+		// untouched and the caller falls back to the standard mutator.
+		return false
+	}
 
 	if insertPos >= len(p0.Calls) {
 		p0.Calls = append(p0.Calls, rootCalls...)
@@ -3514,13 +4505,21 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 		refTime = int64(p0.Calls[insertPos-1].CheckInfo.Etime) - lcs.tscoffFor(0)
 	}
 
+	// The variant picker and the fresh-target open flags judge the base by
+	// basePathIsFile, whose ambiguous-root fallback treats an unknown path as
+	// a file. When the base is an in-program fresh path, the local creation
+	// hint knows better: use it so Same-relation variants follow the actual
+	// type (file-only Same on a fresh dir would open EISDIR; dir-only Same on
+	// a fresh dir would be rejected).
+	baseIsFile := basePathIsFileHinted(lcs.FileTree, rootCallName, basePath, freshKinds)
+
 	for nodeIdx := 1; nodeIdx < len(ps); nodeIdx++ {
 		useExistFd = true
 		ExistingFd = nil
 		p := ps[nodeIdx]
 		cid := hmcfg.Cids[nodeIdx]
 
-		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, basePathIsFile(lcs.FileTree, rootCallName, basePath), basePath)
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, baseIsFile, basePath, allowDirected)
 		if variant == nil {
 			// No usable variant for this base: skip this node's insertion for
 			// this round (ps is already full — no node is dropped).
@@ -3528,15 +4527,18 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 		}
 		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, *variant, r.Rand)
 
-		alignedPos := TimeAlignedInsertPos(p, refTime, lcs.tscoffFor(nodeIdx))
-		ConcurrentInsertPos := alignedPos
+		// One timing helper per variant, mirroring insertDirectedBatch: the HB
+		// form places the variant at the first boundary after the root, the CC
+		// form at the closest boundary. Both fail together (they need refTime
+		// and a timing anchor), so calling them in sequence would only
+		// double-count the timingAlignMiss metric.
+		ConcurrentInsertPos := -1
 		if temporal == TemporalHB {
-			// Causal form: insert where the call most likely starts after
-			// the root finishes (favoring HB pairs).
-			if hbPos := firstBoundaryAfter(p, refTime, lcs.tscoffFor(nodeIdx)); hbPos >= 0 {
-				ConcurrentInsertPos = hbPos
-			}
+			ConcurrentInsertPos = firstBoundaryAfter(p, refTime, lcs.tscoffFor(nodeIdx))
+		} else {
+			ConcurrentInsertPos = TimeAlignedInsertPos(p, refTime, lcs.tscoffFor(nodeIdx))
 		}
+		timingAligned := ConcurrentInsertPos >= 0
 		if ConcurrentInsertPos < 0 {
 			ConcurrentInsertPos = min(insertPos, len(p.Calls))
 		}
@@ -3573,9 +4575,6 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 		} else if concurrentPath == "" {
 			constraint := callNameConstraint(variant.CallName)
 			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, false, constraint)
-			if concurrentPath == "" && basePathCompatible(lcs.FileTree, basePath, constraint) {
-				concurrentPath = basePath
-			}
 			if concurrentPath == "" {
 				// No generatable path of the right type: skip this node's
 				// variant insertion for this round (ps is already full).
@@ -3583,12 +4582,12 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 			}
 		}
 		if IsFdRequiredCall(variant.CallName) {
-			ExistingFd = findOpenFdForPath(p, concurrentPath, ConcurrentInsertPos)
-			if ExistingFd == nil && alignedPos >= 0 {
+			ExistingFd = findOpenFdForPath(p, concurrentPath, ConcurrentInsertPos, capNeeded(variant.CallName))
+			if ExistingFd == nil && timingAligned {
 				// Time alignment may place the call before the open;
 				// fall back to the index-aligned position for fd usability.
 				ConcurrentInsertPos = min(insertPos, len(p.Calls))
-				ExistingFd = findOpenFdForPath(p, concurrentPath, ConcurrentInsertPos)
+				ExistingFd = findOpenFdForPath(p, concurrentPath, ConcurrentInsertPos, capNeeded(variant.CallName))
 			}
 			if ExistingFd == nil {
 				useExistFd = false
@@ -3597,24 +4596,30 @@ func insertCallFromDCT(ps []*Prog, r *randGen, ct *ChoiceTable, sCalls *SpecialC
 
 		concurrentFileSize := uint64(0)
 		concurrentFlags := uint64(2)
-		if lcs != nil {
+		if lcs != nil && lcs.FileTree != nil {
 			node := lcs.FileTree.FindNode(concurrentPath)
 			if node != nil {
 				concurrentFileSize = node.Size
-				if node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir {
+				if nodeIsDir(node) {
 					concurrentFlags = r.target.GetConst("O_DIRECTORY")
 				}
+			} else if !baseIsFile {
+				// Fresh target of a directory-intent root (e.g. mkdir): the
+				// open variant must carry O_DIRECTORY or VFS rejects it
+				// before the hmdfs trace point.
+				concurrentFlags = r.target.GetConst("O_DIRECTORY")
 			}
 		}
 		concurrentCalls := r.generateCallByName(stateFromProg(p), sCalls, variant.CallName, concurrentPath, concurrentPath2, cid, ExistingFd, useExistFd, concurrentFileSize, concurrentFlags)
-
+		if len(concurrentCalls) == 0 || hasNilCall(concurrentCalls) {
+			// A nil call would panic at Serialize; skip this node's variant
+			// for the round (ps is already full — no node is dropped).
+			continue
+		}
 		if ConcurrentInsertPos >= len(p.Calls) {
 			p.Calls = append(p.Calls, concurrentCalls...)
 		} else {
 			p.Calls = append(p.Calls[:ConcurrentInsertPos], append(concurrentCalls, p.Calls[ConcurrentInsertPos:]...)...)
-		}
-		if lcs != nil {
-			lcs.PendingInserts = append(lcs.PendingInserts, InsertedCombo{Root: rootCallName, Variant: *variant})
 		}
 	}
 
@@ -3649,6 +4654,7 @@ func TimeAlignedInsertPos(p *Prog, refTime int64, tscoff int64) int {
 // without any timing anchor (caller falls back to index alignment).
 func firstBoundaryAfter(p *Prog, refTime int64, tscoff int64) int {
 	if refTime < 0 {
+		atomic.AddUint64(&timingAlignMissCount, 1)
 		return -1
 	}
 	hasTiming := false
@@ -3659,6 +4665,7 @@ func firstBoundaryAfter(p *Prog, refTime int64, tscoff int64) int {
 		}
 	}
 	if !hasTiming {
+		atomic.AddUint64(&timingAlignMissCount, 1)
 		return -1
 	}
 	for j := 0; j <= len(p.Calls); j++ {
@@ -3682,6 +4689,7 @@ func firstBoundaryAfter(p *Prog, refTime int64, tscoff int64) int {
 // timeAlignedInRange is TimeAlignedInsertPos restricted to [start, end].
 func timeAlignedInRange(p *Prog, refTime int64, tscoff int64, start, end int) int {
 	if refTime < 0 || start > end {
+		atomic.AddUint64(&timingAlignMissCount, 1)
 		return -1
 	}
 	// Without any timing anchor in the range the boundary times are
@@ -3694,6 +4702,7 @@ func timeAlignedInRange(p *Prog, refTime int64, tscoff int64, start, end int) in
 		}
 	}
 	if !hasTiming {
+		atomic.AddUint64(&timingAlignMissCount, 1)
 		return -1
 	}
 	best := -1
@@ -3723,8 +4732,68 @@ func timeAlignedInRange(p *Prog, refTime int64, tscoff int64, start, end int) in
 	return best
 }
 
-func findInsertPosition(p *Prog, r *randGen, useFd int, sCalls *SpecialCalls, refTime int64, tscoff int64) (int, *ResultArg) {
-	//useFd: 0 is false, 1 is file, 2 is dir
+// ProgTimings extracts the per-call execution timeline of every prog as
+// flattened [Stime, Etime] pairs (0/0 for calls without CheckInfo) for RPC
+// transfer. CheckInfo is runtime-only and not part of the prog serialization,
+// so this is how corpus seeds keep their timeline across fuzzer restarts.
+func ProgTimings(ps []*Prog) [][]uint64 {
+	timings := make([][]uint64, len(ps))
+	for i, p := range ps {
+		if p == nil {
+			continue
+		}
+		t := make([]uint64, 2*len(p.Calls))
+		for j, call := range p.Calls {
+			if call == nil || call.CheckInfo == nil {
+				continue
+			}
+			t[2*j] = call.CheckInfo.Stime
+			t[2*j+1] = call.CheckInfo.Etime
+		}
+		timings[i] = t
+	}
+	return timings
+}
+
+// ApplyProgTimings restores the per-call CheckInfo timeline of progs from a
+// ProgTimings payload (e.g. a corpus seed re-delivered after a fuzzer
+// restart) and returns the number of calls that got a CheckInfo. Only calls
+// with a non-zero Etime get one: 0/0 pairs mean "no timing observed" and stay
+// nil, matching the no-anchor fallback. Calls that already carry a CheckInfo
+// are left untouched, and a shape mismatch (different prog layout) is ignored
+// safely.
+func ApplyProgTimings(ps []*Prog, timings [][]uint64) int {
+	restored := 0
+	for i, p := range ps {
+		if p == nil || i >= len(timings) {
+			continue
+		}
+		t := timings[i]
+		if len(t) != 2*len(p.Calls) {
+			continue
+		}
+		for j, call := range p.Calls {
+			if call == nil || call.CheckInfo != nil {
+				continue
+			}
+			stime, etime := t[2*j], t[2*j+1]
+			if etime == 0 {
+				continue
+			}
+			call.CheckInfo = &FileMetadata{Stime: stime, Etime: etime}
+			restored++
+		}
+	}
+	return restored
+}
+
+func findInsertPosition(p *Prog, r *randGen, useFd int, sCalls *SpecialCalls, refTime int64, tscoff int64, want uint8, filePath string, ft *FileTree) (int, *ResultArg) {
+	//useFd: 0 is false, 1 is file, 2 is dir; want filters the fd capability
+	//(all requested bits must be present, 0 = any); filePath (when non-empty)
+	//restricts the fd to an open of that very path so pattern semantics keep
+	//operating on the same file/dir; ft classifies an open by the tree node
+	//type when known (a plain open of a directory without O_DIRECTORY must not
+	//be reused as a file fd).
 	if useFd > 0 {
 		if len(p.Calls) == 0 {
 			return r.Intn(len(p.Calls) + 1), nil //没有适合的 fd，无法插入
@@ -3752,6 +4821,12 @@ func findInsertPosition(p *Prog, r *randGen, useFd int, sCalls *SpecialCalls, re
 			if fd == nil {
 				continue
 			}
+			if want != 0 && fdCapOf(p.Target, openCall)&want != want {
+				continue
+			}
+			if filePath != "" && extractPathFromCall(openCall) != filePath {
+				continue
+			}
 			correspondingClose := -1
 			for _, closeIdx := range closeCalls {
 				if closeIdx > openIdx {
@@ -3766,7 +4841,15 @@ func findInsertPosition(p *Prog, r *randGen, useFd int, sCalls *SpecialCalls, re
 			if correspondingClose == -1 {
 				correspondingClose = len(p.Calls)
 			}
-			if isOpenDirectory(openCall) {
+			isDir := isOpenDirectory(openCall)
+			if ft != nil {
+				if path := extractPathFromCall(openCall); path != "" {
+					if node := ft.FindNode(path); node != nil {
+						isDir = nodeIsDir(node)
+					}
+				}
+			}
+			if isDir {
 				dirFdRanges = append(dirFdRanges, fdRange{openIdx: openIdx, closeIdx: correspondingClose, fd: fd})
 			} else {
 				fileFdRanges = append(fileFdRanges, fdRange{openIdx: openIdx, closeIdx: correspondingClose, fd: fd})
@@ -3830,55 +4913,6 @@ func findInsertPosition(p *Prog, r *randGen, useFd int, sCalls *SpecialCalls, re
 
 }
 
-func findInsertPositionByPath(p *Prog, r *randGen, filePath string, sCalls *SpecialCalls) (int, *ResultArg) {
-	if len(p.Calls) == 0 {
-		return 0, nil
-	}
-
-	openIdx := -1
-	var fd *ResultArg
-
-	for i, call := range p.Calls {
-		if !strings.Contains(call.Meta.Name, "open") {
-			continue
-		}
-
-		path := extractPathFromCall(call)
-		if path == filePath {
-			openIdx = i
-			fd = extractFdFromCall(call)
-			break
-		}
-	}
-
-	if openIdx == -1 || fd == nil {
-		return r.Intn(len(p.Calls) + 1), nil
-	}
-
-	closeIdx := len(p.Calls)
-	closeCalls := findCallsByName(p, "close")
-
-	for _, idx := range closeCalls {
-		if idx > openIdx {
-			closeCall := p.Calls[idx]
-			if usesFd(closeCall, fd) {
-				closeIdx = idx
-				break
-			}
-		}
-	}
-
-	startIdx := openIdx + 1
-	endIdx := closeIdx
-
-	if startIdx >= endIdx {
-		return openIdx + 1, fd
-	}
-
-	resultIdx := r.randRange(uint64(startIdx), uint64(endIdx))
-	return int(resultIdx), fd
-}
-
 func genPreadCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultArg) *Call {
 	meta := r.target.Syscalls[sCalls.Pread64Id]
 	if meta == nil {
@@ -3897,7 +4931,8 @@ func genPreadCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultArg
 	bufPtr := r.allocAddr(s, bufPtrType, DirOut, bufArg.Size(), bufArg)
 
 	args := make([]Arg, len(meta.Args))
-	args[0] = fd
+	fdArg := MakeResultArg(meta.Args[0].Type.(*ResourceType), DirIn, fd, 0)
+	args[0] = fdArg
 	args[1] = bufPtr
 	args[2] = MakeConstArg(countType, DirIn, uint64(bufSize))
 	args[3] = MakeConstArg(posType, DirIn, uint64(r.randInt(64)))
@@ -3916,7 +4951,8 @@ func genFsyncCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultArg
 	}
 
 	args := make([]Arg, len(meta.Args))
-	args[0] = fd
+	fdArg := MakeResultArg(meta.Args[0].Type.(*ResourceType), DirIn, fd, 0)
+	args[0] = fdArg
 
 	c := MakeCall(meta, nil)
 	c.Args = args
@@ -3932,7 +4968,8 @@ func genFdatasyncCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *Resul
 	}
 
 	args := make([]Arg, len(meta.Args))
-	args[0] = fd
+	fdArg := MakeResultArg(meta.Args[0].Type.(*ResourceType), DirIn, fd, 0)
+	args[0] = fdArg
 
 	c := MakeCall(meta, nil)
 	c.Args = args
@@ -3941,7 +4978,11 @@ func genFdatasyncCallWithFd(p *Prog, r *randGen, sCalls *SpecialCalls, fd *Resul
 	return c
 }
 
-func removeStashCall(p *Prog, r *randGen) bool {
+func removeStashCall(ps []*Prog, pidx int, r *randGen) bool {
+	if pidx < 0 || pidx >= len(ps) {
+		return false
+	}
+	p := ps[pidx]
 	if len(p.Calls) <= 3 {
 		return false
 	}
@@ -3960,6 +5001,7 @@ func removeStashCall(p *Prog, r *randGen) bool {
 
 	idx := candidates[r.Intn(len(candidates))]
 	p.RemoveCall(idx)
+	shiftGeneralFailPos(ps[0], pidx, idx, -1)
 	return true
 }
 
@@ -4001,7 +5043,7 @@ func mutateStashTargetNodes(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg 
 		var cmdBuilder strings.Builder
 		cmdBuilder.WriteString("iptables -F;iptables -X;")
 		cmdBuilder.WriteString(genIptablesDropCmd(hmcfg.InitIp, newNodes))
-		newCmd := cmdBuilder.String()
+		newCmd := cmdBuilder.String() + "\x00"
 
 		if newCmd == oldCmd {
 			return false
@@ -4021,88 +5063,6 @@ func findCallsByName(p *Prog, name string) []int {
 		}
 	}
 	return indices
-}
-
-func genPwriteCall(p *Prog, r *randGen, sCalls *SpecialCalls) *Call {
-	meta := r.target.Syscalls[sCalls.Pwrite64Id]
-	if meta == nil {
-		return nil
-	}
-
-	fd := findAvailableFd(p)
-	if fd == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	bufSize := r.randBufLen()
-	bufData := make([]byte, bufSize)
-	for i := range bufData {
-		bufData[i] = byte(r.Intn(256))
-	}
-
-	args := make([]Arg, len(meta.Args))
-
-	bufPtrType := meta.Args[1].Type.(*PtrType)
-	countType := meta.Args[2].Type.(*LenType)
-	posType := meta.Args[3].Type.(*IntType)
-
-	bufArg := MakeDataArg(bufPtrType.Elem, DirIn, bufData)
-	bufPtr := r.allocAddr(s, bufPtrType, DirIn, bufArg.Size(), bufArg)
-
-	pwritefdtype := meta.Args[0].Type.(*ResourceType)
-	fdarg := MakeResultArg(pwritefdtype, DirIn, fd, 0)
-
-	args[0] = fdarg
-	args[1] = bufPtr
-	args[2] = MakeConstArg(countType, DirIn, uint64(bufSize))
-	args[3] = MakeConstArg(posType, DirIn, uint64(r.randInt(64)))
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
-}
-
-func genPreadCall(p *Prog, r *randGen, sCalls *SpecialCalls) *Call {
-	meta := r.target.Syscalls[sCalls.Pread64Id]
-	if meta == nil {
-		return nil
-	}
-
-	fd := findAvailableFd(p)
-	if fd == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	bufSize := r.randBufLen()
-
-	args := make([]Arg, len(meta.Args))
-
-	bufPtrType := meta.Args[1].Type.(*PtrType)
-	countType := meta.Args[2].Type.(*LenType)
-	posType := meta.Args[3].Type.(*IntType)
-
-	bufArg := MakeOutDataArg(bufPtrType.Elem, DirOut, bufSize)
-	bufPtr := r.allocAddr(s, bufPtrType, DirOut, bufArg.Size(), bufArg)
-
-	preadfdtype := meta.Args[0].Type.(*ResourceType)
-	fdarg := MakeResultArg(preadfdtype, DirIn, fd, 0)
-
-	args[0] = fdarg
-	args[1] = bufPtr
-	args[2] = MakeConstArg(countType, DirIn, uint64(bufSize))
-	args[3] = MakeConstArg(posType, DirIn, uint64(r.randInt(64)))
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
 }
 
 func genFsyncCall(p *Prog, r *randGen, sCalls *SpecialCalls) *Call {
@@ -4511,7 +5471,7 @@ func mutateDcachePathName(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *H
 			// rename 的目标路径也检查（L9）
 			if strings.Contains(call.Meta.Name, "rename") {
 				if extractPathFromCallByArgIdx(call, 1) == oldPath {
-					updateCallPathByArgIdx(call, 1, newPath, r)
+					updateCallPathByArgIdx(p, call, 1, newPath, r)
 				}
 			}
 		}
@@ -4927,23 +5887,23 @@ func genNanosleepCall(p *Prog, r *randGen, sCalls *SpecialCalls, useHmdfsTimeout
 
 	args, _ := r.generateArgs(s, meta.Args, DirIn)
 
-		if len(args) >= 1 {
-			if ptrArg, ok := args[0].(*PointerArg); ok {
-				if structArg, ok := ptrArg.Res.(*GroupArg); ok {
-					if len(structArg.Inner) >= 2 {
-						// timespec 的 time_sec/time_nsec 是 ResourceType——
-						// generateTimespec 产出 *ResultArg（Res=nil，Val 为值）。
-						// 断言 *ConstArg 恒失败导致超时值写不进（S13）。
-						if tvSec, ok := structArg.Inner[0].(*ResultArg); ok {
-							tvSec.Val = uint64(sec)
-						}
-						if tvNsec, ok := structArg.Inner[1].(*ResultArg); ok {
-							tvNsec.Val = uint64(nsec)
-						}
+	if len(args) >= 1 {
+		if ptrArg, ok := args[0].(*PointerArg); ok {
+			if structArg, ok := ptrArg.Res.(*GroupArg); ok {
+				if len(structArg.Inner) >= 2 {
+					// timespec 的 time_sec/time_nsec 是 ResourceType——
+					// generateTimespec 产出 *ResultArg（Res=nil，Val 为值）。
+					// 断言 *ConstArg 恒失败导致超时值写不进（S13）。
+					if tvSec, ok := structArg.Inner[0].(*ResultArg); ok {
+						tvSec.Val = uint64(sec)
+					}
+					if tvNsec, ok := structArg.Inner[1].(*ResultArg); ok {
+						tvNsec.Val = uint64(nsec)
 					}
 				}
 			}
 		}
+	}
 
 	c := MakeCall(meta, nil)
 	c.Args = args
@@ -5036,21 +5996,9 @@ func extractPathFromCall(call *Call) string {
 }
 
 func updateCallPath(p *Prog, callIdx int, call *Call, newPath string, r *randGen) bool {
-	if len(call.Args) == 0 {
+	if !reassignDataArgAt(p, call, 0, r, []byte(newPath+"\x00")) {
 		return false
 	}
-
-	ptrArg, ok := call.Args[0].(*PointerArg)
-	if !ok {
-		return false
-	}
-
-	dataArg, ok := ptrArg.Res.(*DataArg)
-	if !ok {
-		return false
-	}
-
-	dataArg.data = []byte(newPath + "\x00")
 	r.target.assignSizesCall(call)
 	return true
 }
@@ -5063,7 +6011,7 @@ func extractDirPath(p *Prog) string {
 		}
 
 		name := call.Meta.Name
-		if strings.Contains(name, "getdents64") || strings.Contains(name, "mkdir") || strings.Contains(name, "rmdir") {
+		if strings.Contains(name, "mkdir") || strings.Contains(name, "rmdir") {
 			return path
 		}
 
@@ -5072,974 +6020,6 @@ func extractDirPath(p *Prog) string {
 			if idx > 0 {
 				return path[:idx]
 			}
-		}
-	}
-	return ""
-}
-
-/******************************* InodeOps Seed Mutation ************************************/
-
-const (
-	InodeOpsMutOpType = iota
-	InodeOpsMutParams
-	InodeOpsMutSequence
-	InodeOpsMutAddRemove
-	InodeOpsMutTypeCount
-)
-
-func MutateInodeOpsProg(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	if len(ps) == 0 {
-		return false
-	}
-
-	r := newRand(ps[0].Target, rs)
-	r.hmcfg = hmcfg
-
-	mutType := r.Intn(InodeOpsMutTypeCount)
-
-	switch mutType {
-	case InodeOpsMutOpType:
-		return mutateInodeOpsOpType(ps, r, sCalls, hmcfg)
-	case InodeOpsMutParams:
-		return mutateInodeOpsParams(ps, r, sCalls)
-	case InodeOpsMutSequence:
-		//TODO: 其实是 swap，重要性存疑
-		return mutateInodeOpsSequence(ps, r)
-	case InodeOpsMutAddRemove:
-		//TODO: 替换为基于distributed choice
-		return mutateInodeOpsAddRemove(ps, r, sCalls, hmcfg)
-	}
-	return false
-}
-
-func mutateInodeOpsOpType(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	for _, p := range ps {
-		if !p.IsInodeOps {
-			continue
-		}
-
-		opTypes := []string{"chmod", "truncate", "rename", "unlink", "mkdir", "rmdir"}
-		targetTypes := []string{"chmod", "truncate", "rename", "unlink", "mkdir", "rmdir"}
-
-		for i, call := range p.Calls {
-			callName := call.Meta.Name
-			for _, opType := range opTypes {
-				if strings.Contains(callName, opType) {
-					newOpType := targetTypes[r.Intn(len(targetTypes))]
-					if newOpType != opType {
-						return replaceInodeOpsCall(p, i, call, newOpType, r, sCalls, hmcfg)
-					}
-				}
-			}
-		}
-	}
-	return false
-}
-
-func replaceInodeOpsCall(p *Prog, idx int, oldCall *Call, newOpType string, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	path := extractPathFromCall(oldCall)
-	if path == "" {
-		return false
-	}
-
-	var newCall *Call
-	switch newOpType {
-	case "chmod":
-		newCall = genChmodCallWithMode(p, r, sCalls, path, r.Intn(0o777+1))
-	/*case "chown":
-	newCall = genChownCall(p, r, sCalls, path)*/
-	case "truncate":
-		fileSize := uint64(0)
-		if hmcfg != nil && hmcfg.FileTree != nil {
-			node := hmcfg.FileTree.FindNode(path)
-			if node != nil {
-				fileSize = node.Size
-			}
-		}
-		newCall = genTruncateCall(p, r, sCalls, path, fileSize)
-	case "rename":
-		newPath := path + "_renamed_" + randomSuffix(r.Rand)
-		newCall = genRenameCallWithPaths(p, r, sCalls, path, newPath)
-	case "unlink":
-		newCall = genUnlinkCallWithPath(p, r, sCalls, path)
-	case "mkdir":
-		newPath := path + "_newdir_" + randomSuffix(r.Rand)
-		newCall = genMkdirCallWithPath(p, r, sCalls, newPath)
-	case "rmdir":
-		newCall = genRmdirCallWithPath(p, r, sCalls, path)
-	}
-
-	if newCall == nil {
-		return false
-	}
-
-	p.Calls[idx] = newCall
-	return true
-}
-
-func mutateInodeOpsParams(ps []*Prog, r *randGen, sCalls *SpecialCalls) bool {
-	for _, p := range ps {
-		if !p.IsInodeOps {
-			continue
-		}
-
-		for _, call := range p.Calls {
-			callName := call.Meta.Name
-
-			if strings.Contains(callName, "chmod") {
-				return mutateChmodMode(call, r)
-			}
-			/*if strings.Contains(callName, "chown") {
-				return mutateChownIds(call, r)
-			}*/
-			if strings.Contains(callName, "truncate") {
-				//TODO: 依然length取什么范围的问题
-				return mutateTruncateLength(call, r)
-			}
-			if strings.Contains(callName, "rename") {
-				return mutateRenamePaths(call, r)
-			}
-		}
-	}
-	return false
-}
-
-func mutateChmodMode(call *Call, r *randGen) bool {
-	if len(call.Args) < 2 {
-		return false
-	}
-
-	modeArg, ok := call.Args[1].(*ConstArg)
-	if !ok {
-		return false
-	}
-
-	oldMode := modeArg.Val
-	newMode := oldMode ^ (1 << uint64(r.Intn(9)))
-	if newMode == oldMode {
-		newMode = 0o755
-	}
-	modeArg.Val = newMode
-	return true
-}
-
-/*func mutateChownIds(call *Call, r *randGen) bool {
-	if len(call.Args) < 3 {
-		return false
-	}
-
-	uidArg, ok1 := call.Args[1].(*ConstArg)
-	gidArg, ok2 := call.Args[2].(*ConstArg)
-	if !ok1 || !ok2 {
-		return false
-	}
-
-	delta := r.Intn(2001) - 1000
-	if delta < 0 {
-		minusdelta := -delta
-		uidArg.Val = uidArg.Val - uint64(minusdelta)
-		gidArg.Val = gidArg.Val - uint64(minusdelta)
-	} else {
-		uidArg.Val = uidArg.Val + uint64(delta)
-		gidArg.Val = gidArg.Val + uint64(delta)
-	}
-	return true
-}*/
-
-func mutateTruncateLength(call *Call, r *randGen) bool {
-	if len(call.Args) < 2 {
-		return false
-	}
-
-	lengthArg, ok := call.Args[1].(*ConstArg)
-	if !ok {
-		return false
-	}
-
-	delta := r.Intn(2049) - 1024
-	newLength := int64(lengthArg.Val) + int64(delta)
-	if newLength < 0 {
-		newLength = 0
-	}
-	lengthArg.Val = uint64(newLength)
-	return true
-}
-
-func mutateRenamePaths(call *Call, r *randGen) bool {
-	if len(call.Args) < 2 {
-		return false
-	}
-
-	oldPath := extractPathFromCallByArgIdx(call, 0)
-	if oldPath == "" {
-		return false
-	}
-
-	newPath := oldPath + "_mutated_" + randomSuffix(r.Rand)
-	return updateCallPathByArgIdx(call, 1, newPath, r)
-}
-
-func mutateInodeOpsSequence(ps []*Prog, r *randGen) bool {
-	for _, p := range ps {
-		if !p.IsInodeOps || len(p.Calls) < 3 {
-			continue
-		}
-
-		candidates := make([]int, 0)
-		for i, call := range p.Calls {
-			if strings.Contains(call.Meta.Name, "syz_failure") ||
-				strings.Contains(call.Meta.Name, "open") || strings.Contains(call.Meta.Name, "close") {
-				continue
-			}
-			candidates = append(candidates, i)
-		}
-
-		if len(candidates) < 2 {
-			continue
-		}
-
-		idx1 := candidates[r.Intn(len(candidates))]
-		idx2 := candidates[r.Intn(len(candidates))]
-		for idx2 == idx1 {
-			idx2 = candidates[r.Intn(len(candidates))]
-		}
-
-		p.Calls[idx1], p.Calls[idx2] = p.Calls[idx2], p.Calls[idx1]
-		return true
-	}
-	return false
-}
-
-func mutateInodeOpsAddRemove(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	for _, p := range ps {
-		if !p.IsInodeOps {
-			continue
-		}
-
-		if r.bin() {
-			return insertInodeOpsCall(p, r, sCalls, hmcfg)
-		} else {
-			return removeInodeOpsCall(p, r)
-		}
-	}
-	return false
-}
-
-func insertInodeOpsCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	if len(p.Calls) == 0 {
-		return false
-	}
-
-	insertPos := r.Intn(len(p.Calls) + 1)
-
-	parentDir := extractDirFromTree(hmcfg, p, r)
-
-	callTypes := []string{"chmod", "truncate", "rename", "unlink", "mkdir"}
-	callType := callTypes[r.Intn(len(callTypes))]
-
-	var newCall *Call
-	switch callType {
-	case "chmod":
-		testFile := extractFileFromTree(hmcfg, p, r)
-		if testFile == "" {
-			testFile = parentDir + "/chmod_test_" + randomSuffix(r.Rand) + ".txt"
-		}
-		newCall = genChmodCallWithMode(p, r, sCalls, testFile, r.Intn(0o777+1))
-	case "truncate":
-		testFile := extractFileFromTree(hmcfg, p, r)
-		if testFile == "" {
-			testFile = parentDir + "/truncate_test_" + randomSuffix(r.Rand) + ".txt"
-		}
-		fileSize := uint64(0)
-		if hmcfg.FileTree != nil {
-			node := hmcfg.FileTree.FindNode(testFile)
-			if node != nil {
-				fileSize = node.Size
-			}
-		}
-		newCall = genTruncateCall(p, r, sCalls, testFile, fileSize)
-	case "rename":
-		oldPath := extractFileFromTree(hmcfg, p, r)
-		if oldPath == "" {
-			oldPath = parentDir + "/rename_old_" + randomSuffix(r.Rand) + ".txt"
-		}
-		newPath := oldPath[:strings.LastIndex(oldPath, "/")+1] + "rename_new_" + randomSuffix(r.Rand) + ".txt"
-		newCall = genRenameCallWithPaths(p, r, sCalls, oldPath, newPath)
-	case "unlink":
-		testFile := extractFileFromTree(hmcfg, p, r)
-		if testFile == "" {
-			testFile = parentDir + "/unlink_test_" + randomSuffix(r.Rand) + ".txt"
-		}
-		newCall = genUnlinkCallWithPath(p, r, sCalls, testFile)
-	case "mkdir":
-		newDir := parentDir + "/mkdir_test_" + randomSuffix(r.Rand)
-		newCall = genMkdirCallWithPath(p, r, sCalls, newDir)
-	}
-
-	if newCall == nil {
-		return false
-	}
-
-	if insertPos >= len(p.Calls) {
-		p.Calls = append(p.Calls, newCall)
-	} else {
-		p.Calls = append(p.Calls[:insertPos], append([]*Call{newCall}, p.Calls[insertPos:]...)...)
-	}
-	return true
-}
-
-func removeInodeOpsCall(p *Prog, r *randGen) bool {
-	if len(p.Calls) <= 2 {
-		return false
-	}
-
-	candidates := make([]int, 0)
-	for i, call := range p.Calls {
-		name := call.Meta.Name
-		if strings.Contains(name, "chmod") || strings.Contains(name, "chown") ||
-			strings.Contains(name, "truncate") || strings.Contains(name, "rename") ||
-			strings.Contains(name, "unlink") || strings.Contains(name, "mkdir") ||
-			strings.Contains(name, "rmdir") {
-			candidates = append(candidates, i)
-		}
-	}
-
-	if len(candidates) == 0 {
-		return false
-	}
-
-	idx := candidates[r.Intn(len(candidates))]
-	p.RemoveCall(idx)
-	return true
-}
-
-func genChmodCallWithMode(p *Prog, r *randGen, sCalls *SpecialCalls, filePath string, mode int) *Call {
-	meta := r.target.Syscalls[sCalls.ChmodId]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	ptrType := meta.Args[0].Type.(*PtrType)
-	modeType := meta.Args[1].Type.(*FlagsType)
-
-	pathArg := MakeDataArg(ptrType.Elem, DirIn, []byte(filePath+"\x00"))
-	pathPtr := r.allocAddr(s, ptrType, DirIn, pathArg.Size(), pathArg)
-	modeArg := MakeConstArg(modeType, DirIn, uint64(mode))
-
-	args := make([]Arg, len(meta.Args))
-	args[0] = pathPtr
-	args[1] = modeArg
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
-}
-
-/*func genChownCall(p *Prog, r *randGen, sCalls *SpecialCalls, filePath string) *Call {
-	meta := r.target.Syscalls[sCalls.ChownId]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	ptrType := meta.Args[0].Type.(*PtrType)
-
-	pathArg := MakeDataArg(ptrType.Elem, DirIn, []byte(filePath+"\x00"))
-	pathPtr := r.allocAddr(s, ptrType, DirIn, pathArg.Size(), pathArg)
-
-	uid := r.Intn(65536)
-	gid := r.Intn(65536)
-
-	args := make([]Arg, len(meta.Args))
-	args[0] = pathPtr
-	if len(args) > 1 {
-		args[1] = MakeConstArg(meta.Args[1].Type.(*IntType), DirIn, uint64(uid))
-	}
-	if len(args) > 2 {
-		args[2] = MakeConstArg(meta.Args[2].Type.(*IntType), DirIn, uint64(gid))
-	}
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
-}*/
-
-func genTruncateCall(p *Prog, r *randGen, sCalls *SpecialCalls, filePath string, fileSize uint64) *Call {
-	meta := r.target.Syscalls[sCalls.TruncateId]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	ptrType := meta.Args[0].Type.(*PtrType)
-
-	var length int
-	if fileSize > 0 && r.nOutOf(4, 5) {
-		length = int(r.randRange(0, fileSize*2))
-	} else {
-		length = r.Intn(4096)
-	}
-
-	pathArg := MakeDataArg(ptrType.Elem, DirIn, []byte(filePath+"\x00"))
-	pathPtr := r.allocAddr(s, ptrType, DirIn, pathArg.Size(), pathArg)
-
-	args := make([]Arg, len(meta.Args))
-	args[0] = pathPtr
-	if len(args) > 1 {
-		args[1] = MakeConstArg(meta.Args[1].Type.(*IntType), DirIn, uint64(length))
-	}
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
-}
-
-func genRenameCallWithPaths(p *Prog, r *randGen, sCalls *SpecialCalls, oldPath, newPath string) *Call {
-	meta := r.target.Syscalls[sCalls.RenameId]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	oldPtrType := meta.Args[0].Type.(*PtrType)
-	newPtrType := meta.Args[1].Type.(*PtrType)
-
-	oldPathArg := MakeDataArg(oldPtrType.Elem, DirIn, []byte(oldPath+"\x00"))
-	oldPathPtr := r.allocAddr(s, oldPtrType, DirIn, oldPathArg.Size(), oldPathArg)
-
-	newPathArg := MakeDataArg(newPtrType.Elem, DirIn, []byte(newPath+"\x00"))
-	newPathPtr := r.allocAddr(s, newPtrType, DirIn, newPathArg.Size(), newPathArg)
-
-	args := make([]Arg, len(meta.Args))
-	args[0] = oldPathPtr
-	args[1] = newPathPtr
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
-}
-
-func genMkdirCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, dirPath string) *Call {
-	meta := r.target.Syscalls[sCalls.MkdirId]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-	return genPathCall(meta, dirPath, r, s)
-}
-
-func genRmdirCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, dirPath string) *Call {
-	meta := r.target.Syscalls[sCalls.RmdirId]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-	return genPathCall(meta, dirPath, r, s)
-}
-
-/******************************* FileOps Seed Mutation ************************************/
-
-const (
-	FileOpsMutOffset = iota
-	FileOpsMutLength
-	FileOpsMutData
-	FileOpsMutConcurrent
-	FileOpsMutFsync
-	FileOpsMutTypeCount
-)
-
-func MutateFileopsProg(ps []*Prog, rs rand.Source, ct *ChoiceTable, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	if len(ps) == 0 {
-		return false
-	}
-
-	r := newRand(ps[0].Target, rs)
-	r.hmcfg = hmcfg
-
-	mutType := r.Intn(FileOpsMutTypeCount)
-
-	switch mutType {
-	case FileOpsMutOffset:
-		return mutateFileopsOffset(ps, r)
-	case FileOpsMutLength:
-		return mutateFileopsLength(ps, r)
-	case FileOpsMutData:
-		return mutateFileopsData(ps, r)
-	case FileOpsMutConcurrent:
-		return mutateFileopsConcurrent(ps, r, sCalls, hmcfg)
-	case FileOpsMutFsync:
-		return mutateFileopsFsync(ps, r, sCalls)
-	}
-	return false
-}
-
-func mutateFileopsOffset(ps []*Prog, r *randGen) bool {
-	for _, p := range ps {
-		if !p.IsFileOps {
-			continue
-		}
-
-		pwriteCalls := findCallsByName(p, "pwrite64")
-		preadCalls := findCallsByName(p, "pread64")
-
-		allCalls := append(pwriteCalls, preadCalls...)
-		if len(allCalls) == 0 {
-			continue
-		}
-
-		callIdx := allCalls[r.Intn(len(allCalls))]
-		call := p.Calls[callIdx]
-
-		if len(call.Args) < 4 {
-			continue
-		}
-
-		posArg, ok := call.Args[3].(*ConstArg)
-		if !ok {
-			continue
-		}
-
-		delta := r.Intn(2049) - 1024
-		if delta == 0 {
-			delta = 1
-		}
-		newVal := int64(posArg.Val) + int64(delta)
-		if newVal < 0 {
-			newVal = 0
-		}
-		posArg.Val = uint64(newVal)
-		return true
-	}
-	return false
-}
-
-func mutateFileopsLength(ps []*Prog, r *randGen) bool {
-	for _, p := range ps {
-		if !p.IsFileOps {
-			continue
-		}
-
-		pwriteCalls := findCallsByName(p, "pwrite64")
-		preadCalls := findCallsByName(p, "pread64")
-
-		allCalls := append(pwriteCalls, preadCalls...)
-		if len(allCalls) == 0 {
-			continue
-		}
-
-		callIdx := allCalls[r.Intn(len(allCalls))]
-		call := p.Calls[callIdx]
-
-		if len(call.Args) < 3 {
-			continue
-		}
-
-		countArg, ok := call.Args[2].(*ConstArg)
-		if !ok {
-			continue
-		}
-
-		delta := r.Intn(1025) - 512
-		if delta == 0 {
-			delta = 1
-		}
-		newLen := int64(countArg.Val) + int64(delta)
-		if newLen < 1 {
-			newLen = 1
-		}
-		if newLen > 8192 {
-			newLen = 8192
-		}
-		countArg.Val = uint64(newLen)
-
-		if len(call.Args) >= 2 {
-			if ptrArg, ok := call.Args[1].(*PointerArg); ok {
-				if dataArg, ok := ptrArg.Res.(*DataArg); ok {
-					oldData := dataArg.Data()
-					newData := make([]byte, newLen)
-					copy(newData, oldData)
-					for i := len(oldData); i < int(newLen); i++ {
-						newData[i] = byte(r.Intn(256))
-					}
-					dataArg.data = newData
-				}
-			}
-		}
-		return true
-	}
-	return false
-}
-
-func mutateFileopsData(ps []*Prog, r *randGen) bool {
-	for _, p := range ps {
-		if !p.IsFileOps {
-			continue
-		}
-
-		pwriteCalls := findCallsByName(p, "pwrite64")
-		if len(pwriteCalls) == 0 {
-			continue
-		}
-
-		callIdx := pwriteCalls[r.Intn(len(pwriteCalls))]
-		call := p.Calls[callIdx]
-
-		if len(call.Args) < 2 {
-			continue
-		}
-
-		ptrArg, ok := call.Args[1].(*PointerArg)
-		if !ok {
-			continue
-		}
-
-		dataArg, ok := ptrArg.Res.(*DataArg)
-		if !ok {
-			continue
-		}
-
-		data := dataArg.Data()
-		olddata := dataArg.Data()
-		if len(data) == 0 {
-			continue
-		}
-
-		data = mutateData(r, data, 1, 8192)
-		dataArg.data = data
-
-		countArg, ok := call.Args[2].(*ConstArg)
-		if !ok {
-			dataArg.data = olddata
-			return false
-		}
-		countArg.Val = uint64(len(data))
-		return true
-	}
-	return false
-}
-
-func mutateFileopsConcurrent(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	if len(ps) < 2 {
-		return false
-	}
-
-	for _, p := range ps {
-		if !p.IsFileOps {
-			continue
-		}
-
-		mutType := r.Intn(3)
-		switch mutType {
-		//TODO: 这里插入并发读和写的约束太松弛了，实际上并没有很并发，考虑替换为基于 distributed choice。然后这里 distributed choice 是否要把 offset、length 等元数据也纳入考虑？
-		case 0:
-			return insertConcurrentRead(ps, r, sCalls, hmcfg)
-		case 1:
-			return insertConcurrentWrite(ps, r, sCalls, hmcfg)
-		case 2:
-			return insertOverlappingWrite(ps, r, sCalls, hmcfg)
-		}
-	}
-	return false
-}
-
-func insertOverlappingWrite(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	for srcNodeIdx, srcP := range ps {
-		if !srcP.IsFileOps || len(srcP.Calls) == 0 {
-			continue
-		}
-
-		pwriteCalls := findCallsByName(srcP, "pwrite64")
-		if len(pwriteCalls) == 0 {
-			continue
-		}
-
-		srcCallIdx := pwriteCalls[r.Intn(len(pwriteCalls))]
-		srcCall := srcP.Calls[srcCallIdx]
-
-		// src 文件 = pwrite 实际写的文件（多 open 时第一个 open 路径可能
-		// 不一致——overlap 相对错误文件计算，L24）。
-		srcFilePath := extractFilePath(srcP)
-		if p := resolveFdToPath(srcP, srcCall); p != "" {
-			srcFilePath = p
-		}
-		if srcFilePath == "" {
-			continue
-		}
-
-		srcOffset := extractPwriteOffset(srcCall)
-		srcLength := extractPwriteLength(srcCall)
-		if srcLength == 0 {
-			srcLength = 100
-		}
-
-		for dstNodeIdx, dstP := range ps {
-			if dstNodeIdx == srcNodeIdx || !dstP.IsFileOps {
-				continue
-			}
-
-			overlapOffset := srcOffset + int64(r.Intn(int(srcLength)))
-			if overlapOffset < 0 {
-				overlapOffset = srcOffset
-			}
-
-			insertPos := r.Intn(len(dstP.Calls) + 1)
-			fd := findOpenFdForPath(dstP, srcFilePath, insertPos)
-			if fd == nil {
-				continue
-			}
-
-			overlapWrite := genPwriteCallWithOffsetAndLength(dstP, r, sCalls, fd, overlapOffset, int64(r.Intn(100)+1))
-			if overlapWrite == nil {
-				continue
-			}
-			//TODO: 这里没有让覆盖写尽可能并发
-			if insertPos >= len(dstP.Calls) {
-				dstP.Calls = append(dstP.Calls, overlapWrite)
-			} else {
-				dstP.Calls = append(dstP.Calls[:insertPos], append([]*Call{overlapWrite}, dstP.Calls[insertPos:]...)...)
-			}
-			return true
-		}
-	}
-	return false
-}
-
-func extractPwriteOffset(call *Call) int64 {
-	if len(call.Args) < 4 {
-		return 0
-	}
-	posArg, ok := call.Args[3].(*ConstArg)
-	if !ok {
-		return 0
-	}
-	return int64(posArg.Val)
-}
-
-func extractPwriteLength(call *Call) int64 {
-	if len(call.Args) < 3 {
-		return 0
-	}
-	countArg, ok := call.Args[2].(*ConstArg)
-	if !ok {
-		return 0
-	}
-	return int64(countArg.Val)
-}
-
-func genPwriteCallWithOffsetAndLength(p *Prog, r *randGen, sCalls *SpecialCalls, fd *ResultArg, offset, length int64) *Call {
-	meta := r.target.Syscalls[sCalls.Pwrite64Id]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	bufData := make([]byte, length)
-	for i := range bufData {
-		bufData[i] = byte(r.Intn(256))
-	}
-
-	bufPtrType := meta.Args[1].Type.(*PtrType)
-	countType := meta.Args[2].Type.(*LenType)
-	posType := meta.Args[3].Type.(*IntType)
-
-	bufArg := MakeDataArg(bufPtrType.Elem, DirIn, bufData)
-	bufPtr := r.allocAddr(s, bufPtrType, DirIn, bufArg.Size(), bufArg)
-
-	if fd == nil {
-		return nil
-	}
-
-	pwritefdtype := meta.Args[0].Type.(*ResourceType)
-	fdarg := MakeResultArg(pwritefdtype, DirIn, fd, 0)
-
-	args := make([]Arg, len(meta.Args))
-	args[0] = fdarg
-	args[1] = bufPtr
-	args[2] = MakeConstArg(countType, DirIn, uint64(length))
-	args[3] = MakeConstArg(posType, DirIn, uint64(offset))
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
-}
-
-func findFdForPath(p *Prog, filePath string) *ResultArg {
-	for _, call := range p.Calls {
-		if !strings.Contains(call.Meta.Name, "open") {
-			continue
-		}
-
-		path := extractPathFromCall(call)
-		if path == filePath {
-			return extractFdFromCall(call)
-		}
-	}
-	return nil
-}
-
-func insertConcurrentRead(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	for i, p := range ps {
-		if !p.IsFileOps || len(p.Calls) == 0 {
-			continue
-		}
-
-		filePath := extractFilePath(p)
-		if filePath == "" {
-			continue
-		}
-
-		for j, otherP := range ps {
-			if i == j || !otherP.IsFileOps {
-				continue
-			}
-
-			if len(otherP.Calls) == 0 {
-				continue
-			}
-
-			insertPos := r.Intn(len(otherP.Calls) + 1)
-			fd := findOpenFdForPath(otherP, filePath, insertPos)
-			if fd == nil {
-				continue
-			}
-			readCall := genPreadCallWithFd(otherP, r, sCalls, fd)
-
-			if readCall == nil {
-				continue
-			}
-
-			if insertPos >= len(otherP.Calls) {
-				otherP.Calls = append(otherP.Calls, readCall)
-			} else {
-				otherP.Calls = append(otherP.Calls[:insertPos], append([]*Call{readCall}, otherP.Calls[insertPos:]...)...)
-			}
-			return true
-		}
-	}
-	return false
-}
-
-func insertConcurrentWrite(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) bool {
-	for i, p := range ps {
-		if !p.IsFileOps || len(p.Calls) == 0 {
-			continue
-		}
-
-		filePath := extractFilePath(p)
-		if filePath == "" {
-			continue
-		}
-
-		for j, otherP := range ps {
-			if i == j || !otherP.IsFileOps {
-				continue
-			}
-
-			if len(otherP.Calls) == 0 {
-				continue
-			}
-
-			insertPos := r.Intn(len(otherP.Calls) + 1)
-			fd := findOpenFdForPath(otherP, filePath, insertPos)
-			if fd == nil {
-				continue
-			}
-			writeCall := genPwriteCallWithFd(otherP, r, sCalls, fd)
-
-			if writeCall == nil {
-				continue
-			}
-
-			if insertPos >= len(otherP.Calls) {
-				otherP.Calls = append(otherP.Calls, writeCall)
-			} else {
-				otherP.Calls = append(otherP.Calls[:insertPos], append([]*Call{writeCall}, otherP.Calls[insertPos:]...)...)
-			}
-			return true
-		}
-	}
-	return false
-}
-
-func mutateFileopsFsync(ps []*Prog, r *randGen, sCalls *SpecialCalls) bool {
-	for _, p := range ps {
-		if !p.IsFileOps {
-			continue
-		}
-		//TODO: 这里所有的 fsync 和 fdatasync 的问题都是一样的，只插入一个，也不突变位置，肯定不好
-		fsyncCalls := findCallsByName(p, "fsync")
-		fdatasyncCalls := findCallsByName(p, "fdatasync")
-
-		if len(fsyncCalls) > 0 && len(fdatasyncCalls) > 0 {
-			continue
-		}
-
-		openCalls := findCallsByName(p, "open")
-		if len(openCalls) == 0 {
-			continue
-		}
-
-		// 插入位置约束在第一个 open 之后——fsync 的 fd（findAvailableFd 同款）
-		// 在 insertPos 前有效（避免 use-before-produce，S14）。
-		openIdx := openCalls[0]
-		insertPos := openIdx + 1 + r.Intn(len(p.Calls)-openIdx)
-
-		var fsyncCall *Call
-		if r.bin() {
-			fsyncCall = genFsyncCall(p, r, sCalls)
-		} else {
-			fsyncCall = genFdatasyncCall(p, r, sCalls)
-		}
-
-		if fsyncCall == nil {
-			continue
-		}
-
-		if insertPos >= len(p.Calls) {
-			p.Calls = append(p.Calls, fsyncCall)
-		} else {
-			p.Calls = append(p.Calls[:insertPos], append([]*Call{fsyncCall}, p.Calls[insertPos:]...)...)
-		}
-		return true
-	}
-	return false
-}
-
-func findReadWriteCalls(p *Prog) []int {
-	var indices []int
-	for i, call := range p.Calls {
-		name := call.Meta.Name
-		if strings.Contains(name, "pwrite64") || strings.Contains(name, "pread64") ||
-			strings.Contains(name, "write") || strings.Contains(name, "read") {
-			indices = append(indices, i)
-		}
-	}
-	return indices
-}
-
-func extractFilePath(p *Prog) string {
-	for _, call := range p.Calls {
-		name := call.Meta.Name
-		if strings.Contains(name, "open") || strings.Contains(name, "creat") {
-			return extractPathFromCall(call)
 		}
 	}
 	return ""
@@ -6065,106 +6045,10 @@ func extractPathFromCallByArgIdx(call *Call, argIdx int) string {
 	return path
 }
 
-func updateCallPathByArgIdx(call *Call, argIdx int, newPath string, r *randGen) bool {
-	if len(call.Args) <= argIdx {
+func updateCallPathByArgIdx(p *Prog, call *Call, argIdx int, newPath string, r *randGen) bool {
+	if !reassignDataArgAt(p, call, argIdx, r, []byte(newPath+"\x00")) {
 		return false
 	}
-
-	ptrArg, ok := call.Args[argIdx].(*PointerArg)
-	if !ok {
-		return false
-	}
-
-	dataArg, ok := ptrArg.Res.(*DataArg)
-	if !ok {
-		return false
-	}
-
-	dataArg.data = []byte(newPath + "\x00")
 	r.target.assignSizesCall(call)
 	return true
-}
-
-func genPreadCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, filePath string) *Call {
-	meta := r.target.Syscalls[sCalls.Pread64Id]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	bufSize := r.randBufLen()
-
-	ptrType := meta.Args[1].Type.(*PtrType)
-	countType := meta.Args[2].Type.(*LenType)
-	posType := meta.Args[3].Type.(*IntType)
-
-	bufArg := MakeOutDataArg(ptrType.Elem, DirOut, bufSize)
-	bufPtr := r.allocAddr(s, ptrType, DirOut, bufArg.Size(), bufArg)
-
-	args := make([]Arg, len(meta.Args))
-	fd := findFdForPath(p, filePath)
-	if fd == nil {
-		return nil
-	}
-	preadfdtype := meta.Args[0].Type.(*ResourceType)
-	fdarg := MakeResultArg(preadfdtype, DirIn, fd, 0)
-	args[0] = fdarg
-	args[1] = bufPtr
-	args[2] = MakeConstArg(countType, DirIn, uint64(bufSize))
-	args[3] = MakeConstArg(posType, DirIn, uint64(r.randInt(64)))
-
-	if args[0] == nil {
-		return nil
-	}
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
-}
-
-func genPwriteCallWithPath(p *Prog, r *randGen, sCalls *SpecialCalls, filePath string) *Call {
-	meta := r.target.Syscalls[sCalls.Pwrite64Id]
-	if meta == nil {
-		return nil
-	}
-
-	s := stateFromProg(p)
-
-	bufSize := r.randBufLen()
-	bufData := make([]byte, bufSize)
-	for i := range bufData {
-		bufData[i] = byte(r.Intn(256))
-	}
-
-	ptrType := meta.Args[1].Type.(*PtrType)
-	countType := meta.Args[2].Type.(*LenType)
-	posType := meta.Args[3].Type.(*IntType)
-
-	bufArg := MakeDataArg(ptrType.Elem, DirIn, bufData)
-	bufPtr := r.allocAddr(s, ptrType, DirIn, bufArg.Size(), bufArg)
-
-	args := make([]Arg, len(meta.Args))
-	fd := findFdForPath(p, filePath)
-	if fd == nil {
-		return nil
-	}
-	pwritefdtype := meta.Args[0].Type.(*ResourceType)
-	fdarg := MakeResultArg(pwritefdtype, DirIn, fd, 0)
-	args[0] = fdarg
-	args[1] = bufPtr
-	args[2] = MakeConstArg(countType, DirIn, uint64(bufSize))
-	args[3] = MakeConstArg(posType, DirIn, uint64(r.randInt(64)))
-
-	if args[0] == nil {
-		return nil
-	}
-
-	c := MakeCall(meta, nil)
-	c.Args = args
-	r.target.assignSizesCall(c)
-
-	return c
 }

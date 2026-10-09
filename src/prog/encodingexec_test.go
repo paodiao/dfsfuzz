@@ -16,7 +16,7 @@ func TestSerializeForExecRandom(t *testing.T) {
 	ct := target.DefaultChoiceTable()
 	buf := make([]byte, ExecBufferSize)
 	for i := 0; i < iters; i++ {
-		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 		n, err := p.SerializeForExec(buf)
 		if err != nil {
 			t.Fatalf("failed to serialize: %v", err)

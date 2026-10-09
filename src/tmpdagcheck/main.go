@@ -7,8 +7,8 @@ import (
 )
 
 func main() {
-	// ---- DCT direction-1/2 checks ----
-	dct := prog.NewDistributedChoiceTable("inodeops")
+	// ---- DCT Phase-3 checks: static weights, no dynamics ----
+	dct := prog.NewDistributedChoiceTable()
 	r := rand.New(rand.NewSource(1))
 
 	v1 := dct.ChooseVariant("mkdir", r)
@@ -17,9 +17,8 @@ func main() {
 		panic("ChooseVariant returned nil")
 	}
 
-	// 25 selections without any yield: the combo's weight must never grow,
-	// and if it was picked >= noYieldThreshold(10) times it must have been
-	// down-weighted by noYieldDelta(5).
+	// Phase 3: weights are static — repeated selections must never change
+	// any combo's weight (no yield rewards, no no-yield decay).
 	combo := *v1
 	w0 := dct.WeightOf("mkdir", combo)
 	picked := 0
@@ -30,23 +29,10 @@ func main() {
 		}
 	}
 	w25 := dct.WeightOf("mkdir", combo)
-	fmt.Printf("combo=%v picked=%d/25 weight %d -> %d (no growth expected, %d down if picked>=20)\n",
-		combo, picked, w0, w25, 5)
-	if w25 > w0 {
-		panic("weight grew without any yield")
-	}
-
-	// A yield marks the combo explored and resets its no-yield counter:
-	// further picks should not down-weight it again soon.
-	dct.MarkYield("mkdir", combo)
-	prev := dct.WeightOf("mkdir", combo)
-	for i := 0; i < 10; i++ {
-		dct.ChooseVariant("mkdir", r)
-	}
-	after := dct.WeightOf("mkdir", combo)
-	fmt.Printf("weight after yield + 10 picks: %d -> %d\n", prev, after)
-	if after > prev {
-		panic("weight grew after yield")
+	fmt.Printf("combo=%v picked=%d/25 weight %d -> %d (static expected)\n",
+		combo, picked, w0, w25)
+	if w25 != w0 {
+		panic("weight changed without any yield (Phase 3 static weights)")
 	}
 
 	fmt.Printf("HasRoot(mkdir)=%v HasRoot(open)=%v\n",

@@ -15,7 +15,7 @@ func TestGeneration(t *testing.T) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
 	for i := 0; i < iters; i++ {
-		_, _ = target.Generate(rs, 20, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		_, _ = target.Generate(rs, 20, ct, nil, false, nil, false, &Hmdfs_config{})
 	}
 }
 
@@ -60,7 +60,7 @@ func testSerialize(t *testing.T, verbose bool) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
 	for i := 0; i < iters; i++ {
-		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 		var data []byte
 		mode := NonStrict
 		if verbose {
@@ -186,7 +186,7 @@ func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
 		iters /= 10
 	}
 	for i := 0; i < iters; i++ {
-		p, _ := target.Generate(rs, 20, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 20, ct, nil, false, nil, false, &Hmdfs_config{})
 		testCrossArchProg(t, p, crossTargets)
 		ps, err := target.Deserialize([][]byte{p.Serialize()}, NonStrict)
 		if err != nil {
@@ -194,7 +194,7 @@ func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
 		}
 		p = ps[0]
 		testCrossArchProg(t, p, crossTargets)
-		p.Mutate(rs, 20, ct, nil, nil, 0, false, false, &Hmdfs_config{}, 0)
+		p.Mutate(rs, 20, ct, nil, nil, 0, false, false, &Hmdfs_config{})
 		testCrossArchProg(t, p, crossTargets)
 		minPs, _ := Minimize([]*Prog{p}, -1, 0, false, 0, func(ps []*Prog, _ int) bool {
 			return rs.Int63()%2 == 0
@@ -467,7 +467,7 @@ func TestSanitizeRandom(t *testing.T) {
 	testEachTargetRandom(t, func(t *testing.T, target *Target, rs rand.Source, iters int) {
 		ct := target.DefaultChoiceTable()
 		for i := 0; i < iters; i++ {
-			p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+			p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 			s0 := string(p.Serialize())
 			p.sanitizeFix()
 			s1 := string(p.Serialize())

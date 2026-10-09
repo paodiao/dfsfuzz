@@ -18,6 +18,12 @@ type RPCInput struct {
 	SrvSignal signal.Serial
 	SrvCover  []uint32
 	CliCover  []uint32
+	// Timings carries the last observed per-call [Stime, Etime] pairs
+	// (flattened per prog: stime0, etime0, stime1, etime1, ...), so corpus
+	// seeds keep their execution timeline across fuzzer restarts: CheckInfo
+	// is runtime-only and not part of the prog serialization. Pairs of 0/0
+	// mean "no timing observed" (the call is left without CheckInfo).
+	Timings [][]uint64
 }
 
 type RPCCandidate struct {

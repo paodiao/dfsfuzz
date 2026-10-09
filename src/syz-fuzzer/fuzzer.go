@@ -85,7 +85,17 @@ type Fuzzer struct {
 	// Depth-bucket distribution of vertices in novel DAG pairs (index 1-3;
 	// bucket 0 is unreachable), to validate the depth bucket boundaries.
 	dagDepthCount [4]uint64
-	tscoffs       []int64
+	// Corpus timing restore counters: timingsTotal counts ingested RPC inputs
+	// that carried a Timings payload, timingsApplied those where
+	// ApplyProgTimings actually restored at least one call's CheckInfo
+	// timeline. Reported in the startup "dag sync" diag to verify the restore
+	// path after a fuzzer restart.
+	timingsApplied uint64
+	timingsTotal   uint64
+	// Seeded from config.TSCOFF at construction and immutable afterwards:
+	// each Proc copies it in newProc and refreshes its own copy from its own
+	// exec report (prevents cross-proc races on the shared slice).
+	tscoffs []int64
 
 	checkResult *rpctype.CheckArgs
 	logMu       sync.Mutex
@@ -401,7 +411,9 @@ func main() {
 	// the local maxDagSignal holds. Offline, compare with the manager's
 	// dagPairs at the same time: localMax ~= dagPairs proves the local set was
 	// fully synced before the first execution (no restart double counting).
-	appendDiagLog("dag sync: localMax=%d corpus=%d", fuzzer.maxDagSignal.Len(), len(fuzzer.corpus))
+	appendDiagLog("dag sync: localMax=%d corpus=%d timings=%d/%d",
+		fuzzer.maxDagSignal.Len(), len(fuzzer.corpus),
+		atomic.LoadUint64(&fuzzer.timingsApplied), atomic.LoadUint64(&fuzzer.timingsTotal))
 
 	/*
 			tmp := 1
@@ -685,6 +697,13 @@ func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.RPCInput) {
 	p := fuzzer.deserializeInput(inp.Prog)
 	if p == nil {
 		return
+	}
+	if len(inp.Timings) > 0 {
+		restored := prog.ApplyProgTimings(p, inp.Timings)
+		atomic.AddUint64(&fuzzer.timingsTotal, 1)
+		if restored > 0 {
+			atomic.AddUint64(&fuzzer.timingsApplied, 1)
+		}
 	}
 	sig := hash.Hash(inp.Prog...)
 	cliSign := inp.CliSignal.Deserialize()

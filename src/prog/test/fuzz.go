@@ -54,7 +54,7 @@ func FuzzDeserialize(data []byte) int {
 			panic(err)
 		}
 	}
-	p3.Mutate(rand.NewSource(0), 3, fuzzChoiceTable, nil, nil, 0, false, false, &prog.Hmdfs_config{}, 0)
+	p3.Mutate(rand.NewSource(0), 3, fuzzChoiceTable, nil, nil, 0, false, false, &prog.Hmdfs_config{})
 	return 0
 }
 

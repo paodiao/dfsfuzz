@@ -76,7 +76,7 @@ func TestPrioDeterminism(t *testing.T) {
 	ct := target.DefaultChoiceTable()
 	var corpus []*Prog
 	for i := 0; i < 100; i++ {
-		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 		corpus = append(corpus, p)
 	}
 	ct0 := target.BuildChoiceTable([][]*Prog{corpus}, nil)

@@ -169,8 +169,8 @@ git基于Merkle树的内容寻址。
 | 无需新的数据收集——使用已有的eBPF追踪事件 | 谓词空间必须手动策划或自动挖掘 |
 | 非常适合HMDFS特定的模式（stash/writeback、dentry TTL、comrade冲突） | 完备性取决于谓词覆盖范围 |
 
-**所需数据**：已收集：eBPF kretprobe事件（15个merge函数 + `WRITEPAGE_CB`）、每节点`fsMd`、
-`infos`（每次调用的errno/ret值）。
+**所需数据**：已收集：eBPF 事件——15 个 merge 函数由**入口 kprobe + kretprobe 配对**捕获
+（返回侧只取返回值），`WRITEPAGE_CB` 是 **perf tracepoint**；每节点`fsMd`、`infos`（每次调用的 errno/ret 值）。
 
 **参考文献**：Daikon（动态不变量检测）；TxF (EuroSys 2013)；Liblit
 et al. (2005)。
@@ -254,8 +254,9 @@ et al. (2005)。
 | `rename(A, B)` 同目录 vs 跨目录 | args[0]和args[2]不同 | 跨目录rename具有不同的原子性保证 |
 | `lookup(dir)` 成功 vs 失败 (ENOENT) | dentry cache命中 vs. 未命中 | 不同的内部代码路径 |
 
-我们的`HmdfsTraceEvent`已经从eBPF kretprobe中捕获了`{FuncID, Ret, Ino, Args[6]}`——
-按结果区分需要**零新增数据收集**。
+我们的`HmdfsTraceEvent`已捕获`{FuncID, Ret, Ino, Off, Size, EntryIno, Mode}`（func_id 0–15）——
+参数派生值来自**入口 kprobe**（`Off/Size/EntryIno/Mode`），kretprobe 只提供返回值；
+`Args[6]` 为保留字段、恒 0。按结果区分无需新增数据收集。
 
 #### 3.10.2 谓词挖掘：手动粒度
 
@@ -287,7 +288,10 @@ et al. (2005)。
 | `FuncID` | 操作类型（谓词模板选择器） |
 | `Ret` | 成功/失败/errno分类 |
 | `Ino` | "同一文件"标识（例如 `WRITE_THEN_READ_SAME_FILE`） |
-| `Args[0..5]` | 标志、偏移量、长度、父inode指针 |
+| `Off` / `Size` | 入口时刻的偏移/大小（越界区分） |
+| `EntryIno` | 命名空间操作的 dentry 目标 inode（create/mkdir/rename/lookup） |
+| `Mode` | 入口时刻的文件 mode（类型分类） |
+| `Args[0..5]` | **保留、恒 0**（仅声明未填充，不可用） |
 
 **优势**：你来选择哪些区别是重要的。反馈粒度恰好是你定义的——不多不少。
 
@@ -378,8 +382,8 @@ Mallory通过在happens-before摘要上应用MinHash聚类来解决这一噪声�
 | 补充谓词挖掘（方法6） | 需要对HMDFS内部代码路径进行逐变量插桩 |
 
 **所需数据**：对HMDFS内部函数进行插桩，以在函数入口/出口处捕获局部变量值
-（超出当前eBPF kretprobe的捕获范围）。当前的`HmdfsTraceEvent.Args[6]`可以作为
-指针级不变量的起点。
+（超出当前eBPF入口kprobe/kretprobe的捕获范围）。当前`HmdfsTraceEvent`字段
+（`Off/Size/EntryIno/Mode`）可作为指针级不变量的起点（`Args[6]`为保留字段、恒 0）。
 
 **参考文献**：Daikon (Ernst et al., 2007)；DIDUCE (Hangal & Lam, 2002)；
 TerrAscope (Joshi et al., 2019)。
@@ -499,8 +503,9 @@ Haskell Hedgehog顺序/并行测试。
 
 **所需数据**：每次调用的TSC开始/结束时间戳（已在`callReply`中，
 已解析到`CheckInfo.Stime/Etime`）；每个VM的`tsc_offset`（已在
-`argv[15]`中）；`WritePageCB`追踪点时间戳（perf收集在进行中）。
-所有数据通道已构建或正在构建中。
+`argv[15]`中）；`WritePageCB`追踪点时间戳（**perf 采集已实现**——
+`perf_event_open` CPU0 + 程序窗口；见 `EBPF_TRACE.md` 161-199 与
+`DAG_KNOWN_ISSUES.md` P7 补充）。所有数据通道已构建。
 
 ---
 
@@ -731,20 +736,24 @@ File Systems via a Load Variance Model," SOSP 2025。
 
 操作DAG从eBPF追踪数据中构造，使用以下因果规则（方法3.3中已枚举）：
 
+> **（2026-10-02 更正）**：下表基于 offset/length 重叠的规则**未实现**——当前
+> `determinePathRel` 只做路径文本/ino 分类，`Off/Size` 仅作顶点特征。实际实现：
+> SAME_PATH、SAME_INODE（同 prog 同非零 ino）、PARENT_CHILD（文本前缀）、SAME_PARENT。
+
 | 规则 | 从eBPF数据推导 |
 |------|-------------|
-| 读写依赖（同ino，区间重叠） | `FuncID ∈ {WRITE, READ}`，同 `Ino`，`args[offset]`/`args[len]` 重叠 |
-| 写写依赖（同ino，区间重叠） | `FuncID ∈ {WRITE, WRITE}`，同 `Ino`，区间重叠 |
+| 读写依赖（同ino） | `FuncID ∈ {WRITE, READ}`，同 `ProgIdx`+`Ino`（无区间重叠判定） |
 | Fsync屏障（同ino，write在fsync前） | `FuncID ∈ {WRITE} → FuncID ∈ {FSYNC}`，同 `Ino` |
-| WRITEPAGE_CB锚点（ino，writeback完成在read之前） | `FuncID ∈ {WRITEPAGE_CB}` → `FuncID ∈ {READ}`，同 `Ino` |
-| 命名空间：创建在打开之前 | `FuncID ∈ {CREATE, MKDIR} → OPEN`，通过 `Ino` 链确定路径关系 |
+| WRITEPAGE_CB锚点（ino，writeback完成在read之前） | `FuncID ∈ {WRITEPAGE_CB}` → `FuncID ∈ {READ}`，同 `Ino`（point-in-time） |
+| 命名空间：创建在打开之前 | `FuncID ∈ {CREATE, MKDIR} → OPEN`，通过路径/ino 链确定关系 |
 | 命名空间：删除/创建冲突 | `FuncID ∈ {UNLINK, RMDIR}` 与 `FuncID ∈ {CREATE, MKDIR}` 重叠，相同路径/ino |
-| 无关系 | 不同 `Ino`，无父子命名关系 |
+| 无关系 | 不同路径/ino 且无父子命名关系 |
 
-这需要**零新数据采集**——所有字段（`FuncID`、`Ino`、`Args`、`Timestamp`）
-已存在于 `HmdfsTraceEvent` 中。
+这需要**零新数据采集**——实际使用的字段（`FuncID`、`Ino`、`ProgIdx`、`Path/CallName`、
+`Timestamp`）已存在于 `HmdfsTraceEvent` 中。
 
-**阶段2（可选增强，如果后续需要）**：
+**阶段2（历史规划，已被取代）**：以下三项是当时列出的候选增强（**未实施**）；
+实际落地的 "Phase 2" 是定向覆盖 2a/2b（coverage board + directed plan）。
 
 ```
 + 谓词挖掘（叠加在DAG之上的语义谓词）
@@ -825,20 +834,20 @@ eBPF事件 → HmdfsTraceEvent → ino → path 映射 (fsMd)
 | `func_id` | `HmdfsTraceEvent.FuncID` | 16种操作类型（MKDIR、WRITE、WRITEPAGE_CB等） |
 | `path` | `HmdfsTraceEvent.Ino` → fsMd反查 | `merge_view/...` 路径；跨节点、跨schedule稳定 |
 | `ret_bucket` | `HmdfsTraceEvent.Ret` → 分桶映射 | `SUCCESS / EEXIST / ENOENT / FAILURE / WRITEPAGE_DONE / WRITEPAGE_ERR` |
-| `off` | write/read: `kiocb->ki_pos`；truncate: `iattr->ia_size`（仅当 `ATTR_SIZE`）；其余 0 | `offset_bucket` 的输入（结束位置——见 #22） |
-| `size` | fsMd `StatMd.Size`（执行后） | `offset_bucket` 的参照（TAIL/BEYOND 边界）；**本身不是特征** |
+| `off` | write/read: `kiocb->ki_pos`；truncate: `iattr->ia_size`（仅当 `ATTR_SIZE`）；其余 0 | `offset_bucket` 的输入（**入口位置**——由入口 kprobe 捕获） |
+| `size` | 事件携带的**入口时刻** `i_size` | `offset_bucket` 的参照（TAIL/BEYOND 边界；BEYOND = 入口 `pos >= size`）；**本身不是特征** |
 
 **为什么用`path`而非`ino`**：HMDFS的merge_view inode号在不同客户端节点上
 不同（参见§2）。`path`通过fsMd的`StatMd.Ino`反查得到，提供跨节点稳定的文件身份。
 
 **`ino → path`反查**：
 
-- kretprobe事件：`BPF_CORE_READ(inode, i_ino)` 给出完整的merge_view inode
-  → 直接匹配 `fsMd[path].StatMd.Ino`。
+- 入口 kprobe 事件：ino 在**入口**读取（命名空间操作在入口保存 dentry 指针、
+  返回后读 `d_inode` 填 `EntryIno`）→ 直接匹配 `fsMd[path].StatMd.Ino`。
 - writepage事件：tracepoint的`ino_raw`字段（低32位）匹配
   `fsMd[path].StatMd.Ino & 0xFFFFFFFF`。
-- 瞬态文件（在一个schedule中创建后又删除）：从eBPF事件中的
-  `creat`/`mkdir`参数（`args[0]`）提取`path`。
+- 瞬态文件（在一个schedule中创建后又删除）：从**测试程序调用参数**
+  （`extractPathFromCall`）与 rename/delete 时间线解析`path`——eBPF args 恒 0。
 
 ### 6.2.1 路径匹配策略
 
@@ -854,32 +863,18 @@ eBPF事件 → HmdfsTraceEvent → ino → path 映射 (fsMd)
 | 2 — FD追踪 | `write`、`read`、`fsync`、`open`、`release`、`getattr`、`setattr`、`iterate` | 同prog内向前查找返回该fd的`open`/`creat`调用 | `resolveFdToPath(prog, call)` |
 | 3 — ino兜底 | `writepage_cb`、未匹配事件 | fsMd：`{path → StatMd.Ino}` | `ino → path`反查 |
 
-**匹配算法**：
+**匹配算法（实现口径，2026-10-02 更正）**：实现是 **event→call** 的窗口匹配
+（`matchEventToCall`，`src/prog/dag.go:794-839`）——对每个事件找
+`[stime-tol, etime+tol]` 内的调用，最近开始的窗口胜出；无 d_name 匹配/候选回退链，
+路径在匹配后按函数各自解析（文件调用 fd 回溯、目录/命名空间调用用调用参数与
+rename/delete 时间线）。以下为历史（未实现）描述：
 
 ```
 for each call in ps[progIdx]:
     path = 通过层级1或2解析路径
-    if path == "": continue
-
-    candidates = [call.stime, call.etime] 窗口内
-                 func_id匹配的eBPF事件
-
-    if 1个候选 → 直接赋值
-
-    elif >1个候选：
-        // 名字冲突回退 — 测试程序使用唯一名字
-        for 候选:
-            d_name = 候选路径的最后一层组件名
-            if d_name == path的最后一层组件名:
-                赋值; break
-        if 仍未匹配: 兜底取窗口内第一个候选
-
-rename: old_path和new_path直接从`call.Args[0]`和`call.Args[1]`获取。无需反查。
+    ...
+rename: old_path和new_path直接从`call.Args[0]`和`call.Args[1]`获取。
 ```
-
-**理由**：由于Monarch通过`randomSuffix`为每个测试生成唯一文件名，d_name匹配
-非常可靠。回退链（时间戳窗口 → d_name → 第一个候选）确保即使在突变破坏了
-名字唯一性的情况下也不会出错。
 
 顶点**不合并**——每个eBPF事件成为自己的顶点。抽象层在签名时处理去重（§6.4）。
 
@@ -903,35 +898,28 @@ HB DAG是从TSC全局时间线（§6.1，全序）中推导出的*偏序*。它�
 | 路径关系 | 判定条件 | 示例 |
 |---------|---------|------|
 | **SAME_PATH** | `A.path == B.path` | `mkdir /A` → `rmdir /A` |
-| **SAME_INODE** | `A.ino == B.ino` 且 A成功；若双方都有offset/length则需重叠，否则同ino即成立 | `write /f(0→128)` → `read /f(64→192)`、`setattr /f` → `read /f` |
-| **BARRIER** | A或B是 `fsync`/`fdatasync`。注：`writepage_cb`延长write的有效etime，之后正常的SAME_INODE处理交互——BARRIER本身不产生独立关系对 | `write /f` → `fsync /f` |
-| **PARENT_CHILD** | 一个路径是另一个的前缀 且 前缀路径是目录 | `rmdir /A` → `mkdir /A/B`（直接），`mkdir /A` → `creat /A/B/C/file.txt`（间接） |
+| **SAME_INODE** | 同 `ProgIdx` 且同非零 `Ino`（**无 A 成功检查、无 offset/length 重叠检查**，见下） | `write /f` → `read /f` |
+| **PARENT_CHILD** | 一个路径是另一个的**文本前缀**（**不检查目录类型**） | `rmdir /A` → `mkdir /A/B`（直接），`mkdir /A` → `creat /A/B/C/file.txt`（间接） |
 | **SAME_PARENT** | 路径共享同一个父目录 | `mkdir /A/X`, `mkdir /A/Y` |
 
-**SAME_INODE对无offset/length操作的细化**：`WRITE`和`READ`在`Args[1]`/`Args[2]`
-中携带`offset`/`length`，可以精确进行重叠检测。像`SETATTR`（truncate、chmod）
-和`WRITEPAGE_CB`这样的操作则没有。当任一操作缺少offset/length时，任何
-同ino关系都被视为因果——修改者改变了文件，所有后续同ino操作都受影响。
+**SAME_INODE（实现口径）**：`determinePathRel`（`src/prog/dag.go:1038-1069`）在
+`A.ProgIdx == B.ProgIdx && A.Ino != 0 && A.Ino == B.Ino` 时返回 SAME_INODE——
+**不检查 A 是否成功、不做 offset/length 重叠判定**（成功只用于 HB 边的 A 侧
+`isSucceededModifier` 门）。`Off/Size` 仅作顶点特征参与签名哈希。
 
 **PARENT_CHILD覆盖任意祖先/后代关系**，不限于直接父子。如果创建了 `/A` 然后
 创建了 `/A/B/C/file.txt`，即使 `/A/B` 没有被显式操作，也存在因果边。DAG的
 传递闭包无法通过从未发生过的中间操作来捕获这种关系。前缀检查覆盖所有层级。
 只声明直接父子会留下盲区。
 
-因为文件系统中只有目录才能有后代，前缀路径必须是目录节点类型。两个常规文件
-共享一个路径前缀（如 `/A/f1` 和 `/A/f2`）不产生PARENT_CHILD——它们归入
-SAME_PARENT或无关系。
+**（2026-10-02 更正）**：实现只做文本 `strings.HasPrefix`，**不检查前缀路径的
+节点类型**（`src/prog/dag.go:1051-1060`）。`/A/f1` 与 `/A/f2` 互不为前缀不会误判，
+但类型不匹配不会被显式拒绝。
 
-**Rename双路径边规则**：`RENAME`顶点携带两个路径——`old_path`和`new_path`，
-直接从调用参数获取（§6.2.1）。在happens-before边判定中，rename顶点的角色是方向性的：
-
-| 比较方向 | 使用的路径 | 理由 |
-|---|---|---|
-| 其他操作 → RENAME | `old_path` | 之前操作影响的是位于旧位置的文件 |
-| RENAME → 其他操作 | `new_path` | rename已将文件移动到了新位置 |
-
-对于并发对，两个路径分别与对方操作的路径进行比较。可以为`old_path`、`new_path`、
-两者皆可、或两者皆不可记录并发对。
+**Rename 双路径边规则（实现口径，2026-10-02 更正）**：当前实现**不做方向性
+old/new 选择**——`determinePathRel`（`dag.go:1029-1037`）对
+`{Path, OldPath} × {Path, OldPath}` 全交叉比较，`ordered` 参数未使用，属无序近似。
+历史描述（未实现）：其他操作→RENAME 用 `old_path`、RENAME→其他用 `new_path`。
 
 **SAME_PARENT不产生HB边**——sibling文件之间没有直接因果依赖。
 它会在签名中作为并发对出现（参见§6.4）。
@@ -985,7 +973,7 @@ read观测到的数据。
 - **并发对**：直接从TSC时间线计算——执行区间重叠、满足修改者/观察者规则
   （§6.3.1）、且共享路径关系的顶点对。它们不要求或使用DAG。
 
-两者通过相同的管道进行抽象：将每个顶点抽象为其5特征元组，确定关系类型，
+两者通过相同的管道进行抽象：将每个顶点抽象为其6特征元组，确定关系类型，
 哈希，插入`maxDagSignal`（专用DAG通道；见§5.3）。
 
 对于每对共享路径关系且满足修改者/观察者规则的顶点 (A, B)（HB边需A成功）：
@@ -1014,8 +1002,9 @@ read观测到的数据。
      HMDFS远程RPC路径；这个区分已被`func_id`捕获（OPEN vs CREAT）。
     - `TMP_DIR`——Monarch测试框架的人为分类，不是HMDFS的行为差异。
     - `length`——写长度影响写回合并，但其主要行为影响（跨文件大小/页边界）
-      已被`offset_bucket`捕获（kretprobe读到的是结束位置 ki_pos ≈ pos+len，
-      跨边界的写落入BEYOND桶）。单独编码length会产生噪声而无额外信号。
+      已被`offset_bucket`捕获（入口语义：BEYOND = 入口 `pos >= size`；
+      `off` 为入口 `ki_pos`、`size` 为入口 `i_size`）。单独编码 length 会
+      产生噪声而无额外信号。
       （注：原始设计也拒绝了`offset`——认为是参数级噪声无额外信号。现被重新审视：
       `offset_bucket`不是参数级区分，而是**并发语义**区分——分离真实数据竞争
       （同位置）与独立区写——这正是数据竞争反馈缺失的维度。见
@@ -1027,7 +1016,7 @@ read观测到的数据。
    - `depth_bucket` = `path`中'/'的数量直接分桶（`merge_view/`前缀计入）。0（无'/'）实际不可达——所有路径都带`merge_view/`前缀；1表示`merge_view/file`根级文件；2-4为浅层嵌套（如`merge_view/cid/file`）；5+为深层嵌套（'/' 数 ≥5，如`merge_view/a/b/c/d/e`）
    - `node_type`：`StatMd.Mode & S_IFDIR != 0` → DIR，否则 → FILE
    - `is_persist`：`hmcfg.Persistence_dir`前缀匹配 → true
-   - `offset_bucket`：非读写/truncate函数（无偏移语义）→ NA；pos == 0 → 0；pos ≥ size → BEYOND；size % 4096 > 0 且 pos ≥ size−(size % 4096) → TAIL；否则 → MID。`off` 来源：write/read 的 `kiocb->ki_pos`、truncate 的 `iattr->ia_size`（仅当 `ia_valid & ATTR_SIZE`）；`size` 取 post-exec fsMd（分桶参照，**本身不入特征**）
+   - `offset_bucket`：非读写/truncate函数（无偏移语义）→ NA；pos == 0 → 0；pos ≥ size → BEYOND；size % 4096 > 0 且 pos ≥ size−(size % 4096) → TAIL；否则 → MID。`off` 来源：write/read 的 `kiocb->ki_pos`、truncate 的 `iattr->ia_size`（仅当 `ia_valid & ATTR_SIZE`）；`size` 取**入口时刻**事件携带的 `i_size`（分桶参照，**本身不入特征**；2026-10-02 更正，原为 post-exec fsMd）
 
 4. **计算签名哈希**：
 
@@ -1047,7 +1036,7 @@ read观测到的数据。
 6. **Schedule级哈希（双粒度）**：
 
     ```
-    all_pair_hashes = sorted({hash(pair) for all pairs})
+    all_pair_hashes = sorted([hash(pair) for all pairs])   // 保留重复，非集合
     schedule_hash = hash(all_pair_hashes)  → uint64 → uint32 → maxDagSchedSignal
     ```
 
@@ -1079,39 +1068,31 @@ schedule hash以单个统计bit奖励"这个组合是新的"。
 后者是并发的冲突。两者必须产生可区分的签名位。
 
 **集合语义的自动去重**：如果3个WRITE顶点都与1个READ顶点形成相同的关系对，
-每个产生相同的哈希→有序集合将其合并为一个条目。签名捕获的是*是否*出现了
-某个模式，而不是*出现了多少次*。
+每个产生相同的哈希→**per-pair 信号集合**将其合并为一个条目（schedule 哈希对
+**全部哈希（含重复）**排序，因此重数仍影响 schedule 哈希）。per-pair 签名捕获
+的是*是否*出现了某个模式，而不是*出现了多少次*。
 
 ### 6.5 与突变器的关系
 
-突变设计（DCT权重、经文件树选择路径、分组突变、时间对齐的并发插入——§6.5.2）
-能够产生多样化的因果模式。Op DAG反馈现已**接入突变循环**：新DAG对反馈回
-DCT表（每个新对映射为其`(rootCall, variant)`组合并标记为有产出）。
-triage成功仅入 corpus、不做任何静态归因——DCT 学习完全由动态 pair 反馈驱动
-（见 `DAG_KNOWN_ISSUES.md` #20）。反馈回路如下：
+> **⚠ 已过时（2026-10-02）**：本节描述的 DCT 学习回路与"三方向"中的
+> 方向 1/2（`Explored`/`NoYield`/`MarkYield`/`TickNoYield`/`TemporalWeights`/
+> `applyInsertFeedback`/`PendingInserts`）已随 Phase 3 整体移除；当前机制为
+> coverage board（Phase 2a）+ 定向覆盖（Phase 2b，`PendingDirected`/
+> `ResolveDirectedPending`），以 `docs/seed-optimization-plan.md` §8 为准。
 
-```
-insertCallFromDCT 记录本次插入的 (root, variant)；未产出者优先
-ChooseTemporal 选择组合的插入形态（并发/因果）→ 执行
-→ 有新 DAG 反馈 → 对每个记录组合 MarkYield + 权重 +1（Explored = true）
-→ 无新 DAG 反馈 → 对每个记录组合 TickNoYield；≥阈值降权
-→ pair 时态（CONCURRENT/HB）→ UpdateTemporalWeight（第二层，按形态）
-```
+突变设计（DCT 静态权重、经文件树选择路径、分组突变、时间对齐的并发插入——§6.5.2）
+能够产生多样化的因果模式。当前 DAG 反馈管线：新 pair → corpus triage 入队 +
+`prog.RecordCoveragePairs`（coverage board）+ HB/CC 计数；**不存在 DCT 学习**
+（`DAG_KNOWN_ISSUES.md` #20/#28）。
 
-原始设计识别的三个增强方向中，两个已实现、一个推迟：
-
-| 方向 | 状态 | 实现 |
+| 方向 | 状态 | 说明 |
 |------|:--:|------|
-| 路径关系探索度追踪 | **已实现** | DCT 为每个 `(rootCall, variant)` 维护 `Explored` 表；`chooseVariant` 只从从未产出信号且仍在探索预算内（`NoYield < 10`）的组合中选取 |
-| 自适应权重下调 | **已实现** | DCT 为每个组合维护 `NoYield` 计数：插入后的执行无新 DAG 反馈时（`TickNoYield`）+1，产出时（`MarkYield`）清零，连续10次无产出则权重 −5（下限1） |
-| 时态形态层 | **已实现** | 组合下的第二层：`TemporalWeights`（并发 vs 因果/HB 形态，默认 50/50）。`insertCallFromDCT` 按 `ChooseTemporal` 选形态；因果形态插入到 `firstBoundaryAfter`（root 完成后的最早边界，倾向 HB 对）。`feedbackDagPairs` 按实际产出的 pair 时态更新形态权重；方向 1/2 的奖励由记录的组合单独驱动（`applyInsertFeedback`：执行有新反馈即奖励，无论产出形态——见 `DAG_KNOWN_ISSUES.md` #16） |
-| 指令性突变 | 推迟 | "我需要在深度3+的DIR上产生WRITE→READ的SAME_INODE HB对，但尚未见过" → 专门构造。需要合成器；评估前两个方向后再决定。更广泛的建模调研（并发/因果关系结构）见 `DAG_KNOWN_ISSUES.md` #17 |
+| 路径关系探索度追踪 | **Removed (Phase 3)** | 历史：`Explored` 表 + 独占探索池（`NoYield < 10`）。 |
+| 自适应权重下调 | **Removed (Phase 3)** | 历史：`NoYield` 计数 + 阈值降权；现 DCT 权重为静态初始值。 |
+| 时态形态层 | **Removed (Phase 3)；由定向覆盖取代** | 历史：`TemporalWeights` 双权重 + `UpdateTemporalWeight`；现 Temporal 以 coverage board cell 维度 + Phase 2b 定向计划（`directed_plan.go` 的 HB/CC 放置）承担。 |
+| 指令性突变 | **由 Phase 2b 定向计划取代** | `PickDirectedBatch`/`insertDirectedBatch` 按未覆盖 cell 合成计划；`DAG_KNOWN_ISSUES.md` #17 的 α/β/γ 仍为调研项。 |
 
-两个已实现方向共用同一个信号源：`applyInsertFeedback`（fuzzer侧，每次执行后
-结算最近一次插入记录的组合：执行有新 DAG 反馈则奖励，否则记一次无产出）。
-`feedbackDagPairs` 保留形态层（`UpdateTemporalWeight`）。
-
-**方向1 — 路径关系探索度追踪（已实现）**
+**方向1 — 路径关系探索度追踪（历史——已随 Phase 3 移除）**
 
 - 机制：DCT 表为每个 `(rootCall, variant)` 维护 `Explored` 标志；
   `chooseVariant` 收集"从未产出信号且仍在探索预算内（`NoYield < 10`）"的
@@ -1124,7 +1105,7 @@ ChooseTemporal 选择组合的插入形态（并发/因果）→ 执行
 - 粒度：DCT 组合（`callName` + `pathRel`），粗于 DAG 特征桶——偏向作用在
   生成/突变的组合选择层，而非 pair 空间本身。
 
-**方向2 — 自适应权重下调（已实现）**
+**方向2 — 自适应权重下调（历史——已随 Phase 3 移除）**
 
 - 机制：每个组合维护 `NoYield` 计数（插入后执行无新 DAG 反馈时 +1）；达到 10 次
   连续无产出时权重 −5（下限 1）、重算 `TotalWeights`、并重置计数（防止连续降权）。
@@ -1144,7 +1125,7 @@ ChooseTemporal 选择组合的插入形态（并发/因果）→ 执行
   方向1的延伸）；② 从抽象特征到具体程序的合成器（程序合成问题；现成积木：
   `generateCallByName`、fd 链构造、barrier/nanosleep 时序控制）；③ 验证闭环
   （执行后检查目标 pair 是否触发，未命中则调整）。
-- 弱化版已就位：§6.5.3 调用移动重排已有调用逼近目标；完整版是凭空构造。
+- **（2026-10-02 更正）**：该形态已由 Phase 2b 定向计划实现（`PickDirectedBatch`/`insertDirectedBatch` 按未覆盖 cell 合成插入）；§6.5.3 的 `MoveCallTimeAligned` 仍未建。
 - 优先级：推迟——依赖三项前置条件，且应先用方向1/2的实验数据确认
   "缺失模式是否真的是探索瓶颈"。
 
@@ -1232,12 +1213,14 @@ refTime = 0                                     若 insertPos == 0      （prog 
   corpus 重执行（triage）会刷新它。
 - **跨VM归一化**：窗口是各VM的 raw TSC；比较时减去各VM的 `tsc_offset` 进入
   全局域——与DAG全局时间线使用相同的归一化。
-- **fd约束**：`findInsertPosition` 在选中的 open/close fd 范围内对齐；
-  `insertCallFromDCT` 在时间对齐会把需要 fd 的调用放到其 open 之前时，
-  回退到索引对齐位置。
-- **覆盖范围**：`insertCallFromPattern`（ops 与 verification 调用）和
-  `insertCallFromDCT`（并发调用）都对齐；生成路径
-  （`generateFromDistributedChoiceTable`）不动——新生成的程序没有执行历史可对齐。
+- **fd约束**：`findOpenFdForPath` 在选中的 open/close fd 范围内解析可复用 fd
+  （旧 `findInsertPosition` 现仅测试使用）；`insertCallFromDCT` 在时间对齐会把
+  需要 fd 的调用放到其 open 之前时，回退到索引对齐位置。
+- **覆盖范围**：`insertCallFromDCT` **两种形态都对齐**——CC 用
+  `TimeAlignedInsertPos`（最近边界）、HB 用 `firstBoundaryAfter`（root 完成后
+  的第一个边界）；休眠的 `insertCallFromPattern` 已删除（P2-#12，2026-10）。
+  生成路径（`generateFromDistributedChoiceTable`）不动——新生成的程序没有执行
+  历史可对齐。
 
 ### 6.5.3 基于时间对齐的调用移动
 
@@ -1305,14 +1288,14 @@ pickAnchor(ps, r, wantReadWrite)      从 ps[0] 随机选有路径+时间线的�
 
 统一组 = 锚 + 并发者 + 直接因果后继（见 `DAG_KNOWN_ISSUES.md` #18）——四个突变对因果对与并发对一视同仁：数据共享产生"顺序 write→read 同 offset"（一致性验证）、路径迁移把因果链成员一起搬走、删除时因果成员随组处理。
 
-**四个动态突变**（`MutateInodeOpsWithDCT`/`MutateFileopsWithDCT` 分发：removeGroup 20% / removeOneInGroup 10% / 路径迁移 10% / 数据突变 10% / 插入 50%）：
+**四个动态突变**（**2026-10-02 更正**：入口为 `MutateFsopsWithDCT`；`MutateInodeOpsWithDCT`/`MutateFileopsWithDCT` 已删除。预算由 `mutateMixForSize` 按调用数分带：85/5/0/10、60/10/5/25、35/25/10/30、10/40/20/30（ins/removeOne/removeGroup/mutPathData），组内 path:data=70:30）：
 
-- `MutateGroupPathDynamic`：锚迁移到新 base 路径（`pickNewBasePath`）；并发者按现场关系相对解析；fd 调用经 `resolveFdTarget` 回溯；非并发主干调用留在原地（无需第二遍跟随逻辑）。
-- `RemoveGroupDynamic`：删除锚及其全部并发者。
+- `MutateGroupPathDynamic`：锚迁移到新 base 路径（`pickNewBasePath`）；**统一组**成员（并发 + 直接因果后继）按现场关系相对解析；fd 调用经 `resolveFdTarget` 回溯；非组成员调用留在原地（无需第二遍跟随逻辑）。
+- `RemoveGroupDynamic`：删除锚统一组的 fd 安全子集（外部有使用者的 open/creat 保留；定向臂 `mutateGroupPathDirected`）。
 - `RemoveReservoirDynamic`：水库式跨 prog 删除——随机起点环形遍历，每个 prog 至多删一个 fd 安全调用（`AnalyzeProgFds`，保留故障注入伪调用）；候选预筛为"有可删调用"的 prog，目标删除数达到即保底（存在可删调用即至少删 1 个）。
-- `MutateGroupDataDynamic`：锚必须是读写调用；集合内全部读写调用共享同一随机 offset（write 还共享 length，经 `updateWriteDataBuf`）——确定性对应被移除的插入侧概率 OffsetSame。范围取锚路径文件大小（无则 1MB 兜底）。
+- `MutateGroupDataDynamic`：锚必须是**读/写/truncate** 调用；集合内全部读/写（及 truncate 长度）调用共享同一随机 offset/length（`applyGroupDataValues`）——确定性对应被移除的插入侧概率 OffsetSame。范围取锚路径文件大小（无则 1MB 兜底）。定向臂 `mutateGroupDataDirected` 按未覆盖势能选桶。
 
-**路径迁移保持相对关系（P1 决策）**：路径突变器把已验证模式推广到其他路径形状，不重塑关系——生成新 rel 组合是 `insertCallFromDCT`/`ChooseVariant` 的职责。重随机 rel 会 (a) 与生成机制重叠，(b) 拆散并发同路径对（hmdfs 冲突核心场景），(c) 污染 DCT 权重学习（路径维度反馈被归因到 rel 维度）。
+**路径迁移保持相对关系（P1 决策）**：路径突变器把已验证模式推广到其他路径形状，不重塑关系——生成新 rel 组合是 `insertCallFromDCT`/`ChooseVariant` 的职责。重随机 rel 会 (a) 与生成机制重叠，(b) 拆散并发同路径对（hmdfs 冲突核心场景），(c) 污染静态 DCT 组合权重/采样（路径维度反馈被归因到 rel 维度；Phase 3 后无权重学习）。
 
 **移除内容**：`CallProps.GroupID/PathRel/IsFromDCT/OffsetRel/LengthRel`（5 个序列化 key）、`Prog.Groups/LastGroupID`、`GroupMeta`/`GroupSourceType`、`AllocGroupID/renumberGroups/GetGroupPositions/RemoveGroup/collectAll*/...`、~55 处 `SetGroupID` 调用、插入侧概率 offset/length 选择（`ChooseOffsetRel`/`ChooseLengthRel`/权重表）——共享偏移改由 `MutateGroupDataDynamic` 定向产生。序列化向后兼容（反序列化忽略未知 key）。见 `DAG_KNOWN_ISSUES.md` #13/#14/#15。
 
@@ -1321,14 +1304,16 @@ pickAnchor(ps, r, wantReadWrite)      从 ps[0] 随机选有路径+时间线的�
 
 ## 7. 数据依赖关系
 
+> **2026-10-02 更正**：DAG 反馈现走 coverage board（`RecordCoveragePairs` + Phase 2b 定向；**无 DCT 学习**）；eBPF 侧为 15 个入口 kprobe+kretprobe 配对 + writepage perf tracepoint（16 func_ids）。
+
 ```
                      Monarch数据管道
                             │
          ┌──────────────────┼──────────────────┐
          │                  │                   │
-    eBPF kretprobe      代码覆盖率          callReply
-    (15个merge函数       (KCOV)            (Stime/Etime
-     + writepage_cb)         │              + tsc_offset)
+    eBPF 15个merge函数   代码覆盖率          callReply
+    (入口kprobe+kretprobe；(KCOV)            (Stime/Etime
+     writepage=perf tracepoint)               + tsc_offset)
          │                  │                   │
          │                  ▼                   │
          │            边覆盖率                  │
@@ -1344,7 +1329,7 @@ pickAnchor(ps, r, wantReadWrite)      从 ps[0] 随机选有路径+时间线的�
                     └──────────┬────────────────┘
                                │
                  maxDagSignal / maxDagSchedSignal
-      (新DAG对 = corpus入队 + DCT反馈；
+      (新DAG对 = corpus入队 + coverage board反馈；
        schedule位 = 仅统计)
       — 独立通道，从不并入覆盖率 maxSignal
 ```

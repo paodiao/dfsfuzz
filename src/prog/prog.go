@@ -27,8 +27,7 @@ type Prog struct {
 	HasNetFail        bool
 	IsStash           bool
 	IsDCache          bool
-	IsFileOps         bool
-	IsInodeOps        bool
+	IsFsops           bool
 	SyncIdx           uint64
 	BarrierIdx        uint64
 	SrvFailPos        [][]int
@@ -57,6 +56,15 @@ type FileMetadata struct {
 // HmdfsTraceEvent is a per-function-return event captured by the eBPF
 // kretprobe tracer on hmdfs merge-view VFS operations.
 // Fields match the C structure layout written by hmdfs_trace.cc.
+// Argument-derived state is captured at function entry (a kretprobe's
+// pt_regs hold the function body's leftovers, not the arguments):
+// Off/Size come from the paired entry kprobe for write/read/setattr
+// (ia_size for truncate), Ino from the entry kprobe, and EntryIno/Mode
+// for mkdir/create/rename/lookup are read at return through the entry
+// dentry pointer; Args is reserved and always 0 (no consumer).
+// EntryTs is the entry kprobe's bpf_ktime_get_ns(): this event's own
+// execution window is [EntryTs, Timestamp] (0 when the entry state was
+// lost; consumers fall back to the call window then).
 type HmdfsTraceEvent struct {
 	Timestamp uint64
 	FuncID    uint32
@@ -65,6 +73,10 @@ type HmdfsTraceEvent struct {
 	Args      [6]uint64
 	ProgIdx   int // VM/prog index that produced this event
 	Off       uint64
+	Size      uint64
+	EntryIno  uint64
+	Mode      uint32
+	EntryTs   uint64
 }
 
 // HmdfsFuncName maps BPF func_id constants to human-readable operation names.
@@ -188,6 +200,10 @@ func isReadCall(c *Call) bool {
 
 func isWriteCall(c *Call) bool {
 	return strings.Contains(c.Meta.Name, "write") || strings.Contains(c.Meta.Name, "pwrite64")
+}
+
+func isTruncateCall(c *Call) bool {
+	return strings.Contains(c.Meta.Name, "truncate")
 }
 
 func isFsyncCall(c *Call) bool {

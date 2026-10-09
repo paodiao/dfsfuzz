@@ -158,7 +158,7 @@ func TestSizeMutateArg(t *testing.T) {
 	r := newRand(target, rs)
 	ct := target.DefaultChoiceTable()
 	for i := 0; i < iters; i++ {
-		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 		for it := 0; it < 10; it++ {
 			p1 := p.Clone()
 			ctx := &mutator{
@@ -188,7 +188,7 @@ func TestClone(t *testing.T) {
 	target, rs, iters := initTest(t)
 	ct := target.DefaultChoiceTable()
 	for i := 0; i < iters; i++ {
-		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 		p1 := p.Clone()
 		data := p.Serialize()
 		data1 := p1.Serialize()
@@ -203,13 +203,13 @@ func TestMutateRandom(t *testing.T) {
 		ct := target.DefaultChoiceTable()
 	next:
 		for i := 0; i < iters; i++ {
-			p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+			p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 			data0 := p.Serialize()
 			p1 := p.Clone()
 			// There is a chance that mutation will produce the same program.
 			// So we check that at least 1 out of 20 mutations actually change the program.
 			for try := 0; try < 20; try++ {
-				p1.Mutate(rs, 10, ct, nil, nil, 0, false, false, &Hmdfs_config{}, 0)
+				p1.Mutate(rs, 10, ct, nil, nil, 0, false, false, &Hmdfs_config{})
 				data := p.Serialize()
 				if !bytes.Equal(data0, data) {
 					t.Fatalf("program changed after mutate\noriginal:\n%s\n\nnew:\n%s\n",
@@ -234,12 +234,12 @@ func TestMutateCorpus(t *testing.T) {
 	ct := target.DefaultChoiceTable()
 	var corpus []*Prog
 	for i := 0; i < 100; i++ {
-		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
 		corpus = append(corpus, p)
 	}
 	for i := 0; i < iters; i++ {
-		p1, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
-		p1.Mutate(rs, 10, ct, [][]*Prog{corpus}, nil, 0, false, false, &Hmdfs_config{}, 0)
+		p1, _ := target.Generate(rs, 10, ct, nil, false, nil, false, &Hmdfs_config{})
+		p1.Mutate(rs, 10, ct, [][]*Prog{corpus}, nil, 0, false, false, &Hmdfs_config{})
 	}
 }
 
@@ -366,12 +366,12 @@ func BenchmarkMutate(b *testing.B) {
 	defer cleanup()
 	ct := target.DefaultChoiceTable()
 	const progLen = 30
-	p, _ := target.Generate(rand.NewSource(0), progLen, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+	p, _ := target.Generate(rand.NewSource(0), progLen, ct, nil, false, nil, false, &Hmdfs_config{})
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		rs := rand.NewSource(0)
 		for pb.Next() {
-			p.Clone().Mutate(rs, progLen, ct, nil, nil, 0, false, false, &Hmdfs_config{}, 0)
+			p.Clone().Mutate(rs, progLen, ct, nil, nil, 0, false, false, &Hmdfs_config{})
 		}
 	})
 }
@@ -385,7 +385,7 @@ func BenchmarkGenerate(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		rs := rand.NewSource(0)
 		for pb.Next() {
-			_, _ = target.Generate(rs, progLen, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+			_, _ = target.Generate(rs, progLen, ct, nil, false, nil, false, &Hmdfs_config{})
 		}
 	})
 }
@@ -410,7 +410,7 @@ func runMutationTests(t *testing.T, tests [][2]string, valid bool) {
 			}
 			for i := 0; i < iters; i++ {
 				p1 := p.Clone()
-				p1.Mutate(rs, len(goal.Calls), ct, nil, nil, 0, false, false, &Hmdfs_config{}, 0)
+				p1.Mutate(rs, len(goal.Calls), ct, nil, nil, 0, false, false, &Hmdfs_config{})
 				data1 := p1.Serialize()
 				if bytes.Equal(want, data1) {
 					if !valid {

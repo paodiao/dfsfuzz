@@ -488,6 +488,9 @@ static __inline__ unsigned long long rdtsc(void);
 double tsc_ns_ratio = 1.0;
 uint64_t tsc_anchor_tsc = 0;
 uint64_t tsc_anchor_ns = 0;
+// Smallest TSC-domain read gap of the accepted calibration round (ticks):
+// an independent upper bound on the anchor error of tsc_ns_to_global().
+uint64_t tsc_best_gap = 0;
 
 // Anchor samples per calibration: preemption between rdtsc() and
 // clock_gettime() skews that sample's phase by milliseconds, and the whole
@@ -551,6 +554,7 @@ static void calibrate_tsc(void) {
   double fb_ratio = 0.0;
   uint64_t fb_t = 0;
   struct timespec fb_ts;
+  uint64_t fb_gap = 0;
   double fb_ratios[CALIB_SAMPLES];
   double fb_rel_spread = 0.0;
   for (int round = 0; round < 2; round++) {
@@ -591,10 +595,12 @@ static void calibrate_tsc(void) {
     fb_ratio = median;
     fb_t = t[0];
     fb_ts = ts[0];
+    fb_gap = best_gap;
     for (int i = 0; i < CALIB_SAMPLES; i++)
       fb_ratios[i] = r[i];
     fb_rel_spread = median > 0 ? spread / median : -1.0;
     if (median > 0 && spread / median <= CALIB_CONSISTENCY_TOL) {
+      tsc_best_gap = best_gap;
       set_tsc_calib(median, t[0], &ts[0]);
       fprintf(stderr,
               "executor %lld tsc calibrate: ratio=%f anchor_tsc=%llu anchor_ns=%llu gap=%llu ratios=[%f %f %f]\n",
@@ -617,17 +623,23 @@ static void calibrate_tsc(void) {
           "executor %lld tsc calibrate: accepting median %f after retries ratios=[%f %f %f] spread/median=%f\n",
           executor_index, fb_ratio, fb_ratios[0], fb_ratios[1], fb_ratios[2],
           fb_rel_spread);
+  tsc_best_gap = fb_gap;
   set_tsc_calib(fb_ratio, fb_t, &fb_ts);
 }
 
 // Convert a bpf_ktime_get_ns() timestamp into the global raw-TSC domain.
+// A timestamp older than the round anchor (clock-domain glitch) clamps to the
+// anchor instead of wrapping the unsigned subtraction.
 uint64_t tsc_ns_to_global(uint64_t ns) {
-  uint64_t tsc = tsc_anchor_tsc + (uint64_t)((double)(ns - tsc_anchor_ns) / tsc_ns_ratio);
+  uint64_t tsc = tsc_anchor_tsc;
+  if (ns >= tsc_anchor_ns)
+    tsc += (uint64_t)((double)(ns - tsc_anchor_ns) / tsc_ns_ratio);
   return tsc - (uint64_t)tsc_offset;
 }
 
 #else
 
+uint64_t tsc_best_gap = 0;
 static void calibrate_tsc(void) {}
 uint64_t tsc_ns_to_global(uint64_t ns) { return ns; }
 

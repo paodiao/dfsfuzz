@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -37,6 +38,10 @@ struct hmdfs_event {
 	unsigned long long ino;
 	unsigned long long args[6];
 	unsigned long long off;
+	unsigned long long size;
+	unsigned long long entry_ino;
+	unsigned int i_mode;
+	unsigned long long entry_ts;
 };
 
 /* ── Per‑tracepoint field descriptor (from /sys/.../format) ──── */
@@ -72,6 +77,7 @@ extern uint64_t tsc_ns_to_global(uint64_t ns);
 extern signed long long int tsc_offset;
 extern uint64_t g_prog_end_raw;
 extern double tsc_ns_ratio;
+extern uint64_t tsc_best_gap;
 
 static struct hmdfs_trace_bpf *skel;
 static struct ring_buffer *rb;
@@ -79,10 +85,14 @@ static struct hmdfs_event collected[MAX_HMDFS_TRACE_EVENTS];
 static int collected_count;
 
 /* ── Ring buffer callback (BPF kretprobe events) ─────────────── */
-static int handle_event(void *ctx, void *data, size_t data_sz) __attribute__((unused));
+static int handle_event(void *ctx, void *data, size_t data_sz);
 static int handle_event(void *ctx, void *data, size_t data_sz)
 {
 	if (collected_count >= MAX_HMDFS_TRACE_EVENTS)
+		return 0;
+	/* Reject records whose size does not match this build's event
+	 * struct (e.g. a stale embedded BPF object / skeleton). */
+	if (data_sz != sizeof(struct hmdfs_event))
 		return 0;
 	memcpy(&collected[collected_count], data,
 	       sizeof(struct hmdfs_event));
@@ -154,6 +164,7 @@ static int find_field(const struct tp_field *fields, int count,
 /* ── Perf: open writepage tracepoint ─────────────────────────── */
 static int open_wb_tracepoint(struct perf_state *ps)
 {
+	ps->fd = -1;
 	/* read tracepoint id */
 	char id_path[256];
 	snprintf(id_path, sizeof(id_path),
@@ -186,6 +197,11 @@ static int open_wb_tracepoint(struct perf_state *ps)
 	attr.size = sizeof(attr);
 	attr.sample_period = 1;
 	attr.sample_type = PERF_SAMPLE_TIME | PERF_SAMPLE_RAW;
+	/* SAMPLE_TIME defaults to local_clock(); use the same clock as the BPF
+	 * halves (bpf_ktime_get_ns = CLOCK_MONOTONIC) so writepage timestamps
+	 * live in the domain the calibration/offsets are anchored to. */
+	attr.use_clockid = 1;
+	attr.clockid = CLOCK_MONOTONIC;
 	attr.disabled = 1;
 	attr.config = tp_id;
 
@@ -219,10 +235,37 @@ static void close_wb_tracepoint(struct perf_state *ps)
 	}
 }
 
+/* ── Perf ring record helpers ───────────────────────────────── */
+/* Largest accepted record: the tracepoint raw sample is ~190 bytes. */
+#define WB_MAX_RECORD 1024
+
+/* ring_read copies n bytes at ring offset off (already modulo data_size),
+ * wrapping at the ring end: perf records may straddle it. */
+static void ring_read(void *dst, const unsigned char *base, uint64_t size,
+		      uint64_t off, uint64_t n)
+{
+	if (off + n <= size) {
+		memcpy(dst, base + off, n);
+		return;
+	}
+	uint64_t first = size - off;
+	memcpy(dst, base + off, first);
+	memcpy((unsigned char *)dst + first, base, n - first);
+}
+
+static uint64_t ring_read_u64(const unsigned char *raw, int off,
+			      uint32_t raw_sz)
+{
+	uint64_t v = 0;
+	if (off >= 0 && (uint64_t)off + 8 <= raw_sz)
+		memcpy(&v, raw + off, 8);
+	return v;
+}
+
 /* ── Perf: drain ring buffer into collected[] ────────────────── */
 static void drain_wb_events(struct perf_state *ps)
 {
-	if (ps->fd < 0)
+	if (ps->fd < 0 || !ps->buf || ps->page_cnt <= 0)
 		return;
 
 	/* The perf ring mmap is not inherited across fork() (the kernel
@@ -247,56 +290,86 @@ static void drain_wb_events(struct perf_state *ps)
 	uint64_t head = __atomic_load_n(&mp->data_head, __ATOMIC_ACQUIRE);
 	uint64_t tail = mp->data_tail;
 
-	uint64_t base = (uint64_t)ps->buf + mp->data_offset;
+	const unsigned char *base = (const unsigned char *)ps->buf + mp->data_offset;
 	uint64_t size = mp->data_size;
+	if (size == 0)
+		return;
 
+	/* Reader fell behind (not expected in non-overwrite mode): drop the
+	 * backlog instead of walking stale bytes (perf's "failed to keep up"
+	 * resync). */
+	if (head - tail > size)
+		tail = head;
+
+	unsigned char rec[WB_MAX_RECORD];
 	while (tail < head) {
 		if (collected_count >= MAX_HMDFS_TRACE_EVENTS)
 			break;
 
-		uint64_t pos = base + (tail % size);
-		struct perf_event_header *hdr =
-			(struct perf_event_header *)pos;
-
-		if (hdr->size == 0 || tail + hdr->size > head)
+		uint64_t off = tail % size;
+		struct perf_event_header hdr;
+		ring_read(&hdr, base, size, off, sizeof(hdr));
+		if (hdr.size < sizeof(hdr) || hdr.size > size ||
+		    tail + hdr.size > head)
 			break;
 
-		/* advance past header to sample data */
-		unsigned char *data = (unsigned char *)(pos + sizeof(*hdr));
-		uint64_t sample_time = *(uint64_t *)data;
-		data += 8;
+		/* Linearize records that straddle the ring end. */
+		const unsigned char *data;
+		if (off + hdr.size <= size) {
+			data = base + off;
+		} else {
+			if (hdr.size > sizeof(rec)) {
+				tail += hdr.size;
+				continue;
+			}
+			ring_read(rec, base, size, off, hdr.size);
+			data = rec;
+		}
+		tail += hdr.size;
 
-		uint32_t raw_sz = *(uint32_t *)data;
-		data += 4;
-		(void)raw_sz;
-		/* data now points at raw trace buffer (common +
-		 * custom fields) — use format offsets */
+		if (hdr.type != PERF_RECORD_SAMPLE)
+			continue; /* LOST and other records have different layouts */
+
+		/* Sample layout: u64 time, u32 raw size, then the raw trace data. */
+		if (hdr.size < sizeof(hdr) + 12)
+			continue;
+		uint64_t sample_time;
+		uint32_t raw_sz;
+		memcpy(&sample_time, data + sizeof(hdr), 8);
+		memcpy(&raw_sz, data + sizeof(hdr) + 8, 4);
+		if (raw_sz > hdr.size - (sizeof(hdr) + 12))
+			continue;
+		const unsigned char *raw = data + sizeof(hdr) + 12;
+
+		int err = 0;
+		if (ps->off_err >= 0 && (uint64_t)ps->off_err + 4 <= raw_sz)
+			memcpy(&err, raw + ps->off_err, 4);
 
 		collected[collected_count].timestamp = sample_time;
 		collected[collected_count].func_id = FUNC_WRITEPAGE_CB;
-		collected[collected_count].ret =
-			ps->off_err >= 0
-			? *(int *)(data + ps->off_err) : 0;
+		collected[collected_count].ret = err;
 		collected[collected_count].ino =
-			ps->off_ino_raw >= 0
-			? *(uint64_t *)(data + ps->off_ino_raw) : 0;
+			ring_read_u64(raw, ps->off_ino_raw, raw_sz);
 		collected[collected_count].args[0] =
-			ps->off_remote_ino >= 0
-			? *(uint64_t *)(data + ps->off_remote_ino) : 0;
+			ring_read_u64(raw, ps->off_remote_ino, raw_sz);
 		collected[collected_count].args[1] =
-			ps->off_device_id >= 0
-			? *(uint64_t *)(data + ps->off_device_id) : 0;
+			ring_read_u64(raw, ps->off_device_id, raw_sz);
 		collected[collected_count].args[2] =
-			ps->off_page_index >= 0
-			? *(unsigned long *)(data + ps->off_page_index)
-			: 0;
+			ring_read_u64(raw, ps->off_page_index, raw_sz);
 		collected[collected_count].args[3] = 0;
 		collected[collected_count].args[4] = 0;
 		collected[collected_count].args[5] = 0;
+		/* No offset/entry semantics for the async writeback
+		 * completion: initialize explicitly (collected[] is a
+		 * static buffer reused across rounds). */
+		collected[collected_count].off = 0;
+		collected[collected_count].size = 0;
+		collected[collected_count].entry_ino = 0;
+		collected[collected_count].i_mode = 0;
+		/* Point event: the sample time is both window start and end. */
+		collected[collected_count].entry_ts = sample_time;
 
 		collected_count++;
-
-		tail += hdr->size;
 	}
 	__atomic_store_n(&mp->data_tail, tail, __ATOMIC_RELEASE);
 }
@@ -328,7 +401,7 @@ void init_hmdfs_trace(void)
 			hmdfs_trace_bpf__destroy(skel);
 			skel = NULL;
 		} else {
-			fprintf(stderr, "hmdfs_trace: %d kretprobes attached\n", 15);
+			fprintf(stderr, "hmdfs_trace: 15 kretprobes + 15 kprobes attached\n");
 		}
 	}
 
@@ -372,8 +445,11 @@ void stop_collect_hmdfs_trace(void)
 			  event_before);
 		/* convert bpf_ktime_get_ns() timestamps to the global
 		 * raw-TSC domain (shared with per-call windows) */
-		for (int i = 0; i < collected_count; i++)
+		for (int i = 0; i < collected_count; i++) {
 			collected[i].timestamp = tsc_ns_to_global(collected[i].timestamp);
+			if (collected[i].entry_ts)
+				collected[i].entry_ts = tsc_ns_to_global(collected[i].entry_ts);
+		}
 	}
 	/* Split into program-phase vs collection-phase events: events before
 	 * g_prog_end_raw (recorded after clt_finish(), converted to the same
@@ -387,11 +463,14 @@ void stop_collect_hmdfs_trace(void)
 		(int)getpid(), collected_count, prog_cnt);
 
 	/* 4. write to output: fixed-point tsc_ns_ratio (×1e9) first, then this
-	 * executor's global-domain tsc_offset (so the fuzzer can refresh its
-	 * static tscoffs after VM restarts), then the event count (always
-	 * written, even when empty), then the events. */
+	 * executor's global-domain tsc_offset, then the accepted calibration gap
+	 * (an independent bound on the conversion error, logged by the parser),
+	 * then the event count (always written, even when empty), then the
+	 * events. The offset is fixed for one QEMU lifetime and the manager
+	 * re-reads it on every fuzzer launch; there is no in-process refresh. */
 	write_output_64((uint64_t)(tsc_ns_ratio * 1000000000.0));
 	write_output_64((uint64_t)tsc_offset);
+	write_output_64(tsc_best_gap);
 	write_output((uint32)collected_count);
 	for (int i = 0; i < collected_count; i++) {
 		write_output_64(collected[i].timestamp);
@@ -401,6 +480,10 @@ void stop_collect_hmdfs_trace(void)
 		for (int j = 0; j < 6; j++)
 			write_output_64(collected[i].args[j]);
 		write_output_64(collected[i].off);
+		write_output_64(collected[i].size);
+		write_output_64(collected[i].entry_ino);
+		write_output(collected[i].i_mode);
+		write_output_64(collected[i].entry_ts);
 	}
 
 	/* 5. reset for the next round: this runs in the parent (loop) process,

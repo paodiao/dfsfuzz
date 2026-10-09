@@ -1551,6 +1551,11 @@ func (mgr *Manager) newInput(inp rpctype.RPCInput, cliSign signal.Signal, srvSig
 		srvCov.Merge(inp.SrvCover)
 		old.CliCover = cliCov.Serialize()
 		old.SrvCover = srvCov.Serialize()
+		// Refresh the execution timeline when the rediscovered input carries
+		// one; never overwrite a stored timeline with an empty payload.
+		if len(inp.Timings) > 0 {
+			old.Timings = inp.Timings
+		}
 		mgr.corpus[sig] = old
 	} else {
 		mgr.corpus[sig] = inp

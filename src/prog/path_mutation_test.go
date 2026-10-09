@@ -68,34 +68,28 @@ func TestPickAnchor(t *testing.T) {
 	}
 }
 
-// TestChooseTemporal covers the temporal-form selection: new combos start at
-// 50/50 (both forms appear), and feedback shifts the choice.
+// TestChooseTemporal covers the Phase 3 temporal-form selection: the learned
+// weights are gone; modifier roots pick 50/50, non-modifier roots always pick
+// the concurrent form.
 func TestChooseTemporal(t *testing.T) {
-	dct := NewDistributedChoiceTable("fileops")
+	dct := NewDistributedChoiceTable()
 	r := rand.New(rand.NewSource(1))
-	root := "write"
 	variant := CallVariant{CallName: "read", PathRelation: PathSame}
 
 	seen := map[TemporalRel]int{}
 	for i := 0; i < 40; i++ {
-		seen[dct.ChooseTemporal(root, variant, r)]++
+		seen[dct.ChooseTemporal("write", variant, r)]++
 	}
 	if seen[TemporalConcurrent] == 0 || seen[TemporalHB] == 0 {
-		t.Fatalf("50/50 start not observed: %v", seen)
+		t.Fatalf("modifier root 50/50 not observed: %v", seen)
 	}
 
-	// Reward the HB form 8 times: the choice must shift toward HB.
-	for i := 0; i < 8; i++ {
-		dct.UpdateTemporalWeight(root, variant, TemporalHB)
-	}
-	hb := 0
+	// Non-modifier roots (open/read/pread64/stat/getdents64): an HB placement
+	// after such a root cannot produce an HB pair of this combo.
 	for i := 0; i < 40; i++ {
-		if dct.ChooseTemporal(root, variant, r) == TemporalHB {
-			hb++
+		if got := dct.ChooseTemporal("read", variant, r); got != TemporalConcurrent {
+			t.Fatalf("non-modifier root chose %v, want concurrent", got)
 		}
-	}
-	if hb < 30 {
-		t.Fatalf("HB form not preferred after rewards: %v/40", hb)
 	}
 }
 
@@ -143,68 +137,92 @@ func TestDagPairToVariantTemporal(t *testing.T) {
 	}
 }
 
-// TestMarkYieldRewardsWeight verifies that a yield (novel concurrent pair)
-// rewards the combo: weight +1 per yield, capped at maxComboWeight.
-func TestMarkYieldRewardsWeight(t *testing.T) {
-	dct := NewDistributedChoiceTable("fileops")
-	root := "write"
-	variant := CallVariant{CallName: "read", PathRelation: PathSame}
-	w0 := dct.WeightOf(root, variant)
-	dct.MarkYield(root, variant)
-	if w := dct.WeightOf(root, variant); w != w0+1 {
-		t.Fatalf("weight after yield = %v, want %v", w, w0+1)
+// TestDagRelToDctRelRenamePrePost pins the direction mapping on the same
+// pre/post path basis as determinePathRel: a rename vertex's relation is
+// established through its pre path (source), so a post-only check would drop
+// the variant-rename Parent and root-rename Child forms (and the
+// rename-rename combinations).
+func TestDagRelToDctRelRenamePrePost(t *testing.T) {
+	mkRename := func(dst, src string) *DAGVertex {
+		return &DAGVertex{FuncID: FuncRename, CallName: "rename", Path: dst, OldPath: src}
 	}
-	// Explored set and NoYield reset alongside the reward.
-	dct.MarkYield(root, variant)
-	if !dct.Explored[root][variant] {
-		t.Fatal("MarkYield did not set Explored")
+	mkCall := func(name string, fid uint32, path string) *DAGVertex {
+		return &DAGVertex{CallName: name, FuncID: fid, Path: path}
 	}
-	if dct.NoYield[root][variant] != 0 {
-		t.Fatalf("MarkYield did not reset NoYield: %v", dct.NoYield[root][variant])
+	cases := []struct {
+		name string
+		pair DAGPair
+		want PathRelation
+		ok   bool
+	}{
+		{
+			// Variant rename with Parent: B src = parent of A, B dst = a
+			// same-parent sibling of that parent.
+			name: "variant rename Parent",
+			pair: DAGPair{
+				A:       mkCall("stat", FuncGetattr, "merge_view/d/a"),
+				B:       mkRename("merge_view/d/sib._renamed_x", "merge_view/d"),
+				PathRel: PathParentChild, Temporal: TemporalConcurrent,
+			},
+			want: PathParent, ok: true,
+		},
+		{
+			// Root rename with Child: B is a child of the root's source; the
+			// root destination is a fresh sibling of the source.
+			name: "root rename Child",
+			pair: DAGPair{
+				A:       mkRename("merge_view/d/a._renamed_x", "merge_view/d/a"),
+				B:       mkCall("creat", FuncCreate, "merge_view/d/a/c"),
+				PathRel: PathParentChild, Temporal: TemporalConcurrent,
+			},
+			want: PathChild, ok: true,
+		},
+		{
+			// Rename x rename: B src = parent of A src, the two destinations
+			// are unrelated; the relation only holds through the pre paths.
+			name: "rename rename Parent",
+			pair: DAGPair{
+				A:       mkRename("merge_view/d/a._renamed_x", "merge_view/d/a"),
+				B:       mkRename("merge_view/d/._renamed_y", "merge_view/d"),
+				PathRel: PathParentChild, Temporal: TemporalConcurrent,
+			},
+			want: PathParent, ok: true,
+		},
+		{
+			// Unrelated rename paths stay unmapped. Defensive only: the
+			// extractor never classifies unrelated paths as PathParentChild
+			// (it requires an ancestry relation), so this pins the fallback
+			// branch against hand-built/inconsistent inputs.
+			name: "unrelated rename",
+			pair: DAGPair{
+				A:       mkCall("stat", FuncGetattr, "merge_view/d/a"),
+				B:       mkRename("merge_view/x/b._renamed_x", "merge_view/x/b"),
+				PathRel: PathParentChild, Temporal: TemporalConcurrent,
+			},
+			want: 0, ok: false,
+		},
+		{
+			// Without rename the post-only and pre/post bases coincide.
+			name: "plain child",
+			pair: DAGPair{
+				A:       mkCall("stat", FuncGetattr, "merge_view/d"),
+				B:       mkCall("creat", FuncCreate, "merge_view/d/a"),
+				PathRel: PathParentChild, Temporal: TemporalConcurrent,
+			},
+			want: PathChild, ok: true,
+		},
 	}
-	// Reward is capped at maxComboWeight.
-	for i := 0; i < 200; i++ {
-		dct.MarkYield(root, variant)
+	for _, tc := range cases {
+		rel, ok := dagRelToDctRel(&tc.pair)
+		if ok != tc.ok || (ok && rel != tc.want) {
+			t.Fatalf("%s: rel=%v ok=%v, want rel=%v ok=%v", tc.name, rel, ok, tc.want, tc.ok)
+		}
 	}
-	if w := dct.WeightOf(root, variant); w > maxComboWeight {
-		t.Fatalf("weight %v exceeds cap %v", w, maxComboWeight)
-	}
-}
-
-// TestNoYieldDownweightFloor verifies the down-weight floor semantics: combos
-// above noYieldDelta decay by noYieldDelta; combos in (1, noYieldDelta] drop
-// straight to 1 on the next trigger; weight 1 is the floor.
-func TestNoYieldDownweightFloor(t *testing.T) {
-	dct := NewDistributedChoiceTable("fileops")
-	root := "write"
-	variant := CallVariant{CallName: "read", PathRelation: PathSame}
-	// Pre-fill the no-yield counter so the next selection triggers a decay.
-	if dct.NoYield[root] == nil {
-		dct.NoYield[root] = make(map[CallVariant]int)
-	}
-
-	// w = 5 (in (1, noYieldDelta]): one trigger drops it to 1.
-	dct.Weights[root][variant] = 5
-	dct.NoYield[root][variant] = noYieldThreshold - 1
-	dct.noYieldTick(root, variant)
-	if w := dct.WeightOf(root, variant); w != 1 {
-		t.Fatalf("w=5 after trigger = %v, want 1", w)
-	}
-
-	// w = 1 (floor): trigger does not drop further.
-	dct.Weights[root][variant] = 1
-	dct.NoYield[root][variant] = noYieldThreshold - 1
-	dct.noYieldTick(root, variant)
-	if w := dct.WeightOf(root, variant); w != 1 {
-		t.Fatalf("w=1 after trigger = %v, want 1", w)
-	}
-
-	// w = 30 (above noYieldDelta): decays by noYieldDelta (25).
-	dct.Weights[root][variant] = 30
-	dct.NoYield[root][variant] = noYieldThreshold - 1
-	dct.noYieldTick(root, variant)
-	if w := dct.WeightOf(root, variant); w != 30-noYieldDelta {
-		t.Fatalf("w=30 after trigger = %v, want %v", w, 30-noYieldDelta)
+	// DagPairToVariant surfaces the mapped relation end to end.
+	pair := cases[0].pair
+	root, variant, _, ok := DagPairToVariant(&pair)
+	if !ok || root != "stat" || variant.CallName != "rename" || variant.PathRelation != PathParent {
+		t.Fatalf("variant rename Parent mapping: root=%v variant=%+v ok=%v", root, variant, ok)
 	}
 }
 
@@ -213,7 +231,18 @@ func TestNoYieldDownweightFloor(t *testing.T) {
 // size-r <= pos < size with r = size % 4096), zero, mid, and NA.
 func TestOffsetBucketOf(t *testing.T) {
 	mkV := func(fid uint32, off, size uint64) *DAGVertex {
-		return &DAGVertex{FuncID: fid, Off: off, Size: size}
+		name := ""
+		switch fid {
+		case FuncWrite:
+			name = "write"
+		case FuncRead:
+			name = "read"
+		case FuncSetattr:
+			name = "truncate"
+		case FuncMkdir:
+			name = "mkdir"
+		}
+		return &DAGVertex{FuncID: fid, CallName: name, Off: off, Size: size}
 	}
 	// Non-offset funcs are NA regardless of off/size.
 	if b := offsetBucketOf(mkV(FuncMkdir, 100, 1000)); b != offsetBucketNA {
@@ -251,17 +280,25 @@ func TestOffsetBucketOf(t *testing.T) {
 	if b := offsetBucketOf(mkV(FuncSetattr, 2000, 1000)); b != offsetBucketBeyond {
 		t.Fatalf("truncate@2000/1000 bucket = %v, want Beyond", b)
 	}
+	// chmod/utime share FuncSetattr but carry no ia_size: the name-level gate
+	// must classify their off=0 as NA, not Zero (same as truncate@0).
+	if b := offsetBucketOf(&DAGVertex{FuncID: FuncSetattr, CallName: "chmod", Off: 0, Size: 1000}); b != offsetBucketNA {
+		t.Fatalf("chmod bucket = %v, want NA", b)
+	}
+	if b := offsetBucketOf(&DAGVertex{FuncID: FuncSetattr, CallName: "utime", Off: 0, Size: 1000}); b != offsetBucketNA {
+		t.Fatalf("utime bucket = %v, want NA", b)
+	}
 }
 
 // TestFeaturesOfOffsetLayout asserts the offset bucket sits at bits 12-14 of
 // the feature vector and distinct buckets produce distinct feature values.
 func TestFeaturesOfOffsetLayout(t *testing.T) {
 	mkV := func(fid uint32, off, size uint64) *DAGVertex {
-		return &DAGVertex{FuncID: fid, Path: "merge_view/a", RetBucket: RetSuccess, Off: off, Size: size}
+		return &DAGVertex{FuncID: fid, CallName: "write", Path: "merge_view/a", RetBucket: RetSuccess, Off: off, Size: size}
 	}
-	f0 := featuresOf(mkV(FuncWrite, 0, 1000), nil)     // Zero
-	f1 := featuresOf(mkV(FuncWrite, 500, 1000), nil)   // Mid
-	f2 := featuresOf(mkV(FuncWrite, 995, 1000), nil)   // Beyond? 995<1000 -> 995>=1000-1000%4096? size=1000 r=1000 -> size-r=0 -> Tail
+	f0 := featuresOf(mkV(FuncWrite, 0, 1000), nil)   // Zero
+	f1 := featuresOf(mkV(FuncWrite, 500, 1000), nil) // Mid
+	f2 := featuresOf(mkV(FuncWrite, 995, 1000), nil) // Beyond? 995<1000 -> 995>=1000-1000%4096? size=1000 r=1000 -> size-r=0 -> Tail
 	if f0 == f1 || f1 == f2 || f0 == f2 {
 		t.Fatalf("offset buckets collide: %v %v %v", f0, f1, f2)
 	}
@@ -270,5 +307,73 @@ func TestFeaturesOfOffsetLayout(t *testing.T) {
 	}
 	if f0>>12&7 != offsetBucketZero || f1>>12&7 != offsetBucketMid || f2>>12&7 != offsetBucketTail {
 		t.Fatalf("offset bits wrong: %v %v %v", f0>>12&7, f1>>12&7, f2>>12&7)
+	}
+}
+
+// TestProgTimingsRoundTrip covers the corpus timeline transfer added for
+// fuzzer restarts: ProgTimings extracts per-call [Stime, Etime] pairs (0/0 for
+// calls without CheckInfo) and ApplyProgTimings restores them on a fresh copy,
+// leaving missing calls nil, never overwriting an existing CheckInfo and
+// ignoring shape mismatches.
+func TestProgTimingsRoundTrip(t *testing.T) {
+	target := smokeTarget(t)
+	mk := func(stime, etime uint64) *Call {
+		return &Call{CheckInfo: &FileMetadata{Stime: stime, Etime: etime}}
+	}
+	ps := []*Prog{{
+		Target: target,
+		Calls:  []*Call{mk(100, 200), {}, mk(300, 400)},
+	}}
+	timings := ProgTimings(ps)
+	if len(timings) != 1 || len(timings[0]) != 6 {
+		t.Fatalf("ProgTimings shape = %v, want 1x6", timings)
+	}
+	want := []uint64{100, 200, 0, 0, 300, 400}
+	for i, v := range want {
+		if timings[0][i] != v {
+			t.Fatalf("timings[0][%d] = %d, want %d", i, timings[0][i], v)
+		}
+	}
+
+	fresh := &Prog{Target: target, Calls: []*Call{{}, {}, {}}}
+	if n := ApplyProgTimings([]*Prog{fresh}, timings); n != 2 {
+		t.Fatalf("ApplyProgTimings restored %d calls, want 2", n)
+	}
+	if ci := fresh.Calls[0].CheckInfo; ci == nil || ci.Stime != 100 || ci.Etime != 200 {
+		t.Fatalf("call0 CheckInfo not restored: %+v", ci)
+	}
+	if fresh.Calls[1].CheckInfo != nil {
+		t.Fatal("0/0 pair must leave CheckInfo nil")
+	}
+	if ci := fresh.Calls[2].CheckInfo; ci == nil || ci.Stime != 300 || ci.Etime != 400 {
+		t.Fatalf("call2 CheckInfo not restored: %+v", ci)
+	}
+
+	// Existing CheckInfo is never overwritten: the prog matches the payload
+	// shape, so the per-call guard (not the shape guard) is what skips call 0.
+	keep := &Prog{Target: target, Calls: []*Call{mk(1, 2), {}, {}}}
+	if n := ApplyProgTimings([]*Prog{keep}, timings); n != 1 {
+		t.Fatalf("existing CheckInfo restored count = %d, want 1", n)
+	}
+	if ci := keep.Calls[0].CheckInfo; ci == nil || ci.Stime != 1 || ci.Etime != 2 {
+		t.Fatalf("ApplyProgTimings overwrote an existing CheckInfo: %+v", ci)
+	}
+	if ci := keep.Calls[2].CheckInfo; ci == nil || ci.Stime != 300 || ci.Etime != 400 {
+		t.Fatalf("call2 CheckInfo not restored: %+v", ci)
+	}
+	// A short (mismatched) payload is ignored.
+	if n := ApplyProgTimings([]*Prog{fresh}, [][]uint64{{1, 2}}); n != 0 {
+		t.Fatalf("short payload restored count = %d, want 0", n)
+	}
+	if fresh.Calls[0].CheckInfo.Stime != 100 || fresh.Calls[0].CheckInfo.Etime != 200 {
+		t.Fatal("short timing payload must be ignored")
+	}
+	// A longer payload must not restore by index (misaligned layout).
+	long := &Prog{Target: target, Calls: []*Call{{}}}
+	if n := ApplyProgTimings([]*Prog{long}, [][]uint64{{5, 6, 7, 8}}); n != 0 {
+		t.Fatalf("long payload restored count = %d, want 0", n)
+	}
+	if long.Calls[0].CheckInfo != nil {
+		t.Fatal("long payload must not restore a misaligned CheckInfo")
 	}
 }

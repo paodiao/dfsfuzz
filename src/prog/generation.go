@@ -10,7 +10,7 @@ import (
 // Generate generates a random program with ncalls calls.
 // ct contains a set of allowed syscalls, if nil all syscalls are used.
 func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable, files map[string]bool, isForSrv bool,
-	sCalls *SpecialCalls, enableC2san bool, hmcfg *Hmdfs_config, idx int) (*Prog, map[string]bool) {
+	sCalls *SpecialCalls, enableC2san bool, hmcfg *Hmdfs_config) (*Prog, map[string]bool) {
 	p := &Prog{
 		Target: target,
 		//IsForSrv: isForSrv,
@@ -22,7 +22,6 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable, file
 
 	r := newRand(target, rs)
 	r.hmcfg = hmcfg
-	r.curIdx = idx
 	s := newState(target, ct, nil)
 	//Add file set from previously generated syscalls to new state
 	for file, _ := range files {
@@ -253,20 +252,20 @@ func (target *Target) GenerateProgsForHmdfsDcache(rs rand.Source, sCalls *Specia
 	return ps
 }
 
-func (target *Target) GenerateProgsForHmdfsInodeops(rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config) []*Prog {
+func (target *Target) GenerateProgsForHmdfsFsops(rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config) []*Prog {
 	var ps []*Prog
 
 	r := newRand(target, rs)
 	r.hmcfg = hmcfg
 	s := newState(target, nil, nil)
 
-	lcs := NewLayeredChoiceStrategy("inodeops", hmcfg, target)
+	lcs := NewLayeredChoiceStrategy(hmcfg, target)
 
 	if lcs.ShouldUsePattern(r.Rand) {
-		ps = r.generateFromPredefinedPattern(s, sCalls, hmcfg, lcs, "inodeops")
-		r.expandWithDCT(ps, sCalls, hmcfg, lcs, "inodeops")
+		ps = r.generateFromPredefinedPattern(s, sCalls, hmcfg, lcs)
+		r.expandWithDCT(ps, sCalls, hmcfg, lcs)
 	} else {
-		ps = r.generateDCTMultiRound(s, sCalls, hmcfg, lcs, "inodeops")
+		ps = r.generateDCTMultiRound(s, sCalls, hmcfg, lcs)
 	}
 
 	if len(ps) == 0 {
@@ -275,9 +274,10 @@ func (target *Target) GenerateProgsForHmdfsInodeops(rs rand.Source, sCalls *Spec
 			testDir = "merge_view"
 		}
 
-		testType := r.Intn(6)
-
-		switch testType {
+		// Uniformly pick one of the legacy fallback generators (6 dir-centric
+		// + 3 file-centric); used only when the DCT/pattern path yielded
+		// nothing.
+		switch r.Intn(9) {
 		case 0:
 			ps = r.generateFileopsSetattrConcurrent(s, sCalls, hmcfg, testDir)
 		case 1:
@@ -290,46 +290,17 @@ func (target *Target) GenerateProgsForHmdfsInodeops(rs rand.Source, sCalls *Spec
 			ps = r.generateConcurrentInodeOps(s, sCalls, hmcfg, testDir)
 		case 5:
 			ps = r.generateConcurrentRenameOps(s, sCalls, hmcfg, testDir)
-		}
-	}
-
-	for _, p := range ps {
-		p.IsInodeOps = true
-	}
-	return ps
-}
-
-func (target *Target) GenerateProgsForHmdfsFileops(rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config) []*Prog {
-	var ps []*Prog
-
-	r := newRand(target, rs)
-	r.hmcfg = hmcfg
-	s := newState(target, nil, nil)
-
-	lcs := NewLayeredChoiceStrategy("fileops", hmcfg, target)
-
-	if lcs.ShouldUsePattern(r.Rand) {
-		ps = r.generateFromPredefinedPattern(s, sCalls, hmcfg, lcs, "fileops")
-		r.expandWithDCT(ps, sCalls, hmcfg, lcs, "fileops")
-	} else {
-		ps = r.generateDCTMultiRound(s, sCalls, hmcfg, lcs, "fileops")
-	}
-
-	if len(ps) == 0 {
-		testType := r.Intn(3)
-
-		switch testType {
-		case 0:
+		case 6:
 			ps = r.generateProgsForConcurrentRW(s, sCalls, hmcfg)
-		case 1:
+		case 7:
 			ps = r.generateProgsForFsyncTest(s, sCalls, hmcfg)
-		case 2:
+		case 8:
 			ps = r.generateProgsForAppendTest(s, sCalls, hmcfg)
 		}
 	}
 
 	for _, p := range ps {
-		p.IsFileOps = true
+		p.IsFsops = true
 	}
 	return ps
 }
@@ -341,7 +312,7 @@ func (target *Target) GenerateProgsForHmdfsFileops(rs rand.Source, sCalls *Speci
 // mkdir/creat preprocessing, fd lifecycle handling and time-aligned variants
 // are inherited from insertCallFromDCT.
 func (r *randGen) expandWithDCT(ps []*Prog, sCalls *SpecialCalls, hmcfg *Hmdfs_config,
-	lcs *LayeredChoiceStrategy, seedType string) {
+	lcs *LayeredChoiceStrategy) {
 	if len(ps) == 0 {
 		return
 	}
@@ -351,8 +322,8 @@ func (r *randGen) expandWithDCT(ps []*Prog, sCalls *SpecialCalls, hmcfg *Hmdfs_c
 		if avgCalls(ps) >= target {
 			break
 		}
-		if !insertCallFromDCT(ps, r, nil, sCalls, hmcfg, lcs, seedType) {
-			failed++ // ct is a dead parameter (unused inside); stop after 3 consecutive failures
+		if !insertCallFromDCT(ps, r, sCalls, hmcfg, lcs, true) {
+			failed++ // stop after 3 consecutive failures
 			continue
 		}
 		failed = 0
@@ -362,12 +333,12 @@ func (r *randGen) expandWithDCT(ps []*Prog, sCalls *SpecialCalls, hmcfg *Hmdfs_c
 // generateDCTMultiRound builds a minimal DCT seed, then grows it with
 // expandWithDCT (multi-group programs with continuous fd lifecycles).
 func (r *randGen) generateDCTMultiRound(s *state, sCalls *SpecialCalls, hmcfg *Hmdfs_config,
-	lcs *LayeredChoiceStrategy, seedType string) []*Prog {
-	ps := r.generateFromDistributedChoiceTable(s, sCalls, hmcfg, lcs, seedType)
+	lcs *LayeredChoiceStrategy) []*Prog {
+	ps := r.generateFromDistributedChoiceTable(s, sCalls, hmcfg, lcs)
 	if len(ps) == 0 {
 		return ps
 	}
-	r.expandWithDCT(ps, sCalls, hmcfg, lcs, seedType)
+	r.expandWithDCT(ps, sCalls, hmcfg, lcs)
 	return ps
 }
 

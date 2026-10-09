@@ -82,8 +82,8 @@ type DAGVertex struct {
 	Ino       uint64
 	ProgIdx   int
 	IsDir     bool
-	Off       uint64 // write/read: kiocb->ki_pos; truncate: ia_size; else 0
-	Size      uint64 // file size at execution (post-exec fsMd)
+	Off       uint64 // entry position: write/read entry ki_pos (O_APPEND=EOF); truncate ia_size; else 0
+	Size      uint64 // entry-time file size for write/read/truncate (entry kprobe); else 0
 }
 
 // DAGPair is an ordered pair of vertices with temporal and path relations.
@@ -146,6 +146,10 @@ type DagDiag struct {
 	PersistHist   [2]int     // 0 = non-persistence path, 1 = under hmcfg.Persistence_dir
 	TypeHist      [2]int     // 0 = file, 1 = dir
 	RetByFunc     [16][6]int // matched vertices per (FuncID, RetBucket)
+	OffByCall     [6][5]int  // matched vertices per (off-call row, offset bucket)
+	TypeByFunc    [16][2]int // matched vertices per (FuncID, 0=file 1=dir)
+	InoByFunc     [16][4]int // namespace funcs: 0=EntryIno==0, 1=EntryIno==0 and RetSuccess (capture-failure alarm; RENAME fresh-dst successes legitimately land here — the upper new_dentry has no inode until VFS's post-rename d_move, which runs after the kretprobe; the BPF entry fallback supplies the event-time type), 2=EntryIno!=Ino, 3=EntryIno==Ino
+	RelHist       [5]int     // produced hb+cc pairs per PathRel (SamePath..None)
 	PairRetCombos [6][6]int  // produced hb+cc pairs per (A.RetBucket, B.RetBucket)
 }
 
@@ -162,6 +166,20 @@ type deleteEvent struct {
 	ret  int32 // kernel return value: only ret==0 deletes remove the path
 }
 
+// inoKey is the shared reverse-lookup key: the writepage tracepoint only
+// carries i_ino&0xFFFFFFFF while the kprobe events carry the full composed
+// DOMAIN:dev_id:ino_raw value.
+func inoKey(ino uint64) uint64 {
+	return ino & 0xFFFFFFFF
+}
+
+// pathInDir reports whether path is dir itself or a descendant of it. A plain
+// string prefix is not enough: "merge_view/persist" must not match a sibling
+// named "merge_view/persistent".
+func pathInDir(path, dir string) bool {
+	return dir != "" && (path == dir || strings.HasPrefix(path, dir+"/"))
+}
+
 // BuildVertices maps eBPF trace events to concrete (func, path) vertices.
 // Events without a resolvable path are dropped.
 func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
@@ -171,13 +189,12 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 	diag := &DagDiag{Events: len(events)}
 
 	// 1. per-node ino -> path (inos are node-local; cross-node the same file
-	// has a different ino, so lookups must use the event's own node first)
-	// and path -> isDir from the post-execution fsMd state. The merged map
-	// is kept as a fallback for nodes whose fsMd is missing.
+	// has a different ino, so lookups must use the event's own node first).
+	// nodeType is the post-execution fallback for vertices whose event did
+	// not carry an i_mode (e.g. negative lookups).
 	inoToPathByNode := make(map[int]map[uint64]string)
 	inoToPath := make(map[uint64]string)
 	nodeType := make(map[string]bool)
-	pathSize := make(map[string]uint64)
 	for nodeIdx, fsMd := range fsMds {
 		if fsMd == nil {
 			continue
@@ -185,7 +202,7 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		m := make(map[uint64]string, len(fsMd))
 		for path, md := range fsMd {
 			path = NormalizeMergeViewPath(path) // fsMd keys are "./<rel>" — align with call-argument paths
-			ino := md.StatMd.Ino & 0xFFFFFFFF
+			ino := inoKey(md.StatMd.Ino)
 			if _, ok := m[ino]; !ok {
 				m[ino] = path
 			}
@@ -193,9 +210,6 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 				inoToPath[ino] = path
 			}
 			nodeType[path] = md.StatMd.Mode&syscall.S_IFMT == syscall.S_IFDIR
-			if md.StatMd.Size >= 0 {
-				pathSize[path] = uint64(md.StatMd.Size)
-			}
 		}
 		inoToPathByNode[nodeIdx] = m
 	}
@@ -227,7 +241,7 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 				if deleteTLByNode[ev.ProgIdx] == nil {
 					deleteTLByNode[ev.ProgIdx] = make(map[uint64][]deleteEvent)
 				}
-				deleteTLByNode[ev.ProgIdx][ev.Ino] = append(deleteTLByNode[ev.ProgIdx][ev.Ino],
+				deleteTLByNode[ev.ProgIdx][inoKey(ev.Ino)] = append(deleteTLByNode[ev.ProgIdx][inoKey(ev.Ino)],
 					deleteEvent{ts: ev.Timestamp, path: path, ret: ev.Ret})
 			}
 		}
@@ -257,25 +271,37 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		v := DAGVertex{
 			FuncID:    ev.FuncID,
 			RetBucket: bucketizeRet(ev.FuncID, ev.Ret),
-			Ino:       ev.Ino,
+			Ino:       vertexIno(ev),
 			ProgIdx:   ev.ProgIdx,
 		}
 		switch ev.FuncID {
 		case FuncWritepage:
 			// Async callback: no call window, point-in-time vertex.
 			v.Stime, v.Etime = ev.Timestamp, ev.Timestamp
+			// Current (post-execution) path when the file still exists.
 			pth := ""
 			if m, ok := inoToPathByNode[ev.ProgIdx]; ok {
-				pth = m[ev.Ino&0xFFFFFFFF]
+				pth = m[inoKey(ev.Ino)]
+			}
+			// Already-unlinked files: the node-local delete timeline is
+			// authoritative, so consult it before the merged cross-node map
+			// (raw inos are node-local).
+			deleted := false
+			if pth == "" {
+				if d := deletePathAt(ev.ProgIdx, inoKey(ev.Ino), ev.Timestamp, deleteTLByNode); d != "" {
+					pth, deleted = d, true
+				}
 			}
 			if pth == "" {
-				pth = inoToPath[ev.Ino&0xFFFFFFFF]
+				pth = inoToPath[inoKey(ev.Ino)]
 			}
-			if pth != "" {
-				pth = renamePathAt(pth, ev.Timestamp, renameTLByPath)
-			}
-			if pth == "" {
-				pth = deletePathAt(ev.ProgIdx, ev.Ino, ev.Timestamp, deleteTLByNode)
+			// A delete-time path is a historical snapshot: a later rename of
+			// the same path string belongs to a different file. renamePathAt
+			// returns "" when no earlier rename applies, so keep pth then.
+			if pth != "" && !deleted {
+				if renamed := renamePathAt(pth, ev.Timestamp, renameTLByPath); renamed != "" {
+					pth = renamed
+				}
 			}
 			v.Path = pth
 		default:
@@ -341,33 +367,46 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 			off := tscoffFor(tscoffs, ev.ProgIdx)
 			ws := int64(ci.Stime) - off
 			we := int64(ci.Etime) - off
-			// Distance to the nearest window edge (inside the window).
-			dist := int64(ev.Timestamp) - ws
-			if d2 := we - int64(ev.Timestamp); d2 < dist {
-				dist = d2
+			evStart, evEnd := eventEdges(ev)
+			// Distance to the raw call window (0 inside; tolerance admissions
+			// get their true edge distance instead of folding into bucket 0).
+			// Both endpoints of the event's own window must be admitted, so
+			// the farther of the two edges decides.
+			dist := edgeDist(evStart, ws, we)
+			if d := edgeDist(evEnd, ws, we); d > dist {
+				dist = d
 			}
 			diag.MatchDistIn[matchDistBucket(dist)]++
-			v.Stime = uint64(ws)
-			v.Etime = uint64(we)
+			// Vertex time is the event's own execution window (entry kprobe ->
+			// return probe), not the enclosing syscall window: the call window
+			// is only the attribution/filter bound. Fall back to the call
+			// window when the entry state was lost.
+			if ev.EntryTs != 0 && ev.EntryTs <= ev.Timestamp {
+				v.Stime, v.Etime = ev.EntryTs, ev.Timestamp
+			} else {
+				v.Stime, v.Etime = uint64(ws), uint64(we)
+			}
+			refTs := eventRefTs(ev)
 			switch ev.FuncID {
 			case FuncMkdir, FuncCreate:
 				v.Path = extractPathFromCall(call)
 			case FuncRmdir, FuncUnlink:
+				// The call argument is the path used at execution time; a
+				// rename-timeline rewrite would corrupt a re-created path.
 				v.Path = extractPathFromCall(call)
-				if pth := renamePathAt(v.Path, ev.Timestamp, renameTLByPath); pth != "" {
-					v.Path = pth
-				}
 			case FuncRename:
 				v.OldPath, v.Path = extractRenamePaths(call)
 			case FuncLookup:
-				v.Path = lookupPath(ev, call, inoToPathByNode, inoToPath)
+				v.Path, v.OldPath = lookupPath(ev, call, inoToPathByNode, inoToPath)
 			default:
 				v.Path = extractPathFromCall(call)
 				if v.Path == "" {
+					// FD-derived paths come from an earlier open call and may
+					// predate a rename: rewrite them to the current path only.
 					v.Path = resolveFdToPath(p, call)
-				}
-				if pth := renamePathAt(v.Path, ev.Timestamp, renameTLByPath); pth != "" {
-					v.Path = pth
+					if pth := renamePathAt(v.Path, uint64(refTs), renameTLByPath); pth != "" {
+						v.Path = pth
+					}
 				}
 			}
 		}
@@ -375,9 +414,9 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 			diag.PathEmpty++
 			continue
 		}
-		v.IsDir = nodeType[v.Path]
+		v.IsDir = eventIsDir(ev, nodeType[v.Path])
 		v.Off = ev.Off
-		v.Size = pathSize[v.Path]
+		v.Size = ev.Size
 		if int(v.FuncID) < len(diag.PerFuncVertices) {
 			diag.PerFuncVertices[v.FuncID]++
 		}
@@ -399,11 +438,12 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		} else {
 			diag.TypeHist[0]++
 		}
-		if hmcfg != nil && hmcfg.Persistence_dir != "" && strings.HasPrefix(v.Path, hmcfg.Persistence_dir) {
+		if hmcfg != nil && pathInDir(v.Path, hmcfg.Persistence_dir) {
 			diag.PersistHist[1]++
 		} else {
 			diag.PersistHist[0]++
 		}
+		recordCallTypeIno(diag, ev, &v)
 		vertices = append(vertices, v)
 		if diag.PerNodeVertices == nil {
 			diag.PerNodeVertices = make([]int, len(ps))
@@ -418,6 +458,122 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		return vertices[i].Stime < vertices[j].Stime
 	})
 	return vertices, diag
+}
+
+// isEntryInoFunc reports whether the event's Ino field is the PARENT
+// directory (old parent for rename) rather than the operation's own entry.
+// For these functions the vertex must use EntryIno instead (0 when the
+// entry is unknown, e.g. a negative lookup).
+func isEntryInoFunc(fid uint32) bool {
+	switch fid {
+	case FuncMkdir, FuncCreate, FuncRename, FuncLookup:
+		return true
+	}
+	return false
+}
+
+// vertexIno returns the inode that identifies the operation's own entry:
+// EntryIno for the parent-inode functions (never falling back to the
+// parent), the event's Ino for everyone else.
+func vertexIno(ev *HmdfsTraceEvent) uint64 {
+	if isEntryInoFunc(ev.FuncID) {
+		return ev.EntryIno
+	}
+	return ev.Ino
+}
+
+// eventIsDir decides whether the vertex's path is a directory. The
+// event-time i_mode wins, then the operation's unambiguous entry type for
+// functions that can only create/delete/open one kind (fixing the
+// post-execution fsMd skew where e.g. a removed directory is no longer
+// listed and would be typed as a file), and only then the post-execution
+// nodeType fallback.
+func eventIsDir(ev *HmdfsTraceEvent, fallback bool) bool {
+	if ev.Mode != 0 {
+		return ev.Mode&syscall.S_IFMT == syscall.S_IFDIR
+	}
+	if d, known := funcDefaultIsDir(ev.FuncID); known {
+		return d
+	}
+	return fallback
+}
+
+// funcDefaultIsDir returns the operation's unambiguous entry type and
+// whether it is known from the function alone.
+func funcDefaultIsDir(fid uint32) (isDir bool, known bool) {
+	switch fid {
+	case FuncMkdir, FuncRmdir, FuncDirOpen, FuncIterate:
+		return true, true
+	case FuncCreate, FuncUnlink, FuncWrite, FuncRead, FuncFileOpen,
+		FuncFsync, FuncWritepage:
+		return false, true
+	}
+	return false, false
+}
+
+// OffCallNames is the fixed row order of DagDiag.OffByCall.
+var OffCallNames = [6]string{"write", "read", "pwrite64", "pread64", "truncate", "chmod"}
+
+// offCallRow maps a call name to the OffByCall row. CallName may carry
+// variant suffixes (mirroring the Contains style of isWriteCall etc.), so the
+// more specific names are matched first; non-offset calls and empty names
+// return -1 (not counted).
+func offCallRow(name string) int {
+	switch {
+	case strings.Contains(name, "pwrite64"):
+		return 2
+	case strings.Contains(name, "pread64"):
+		return 3
+	case strings.Contains(name, "truncate"):
+		return 4
+	case strings.Contains(name, "chmod"):
+		return 5
+	case strings.Contains(name, "write"):
+		return 0
+	case strings.Contains(name, "read"):
+		return 1
+	}
+	return -1
+}
+
+// recordCallTypeIno fills the per-call-type diagnostic marginals of matched
+// vertices: the entry-semantics offset bucket per offset-call row, the
+// event-time type per FuncID, and the entry-ino capture mode of the namespace
+// functions (EntryIno==0 / EntryIno==0 with success / !=Ino / ==Ino).
+//
+// The offset-call rows only accept vertices whose event function actually
+// carries offset semantics (write/read/setattr): a path-resolving call like
+// truncate/chmod also produces LOOKUP events for its own path resolution,
+// and those matched vertices must not pollute the call's offset buckets.
+// Diagnostics only.
+func recordCallTypeIno(diag *DagDiag, ev *HmdfsTraceEvent, v *DAGVertex) {
+	if isOffsetFunc(ev.FuncID) {
+		if row := offCallRow(v.CallName); row >= 0 {
+			diag.OffByCall[row][int(offsetBucketOf(v))]++
+		}
+	}
+	if int(v.FuncID) < len(diag.TypeByFunc) {
+		if v.IsDir {
+			diag.TypeByFunc[v.FuncID][1]++
+		} else {
+			diag.TypeByFunc[v.FuncID][0]++
+		}
+	}
+	if isEntryInoFunc(ev.FuncID) && int(ev.FuncID) < len(diag.InoByFunc) {
+		switch {
+		case ev.EntryIno == 0:
+			diag.InoByFunc[ev.FuncID][0]++
+			// A successful namespace op that still has no entry inode
+			// means the entry capture itself failed (the alarm counter).
+			if bucketizeRet(ev.FuncID, ev.Ret) == RetSuccess {
+				diag.InoByFunc[ev.FuncID][1]++
+			}
+		case ev.EntryIno != ev.Ino:
+			diag.InoByFunc[ev.FuncID][2]++
+		default:
+			diag.InoByFunc[ev.FuncID][3]++
+		}
+	}
 }
 
 // ExtractPairs computes happens-before edges (from succeeded modifiers) and
@@ -442,6 +598,7 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 				// while pure read||read pairs have no consistency value.
 				if rel := determinePathRel(A, B, false); rel != PathNone &&
 					(isModifierFunc(A.FuncID) || isModifierFunc(B.FuncID)) {
+					diag.RelHist[rel]++
 					ccPairs = append(ccPairs, DAGPair{A: A, B: B, Temporal: TemporalConcurrent, PathRel: rel})
 				} else if rel == PathNone {
 					diag.FilteredPathRel++
@@ -451,6 +608,7 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 			case A.Etime < B.Stime:
 				diag.HBForwardPairs++
 				if rel := determinePathRel(A, B, true); rel != PathNone && aMod {
+					diag.RelHist[rel]++
 					hbPairs = append(hbPairs, DAGPair{A: A, B: B, Temporal: TemporalHB, PathRel: rel})
 				} else if rel == PathNone {
 					diag.FilteredPathRel++
@@ -460,6 +618,7 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 			default:
 				diag.HBReversePairs++
 				if rel := determinePathRel(B, A, true); rel != PathNone && bMod {
+					diag.RelHist[rel]++
 					hbPairs = append(hbPairs, DAGPair{A: B, B: A, Temporal: TemporalHB, PathRel: rel})
 				} else if rel == PathNone {
 					diag.FilteredPathRel++
@@ -502,9 +661,17 @@ func ComputeFeedback(hbPairs, ccPairs []DAGPair, hmcfg *Hmdfs_config, diag *DagD
 	}
 	sort.Slice(hashes, func(i, j int) bool { return hashes[i] < hashes[j] })
 	if diag != nil {
+		// Count distinct signal bits, not distinct 64-bit hashes: pairBits
+		// truncates each hash to uint32 (a collision sets a single bit), so
+		// the diagnostic must use the same granularity.
+		bits := make([]uint32, len(hashes))
+		for i, h := range hashes {
+			bits[i] = uint32(h)
+		}
+		sort.Slice(bits, func(i, j int) bool { return bits[i] < bits[j] })
 		unique := 0
-		for i := range hashes {
-			if i == 0 || hashes[i] != hashes[i-1] {
+		for i := range bits {
+			if i == 0 || bits[i] != bits[i-1] {
 				unique++
 			}
 		}
@@ -574,23 +741,51 @@ func callNameOfFunc(fid uint32) string {
 }
 
 // dagRelToDctRel maps the DAG path relation onto the DCT PathRelation
-// (the variant's path relative to the root's path).
+// (the variant's path relative to the root's path). The Parent/Child
+// direction is decided on the same candidate path basis as determinePathRel
+// ({post, pre} per vertex): a rename vertex's post path (destination) does not
+// preserve the relation established through its pre path (source), so a
+// post-only check drops the rename Parent/Child forms (variant rename + Parent
+// and root rename + Child in particular). The cell's depth/persist dims are
+// still taken from B's post path, which is sound because every generated
+// rename destination is a same-parent sibling of its source (hmdfs requires
+// it); a cross-parent destination would need the matched B path instead.
+// determinePathRel classifies a pair as PathParentChild only when some
+// candidate combination has an ancestry relation, so for real extracted pairs
+// one of the two loops below always matches; the false return is defensive
+// against hand-built or inconsistent inputs only.
 func dagRelToDctRel(p *DAGPair) (PathRelation, bool) {
 	switch p.PathRel {
 	case PathSamePath, PathSameInode:
 		return PathSame, true
 	case PathParentChild:
-		if pathIsAncestorOf(p.A.Path, p.B.Path) {
-			return PathChild, true
+		ap, bp := pairPathCandidates(p.A), pairPathCandidates(p.B)
+		for _, a := range ap {
+			for _, b := range bp {
+				if pathIsAncestorOf(a, b) {
+					return PathChild, true
+				}
+			}
 		}
-		if pathIsAncestorOf(p.B.Path, p.A.Path) {
-			return PathParent, true
+		for _, a := range ap {
+			for _, b := range bp {
+				if pathIsAncestorOf(b, a) {
+					return PathParent, true
+				}
+			}
 		}
 		return 0, false
 	case PathSameParent:
 		return PathSibling, true
 	}
 	return 0, false
+}
+
+// pairPathCandidates returns the path candidates of one vertex used by the
+// path-relation classifier: the post path plus the pre path (rename old path,
+// identical otherwise).
+func pairPathCandidates(v *DAGVertex) [2]string {
+	return [2]string{v.Path, prePath(v)}
 }
 
 func pathIsAncestorOf(parent, child string) bool {
@@ -646,22 +841,54 @@ func matchDistBucket(ticks int64) int {
 // matchEventToCall finds the call whose execution window contains the event
 // timestamp, within mfTolTicks of the window edges (the event may be sampled
 // slightly after the window end by the kretprobe handler, or a few µs before
-// the window start by calibration imprecision). Among overlapping windows
-// (should not happen within one VM since calls run sequentially) the one
-// started last wins.
+// the window start by calibration imprecision). The tolerance makes adjacent
+// same-type windows overlap at their edges, so the nearest admissible window
+// wins; ties keep the previous latest-start preference.
 // Returns the call index on success, or a negative reason code:
 //
 //	-1 no matching call
 //	-2 no call of the event's function type
 //	-3 calls exist but CheckInfo is nil
 //	-4 calls exist with windows, but the timestamp is outside all of them
+//
+// eventEdges returns the event's own execution window in the global domain:
+// the paired entry kprobe timestamp (start) and the return timestamp (end).
+// A missing/lost entry state falls back to the return timestamp.
+func eventEdges(ev *HmdfsTraceEvent) (start, end int64) {
+	end = int64(ev.Timestamp)
+	start = end
+	if ev.EntryTs != 0 && ev.EntryTs <= ev.Timestamp {
+		start = int64(ev.EntryTs)
+	}
+	return start, end
+}
+
+// eventRefTs is the path-history reference time of an operation: the start of
+// its own window, i.e. what the operation saw when it began.
+func eventRefTs(ev *HmdfsTraceEvent) int64 {
+	start, _ := eventEdges(ev)
+	return start
+}
+
+// edgeDist returns the distance of ts to the [ws,we] window (0 inside).
+func edgeDist(ts, ws, we int64) int64 {
+	if ts < ws {
+		return ws - ts
+	}
+	if ts > we {
+		return ts - we
+	}
+	return 0
+}
+
 func matchEventToCall(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) int {
 	off := tscoffFor(tscoffs, ev.ProgIdx)
 	best := -1
 	hasFunc := false
 	hasCI := false
-	var bestStime int64
-	ts := int64(ev.Timestamp)
+	var bestStime, bestDist int64
+	tol := atomic.LoadInt64(&mfTolTicks)
+	evStart, evEnd := eventEdges(ev)
 	for i, call := range p.Calls {
 		if !funcMatchesCall(ev.FuncID, call.Meta.Name) {
 			continue
@@ -674,8 +901,21 @@ func matchEventToCall(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) int {
 		hasCI = true
 		ws := int64(ci.Stime) - off
 		we := int64(ci.Etime) - off
-		if ts >= ws-atomic.LoadInt64(&mfTolTicks) && ts <= we+atomic.LoadInt64(&mfTolTicks) && (best == -1 || ws > bestStime) {
-			best, bestStime = i, ws
+		// Both endpoints of the event's own window must be admitted (within
+		// the tolerance). A tolerance-only admission is farther from the raw
+		// window than an exact containment, so the farther edge decides: an
+		// event fully inside a window can never be stolen by a later
+		// same-type call whose tolerance-extended window also admits it.
+		dStart, dEnd := edgeDist(evStart, ws, we), edgeDist(evEnd, ws, we)
+		if dStart > tol || dEnd > tol {
+			continue
+		}
+		dist := dStart
+		if dEnd > dist {
+			dist = dEnd
+		}
+		if best == -1 || dist < bestDist || (dist == bestDist && ws > bestStime) {
+			best, bestStime, bestDist = i, ws, dist
 		}
 	}
 	if best != -1 {
@@ -739,26 +979,115 @@ func nearestWindowOfFunc(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) (delta i
 	return
 }
 
-// lookupPath resolves the looked-up path component via the parent directory
-// ino (LOOKUP events carry the parent's inode). The event's own node is
+// hmdfsRootMergeIno is HMDFS_ROOT_MERGE (hmdfs/inode.h): the low 32 bits of
+// the merge-view root's i_ino. The root is never part of the fsMd snapshot,
+// so root-parent lookups need this sentinel.
+const hmdfsRootMergeIno = 6
+
+// lookupPath resolves the looked-up path component of a LOOKUP event. The
+// event carries the parent inode (ev.Ino) and, for positive lookups, the
+// child inode (ev.EntryIno; 0 for negative ones). The event's own node is
 // consulted first (inos are node-local), falling back to the merged map.
+// The second return value is an alternative candidate for the same component,
+// used only for the rename source/destination ambiguity: the relation
+// classifier consumes it through prePath, so an ambiguous lookup never loses
+// a real path relation.
 func lookupPath(ev *HmdfsTraceEvent, call *Call,
-	inoToPathByNode map[int]map[uint64]string, inoToPath map[uint64]string) string {
+	inoToPathByNode map[int]map[uint64]string, inoToPath map[uint64]string) (string, string) {
 	full := extractPathFromCall(call)
 	if full == "" {
-		return ""
+		return "", ""
 	}
-	ino := ev.Ino & 0xFFFFFFFF
+	ino := inoKey(ev.Ino)
 	parentPath, ok := inoToPathByNode[ev.ProgIdx][ino]
 	if !ok {
 		parentPath, ok = inoToPath[ino]
 	}
+	rootParent := ino == hmdfsRootMergeIno && !ok
+	// Positive lookup: the child inode resolves the exact component. Only
+	// accept the reverse lookup when it is a component of the call's own path
+	// (a later rename would otherwise relabel the destination here).
+	var child string
+	var okChild bool
+	if ev.EntryIno != 0 {
+		eino := inoKey(ev.EntryIno)
+		child, okChild = inoToPathByNode[ev.ProgIdx][eino]
+		if !okChild {
+			child, okChild = inoToPath[eino]
+		}
+	}
+	childOnCall := okChild && (child == full || strings.HasPrefix(full, child+"/")) &&
+		(rootParent || parentPath == GetParentDir(child))
+	// A rename resolves two final components (source and destination). The
+	// post-execution ino map cannot disambiguate same-parent renames (after a
+	// successful rename the source inode lives at the destination), and the
+	// tracer only sees fs-level lookups, so a dcache-served source leaves no
+	// event at all: exact per-event disambiguation is impossible. The parent
+	// inode still pins cross-parent finals and the child inode pins
+	// intermediates; a same-parent final keeps both candidates (sign picks
+	// the primary, the alternative carries the other side for the relation
+	// classifier).
+	if call != nil && call.Meta != nil && call.Meta.Name == "rename" {
+		oldP, newP := extractRenamePaths(call)
+		if oldP != "" && newP != "" {
+			oldPar, newPar := GetParentDir(oldP), GetParentDir(newP)
+			mergeRoot := strings.TrimSuffix(MergeViewPrefix, "/")
+			onOld := parentPath == oldPar || (rootParent && oldPar == mergeRoot)
+			onNew := parentPath == newPar || (rootParent && newPar == mergeRoot)
+			if ev.EntryIno == 0 {
+				if oldPar != newPar {
+					// Cross-parent: the parent side decides exactly.
+					if onOld && !onNew {
+						return oldP, ""
+					}
+					if onNew && !onOld {
+						return newP, ""
+					}
+				} else if onOld {
+					// Same-parent final component: the positive lookup is the
+					// source, the negative one the destination (a missing
+					// source removes the rename's only lookup). Both
+					// candidates are kept so the relation classifier sees the
+					// other side as well.
+					return newP, oldP
+				}
+			} else if !childOnCall {
+				// A positive event whose child cannot be pinned to the call's
+				// own path: a source/destination final (an intermediate would
+				// have resolved through childOnCall).
+				if oldPar != newPar {
+					if onOld && !onNew {
+						return oldP, ""
+					}
+					if onNew && !onOld {
+						return newP, ""
+					}
+				} else if onOld {
+					// Same-parent final: the positive lookup is the source;
+					// keep the destination as the alternative candidate
+					// (positive destination lookups of an overwrite rename
+					// land here too).
+					return oldP, newP
+				}
+			}
+		}
+	}
+	if childOnCall {
+		return child, ""
+	}
+	// Root-parent lookup: the merge-view root is not in fsMd; the looked-up
+	// component is the first path element under it.
+	if rootParent {
+		if comp := firstComponentUnderRoot(full); comp != "" {
+			return comp, ""
+		}
+	}
 	if !ok {
-		return full
+		return full, ""
 	}
 	for comp := full; comp != ""; {
 		if GetParentDir(comp) == parentPath {
-			return comp
+			return comp, ""
 		}
 		parent := GetParentDir(comp)
 		if parent == comp {
@@ -766,7 +1095,20 @@ func lookupPath(ev *HmdfsTraceEvent, call *Call,
 		}
 		comp = parent
 	}
-	return full
+	return full, ""
+}
+
+// firstComponentUnderRoot returns "merge_view/<first>" for the first path
+// component under the merge-view root; "" when the path is not under it.
+func firstComponentUnderRoot(path string) string {
+	rest := strings.TrimPrefix(path, MergeViewPrefix)
+	if rest == path || rest == "" {
+		return ""
+	}
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		rest = rest[:i]
+	}
+	return MergeViewPrefix + rest
 }
 
 // renamePathAt rewrites path to its post-rename value at time ts, applying
@@ -804,6 +1146,7 @@ func renamePathAt(path string, ts uint64, renameTL map[string][]renameEvent) str
 
 // deletePathAt returns the path of ino on node at time ts if it was deleted
 // by then (fallback for async writepage events on already-unlinked files).
+// ino is inoKey-truncated, like the fsMd reverse maps.
 func deletePathAt(nodeIdx int, ino, ts uint64,
 	deleteTL map[int]map[uint64][]deleteEvent) string {
 	dels, ok := deleteTL[nodeIdx][ino]
@@ -870,9 +1213,11 @@ func isSucceededModifier(v *DAGVertex) bool {
 	return v.RetBucket == RetSuccess || v.RetBucket == RetWritepageDone
 }
 
-// prePath returns the path the operation saw on entry (rename: old path).
+// prePath returns the path the operation saw on entry: the rename old path,
+// or the alternative candidate of an ambiguous rename lookup. Identical to
+// Path otherwise.
 func prePath(v *DAGVertex) string {
-	if v.FuncID == FuncRename && v.OldPath != "" {
+	if v.OldPath != "" {
 		return v.OldPath
 	}
 	return v.Path
@@ -883,10 +1228,13 @@ func prePath(v *DAGVertex) string {
 // compares the Cartesian product of {A.Path, prePath(A)} × {B.Path,
 // prePath(B)}. For ordered pairs this over-approximates (a later rename's
 // old path may match an earlier op's post path), but never misses a real
-// relation.
+// relation. SameInode additionally requires both vertices to be on the same
+// node: inode numbers are per-node identifiers, so equal values on different
+// nodes do not identify the same file (cross-node same-path pairs are
+// classified as SamePath first).
 func determinePathRel(A, B *DAGVertex, ordered bool) PathRel {
-	aPaths := []string{A.Path, prePath(A)}
-	bPaths := []string{B.Path, prePath(B)}
+	ap, bp := pairPathCandidates(A), pairPathCandidates(B)
+	aPaths, bPaths := ap[:], bp[:]
 	for _, a := range aPaths {
 		for _, b := range bPaths {
 			if a != "" && a == b {
@@ -894,7 +1242,7 @@ func determinePathRel(A, B *DAGVertex, ordered bool) PathRel {
 			}
 		}
 	}
-	if A.Ino != 0 && A.Ino == B.Ino {
+	if A.ProgIdx == B.ProgIdx && A.Ino != 0 && A.Ino == B.Ino {
 		return PathSameInode
 	}
 	for _, a := range aPaths {
@@ -935,7 +1283,11 @@ func funcMatchesCall(fid uint32, name string) bool {
 		return strings.Contains(name, "write")
 	case FuncRead:
 		return strings.Contains(name, "read") && !strings.Contains(name, "getdents")
-	case FuncFileOpen, FuncDirOpen:
+	case FuncFileOpen:
+		// creat() reaches the file .open (hmdfs_file_open_merge), so its
+		// FILE_OPEN event must be attributable to the creat call too.
+		return strings.Contains(name, "open") || strings.Contains(name, "creat")
+	case FuncDirOpen:
 		return strings.Contains(name, "open")
 	case FuncGetattr:
 		return name == "stat" || strings.Contains(name, "fstatat")
@@ -962,19 +1314,47 @@ func isPathResolvingCall(name string) bool {
 		strings.Contains(name, "truncate") || strings.Contains(name, "utime")
 }
 
-// featuresOf packs the vertex feature vector into one uint64:
+// packFeatures packs the vertex feature vector into one uint64:
 // funcID(5b) | ret(3b) | depth(2b) | nodeType(1b) | persist(1b) | offset(3b).
-func featuresOf(v *DAGVertex, hmcfg *Hmdfs_config) uint64 {
-	depth := DepthBucketOf(v.Path)
+func packFeatures(funcID uint32, ret RetBucket, depth uint64, isDir, persist bool, off uint64) uint64 {
 	nt := uint64(0)
-	if v.IsDir {
+	if isDir {
 		nt = 1
 	}
-	persist := uint64(0)
-	if hmcfg != nil && hmcfg.Persistence_dir != "" && strings.HasPrefix(v.Path, hmcfg.Persistence_dir) {
-		persist = 1
+	p := uint64(0)
+	if persist {
+		p = 1
 	}
-	return uint64(v.FuncID) | uint64(v.RetBucket)<<5 | depth<<8 | nt<<10 | persist<<11 | offsetBucketOf(v)<<12
+	return uint64(funcID) | uint64(ret)<<5 | depth<<8 | nt<<10 | p<<11 | off<<12
+}
+
+// featuresOfDir packs a vertex's feature vector under an explicit persist
+// prefix (the coverage board stores only persistDir, not the whole config).
+func featuresOfDir(v *DAGVertex, persistDir string) uint64 {
+	persist := pathInDir(v.Path, persistDir)
+	return packFeatures(v.FuncID, v.RetBucket, DepthBucketOf(v.Path), v.IsDir, persist, offsetBucketOf(v))
+}
+
+// featuresOf packs the vertex feature vector (see packFeatures).
+func featuresOf(v *DAGVertex, hmcfg *Hmdfs_config) uint64 {
+	pd := ""
+	if hmcfg != nil {
+		pd = hmcfg.Persistence_dir
+	}
+	return featuresOfDir(v, pd)
+}
+
+// hashShape mixes one abstract event shape — the pair's dimensions without any
+// call names — exactly like hashPair does for a concrete pair. Feedback is
+// event-level by design: two syscalls that trigger the same low-level func
+// with the same margins carry the same shape.
+func hashShape(temporal TemporalRel, rel PathRel, af, bf uint64) uint64 {
+	h := fnv1a64()
+	h = fnvAdd64(h, uint64(temporal))
+	h = fnvAdd64(h, uint64(rel))
+	h = fnvAdd64(h, af)
+	h = fnvAdd64(h, bf)
+	return h
 }
 
 // offset bucket constants (3 bits, values 0-4).
@@ -991,8 +1371,10 @@ const (
 // writes only size-pos bytes for it (file_remote.c hmdfs_get_writecount).
 const writebackBlocksize = 4096
 
-// isOffsetFunc reports whether the function carries offset semantics
-// (write/read via kiocb->ki_pos; truncate via iattr->ia_size).
+// isOffsetFunc reports whether the kernel function carries offset semantics
+// (write/read via kiocb->ki_pos; truncate via iattr->ia_size). It is only the
+// FuncID-level gate: callers that score features must also refine by call name
+// (isOffsetCall), because chmod/utime share FuncSetattr with truncate.
 func isOffsetFunc(fid uint32) bool {
 	return fid == FuncWrite || fid == FuncRead || fid == FuncSetattr
 }
@@ -1003,8 +1385,13 @@ func isOffsetFunc(fid uint32) bool {
 //	pos >= size            -> count = 0          (beyond — no remote write)
 //	size < pos + PAGE_SIZE -> count = size - pos (tail — partial page)
 //	otherwise              -> count = PAGE_SIZE  (full page)
+//
+// The name gate (isOffsetCall) keeps non-offset operations on offset FuncIDs
+// out of the bucket space: chmod/utime write off=0 in the event, which would
+// otherwise read as "truncate to 0" (Zero bucket). With the gate, features,
+// cells, off=/offCall= marginals and producibleOffBuckets all agree.
 func offsetBucketOf(v *DAGVertex) uint64 {
-	if !isOffsetFunc(v.FuncID) {
+	if !isOffsetFunc(v.FuncID) || !isOffsetCall(v.CallName) {
 		return offsetBucketNA
 	}
 	pos := v.Off
@@ -1038,12 +1425,7 @@ func DepthBucketOf(path string) uint64 {
 }
 
 func hashPair(p DAGPair, hmcfg *Hmdfs_config) uint64 {
-	h := fnv1a64()
-	h = fnvAdd64(h, uint64(p.Temporal))
-	h = fnvAdd64(h, uint64(p.PathRel))
-	h = fnvAdd64(h, featuresOf(p.A, hmcfg))
-	h = fnvAdd64(h, featuresOf(p.B, hmcfg))
-	return h
+	return hashShape(p.Temporal, p.PathRel, featuresOf(p.A, hmcfg), featuresOf(p.B, hmcfg))
 }
 
 func fnv1a64() uint64 {

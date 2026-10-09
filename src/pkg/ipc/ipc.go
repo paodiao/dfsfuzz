@@ -138,6 +138,12 @@ type ProgInfo struct {
 	DagSignal      []uint32
 	DagScheduleBit uint32
 	DagPairs       []prog.DAGPair
+	// DagComputed marks that the DAG pipeline observed this execution
+	// (events were collected and parsed), even when no pair formed. The 2b
+	// pending resolver uses it to distinguish "observed, nothing produced"
+	// (a genuine miss) from "not observed at all" (clear without a miss).
+	// Fuzzer-set, local like DagSignal/DagPairs.
+	DagComputed bool
 }
 
 type Env struct {
@@ -382,6 +388,16 @@ func (env *Env) Exec(opts *ExecOpts, ps []*prog.Prog) (output []byte, infos []*P
 	var progOffsets [64]uint64
 	if len(ps) > 64 {
 		err0 = fmt.Errorf("too many programs: %v (max 64)", len(ps))
+		return
+	}
+	// Defense-in-depth: parseOutputs assumes one program per executor and
+	// ServNum server programs at the front; a mismatch would otherwise panic
+	// deep inside the output parser (env.outs[idx] index, negative client
+	// slice) or on the ps[0] deref below. Convert it into the standard
+	// execution error instead.
+	if nOut := len(env.outs); len(ps) == 0 || len(ps) > nOut || len(ps) < env.config.ServNum {
+		err0 = fmt.Errorf("ipc.Exec: invalid program count %d (executors %d, servers %d)",
+			len(ps), nOut, env.config.ServNum)
 		return
 	}
 	for idx, p := range ps {
@@ -1042,12 +1058,12 @@ func (w *diagWriter) Write(data []byte) (int, error) {
 
 func parseHmdfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64) {
 	out := *data
-	if len(out) < 20 {
+	if len(out) < 28 {
 		return nil, 0, 0
 	}
-	// The executor always writes the fixed-point tsc_ns_ratio (×1e9) and its
-	// global-domain tsc_offset before the event count, even when the count is
-	// zero.
+	// The executor always writes the fixed-point tsc_ns_ratio (×1e9), its
+	// global-domain tsc_offset and the accepted calibration gap before the
+	// event count, even when the count is zero.
 	ratioFixed, okRatio := readUint64(&out)
 	ratio := float64(0)
 	if okRatio {
@@ -1058,8 +1074,12 @@ func parseHmdfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64
 	if okOffset {
 		tscOffset = int64(offsetFixed)
 	}
+	gap, okGap := readUint64(&out)
+	if !okGap {
+		gap = 0
+	}
 	count, ok := readUint32(&out)
-	appendParseDiag("parseTrace: ratio=%.9f count=%d remaining=%d", ratio, count, len(out))
+	appendParseDiag("parseTrace: ratio=%.9f gap=%d count=%d remaining=%d", ratio, gap, count, len(out))
 	if !ok || count == 0 {
 		*data = out
 		return nil, ratio, tscOffset
@@ -1091,6 +1111,26 @@ func parseHmdfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64
 			break
 		}
 		events[i].Off = off
+		sz, ok7 := readUint64(&out)
+		if !ok7 {
+			break
+		}
+		events[i].Size = sz
+		eino, ok8 := readUint64(&out)
+		if !ok8 {
+			break
+		}
+		events[i].EntryIno = eino
+		mode, ok9 := readUint32(&out)
+		if !ok9 {
+			break
+		}
+		events[i].Mode = mode
+		ets, ok10 := readUint64(&out)
+		if !ok10 {
+			break
+		}
+		events[i].EntryTs = ets
 	}
 	*data = out
 	return events, ratio, tscOffset

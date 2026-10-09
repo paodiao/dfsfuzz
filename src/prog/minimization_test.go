@@ -206,7 +206,7 @@ func TestMinimizeRandom(t *testing.T) {
 	r := rand.New(rs)
 	for i := 0; i < iters; i++ {
 		for _, crash := range []bool{false, true} {
-			p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+			p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{})
 			copyP := p.Clone()
 			minPs, _ := Minimize([]*Prog{p}, len(p.Calls)-1, 0, crash, 0, func(minPs []*Prog, callIndex int) bool {
 				p1 := minPs[0]
@@ -231,7 +231,7 @@ func TestMinimizeCallIndex(t *testing.T) {
 	ct := target.DefaultChoiceTable()
 	r := rand.New(rs)
 	for i := 0; i < iters; i++ {
-		p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{})
 		ci := r.Intn(len(p.Calls))
 		ps1, ci1 := Minimize([]*Prog{p}, ci, 0, r.Intn(2) == 0, 0, func(ps []*Prog, callIndex int) bool {
 			return r.Intn(2) == 0
@@ -240,5 +240,51 @@ func TestMinimizeCallIndex(t *testing.T) {
 		if ci1 < 0 || ci1 >= len(p1.Calls) || p.Calls[ci].Meta.Name != p1.Calls[ci1].Meta.Name {
 			t.Fatalf("bad call index after minimization")
 		}
+	}
+}
+
+// TestMinimizePreservesFailureCalls pins that minimization never drops
+// syz_failure* calls from any client prog: the coverage predicate cannot judge
+// their removal, and dcache seeds rely on syz_failure_barrier on every client
+// for cross-node synchronization.
+func TestMinimizePreservesFailureCalls(t *testing.T) {
+	target, err := GetTarget("linux", "amd64")
+	if err != nil {
+		t.Skipf("no linux/amd64 target data: %v", err)
+	}
+	barrier := target.SyscallMap["syz_failure_barrier"]
+	if barrier == nil {
+		t.Skip("target has no syz_failure_barrier")
+	}
+	mkBarrier := func() *Call {
+		c := MakeCall(barrier, nil)
+		c.Args = make([]Arg, len(barrier.Args))
+		for i := range c.Args {
+			c.Args[i] = barrier.Args[i].DefaultArg(DirIn)
+		}
+		return c
+	}
+	ps := []*Prog{
+		{Target: target, Calls: []*Call{
+			mkPathCall(t, target, "unlink", "merge_view/a", 0, 0), mkBarrier(),
+			mkPathCall(t, target, "unlink", "merge_view/b", 0, 0)}},
+		{Target: target, Calls: []*Call{
+			mkPathCall(t, target, "unlink", "merge_view/c", 0, 0), mkBarrier()}},
+	}
+	ps, _ = Minimize(ps, 0, 0, false, 0, func([]*Prog, int) bool { return true })
+	for i, p := range ps {
+		kept := false
+		for _, c := range p.Calls {
+			if c.Meta.Name == "syz_failure_barrier" {
+				kept = true
+			}
+		}
+		if !kept {
+			t.Fatalf("prog %d lost its syz_failure_barrier (%d calls left)", i, len(p.Calls))
+		}
+	}
+	// Minimization still removed the ordinary call on the non-target prog.
+	if len(ps[1].Calls) != 1 {
+		t.Fatalf("prog 1 calls = %d, want 1 (ordinary call minimized away)", len(ps[1].Calls))
 	}
 }

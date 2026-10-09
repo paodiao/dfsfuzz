@@ -51,8 +51,8 @@ func TestDeterminism(t *testing.T) {
 }
 
 func generateProg(t *testing.T, target *Target, rs rand.Source, ct *ChoiceTable, corpus []*Prog) *Prog {
-	p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
-	p.Mutate(rs, 10, ct, [][]*Prog{corpus}, nil, 0, false, false, &Hmdfs_config{}, 0)
+	p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{})
+	p.Mutate(rs, 10, ct, [][]*Prog{corpus}, nil, 0, false, false, &Hmdfs_config{})
 	for i, c := range p.Calls {
 		comps := make(CompMap)
 		for v := range extractValues(c) {
@@ -96,9 +96,9 @@ func TestEnabledCalls(t *testing.T) {
 	ct := target.BuildChoiceTable(nil, enabled)
 	const tries = 10
 	for i := 0; i < tries; i++ {
-		p, _ := target.Generate(rs, 50, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 50, ct, nil, false, nil, false, &Hmdfs_config{})
 		for it := 0; it < iters/tries; it++ {
-			p.Mutate(rs, 50, ct, nil, nil, 0, false, false, &Hmdfs_config{}, 0)
+			p.Mutate(rs, 50, ct, nil, nil, 0, false, false, &Hmdfs_config{})
 		}
 		for _, c := range p.Calls {
 			if _, ok := enabledCalls[c.Meta.Name]; !ok {

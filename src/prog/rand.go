@@ -35,7 +35,6 @@ type randGen struct {
 	inGenerateResource bool
 	recDepth           map[string]int
 	hmcfg              *Hmdfs_config
-	curIdx             int
 }
 
 func newRand(target *Target, rs rand.Source) *randGen {
@@ -669,6 +668,10 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int, sCalls *Sp
 	biasCall := -1
 	if insertionPoint > 0 {
 		// Choosing the base call is based on the insertion point of the new calls sequence.
+		// NOTE: s.ct must contain every call that can appear in p.Calls: a bias
+		// outside the table makes ChoiceTable.choose panic. The only hmdfs
+		// production caller of Mutate (mutateHmdfs fallback) passes the full
+		// fuzzer choice table; do not pass the fsops sub table here.
 		biasCall = p.Calls[r.Intn(insertionPoint)].Meta.ID
 	}
 	idx := s.ct.choose(r.Rand, biasCall)
@@ -1138,7 +1141,7 @@ func (r *randGen) genNetDownCall(s *state, sCalls *SpecialCalls, targetNodes []i
 	var cmdBuilder strings.Builder
 	cmdBuilder.WriteString("iptables -F;iptables -X;")
 	cmdBuilder.WriteString(genIptablesDropCmd(r.hmcfg.InitIp, targetNodes))
-	custData := []byte(cmdBuilder.String())
+	custData := []byte(cmdBuilder.String() + "\x00")
 
 	// 显式构造：按 custData 实际长度分配——不依赖 generateArgs 的随机分配
 	// （原随机 filename 长度 < 命令长度——覆写后尺寸陈旧——copyin 越界覆盖，L6）。
@@ -1819,8 +1822,13 @@ func (r *randGen) generateFileopsSetattrConcurrent(s *state, sCalls *SpecialCall
 		testFile = r.generateFileName(testDir)
 	}
 
+	// The two racers (write + setattr) are the core shape; the setup create
+	// is a separate program only when a slot is left for it. With only
+	// Node_num slots and no existing file, the create rides in the writer
+	// program so the batch still totals Node_num.
+	foldCreate := !useExisting && hmcfg.Node_num < 3
 	p0 := &Prog{Target: r.target}
-	if !useExisting {
+	if !useExisting && !foldCreate {
 		calls0 := r.generateCreateFileCalls(s, sCalls, testFile)
 		for _, c := range calls0 {
 			p0.Calls = append(p0.Calls, c)
@@ -1836,6 +1844,9 @@ func (r *randGen) generateFileopsSetattrConcurrent(s *state, sCalls *SpecialCall
 	}
 
 	p1 := &Prog{Target: r.target}
+	if foldCreate {
+		p1.Calls = append(p1.Calls, r.generateCreateFileCalls(s, sCalls, testFile)...)
+	}
 	opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, testFile, 2)
 	writecalls := r.generateWriteCallsSeq(s, sCalls, testFile, writeData, RetFd)
 	closecall := r.generateCloseCall(s, sCalls, RetFd)
@@ -1914,6 +1925,15 @@ func (r *randGen) generateConcurrentDirDelete(s *state, sCalls *SpecialCalls, hm
 	if hmcfg.Node_num < 3 {
 		numDeleters = 1
 	}
+	// One unlink program per deleter is the core shape; creation programs for
+	// fresh targets fit only in the leftover budget, so the batch never
+	// exceeds Node_num. When the budget is exhausted, an extra fresh deleter
+	// reuses an already-selected (created) target for a double-unlink race
+	// instead of deleting a path that was never created.
+	createBudget := hmcfg.Node_num - numDeleters
+	if createBudget < 0 {
+		createBudget = 0
+	}
 
 	var filesToDelete []string
 	for i := 0; i < numDeleters; i++ {
@@ -1925,6 +1945,11 @@ func (r *randGen) generateConcurrentDirDelete(s *state, sCalls *SpecialCalls, hm
 			}
 		}
 		useExisting := testFile != ""
+		if !useExisting && createBudget == 0 && len(filesToDelete) > 0 {
+			testFile = filesToDelete[r.Intn(len(filesToDelete))]
+			filesToDelete = append(filesToDelete, testFile)
+			continue
+		}
 		if !useExisting {
 			testFile = r.generateFileName(testDir)
 		}
@@ -1935,11 +1960,11 @@ func (r *randGen) generateConcurrentDirDelete(s *state, sCalls *SpecialCalls, hm
 			calls := r.generateCreateFileCalls(s, sCalls, testFile)
 			p.Calls = append(p.Calls, calls...)
 			ps = append(ps, p)
+			createBudget--
 		}
 	}
 
 	for _, file := range filesToDelete {
-		//TODO: 有隐患，可能超出节点数量
 		p := &Prog{Target: r.target}
 		calls := r.generateUnlinkCalls(s, sCalls, file)
 		p.Calls = append(p.Calls, calls...)
@@ -1977,12 +2002,20 @@ func (r *randGen) generateConcurrentDirMixed(s *state, sCalls *SpecialCalls, hmc
 	p1.Calls = append(p1.Calls, calls1...)
 	ps = append(ps, p1)
 
-	p2 := &Prog{Target: r.target}
-	calls2 := r.generateUnlinkCalls(s, sCalls, testFile2)
-	p2.Calls = append(p2.Calls, calls2...)
-	calls2 = r.generateUnlinkCalls(s, sCalls, testFile1)
-	p2.Calls = append(p2.Calls, calls2...)
-	ps = append(ps, p2)
+	if hmcfg.Node_num < 3 {
+		// Only two slots: the mixed delete race rides in the second creator
+		// program (p0 create2 ∥ p1 create1+unlink2+unlink1) instead of a
+		// separate third program.
+		p1.Calls = append(p1.Calls, r.generateUnlinkCalls(s, sCalls, testFile2)...)
+		p1.Calls = append(p1.Calls, r.generateUnlinkCalls(s, sCalls, testFile1)...)
+	} else {
+		p2 := &Prog{Target: r.target}
+		calls2 := r.generateUnlinkCalls(s, sCalls, testFile2)
+		p2.Calls = append(p2.Calls, calls2...)
+		calls2 = r.generateUnlinkCalls(s, sCalls, testFile1)
+		p2.Calls = append(p2.Calls, calls2...)
+		ps = append(ps, p2)
+	}
 
 	for i := len(ps); i < hmcfg.Node_num; i++ {
 		p := &Prog{Target: r.target}
@@ -2083,18 +2116,33 @@ func (r *randGen) generateConcurrentRenameOps(s *state, sCalls *SpecialCalls, hm
 	var testfiles []string
 	testfiles = append(testfiles, testFile1, targetFile1, testFile2, targetFile2)
 
-	if !useExisting1 {
+	// Rename programs are the core shape and are always emitted; the source
+	// creation programs fit only in the leftover budget, so the batch never
+	// exceeds Node_num. At Node_num<=3 only the first source is renamed (p3
+	// needs Node_num>3), so a skipped second create is filler-only.
+	renameProgs := 1
+	if hmcfg.Node_num > 3 {
+		renameProgs = 2
+	}
+	createBudget := hmcfg.Node_num - renameProgs
+	if createBudget < 0 {
+		createBudget = 0
+	}
+
+	if !useExisting1 && createBudget > 0 {
 		p0 := &Prog{Target: r.target}
 		calls0 := r.generateCreateFileCalls(s, sCalls, testFile1)
 		p0.Calls = append(p0.Calls, calls0...)
 		ps = append(ps, p0)
+		createBudget--
 	}
 
-	if !useExisting2 {
+	if !useExisting2 && createBudget > 0 {
 		p1 := &Prog{Target: r.target}
 		calls1 := r.generateCreateFileCalls(s, sCalls, testFile2)
 		p1.Calls = append(p1.Calls, calls1...)
 		ps = append(ps, p1)
+		createBudget--
 	}
 
 	p2 := &Prog{Target: r.target}
@@ -2121,14 +2169,48 @@ func (r *randGen) generateConcurrentRenameOps(s *state, sCalls *SpecialCalls, hm
 	return ps
 }
 
+// renameDstKind classifies a pattern rename destination token given the
+// source relation. The generator realizes each kind; patternOpsFeasible only
+// rejects Unsupported, so adding a destination token means extending this
+// single classification (plus the matching realization).
+type renameDstKind int
+
+const (
+	renameDstUnsupported renameDstKind = iota
+	renameDstTwin                      // SelfTwo: derived fresh second path of the pair
+	renameDstSibling                   // Sibling: same-parent destination via pickRenameDst
+	renameDstBase                      // Same: the pattern base (source must be its sibling)
+)
+
+func renameDstKindOf(srcRel, dstRel PathRelation) renameDstKind {
+	switch dstRel {
+	case PathSelfTwo:
+		return renameDstTwin
+	case PathSibling:
+		return renameDstSibling
+	case PathSame:
+		if srcRel == PathSibling {
+			return renameDstBase
+		}
+	}
+	return renameDstUnsupported
+}
+
 // patternOpsFeasible reports whether the pattern's ops can produce their
 // paths on the given base. Creation ops (creat/mkdir) always work (they build
-// a fresh child inside the base — no structural dependency). Self/Same
-// relations target the base itself and always work. Structural relations
-// (Child/Sibling/Parent/NoRel) of the remaining ops — including the rename
-// source relation — must be available for the op's call type on this base.
+// a fresh child inside the base — no structural dependency). For single-path
+// ops, Self/Same target the base itself and always work; structural relations
+// (Child/Sibling/Parent/NoRel) must be available for the op's call type. A
+// rename carries two slots: [0] is the source relation (resolved against the
+// base, availability checked below) and [1] is the destination relation
+// resolved against the source. renameDstKindOf is the single source of truth
+// for the destination tokens: SelfTwo (derived second path) and Sibling
+// (geometric same-parent, fresh included) are always realizable; Same is the
+// base itself and needs a same-class sibling as source (TmpDir included,
+// matching GetPathByRelation); anything else (Self/Parent/Child/NoRel or Same
+// from a non-sibling source) is unsupported.
 func patternOpsFeasible(lcs *LayeredChoiceStrategy, pattern *ConcurrentPattern, basePath string) bool {
-	relOKByType := lcs.availableRelationsForBase(basePath)
+	relOKByType, _ := lcs.availableRelationsForBase(basePath)
 	for _, ops := range pattern.Operations {
 		for _, op := range ops {
 			if op.CallName == "creat" || op.CallName == "mkdir" {
@@ -2139,7 +2221,22 @@ func patternOpsFeasible(lcs *LayeredChoiceStrategy, pattern *ConcurrentPattern, 
 			}
 			rel := op.PathArgs[0].Relation
 			if len(op.PathArgs) > 1 {
-				rel = op.PathArgs[1].Relation // rename source relation
+				kind := renameDstKindOf(rel, op.PathArgs[1].Relation)
+				if kind == renameDstUnsupported {
+					return false
+				}
+				if kind == renameDstBase {
+					// The source is a same-class sibling of the base (TmpDir
+					// included, matching GetPathByRelation's resolution); a
+					// file/dir mismatch would EPERM before the hmdfs trace.
+					var baseNode *FileNode
+					if lcs.FileTree != nil {
+						baseNode = lcs.FileTree.FindNode(basePath)
+					}
+					if !relOKByType[nodeTypeConstraint(baseNode)][PathSibling] {
+						return false
+					}
+				}
 			}
 			switch rel {
 			case PathSelf, PathSelfTwo, PathSame:
@@ -2154,22 +2251,24 @@ func patternOpsFeasible(lcs *LayeredChoiceStrategy, pattern *ConcurrentPattern, 
 	return true
 }
 
-func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seedType string) []*Prog {
+func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy) []*Prog {
 	var ps []*Prog
-	var writeinfos []*WriteInfo
 
-	pattern := lcs.PredefinedPatterns.GetRandomPattern(seedType, r.Rand)
+	pattern := lcs.PredefinedPatterns.GetRandomPattern(r.Rand)
 	if pattern == nil {
 		return ps
 	}
 
-	if pattern.ClientCount > hmcfg.Node_num {
+	// len(pattern.Operations) is the single source of truth for the number of
+	// client programs; ClientCount is kept as declarative metadata and pinned
+	// to it by TestPatternClientCountMatchesOps.
+	if len(pattern.Operations) > hmcfg.Node_num {
 		return ps
 	}
 
 	basePath := ""
 	for attempt := 0; attempt < 5; attempt++ {
-		if seedType == "fileops" {
+		if pattern.BaseKind == "file" {
 			fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
 			if fileNode == nil {
 				return ps
@@ -2192,12 +2291,11 @@ func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, 
 	}
 
 	sharedOffset := uint64(0)
-	if pattern.OffsetRel == OffsetSame {
-		node := lcs.FileTree.FindNode(basePath)
-		if node != nil && node.Size > 0 && r.nOutOf(4, 5) {
-			sharedOffset = r.randRange(0, node.Size+4096)
+	if pattern.OffsetRel != OffsetUnspecified {
+		if node := lcs.FileTree.FindNode(basePath); node != nil && node.Size > 0 {
+			sharedOffset = r.randHmdfsOffset(node.Size)
 		} else {
-			sharedOffset = r.randInt(64)
+			sharedOffset = r.randHmdfsOffset(0)
 		}
 	}
 
@@ -2219,42 +2317,26 @@ func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, 
 					return ps
 				}
 			}
-			calls, wi, _ := r.generateCallFromPatternOp(s, sCalls, op, basePath, cid, lcs, nil, false, pattern.OffsetRel, sharedOffset)
+			calls, _, _ := r.generateCallFromPatternOp(s, sCalls, op, basePath, cid, lcs, nil, false, pattern.OffsetRel, sharedOffset)
 			for _, c := range calls {
 				p.Calls = append(p.Calls, c)
 			}
-			writeinfos = append(writeinfos, wi...)
 		}
 
-		if seedType == "inodeops" {
-			p.IsInodeOps = true
-		} else {
-			p.IsFileOps = true
-		}
+		p.IsFsops = true
 
 		ps = append(ps, p)
 	}
 
 	for nodeIdx := len(pattern.Operations); nodeIdx < hmcfg.Node_num; nodeIdx++ {
 		p := &Prog{Target: r.target}
-		cid := hmcfg.Cids[nodeIdx]
-		flags := uint64(2)
-		if lcs.FileTree != nil {
-			node := lcs.FileTree.FindNode(basePath)
-			if node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir) {
-				flags = r.target.GetConst("O_DIRECTORY")
-			}
-		}
-		calls := r.generateVerificationCalls(s, sCalls, basePath, cid, seedType, writeinfos, flags)
+		fileSize, isDir := patternVerificationTarget(lcs.FileTree, basePath, pattern.BaseKind)
+		calls := r.generateVerificationCalls(s, sCalls, basePath, fileSize, isDir)
 		for _, c := range calls {
 			p.Calls = append(p.Calls, c)
 		}
 
-		if seedType == "inodeops" {
-			p.IsInodeOps = true
-		} else {
-			p.IsFileOps = true
-		}
+		p.IsFsops = true
 
 		ps = append(ps, p)
 	}
@@ -2301,50 +2383,89 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 
 	path2 := ""
 	if op.CallName == "creat" || op.CallName == "mkdir" {
-		// Creation ops create a fresh child inside a directory base instead
-		// of operating on existing nodes: the pattern shape is about the
-		// directory-entry-level race, and a fresh target keeps it viable even
-		// when the base has no suitable existing children (e.g. readdir_creat
-		// no longer depends on the base having file children). If the base is
-		// a file or outside the tree (fresh path from the root preprocessing),
-		// keep it as the target.
-		if lcs != nil && lcs.FileTree != nil {
-			if node := lcs.FileTree.FindNode(basePath); node != nil && node.Type != NodeTypeFile {
-				path = r.freshChildPath(basePath, op.CallName)
+		// Creation ops target the shared base for Same/Self relations: the
+		// pattern is about the same-name race on that fresh target (the second
+		// create sees EEXIST, possibly reaching hmdfs via a stale merge
+		// dentry). Only geometric relations (Child/Sibling/NoRel) get a fresh
+		// child, mirroring the DCT variant handling; a base outside the tree
+		// (fresh path from the root preprocessing) stays the target.
+		rel := PathSelf
+		if len(op.PathArgs) > 0 {
+			rel = op.PathArgs[0].Relation
+		}
+		switch rel {
+		case PathSame, PathSelf, PathSelfTwo:
+			// keep path == basePath
+		default:
+			if lcs != nil && lcs.FileTree != nil {
+				if node := lcs.FileTree.FindNode(basePath); node != nil && node.Type != NodeTypeFile {
+					path = r.freshChildPath(basePath, op.CallName)
+				}
 			}
 		}
 	} else if len(op.PathArgs) > 1 {
-		pathArg1 := op.PathArgs[1]
-		path, path2 = lcs.GetPathsForRenameVariant(basePath, "", pathArg1.Relation, r.Rand, false)
+		// Rename slots: [0] is the source relation resolved against the
+		// pattern base; [1] is the destination relation (renameDstKindOf is
+		// the single classification shared with patternOpsFeasible). SelfTwo
+		// is the rename-pair token (first path in [0], derived fresh second
+		// path in [1]); Sibling destinations are geometric (same parent,
+		// pickRenameDst keeps the fresh fallback); Same denotes the base
+		// itself and requires a same-class sibling as source (TmpDir
+		// included, per the variant-side rule) so the crossing reaches the
+		// hmdfs rename trace. Unsupported tokens fall back to the stat
+		// keeper below.
+		if len(op.PathArgs) >= 2 {
+			srcRel := op.PathArgs[0].Relation
+			dstRel := op.PathArgs[1].Relation
+			kind := renameDstKindOf(srcRel, dstRel)
+			srcConstraint := relTargetAny
+			if kind == renameDstBase {
+				srcConstraint = nodeTypeConstraint(lcs.FileTree.FindNode(basePath))
+			}
+			srcPath := lcs.FileTree.GetPathByRelation(basePath, "", srcRel, r.Rand, false, srcConstraint)
+			if srcPath != "" {
+				path = srcPath
+				switch kind {
+				case renameDstTwin:
+					path2 = freshRenameDst(srcPath, r.Rand)
+				case renameDstSibling:
+					path2 = lcs.pickRenameDst(srcPath, r.Rand)
+				case renameDstBase:
+					if srcPath != basePath && renameSameParent(srcPath, basePath) {
+						path2 = basePath
+					}
+				}
+			}
+		}
+		if path2 == "" {
+			path = ""
+		}
 	} else if len(op.PathArgs) == 1 {
 		pathArg := op.PathArgs[0]
 		constraint := callNameConstraint(op.CallName)
 		path = lcs.FileTree.GetPathByRelation(basePath, "", pathArg.Relation, r.Rand, false, constraint)
-		if path == "" && basePathCompatible(lcs.FileTree, basePath, constraint) {
-			path = basePath
-		}
 	}
 
 	if path == "" {
-		// No generatable path (rename relation miss, or a fallback that is
-		// incompatible with the op's target type): keep the node non-empty
-		// with a stat on the base path instead of dropping the op or running
-		// a doomed call.
+		// No generatable path (relation miss): keep the node non-empty with a
+		// stat on the base path instead of dropping the op or running a
+		// doomed call.
 		calls = append(calls, r.generateStatCallWithPath(s, sCalls, basePath))
 		return calls, writeinfos, ""
 	}
 
-	openFlags := uint64(2)
+	isDirPath := false
 	if lcs != nil && lcs.FileTree != nil {
-		node := lcs.FileTree.FindNode(path)
-		if node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir) {
-			openFlags = r.target.GetConst("O_DIRECTORY")
-		}
+		isDirPath = nodeIsDir(lcs.FileTree.FindNode(path))
+	}
+	openFlags := uint64(2)
+	if isDirPath {
+		openFlags = r.target.GetConst("O_DIRECTORY")
 	}
 
 	switch op.CallName {
 	case "open":
-		calls, _ = r.generateOpenCallSeq(s, sCalls, path, openFlags)
+		calls, _ = r.generateOpenCallSeq(s, sCalls, path, r.randOpenFlags(r.target, 0, isDirPath))
 	case "close":
 		if UseExistFd {
 			if ExistingFd == nil {
@@ -2360,8 +2481,6 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 		}
 	case "read":
 		if offsetRel != OffsetUnspecified {
-			readSize := uint64(r.Intn(4096) + 1)
-			offset := sharedOffset
 			var fileSize uint64
 			if lcs != nil {
 				node := lcs.FileTree.FindNode(path)
@@ -2369,20 +2488,12 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 					fileSize = node.Size
 				}
 			}
-			if fileSize > 0 && r.nOutOf(4, 5) {
-				if offsetRel == OffsetDifferent {
-					offset = r.randRange(0, fileSize+4096)
-				}
-				if offset < fileSize {
-					readSize = r.randRange(1, uint64(min(int(fileSize-offset+4096), 8192)))
-				} else {
-					readSize = r.randRange(1, 8192)
-				}
-			} else {
-				if offsetRel == OffsetDifferent {
-					offset = r.randInt(64)
-				}
+			refLen := r.randHmdfsLen(fileSize, 1, 8192)
+			offset := sharedOffset
+			if offsetRel == OffsetDifferent {
+				offset = r.randHmdfsOffsetDifferent(fileSize, sharedOffset, refLen)
 			}
+			readSize := clampLenToBucket(fileSize, offset, refLen, bucketOfOffset(fileSize, offset))
 			if UseExistFd {
 				if ExistingFd == nil {
 					return calls, writeinfos, path2
@@ -2390,29 +2501,35 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 				readcalls := r.generatePreadCallsSeq(s, sCalls, path, readSize, offset, ExistingFd)
 				calls = append(calls, readcalls...)
 			} else {
-				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, openFlags)
+				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+					r.randOpenFlags(r.target, capNeeded("read"), false))
 				readcalls := r.generatePreadCallsSeq(s, sCalls, path, readSize, offset, RetFd)
 				calls = append(calls, opencalls...)
 				calls = append(calls, readcalls...)
 			}
 		} else {
+			var fileSize uint64
+			if lcs != nil {
+				if node := lcs.FileTree.FindNode(path); node != nil {
+					fileSize = node.Size
+				}
+			}
 			if UseExistFd {
 				if ExistingFd == nil {
 					return calls, writeinfos, path2
 				}
-				readcalls := r.generateReadCallsSeq(s, sCalls, path, uint64(r.Intn(4096)+1), ExistingFd)
+				readcalls := r.generateReadCallsSeq(s, sCalls, path, r.randHmdfsLen(fileSize, 1, 8192), ExistingFd)
 				calls = append(calls, readcalls...)
 			} else {
-				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, openFlags)
-				readcalls := r.generateReadCallsSeq(s, sCalls, path, uint64(r.Intn(4096)+1), RetFd)
+				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+					r.randOpenFlags(r.target, capNeeded("read"), false))
+				readcalls := r.generateReadCallsSeq(s, sCalls, path, r.randHmdfsLen(fileSize, 1, 8192), RetFd)
 				calls = append(calls, opencalls...)
 				calls = append(calls, readcalls...)
 			}
 		}
 	case "write":
 		if offsetRel != OffsetUnspecified {
-			writeLen := uint64(r.Intn(4096) + 1)
-			offset := sharedOffset
 			var fileSize uint64
 			if lcs != nil {
 				node := lcs.FileTree.FindNode(path)
@@ -2420,16 +2537,12 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 					fileSize = node.Size
 				}
 			}
-			if fileSize > 0 && r.nOutOf(4, 5) {
-				if offsetRel == OffsetDifferent {
-					offset = r.randRange(0, fileSize+4096)
-				}
-				writeLen = r.randRange(1, uint64(min(int(fileSize+4096), 8192)))
-			} else {
-				if offsetRel == OffsetDifferent {
-					offset = r.randInt(64)
-				}
+			refLen := r.randHmdfsLen(fileSize, 1, 8192)
+			offset := sharedOffset
+			if offsetRel == OffsetDifferent {
+				offset = r.randHmdfsOffsetDifferent(fileSize, sharedOffset, refLen)
 			}
+			writeLen := clampLenToBucket(fileSize, offset, refLen, bucketOfOffset(fileSize, offset))
 			data := make([]byte, writeLen)
 			r.Read(data)
 			writeinfos = append(writeinfos, &WriteInfo{Offset: offset, Length: writeLen})
@@ -2440,24 +2553,32 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 				writecalls := r.generatePwriteCallsSeq(s, sCalls, path, data, offset, ExistingFd)
 				calls = append(calls, writecalls...)
 			} else {
-				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, openFlags)
+				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+					r.randOpenFlags(r.target, capNeeded("write"), false))
 				writecalls := r.generatePwriteCallsSeq(s, sCalls, path, data, offset, RetFd)
 				calls = append(calls, opencalls...)
 				calls = append(calls, writecalls...)
 			}
 		} else {
+			var fileSize uint64
+			if lcs != nil {
+				if node := lcs.FileTree.FindNode(path); node != nil {
+					fileSize = node.Size
+				}
+			}
 			if UseExistFd {
 				if ExistingFd == nil {
 					return calls, writeinfos, path2
 				}
-				data := make([]byte, r.Intn(4096)+1)
+				data := make([]byte, r.randHmdfsLen(fileSize, 1, 8192))
 				r.Read(data)
 				writecalls := r.generateWriteCallsSeq(s, sCalls, path, data, ExistingFd)
 				calls = append(calls, writecalls...)
 			} else {
-				data := make([]byte, r.Intn(4096)+1)
+				data := make([]byte, r.randHmdfsLen(fileSize, 1, 8192))
 				r.Read(data)
-				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, openFlags)
+				opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+					r.randOpenFlags(r.target, capNeeded("write"), false))
 				writecalls := r.generateWriteCallsSeq(s, sCalls, path, data, RetFd)
 				calls = append(calls, opencalls...)
 				calls = append(calls, writecalls...)
@@ -2487,6 +2608,9 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 		if path2 != "" {
 			calls = append(calls, r.generateRenameCallWithPaths(s, sCalls, path, path2))
 		} else {
+			// Only a malformed single-slot rename reaches this (a two-slot
+			// pattern rename resolves both paths or falls back to the stat
+			// keeper above); keep the historical fresh-destination shape.
 			calls = append(calls, r.generateRenameCallWithPaths(s, sCalls, path, path+"._renamed_"+randomSuffix(r.Rand)))
 		}
 	case "stat":
@@ -2499,10 +2623,25 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 			fsyncCall := r.generateFsyncCall(s, sCalls, ExistingFd)
 			calls = append(calls, fsyncCall)
 		} else {
-			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, openFlags)
+			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, capNeeded("fsync"), false))
 			fsyncCall := r.generateFsyncCall(s, sCalls, RetFd)
 			calls = append(calls, opencalls...)
 			calls = append(calls, fsyncCall)
+		}
+	case "fdatasync":
+		if UseExistFd {
+			if ExistingFd == nil {
+				return calls, writeinfos, path2
+			}
+			calls = append(calls, r.generateFdatasyncCall(s, sCalls, ExistingFd))
+		} else {
+			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, 0, false))
+			calls = append(calls, opencalls...)
+			if len(opencalls) > 0 {
+				calls = append(calls, r.generateFdatasyncCall(s, sCalls, RetFd))
+			}
 		}
 	case "getdents64":
 		if UseExistFd {
@@ -2512,7 +2651,8 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 			getdents64Call := r.generateGetdents64CallWithFd(s, sCalls, ExistingFd)
 			calls = append(calls, getdents64Call)
 		} else {
-			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, openFlags)
+			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, fdCapDir, true))
 			getdents64Call := r.generateGetdents64CallWithFd(s, sCalls, RetFd)
 			calls = append(calls, opencalls...)
 			calls = append(calls, getdents64Call)
@@ -2522,17 +2662,37 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 	return calls, writeinfos, path2
 }
 
-func (r *randGen) generateVerificationCalls(s *state, sCalls *SpecialCalls, basePath string, cid string, seedType string, writeInfos []*WriteInfo, flags uint64) []*Call {
+// patternVerificationTarget resolves the verification target's size and
+// directory-ness: tree nodes report their type/size; fresh paths (not yet in
+// the tree) fall back to the pattern's base kind.
+func patternVerificationTarget(ft *FileTree, basePath, baseKind string) (uint64, bool) {
+	if ft != nil {
+		if node := ft.FindNode(basePath); node != nil {
+			return node.Size, nodeIsDir(node)
+		}
+	}
+	return 0, baseKind == "dir"
+}
+
+func (r *randGen) generateVerificationCalls(s *state, sCalls *SpecialCalls, basePath string, fileSize uint64, isDir bool) []*Call {
 	var calls []*Call
-	//TODO: 。。。果然没写好
+	if isDir {
+		// open(dir, ...)+pread would be short-circuited by the VFS before
+		// reaching hmdfs; verify directories with a stat instead.
+		return append(calls, r.generateStatCallWithPath(s, sCalls, basePath))
+	}
 	verificationType := r.Intn(3)
 
 	switch verificationType {
 	case 0:
-		calls, _ = r.generateOpenCallSeq(s, sCalls, basePath, flags)
+		calls, _ = r.generateOpenCallSeq(s, sCalls, basePath,
+			r.randOpenFlags(r.target, capNeeded("read"), false))
 	case 1:
-		opencalls1, RetFd := r.generateOpenCallSeq(s, sCalls, basePath, flags)
-		readcalls1 := r.generatePreadCallsSeq(s, sCalls, basePath, uint64(r.Intn(1024)+1), uint64(r.Intn(1024)+1), RetFd)
+		opencalls1, RetFd := r.generateOpenCallSeq(s, sCalls, basePath,
+			r.randOpenFlags(r.target, capNeeded("read"), false))
+		offset := r.randHmdfsOffset(fileSize)
+		readSize := r.pickHmdfsLenAt(fileSize, offset, 8192)
+		readcalls1 := r.generatePreadCallsSeq(s, sCalls, basePath, readSize, offset, RetFd)
 		closecall1 := r.generateCloseCall(s, sCalls, RetFd)
 		calls = append(calls, opencalls1...)
 		calls = append(calls, readcalls1...)
@@ -2544,66 +2704,46 @@ func (r *randGen) generateVerificationCalls(s *state, sCalls *SpecialCalls, base
 	return calls
 }
 
-func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seedType string) []*Prog {
+func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy) []*Prog {
 	var ps []*Prog
 
 	var basePath string
 
 	var ct *ChoiceTable
-	if seedType == "fileops" && lcs != nil {
-		ct = lcs.FileopsChoiceTable
-	} else if lcs != nil {
-		ct = lcs.InodeopsChoiceTable
+	if lcs != nil {
+		ct = lcs.FsopsChoiceTable
 	}
 	rootCallName := r.chooseRootCallName(ct, -1)
 	if rootCallName == "" {
 		return ps
 	}
 
-	if seedType == "fileops" {
+	if IsDirOnlyCall(rootCallName) {
+		dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
+		if dirNode == nil {
+			return ps
+		}
+		basePath = dirNode.FullPath
+	} else if IsFileOnlyCall(rootCallName) {
 		fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
 		if fileNode == nil {
 			return ps
 		}
 		basePath = fileNode.FullPath
 	} else {
-		if IsDirOnlyCall(rootCallName) {
+		dirorfile := r.Intn(3)
+		if dirorfile < 2 {
 			dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
 			if dirNode == nil {
 				return ps
 			}
 			basePath = dirNode.FullPath
-		} else if IsFileOnlyCall(rootCallName) {
+		} else {
 			fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
 			if fileNode == nil {
 				return ps
 			}
 			basePath = fileNode.FullPath
-		} else {
-			dirorfile := r.Intn(3)
-			if dirorfile < 2 {
-				dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
-				if dirNode == nil {
-					return ps
-				}
-				basePath = dirNode.FullPath
-			} else {
-				fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
-				if fileNode == nil {
-					return ps
-				}
-				basePath = fileNode.FullPath
-			}
-			/*dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
-			if dirNode == nil {
-				fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
-				if fileNode == nil {
-					return ps
-				}
-				basePath = fileNode.FullPath
-			} else {
-				basePath = dirNode.FullPath
-			} */
 		}
 	}
 
@@ -2623,6 +2763,17 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 		basePath = emptyDir.FullPath
 	}
 
+	basePath2 := ""
+	if rootCallName == "rename" {
+		basePath2 = freshRenameDst(basePath, r.Rand)
+	}
+	// Failure-shape whitelist (same as insertCallFromDCT): with failShapeProb
+	// rewrite the root target into a shape whose error reaches a traced hmdfs
+	// function. Seed generation previously only produced the success path.
+	if r.Rand.Float64() < failShapeProb {
+		basePath, basePath2 = applyFailureShape(lcs, rootCallName, basePath, basePath2, r)
+	}
+
 	p0 := &Prog{Target: r.target}
 	cid0 := hmcfg.Cids[0]
 	rootFileSize := uint64(0)
@@ -2631,34 +2782,37 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 		node := lcs.FileTree.FindNode(basePath)
 		if node != nil {
 			rootFileSize = node.Size
-			if node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir {
+			if nodeIsDir(node) {
 				rootFlags = r.target.GetConst("O_DIRECTORY")
 			}
 		}
 	}
-	rootCalls := r.generateCallByName(s, sCalls, rootCallName, basePath, "", cid0, nil, false, rootFileSize, rootFlags)
+	rootCalls := r.generateCallByName(s, sCalls, rootCallName, basePath, basePath2, cid0, nil, false, rootFileSize, rootFlags)
+	if len(rootCalls) == 0 || hasNilCall(rootCalls) {
+		// A nil call would panic at Serialize; return an empty set so the
+		// caller falls back to the legacy generators.
+		return ps
+	}
 	for _, c := range rootCalls {
 		p0.Calls = append(p0.Calls, c)
 	}
 
-	if seedType == "inodeops" {
-		p0.IsInodeOps = true
-	} else {
-		p0.IsFileOps = true
-	}
+	p0.IsFsops = true
 	ps = append(ps, p0)
 
 	for nodeIdx := 1; nodeIdx < hmcfg.Node_num; nodeIdx++ {
 		p := &Prog{Target: r.target}
 		cid := hmcfg.Cids[nodeIdx]
 
-		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, basePathIsFile(lcs.FileTree, rootCallName, basePath), basePath)
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, basePathIsFile(lcs.FileTree, rootCallName, basePath), basePath, true)
 		if variant == nil {
 			// No generatable variant for this base (e.g. no relation is
 			// currently available): keep the node slot with a stat call
 			// instead of dropping the node (the executor requires a
 			// program for every client).
-			ps = append(ps, r.fallbackStatNode(s, sCalls, basePath, seedType))
+			if fp := r.fallbackStatNode(s, sCalls, basePath); fp != nil {
+				ps = append(ps, fp)
+			}
 			continue
 		}
 
@@ -2687,44 +2841,54 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 			if concurrentPath == "" {
 				// Not generatable after all (should not happen under
 				// relOK filtering): keep the slot with a stat call.
-				ps = append(ps, r.fallbackStatNode(s, sCalls, basePath, seedType))
+				if fp := r.fallbackStatNode(s, sCalls, basePath); fp != nil {
+					ps = append(ps, fp)
+				}
 				continue
 			}
 		} else if concurrentPath == "" {
 			constraint := callNameConstraint(variant.CallName)
 			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, false, constraint)
-			if concurrentPath == "" && basePathCompatible(lcs.FileTree, basePath, constraint) {
-				concurrentPath = basePath
-			}
 			if concurrentPath == "" {
 				// No generatable path of the right type for this variant:
 				// keep the node slot with a stat call.
-				ps = append(ps, r.fallbackStatNode(s, sCalls, basePath, seedType))
+				if fp := r.fallbackStatNode(s, sCalls, basePath); fp != nil {
+					ps = append(ps, fp)
+				}
 				continue
 			}
 		}
 
 		concurrentFileSize := uint64(0)
 		concurrentFlags := uint64(2)
-		if lcs != nil {
+		if lcs != nil && lcs.FileTree != nil {
 			node := lcs.FileTree.FindNode(concurrentPath)
 			if node != nil {
 				concurrentFileSize = node.Size
-				if node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir {
+				if nodeIsDir(node) {
 					concurrentFlags = r.target.GetConst("O_DIRECTORY")
 				}
+			} else if !basePathIsFile(lcs.FileTree, rootCallName, basePath) {
+				// Fresh target of a directory-intent root (e.g. mkdir): the
+				// open variant must carry O_DIRECTORY or VFS rejects it
+				// before the hmdfs trace point.
+				concurrentFlags = r.target.GetConst("O_DIRECTORY")
 			}
 		}
 		concurrentCalls := r.generateCallByName(s, sCalls, variant.CallName, concurrentPath, concurrentPath2, cid, nil, false, concurrentFileSize, concurrentFlags)
+		if len(concurrentCalls) == 0 || hasNilCall(concurrentCalls) {
+			// A nil call would panic at Serialize; keep the node slot with the
+			// stat fallback instead.
+			if fp := r.fallbackStatNode(s, sCalls, basePath); fp != nil {
+				ps = append(ps, fp)
+			}
+			continue
+		}
 		for _, c := range concurrentCalls {
 			p.Calls = append(p.Calls, c)
 		}
 
-		if seedType == "inodeops" {
-			p.IsInodeOps = true
-		} else {
-			p.IsFileOps = true
-		}
+		p.IsFsops = true
 		ps = append(ps, p)
 
 	}
@@ -2735,14 +2899,23 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 // fallbackStatNode builds a minimal single-call stat program on basePath so
 // that a node slot is never dropped during seed construction: the executor
 // requires a program (non-zero size) for every client.
-func (r *randGen) fallbackStatNode(s *state, sCalls *SpecialCalls, basePath string, seedType string) *Prog {
-	p := &Prog{Target: r.target}
-	p.Calls = append(p.Calls, r.generateStatCallWithPath(s, sCalls, basePath))
-	if seedType == "inodeops" {
-		p.IsInodeOps = true
-	} else {
-		p.IsFileOps = true
+func (r *randGen) fallbackStatNode(s *state, sCalls *SpecialCalls, basePath string) *Prog {
+	c := r.generateStatCallWithPath(s, sCalls, basePath)
+	if c == nil {
+		// Defensive: the target lacks a stat syscall entry (misconfig-only in
+		// practice). Retry through the name-based generator so the node slot
+		// keeps a valid, non-nil call whenever possible.
+		calls := r.generateCallByName(s, sCalls, "stat", basePath, "", "", nil, false, 0, 2)
+		if len(calls) > 0 && !hasNilCall(calls) {
+			c = calls[0]
+		}
 	}
+	if c == nil {
+		return nil
+	}
+	p := &Prog{Target: r.target}
+	p.Calls = append(p.Calls, c)
+	p.IsFsops = true
 	return p
 }
 
@@ -2750,10 +2923,19 @@ func (r *randGen) chooseRootCallName(ct *ChoiceTable, bias int) string {
 	if ct == nil {
 		return ""
 	}
-	// close is a legal bias source (it is in the sub table so that a bias
-	// from a close call introduced by fd self-contained sequences passes
-	// Enabled), but never a root result: retry with the same bias when
-	// close is picked. Bounded retries keep this from looping forever.
+	// A bias call must be enabled in the sub table (ChoiceTable.choose
+	// panics otherwise). Bias calls come from arbitrary program calls, so
+	// sanitize: a disabled bias (close on tables without it, syz_failure_*,
+	// ...) falls back to unbiased selection.
+	if bias >= 0 && !ct.Enabled(bias) {
+		bias = -1
+	}
+	// close is a legal bias source for the fsops choice table
+	// (FsopsChoiceCalls enables it so that a bias from a close call
+	// introduced by fd self-contained sequences passes Enabled); tables that
+	// do not enable a given bias call rely on the sanitize above. close is
+	// never a root result: retry with the same bias when close is picked.
+	// Bounded retries keep this from looping forever.
 	for attempt := 0; attempt < len(ct.calls)+1; attempt++ {
 		idx := ct.choose(r.Rand, bias)
 		if r.target.Syscalls[idx].CallName != "close" {
@@ -2783,10 +2965,7 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			calls = append(calls, closecall)
 		}
 	case "read":
-		readSize := uint64(r.Intn(1024) + 1)
-		if fileSize > 0 && r.nOutOf(4, 5) {
-			readSize = r.randRange(1, uint64(min(int(fileSize), 8192)))
-		}
+		readSize := r.randHmdfsLen(fileSize, 1, 8192)
 		if UseExistFd {
 			if ExistingFd == nil {
 				return nil
@@ -2794,7 +2973,8 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			readcalls := r.generateReadCallsSeq(s, sCalls, path, readSize, ExistingFd)
 			calls = append(calls, readcalls...)
 		} else {
-			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, flags)
+			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, capNeeded("read"), false))
 			readcalls := r.generateReadCallsSeq(s, sCalls, path, readSize, RetFd)
 			closecall := r.generateCloseCall(s, sCalls, RetFd)
 			calls = append(calls, opencalls...)
@@ -2802,10 +2982,7 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			calls = append(calls, closecall)
 		}
 	case "write":
-		writeLen := r.Intn(1024) + 1
-		if fileSize > 0 && r.nOutOf(4, 5) {
-			writeLen = int(r.randRange(1, uint64(min(int(fileSize+4096), 8192))))
-		}
+		writeLen := int(r.randHmdfsLen(fileSize, 1, 8192))
 		data := make([]byte, writeLen)
 		r.Read(data)
 		if UseExistFd {
@@ -2815,7 +2992,8 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			writecalls := r.generateWriteCallsSeq(s, sCalls, path, data, ExistingFd)
 			calls = append(calls, writecalls...)
 		} else {
-			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, flags)
+			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, capNeeded("write"), false))
 			writecalls := r.generateWriteCallsSeq(s, sCalls, path, data, RetFd)
 			closecall := r.generateCloseCall(s, sCalls, RetFd)
 			calls = append(calls, opencalls...)
@@ -2827,30 +3005,15 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			if ExistingFd == nil {
 				return nil
 			}
-			preadOffset := uint64(r.Intn(1024))
-			preadSize := uint64(r.Intn(1024) + 1)
-			if fileSize > 0 && r.nOutOf(4, 5) {
-				preadOffset = r.randRange(0, fileSize+4096)
-				if preadOffset < fileSize {
-					preadSize = r.randRange(1, uint64(min(int(fileSize-preadOffset+4096), 8192)))
-				} else {
-					preadSize = r.randRange(1, 8192)
-				}
-			}
+			preadOffset := r.randHmdfsOffset(fileSize)
+			preadSize := r.pickHmdfsLenAt(fileSize, preadOffset, 8192)
 			preadcalls := r.generatePreadCallsSeq(s, sCalls, path, preadSize, preadOffset, ExistingFd)
 			calls = append(calls, preadcalls...)
 		} else {
-			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, flags)
-			preadOffset := uint64(r.Intn(1024))
-			preadSize := uint64(r.Intn(1024) + 1)
-			if fileSize > 0 && r.nOutOf(4, 5) {
-				preadOffset = r.randRange(0, fileSize+4096)
-				if preadOffset < fileSize {
-					preadSize = r.randRange(1, uint64(min(int(fileSize-preadOffset+4096), 8192)))
-				} else {
-					preadSize = r.randRange(1, 8192)
-				}
-			}
+			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, capNeeded("read"), false))
+			preadOffset := r.randHmdfsOffset(fileSize)
+			preadSize := r.pickHmdfsLenAt(fileSize, preadOffset, 8192)
 			preadcalls := r.generatePreadCallsSeq(s, sCalls, path, preadSize, preadOffset, RetFd)
 			closecall := r.generateCloseCall(s, sCalls, RetFd)
 			calls = append(calls, opencalls...)
@@ -2862,24 +3025,17 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			if ExistingFd == nil {
 				return nil
 			}
-			pwriteOffset := uint64(r.Intn(1024))
-			pwriteLen := r.Intn(1024) + 1
-			if fileSize > 0 && r.nOutOf(4, 5) {
-				pwriteOffset = r.randRange(0, fileSize+4096)
-				pwriteLen = int(r.randRange(1, uint64(min(int(fileSize+4096), 8192))))
-			}
+			pwriteOffset := r.randHmdfsOffset(fileSize)
+			pwriteLen := int(r.pickHmdfsLenAt(fileSize, pwriteOffset, 8192))
 			data := make([]byte, pwriteLen)
 			r.Read(data)
 			pwritecalls := r.generatePwriteCallsSeq(s, sCalls, path, data, pwriteOffset, ExistingFd)
 			calls = append(calls, pwritecalls...)
 		} else {
-			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, flags)
-			pwriteOffset := uint64(r.Intn(1024))
-			pwriteLen := r.Intn(1024) + 1
-			if fileSize > 0 && r.nOutOf(4, 5) {
-				pwriteOffset = r.randRange(0, fileSize+4096)
-				pwriteLen = int(r.randRange(1, uint64(min(int(fileSize+4096), 8192))))
-			}
+			opencalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, capNeeded("write"), false))
+			pwriteOffset := r.randHmdfsOffset(fileSize)
+			pwriteLen := int(r.pickHmdfsLenAt(fileSize, pwriteOffset, 8192))
 			data := make([]byte, pwriteLen)
 			r.Read(data)
 			pwritecalls := r.generatePwriteCallsSeq(s, sCalls, path, data, pwriteOffset, RetFd)
@@ -2917,11 +3073,30 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			fsyncCall := r.generateFsyncCall(s, sCalls, ExistingFd)
 			calls = append(calls, fsyncCall)
 		} else {
-			openCalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, flags)
+			openCalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, capNeeded("fsync"), false))
 			calls = append(calls, openCalls...)
 			if len(openCalls) > 0 {
 				fsyncCall := r.generateFsyncCall(s, sCalls, RetFd)
 				calls = append(calls, fsyncCall)
+				closeCall := r.generateCloseCall(s, sCalls, RetFd)
+				calls = append(calls, closeCall)
+			}
+		}
+	case "fdatasync":
+		if UseExistFd {
+			if ExistingFd == nil {
+				return nil
+			}
+			fdatasyncCall := r.generateFdatasyncCall(s, sCalls, ExistingFd)
+			calls = append(calls, fdatasyncCall)
+		} else {
+			openCalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, capNeeded("fsync"), false))
+			calls = append(calls, openCalls...)
+			if len(openCalls) > 0 {
+				fdatasyncCall := r.generateFdatasyncCall(s, sCalls, RetFd)
+				calls = append(calls, fdatasyncCall)
 				closeCall := r.generateCloseCall(s, sCalls, RetFd)
 				calls = append(calls, closeCall)
 			}
@@ -2934,7 +3109,8 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 			getdents64Call := r.generateGetdents64CallWithFd(s, sCalls, ExistingFd)
 			calls = append(calls, getdents64Call)
 		} else {
-			openCalls, RetFd := r.generateOpenCallSeq(s, sCalls, path, flags)
+			openCalls, RetFd := r.generateOpenCallSeq(s, sCalls, path,
+				r.randOpenFlags(r.target, fdCapDir, true))
 			calls = append(calls, openCalls...)
 			if len(openCalls) > 0 {
 				getdents64Call := r.generateGetdents64CallWithFd(s, sCalls, RetFd)
@@ -3080,6 +3256,22 @@ func (r *randGen) generateFsyncCall(s *state, sCalls *SpecialCalls, fdRet *Resul
 	return cfsync
 }
 
+func (r *randGen) generateFdatasyncCall(s *state, sCalls *SpecialCalls, fdRet *ResultArg) *Call {
+	meta := r.target.Syscalls[sCalls.FdatasyncId]
+	if meta == nil {
+		return nil
+	}
+	fdt := meta.Args[0].Type.(*ResourceType)
+	args := make([]Arg, len(meta.Args))
+	args[0] = MakeResultArg(fdt, DirIn, fdRet, 0)
+
+	c := MakeCall(meta, nil)
+	c.Args = args
+	r.target.assignSizesCall(c)
+	s.analyze(c)
+	return c
+}
+
 func (r *randGen) generateTruncateCallWithPath(s *state, sCalls *SpecialCalls, filePath string, fileSize uint64) *Call {
 	meta := r.target.Syscalls[sCalls.TruncateId]
 	if meta == nil {
@@ -3090,11 +3282,7 @@ func (r *randGen) generateTruncateCallWithPath(s *state, sCalls *SpecialCalls, f
 	lenType := meta.Args[1].Type.(*IntType)
 
 	var truncLen uint64
-	if fileSize > 0 && r.nOutOf(4, 5) {
-		truncLen = r.randRange(0, fileSize*2)
-	} else {
-		truncLen = uint64(r.Intn(8192))
-	}
+	truncLen = r.randHmdfsTruncLen(fileSize)
 
 	pathArg := MakeDataArg(ptrType.Elem, DirIn, []byte(filePath+"\x00"))
 	pathPtr := r.allocAddr(s, ptrType, DirIn, pathArg.Size(), pathArg)
@@ -3122,7 +3310,7 @@ func (r *randGen) generateChmodCallWithPath(s *state, sCalls *SpecialCalls, file
 
 	pathArg := MakeDataArg(ptrType.Elem, DirIn, []byte(filePath+"\x00"))
 	pathPtr := r.allocAddr(s, ptrType, DirIn, pathArg.Size(), pathArg)
-	modeArg := MakeConstArg(modeType, DirIn, uint64(r.Intn(0o777)+1))
+	modeArg := MakeConstArg(modeType, DirIn, r.randChmodMode())
 
 	args := make([]Arg, len(meta.Args))
 	args[0] = pathPtr
@@ -3146,7 +3334,7 @@ func (r *randGen) generateMkdirCallWithPath(s *state, sCalls *SpecialCalls, dirP
 
 	pathArg := MakeDataArg(ptrType.Elem, DirIn, []byte(dirPath+"\x00"))
 	pathPtr := r.allocAddr(s, ptrType, DirIn, pathArg.Size(), pathArg)
-	modeArg := MakeConstArg(modeType, DirIn, 0o755)
+	modeArg := MakeConstArg(modeType, DirIn, r.randFileMode())
 
 	args := make([]Arg, len(meta.Args))
 	args[0] = pathPtr
@@ -3190,7 +3378,7 @@ func (r *randGen) generateCreatCallWithPath(s *state, sCalls *SpecialCalls, file
 
 	pathArg := MakeDataArg(ptrType.Elem, DirIn, []byte(filePath+"\x00"))
 	pathPtr := r.allocAddr(s, ptrType, DirIn, pathArg.Size(), pathArg)
-	modeArg := MakeConstArg(modeType, DirIn, 0o666)
+	modeArg := MakeConstArg(modeType, DirIn, r.randFileMode())
 
 	args := make([]Arg, len(meta.Args))
 	args[0] = pathPtr
@@ -3293,9 +3481,14 @@ func (r *randGen) generateGetdents64CallWithFd(s *state, sCalls *SpecialCalls, f
 	/*buf := MakeOutDataArg(bufPtrType.Elem, DirOut, 8192)
 	bufPtr := r.allocAddr(s, bufPtrType, DirIn, buf.Size(), buf)
 	countArg := MakeConstArg(countType, DirIn, 8192)*/
-	bufPtr, _ := r.generateArg(s, meta.Args[1].Type, DirIn)
-	countArg, _ := r.generateArg(s, meta.Args[2].Type, DirIn)
-	//TODO: 理论上getdents的参数生成也要做一些细化，但比较麻烦，先放在这吧.先用原本的生成
+	bufPtrType := meta.Args[1].Type.(*PtrType)
+	countType := meta.Args[2].Type.(*LenType)
+	// Fixed page size: truncation boundaries trip the checker's dirent
+	// approximation.
+	const gdSize = 4096
+	gdBuf := MakeOutDataArg(bufPtrType.Elem, DirOut, gdSize)
+	bufPtr := r.allocAddr(s, bufPtrType, DirIn, gdBuf.Size(), gdBuf)
+	countArg := MakeConstArg(countType, DirIn, gdSize)
 
 	args := make([]Arg, len(meta.Args))
 	args[0] = fdArg

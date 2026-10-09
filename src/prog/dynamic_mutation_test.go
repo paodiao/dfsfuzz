@@ -81,8 +81,8 @@ func callPath(c *Call) string {
 	return strings.TrimSuffix(string(d.Data()), "\x00")
 }
 
-func smokeRand() *randGen {
-	return &randGen{Rand: rand.New(rand.NewSource(1))}
+func smokeRand(target *Target) *randGen {
+	return newRand(target, rand.NewSource(1))
 }
 
 // Layout: p0 anchor open [100,200]; p1 open [150,250] + pwrite64 [160,260]
@@ -113,10 +113,12 @@ func smokePs(target *Target, withP0Write bool) []*Prog {
 
 func TestMutateGroupPathDynamicSmoke(t *testing.T) {
 	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
 	ps := smokePs(target, false)
 	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
 
-	if !MutateGroupPathDynamic(ps, lcs, smokeRand()) {
+	if !MutateGroupPathDynamic(ps, lcs, smokeRand(target)) {
 		t.Fatal("MutateGroupPathDynamic returned false")
 	}
 	newPath := callPath(ps[0].Calls[0])
@@ -138,20 +140,97 @@ func TestRemoveGroupDynamicSmoke(t *testing.T) {
 	ps := smokePs(target, false)
 	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
 
-	if !RemoveGroupDynamic(ps, lcs, smokeRand()) {
+	openA := ps[0].Calls[0]
+	closeA := ps[0].Calls[1]
+	if !RemoveGroupDynamic(ps, lcs, smokeRand(target)) {
 		t.Fatal("RemoveGroupDynamic returned false")
 	}
-	if len(ps[0].Calls) != 1 || len(ps[1].Calls) != 1 {
-		t.Fatalf("unexpected call counts: p0=%v p1=%v (want 1/1)", len(ps[0].Calls), len(ps[1].Calls))
+	// openA stays: its fd user closeA is outside the concurrent group.
+	// openB and pw1 form a self-contained fd chain inside the group and go.
+	if len(ps[0].Calls) != 2 || len(ps[1].Calls) != 1 || len(ps[2].Calls) != 1 {
+		t.Fatalf("unexpected call counts: p0=%v p1=%v p2=%v (want 2/1/1)",
+			len(ps[0].Calls), len(ps[1].Calls), len(ps[2].Calls))
+	}
+	if ra, ok := closeA.Args[0].(*ResultArg); !ok || ra.Res != openA.Ret {
+		t.Fatal("close user lost its open provider after group removal")
+	}
+	if got := callPath(ps[1].Calls[0]); got != "merge_view/x/y/z" {
+		t.Fatalf("p1 backbone changed: %q", got)
+	}
+	for _, p := range ps {
+		if p.HasBrokenRefs() {
+			t.Fatal("broken refs after RemoveGroupDynamic")
+		}
+	}
+}
+
+// TestRemoveGroupDynamicFdSafe pins the removal-set-aware fd rule: a provider
+// whose user survives outside the group must be kept instead of having the
+// user rewritten to a constant fd 0.
+func TestRemoveGroupDynamicFdSafe(t *testing.T) {
+	target := smokeTarget(t)
+	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
+
+	// Nothing removable: both grouped opens are only used by closes outside
+	// the group, so the mutation must decline without touching ps.
+	openA := mkOpen(target, "merge_view/dirA/a")
+	openA.CheckInfo = &FileMetadata{Stime: 100, Etime: 200}
+	closeA := mkClose(target, openA)
+	openB := mkOpen(target, "merge_view/dirA/a")
+	openB.CheckInfo = &FileMetadata{Stime: 150, Etime: 250}
+	closeB := mkClose(target, openB)
+	ps := []*Prog{
+		{Target: target, Calls: []*Call{openA, closeA}},
+		{Target: target, Calls: []*Call{openB, closeB}},
+	}
+	if RemoveGroupDynamic(ps, lcs, smokeRand(target)) {
+		t.Fatal("RemoveGroupDynamic removed fd-in-use providers")
+	}
+	if len(ps[0].Calls) != 2 || len(ps[1].Calls) != 2 {
+		t.Fatalf("ps changed on declined removal: p0=%v p1=%v", len(ps[0].Calls), len(ps[1].Calls))
+	}
+	if ra, ok := closeB.Args[0].(*ResultArg); !ok || ra.Res != openB.Ret {
+		t.Fatal("closeB lost its open provider")
+	}
+
+	// Mixed group: the self-contained fd chain (openB2+pw1) goes, while openC
+	// is kept because its closeC survives outside the group.
+	openA2 := mkOpen(target, "merge_view/dirA/a")
+	openA2.CheckInfo = &FileMetadata{Stime: 100, Etime: 200}
+	closeA2 := mkClose(target, openA2)
+	openB2 := mkOpen(target, "merge_view/dirA/a")
+	openB2.CheckInfo = &FileMetadata{Stime: 150, Etime: 250}
+	pw1 := mkPwrite64(target, openB2, 8, 0)
+	pw1.CheckInfo = &FileMetadata{Stime: 160, Etime: 260}
+	openC := mkOpen(target, "merge_view/dirB/b")
+	openC.CheckInfo = &FileMetadata{Stime: 150, Etime: 250}
+	closeC := mkClose(target, openC)
+	ps2 := []*Prog{
+		{Target: target, Calls: []*Call{openA2, closeA2}},
+		{Target: target, Calls: []*Call{openB2, pw1}},
+		{Target: target, Calls: []*Call{openC, closeC}},
+	}
+	if !RemoveGroupDynamic(ps2, lcs, smokeRand(target)) {
+		t.Fatal("RemoveGroupDynamic removed nothing in the mixed group")
+	}
+	if len(ps2[0].Calls) != 2 || len(ps2[1].Calls) != 0 || len(ps2[2].Calls) != 2 {
+		t.Fatalf("unexpected call counts: p0=%v p1=%v p2=%v (want 2/0/2)",
+			len(ps2[0].Calls), len(ps2[1].Calls), len(ps2[2].Calls))
+	}
+	if ra, ok := closeC.Args[0].(*ResultArg); !ok || ra.Res != openC.Ret {
+		t.Fatal("closeC lost its open provider")
+	}
+	for _, p := range ps2 {
+		if p.HasBrokenRefs() {
+			t.Fatal("broken refs after mixed group removal")
+		}
 	}
 }
 
 func TestRemoveReservoirDynamicSmoke(t *testing.T) {
 	target := smokeTarget(t)
 	ps := smokePs(target, false)
-	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
-
-	if !RemoveReservoirDynamic(ps, lcs, smokeRand()) {
+	if !RemoveReservoirDynamic(ps, smokeRand(target)) {
 		t.Fatal("RemoveReservoirDynamic returned false")
 	}
 	// The opens that were fd-in-use at removal time (p0's and p1's) must
@@ -175,10 +254,12 @@ func TestRemoveReservoirDynamicSmoke(t *testing.T) {
 
 func TestMutateGroupDataDynamicSmoke(t *testing.T) {
 	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
 	ps := smokePs(target, true)
 	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
 
-	if !MutateGroupDataDynamic(ps, lcs, smokeRand()) {
+	if !MutateGroupDataDynamic(ps, lcs, smokeRand(target)) {
 		t.Fatal("MutateGroupDataDynamic returned false")
 	}
 	// The anchor's pwrite64 and the concurrent pwrite64 must share offset
@@ -227,6 +308,8 @@ func TestFindHBCalls(t *testing.T) {
 // mutation: sequential write->read on the same offset.
 func TestMutateGroupDataDynamicCausal(t *testing.T) {
 	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
 	openA := mkOpen(target, "merge_view/dirA/a")
 	openA.CheckInfo = &FileMetadata{Stime: 100, Etime: 200}
 	pw0 := mkPwrite64(target, openA, 8, 0)
@@ -243,7 +326,7 @@ func TestMutateGroupDataDynamicCausal(t *testing.T) {
 
 	ps := []*Prog{p0, p1}
 	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
-	if !MutateGroupDataDynamic(ps, lcs, smokeRand()) {
+	if !MutateGroupDataDynamic(ps, lcs, smokeRand(target)) {
 		t.Fatal("MutateGroupDataDynamic returned false")
 	}
 	off0 := ps[0].Calls[1].Args[3].(*ConstArg).Val
@@ -258,6 +341,8 @@ func TestMutateGroupDataDynamicCausal(t *testing.T) {
 // migrated together with the anchor (same pattern, new location).
 func TestMutateGroupPathDynamicCausal(t *testing.T) {
 	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
 	openA := mkOpen(target, "merge_view/dirA/a")
 	openA.CheckInfo = &FileMetadata{Stime: 100, Etime: 200}
 	p0 := &Prog{Target: target, Calls: []*Call{openA, mkClose(target, openA)}}
@@ -270,11 +355,63 @@ func TestMutateGroupPathDynamicCausal(t *testing.T) {
 
 	ps := []*Prog{p0, p1}
 	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
-	if !MutateGroupPathDynamic(ps, lcs, smokeRand()) {
+	if !MutateGroupPathDynamic(ps, lcs, smokeRand(target)) {
 		t.Fatal("MutateGroupPathDynamic returned false")
 	}
 	if got := callPath(ps[1].Calls[1]); got == "merge_view/x/y/z" {
 		t.Fatalf("causal successor not migrated: %q", got)
+	}
+}
+
+// TestMutateGroupPathDynamicOwnerUsers pins the owner-user constraint: an
+// O_RDONLY open used by pread64 is file-only, so neither the anchor nor the
+// shared-owner members may migrate to a directory (a constraint that looked
+// only at the op could install a dir and void the read).
+func TestMutateGroupPathDynamicOwnerUsers(t *testing.T) {
+	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
+	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
+
+	okCount := 0
+	for seed := int64(0); seed < 30; seed++ {
+		openA := mkOpen(target, "merge_view/dirA/a")
+		openA.Args[1].(*ConstArg).Val = 0 // O_RDONLY
+		openA.CheckInfo = &FileMetadata{Stime: 100, Etime: 200}
+		preadA := mkPread64At(target, openA, 16, 0)
+		preadA.CheckInfo = &FileMetadata{Stime: 110, Etime: 210}
+		p0 := &Prog{Target: target, Calls: []*Call{openA, preadA}}
+
+		openB := mkOpen(target, "merge_view/dirA/a")
+		openB.Args[1].(*ConstArg).Val = 0
+		openB.CheckInfo = &FileMetadata{Stime: 150, Etime: 250}
+		preadB := mkPread64At(target, openB, 16, 0)
+		preadB.CheckInfo = &FileMetadata{Stime: 160, Etime: 260}
+		closeB := mkClose(target, openB)
+		closeB.CheckInfo = &FileMetadata{Stime: 300, Etime: 400}
+		p1 := &Prog{Target: target, Calls: []*Call{openB, preadB, closeB}}
+
+		ps := []*Prog{p0, p1}
+		r := newRand(target, rand.NewSource(seed))
+		if !MutateGroupPathDynamic(ps, lcs, r) {
+			continue
+		}
+		okCount++
+		for _, pi := range []int{0, 1} {
+			path := callPath(ps[pi].Calls[0])
+			node := lcs.FileTree.FindNode(path)
+			if node == nil || node.Type != NodeTypeFile {
+				t.Fatalf("seed %d: owner path %q is not a file (node=%v)", seed, path, node)
+			}
+		}
+		for _, p := range ps {
+			if p.HasBrokenRefs() {
+				t.Fatalf("seed %d: broken refs after owner-user path mutation", seed)
+			}
+		}
+	}
+	if okCount == 0 {
+		t.Fatal("no seed produced a path mutation")
 	}
 }
 
@@ -309,7 +446,7 @@ func TestSyncStashReadVerification(t *testing.T) {
 	}}
 	ps := []*Prog{p0, p1}
 
-	syncStashReadVerification(ps, 100, 50, 300, 70)
+	syncStashReadVerification(ps, "", 100, 50, 300, 70)
 
 	got0 := p0.Calls[0].Args[3].(*ConstArg).Val
 	got1 := p1.Calls[0].Args[3].(*ConstArg).Val
@@ -476,74 +613,32 @@ func TestInsertDcacheCallGetdents64(t *testing.T) {
 	}
 }
 
-// patternSingleOpenBase builds the base shape that produced the broken-ref
-// programs intercepted in hmdfsfuzz3: every node holds exactly one timed open
-// (no close), so an fd-using pattern op can only reference that open.
-func patternSingleOpenBase(target *Target) []*Prog {
-	paths := []string{"merge_view/dirA/a", "merge_view/dirA/a", "merge_view/dirB/b"}
-	ps := make([]*Prog, 0, len(paths))
-	for i, pth := range paths {
-		o := mkOpen(target, pth)
-		o.CheckInfo = &FileMetadata{Stime: uint64(1000 + i*500), Etime: uint64(1100 + i*500)}
-		ps = append(ps, &Prog{Target: target, Calls: []*Call{o}})
+// TestFindInsertPositionTmpDirFd pins the fd classification of a TmpDir open:
+// the tree node type (TmpDir is a real directory) must win over the raw flag
+// check, so the fd lands in the dir ranges and is never reused as a file fd
+// (a read/write inserted after it would fail EISDIR before the trace).
+func TestFindInsertPositionTmpDirFd(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	sc := hmdfsSmokeSpecialCalls(t, target)
+	r := newRand(target, rand.NewSource(1))
+	s := newState(target, nil, nil)
+	calls := r.generateGetdents64Calls(s, sc, "merge_view/tmpdir")
+	if len(calls) < 3 {
+		t.Fatalf("getdents64 sequence too short: %d", len(calls))
 	}
-	return ps
-}
-
-// patternBrokenSweep runs insertCallFromPattern over deterministic seeds on
-// the given base shape and reports how many resulting programs hold
-// dangling/forward references (the panic: no result root cause). A hit pins
-// the exact seed for single-step reproduction.
-func patternBrokenSweep(t *testing.T, ps []*Prog, seedType string, sCalls *SpecialCalls,
-	cfg *Hmdfs_config, lcs *LayeredChoiceStrategy, seeds int64) (hits int, firstSeed int64, firstDiag string) {
-	firstSeed = -1
-	for seed := int64(0); seed < seeds; seed++ {
-		ps := Clones(ps)
-		r := newRand(ps[0].Target, rand.NewSource(seed))
-		if !insertCallFromPattern(ps, r, sCalls, cfg, lcs, seedType) {
-			continue
-		}
-		for _, p := range ps {
-			if p.HasBrokenRefs() {
-				hits++
-				if firstSeed < 0 {
-					firstSeed = seed
-					firstDiag = p.DumpRefDiagnosis()
-				}
-				break
-			}
-		}
-	}
-	return
-}
-
-func TestInsertCallFromPatternBrokenRefs(t *testing.T) {
-	target := smokeTarget(t)
-	sCalls := hmdfsSmokeSpecialCalls(t, target)
-	cfg := &Hmdfs_config{
-		Cids:     []string{"c1", "c2", "c3"},
-		Node_num: 3,
-		Serv_num: 0,
-		Init_dir: map[string][]string{
-			"c1": {"merge_view/dirA", "merge_view/dirB"},
-		},
-		Init_file: map[string][]string{
-			"c1": {"merge_view/dirA/a", "merge_view/dirB/b"},
-		},
-	}
+	p := &Prog{Target: target, Calls: calls}
 	ft := NewFileTree()
-	ft.InitFromHmdfsConfig(cfg)
-	cfg.FileTree = ft
+	ft.InitFromHmdfsConfig(&Hmdfs_config{
+		Init_tmpdir: map[string][]string{"c1": {"merge_view/tmpdir"}},
+	})
 
-	const seeds = 30000
-	for _, seedType := range []string{"fileops", "inodeops"} {
-		lcs := NewLayeredChoiceStrategy(seedType, cfg, target)
-		hits, firstSeed, firstDiag := patternBrokenSweep(t, patternSingleOpenBase(target),
-			seedType, sCalls, cfg, lcs, seeds)
-		t.Logf("seedType=%s base=single-open: %d broken-ref hits / %d seeds (first at seed %d)",
-			seedType, hits, seeds, firstSeed)
-		if hits > 0 && firstDiag != "" {
-			t.Logf("first hit diagnosis:\n%s", firstDiag)
+	if _, fd := findInsertPosition(p, r, 2, sc, -1, 0, 0, "", ft); fd != calls[0].Ret {
+		t.Fatalf("TmpDir open not classified as a directory fd: %v", fd)
+	}
+	for seed := int64(0); seed < 20; seed++ {
+		rr := newRand(target, rand.NewSource(seed))
+		if _, fd := findInsertPosition(p, rr, 1, sc, -1, 0, 0, "", ft); fd != nil {
+			t.Fatalf("seed %d: TmpDir fd reused as a file fd", seed)
 		}
 	}
 }
@@ -612,7 +707,7 @@ func TestMutateSrvFailPosConsistency(t *testing.T) {
 			},
 			SrvFailPos: [][]int{{1*100 + 1, 1}, {1*100 + 2, 3}},
 		}
-		p.Mutate(rand.NewSource(int64(1000+iter)), 20, ct, nil, sCalls, 0, true, false, &Hmdfs_config{}, 0)
+		p.Mutate(rand.NewSource(int64(1000+iter)), 20, ct, nil, sCalls, 0, true, false, &Hmdfs_config{})
 
 		syncPos := make(map[int]bool)
 		for i, c := range p.Calls {
@@ -707,7 +802,7 @@ func TestMoveSrvFailPosEntry(t *testing.T) {
 }
 
 // TestGeneralFailPosSyncKeyMapping 端到端校验生成器与 RefreshGeneralFailPos 共同
-// 依赖的映射约定：prog 内 syz_failure_sync 的 id 0/1 对应键 progIdx*100+1/+2。
+// 依赖的映射约定：prog 与 syz_failure_sync 的 id 0/1 对应于 progIdx*100+1/+2。
 func TestGeneralFailPosSyncKeyMapping(t *testing.T) {
 	target := smokeTarget(t)
 	sCalls := hmdfsSmokeSpecialCalls(t, target)
@@ -763,11 +858,462 @@ func TestGeneralFailPosSyncKeyMapping(t *testing.T) {
 		if len(ps) < 2 {
 			continue
 		}
-		// p1 在三种 mode 下都带 sync 对；做一次通用突变 + 重定位后再验。
+		// p1 在三种 mode 下都有 sync 对；做一次通用突变 + 重定位后再验证。
 		ps2 := Clones(ps)
 		ps2[1].Mutate(rand.NewSource(seed+500), RecommendedCalls, target.DefaultChoiceTable(),
-			nil, sCalls, 0, true, false, hmcfg, 1)
+			nil, sCalls, 0, true, false, hmcfg)
 		RefreshGeneralFailPos(ps2, 1)
 		assertMapping(t, ps2)
+	}
+}
+
+// mkTruncate builds truncate(path, len) with a length independent of any
+// buffer, mirroring the data-mutator support for length-only calls.
+func mkTruncate(target *Target, path string, length uint64) *Call {
+	meta := target.SyscallMap["truncate"]
+	ptrType := meta.Args[0].Type.(*PtrType)
+	lenType := meta.Args[1].Type.(*IntType)
+	data := MakeDataArg(ptrType.Elem, DirIn, []byte(path+"\x00"))
+	ptr := MakePointerArg(ptrType, DirIn, 0, data)
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{ptr, MakeConstArg(lenType, DirIn, length)}
+	target.assignSizesCall(c)
+	return c
+}
+
+// mkRead builds read(fd, buf buffer[out], count len[buf]) on an open call's
+// fd: the receive buffer carries no input payload, matching the read support
+// in the data mutator.
+func mkRead(target *Target, openCall *Call, count uint64) *Call {
+	meta := target.SyscallMap["read"]
+	fdType := meta.Args[0].Type.(*ResourceType)
+	bufPtrType := meta.Args[1].Type.(*PtrType)
+	countType := meta.Args[2].Type.(*LenType)
+	fd := MakeResultArg(fdType, DirIn, openCall.Ret, 0)
+	buf := MakeOutDataArg(bufPtrType.Elem, DirOut, count)
+	bufPtr := MakePointerArg(bufPtrType, DirIn, 0, buf)
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{fd, bufPtr, MakeConstArg(countType, DirIn, count)}
+	target.assignSizesCall(c)
+	return c
+}
+
+// mkPread64 is the offset-carrying read variant used by the mixed-kind test.
+func mkPread64(target *Target, openCall *Call, count, offset uint64) *Call {
+	meta := target.SyscallMap["pread64"]
+	fdType := meta.Args[0].Type.(*ResourceType)
+	bufPtrType := meta.Args[1].Type.(*PtrType)
+	countType := meta.Args[2].Type.(*LenType)
+	posType := meta.Args[3].Type.(*IntType)
+	fd := MakeResultArg(fdType, DirIn, openCall.Ret, 0)
+	buf := MakeOutDataArg(bufPtrType.Elem, DirOut, count)
+	bufPtr := MakePointerArg(bufPtrType, DirIn, 0, buf)
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{fd, bufPtr, MakeConstArg(countType, DirIn, count), MakeConstArg(posType, DirIn, offset)}
+	target.assignSizesCall(c)
+	return c
+}
+
+// isPickableLength reports whether v can be returned by the legacy (size==0)
+// pickMutationLength table: the fixed boundary buckets plus the random ranges
+// (512/4096/8192 are fixed bucket values that fall outside the ranges). With a
+// known size the function additionally emits size-relative values, which the
+// size-aware test asserts by range instead.
+func isPickableLength(v uint64) bool {
+	switch v {
+	case 512, 4096, 8192:
+		return true
+	}
+	for _, rr := range lenBucketRanges {
+		if v >= uint64(rr[0]) && v <= uint64(rr[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+func bufDataLen(c *Call) uint64 {
+	ptr, ok := c.Args[1].(*PointerArg)
+	if !ok || ptr.Res == nil {
+		return 0
+	}
+	data, ok := ptr.Res.(*DataArg)
+	if !ok {
+		return 0
+	}
+	// Size() works for both directions; Data() panics on buffer[out].
+	return data.Size()
+}
+
+// TestMutateGroupDataTruncateOnly covers length-only calls: truncate has no
+// buffer, so the data mutator must rewrite its len argument (arg[1]) to the
+// shared length.
+func TestMutateGroupDataTruncateOnly(t *testing.T) {
+	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
+	const origLen = 100000
+
+	tr0 := mkTruncate(target, "merge_view/dirA/a", origLen)
+	tr0.CheckInfo = &FileMetadata{Stime: 100, Etime: 200}
+	p0 := &Prog{Target: target, Calls: []*Call{tr0}}
+
+	tr1 := mkTruncate(target, "merge_view/dirA/a", origLen)
+	tr1.CheckInfo = &FileMetadata{Stime: 150, Etime: 250}
+	p1 := &Prog{Target: target, Calls: []*Call{tr1}}
+
+	ps := []*Prog{p0, p1}
+	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
+	if !MutateGroupDataDynamic(ps, lcs, smokeRand(target)) {
+		t.Fatal("MutateGroupDataDynamic returned false on truncate-only group")
+	}
+	len0 := ps[0].Calls[0].Args[1].(*ConstArg).Val
+	len1 := ps[1].Calls[0].Args[1].(*ConstArg).Val
+	if len0 != len1 {
+		t.Fatalf("shared truncate lengths differ: %v vs %v", len0, len1)
+	}
+	if len0 == origLen || !isPickableLength(len0) {
+		t.Fatalf("truncate length not mutated to a pickable value: %v (orig %v)", len0, origLen)
+	}
+}
+
+// TestMutateGroupDataReadOnly covers receive-buffer-only calls: read has no
+// input payload, so the data mutator must resize the out buffer (arg[1]) and
+// let assignSizesCall recompute count len[buf].
+func TestMutateGroupDataReadOnly(t *testing.T) {
+	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
+	const origSize = 70000
+
+	// Opens carry no CheckInfo: pickAnchor's fd backtracking does not need it,
+	// and leaving it out makes the data call the only eligible anchor.
+	openA := mkOpen(target, "merge_view/dirA/a")
+	rd0 := mkRead(target, openA, origSize)
+	rd0.CheckInfo = &FileMetadata{Stime: 110, Etime: 210}
+	p0 := &Prog{Target: target, Calls: []*Call{openA, rd0}}
+
+	openB := mkOpen(target, "merge_view/dirA/a")
+	rd1 := mkRead(target, openB, origSize)
+	rd1.CheckInfo = &FileMetadata{Stime: 160, Etime: 260}
+	p1 := &Prog{Target: target, Calls: []*Call{openB, rd1}}
+
+	ps := []*Prog{p0, p1}
+	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
+	if !MutateGroupDataDynamic(ps, lcs, smokeRand(target)) {
+		t.Fatal("MutateGroupDataDynamic returned false on read-only group")
+	}
+	for i, p := range ps {
+		rd := p.Calls[1]
+		count := rd.Args[2].(*ConstArg).Val
+		if got := bufDataLen(rd); count != got {
+			t.Fatalf("p%d count=%v != buffer len=%v", i, count, got)
+		}
+	}
+	size0 := bufDataLen(ps[0].Calls[1])
+	size1 := bufDataLen(ps[1].Calls[1])
+	if size0 != size1 {
+		t.Fatalf("shared read sizes differ: %v vs %v", size0, size1)
+	}
+	if size0 == origSize || !isPickableLength(size0) {
+		t.Fatalf("read buffer not resized to a pickable value: %v (orig %v)", size0, origSize)
+	}
+}
+
+// TestMutateGroupDataSharedAcrossKinds covers a mixed group: the write's
+// count, the read's count/buffer and the shared offset must all align, with
+// the write buffer resized to the same length.
+func TestMutateGroupDataSharedAcrossKinds(t *testing.T) {
+	target := smokeTarget(t)
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
+
+	openA := mkOpen(target, "merge_view/dirA/a")
+	pw := mkPwrite64(target, openA, 8, 0)
+	pw.CheckInfo = &FileMetadata{Stime: 110, Etime: 210}
+	p0 := &Prog{Target: target, Calls: []*Call{openA, pw}}
+
+	openB := mkOpen(target, "merge_view/dirA/a")
+	pr := mkPread64(target, openB, 8, 0)
+	pr.CheckInfo = &FileMetadata{Stime: 160, Etime: 260}
+	p1 := &Prog{Target: target, Calls: []*Call{openB, pr}}
+
+	ps := []*Prog{p0, p1}
+	lcs := &LayeredChoiceStrategy{FileTree: smokeFileTree()}
+	if !MutateGroupDataDynamic(ps, lcs, smokeRand(target)) {
+		t.Fatal("MutateGroupDataDynamic returned false on mixed group")
+	}
+	w := ps[0].Calls[1]
+	r := ps[1].Calls[1]
+	wCount := w.Args[2].(*ConstArg).Val
+	rCount := r.Args[2].(*ConstArg).Val
+	wBuf := bufDataLen(w)
+	rBuf := bufDataLen(r)
+	if wCount != rCount || wCount != wBuf || rCount != rBuf {
+		t.Fatalf("lengths not shared: wCount=%v rCount=%v wBuf=%v rBuf=%v", wCount, rCount, wBuf, rBuf)
+	}
+	if !isPickableLength(wBuf) {
+		t.Fatalf("shared length not pickable: %v", wBuf)
+	}
+	wOff := w.Args[3].(*ConstArg).Val
+	rOff := r.Args[3].(*ConstArg).Val
+	if wOff != rOff {
+		t.Fatalf("offsets not shared: %v vs %v", wOff, rOff)
+	}
+}
+
+// TestReassignDataArgKeepsFlatPointer pins the L7 fix: resizing a buffer must
+// replace the pointer's fields (a fresh address + a flat DataArg pointee), not
+// nest a second PointerArg under the old pointer. A nested pointer breaks
+// validation (pointee type must be ptrType.Elem) and, in production, makes the
+// syscall read the old address while the copyin lands on the new one.
+func TestReassignDataArgKeepsFlatPointer(t *testing.T) {
+	target := smokeTarget(t)
+	openA := mkOpen(target, "merge_view/dirA/a")
+	pw := mkPwrite64(target, openA, 8, 0)
+	p := &Prog{Target: target, Calls: []*Call{openA, pw}}
+	r := newRand(target, rand.NewSource(1))
+
+	oldPtr := pw.Args[1].(*PointerArg)
+	oldAddr := oldPtr.Address
+	newData := []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
+	if !reassignDataArg(p, pw, r, newData) {
+		t.Fatal("reassignDataArg returned false")
+	}
+	ptr := pw.Args[1].(*PointerArg)
+	data, ok := ptr.Res.(*DataArg)
+	if !ok {
+		t.Fatalf("pointee is %T, want *DataArg (flat)", ptr.Res)
+	}
+	if data.Size() != uint64(len(newData)) || string(data.Data()) != string(newData) {
+		t.Fatalf("pointee size/data = %v/%q, want %v/%q",
+			data.Size(), data.Data(), len(newData), newData)
+	}
+	// The old allocation (address 0, size 8 in this fixture) is noted by
+	// stateFromProg, so the reallocation must move to a free granule.
+	if ptr.Address == oldAddr {
+		t.Errorf("address not reallocated: 0x%x", ptr.Address)
+	}
+	target.assignSizesCall(pw)
+	// debugValidate (debug=true in tests) runs inside Serialize.
+	if out := p.Serialize(); len(out) == 0 {
+		t.Fatal("serialize returned empty")
+	}
+}
+
+// TestMutateWriteResizeKeepsFlatPointer exercises the stash paths that resize
+// the write buffer: the count and the flat buffer size must stay aligned and
+// the resized program must still validate/serialize.
+func TestMutateWriteResizeKeepsFlatPointer(t *testing.T) {
+	target := smokeTarget(t)
+	openA := mkOpen(target, "merge_view/dirA/a")
+	pw := mkPwrite64(target, openA, 8, 0)
+	pw.CheckInfo = &FileMetadata{Stime: 110, Etime: 210}
+	p := &Prog{Target: target, Calls: []*Call{openA, pw}, IsStash: true}
+	ps := []*Prog{p}
+
+	r := newRand(target, rand.NewSource(1))
+	if !mutateWriteLength(ps, p, pw, r) {
+		t.Fatal("mutateWriteLength returned false")
+	}
+	if got, count := bufDataLen(pw), pw.Args[2].(*ConstArg).Val; got != count {
+		t.Fatalf("after length mutation count=%v != buffer size=%v", count, got)
+	}
+	if !mutateWriteData(ps, p, pw, r) {
+		t.Fatal("mutateWriteData returned false")
+	}
+	if got, count := bufDataLen(pw), pw.Args[2].(*ConstArg).Val; got != count {
+		t.Fatalf("after data mutation count=%v != buffer size=%v", count, got)
+	}
+	if out := p.Serialize(); len(out) == 0 {
+		t.Fatal("serialize returned empty")
+	}
+}
+
+// TestStashFdConstructorsLinkOpenRet pins the fd linkage of the five stash
+// mutation constructors: args[0] must be a ResultArg referencing the open's
+// Ret, not the Ret object itself (which serializes as the constant 0).
+func TestStashFdConstructorsLinkOpenRet(t *testing.T) {
+	target := smokeTarget(t)
+	sc := hmdfsSmokeSpecialCalls(t, target)
+	openA := mkOpen(target, "merge_view/dirA/a")
+	p := &Prog{Target: target, Calls: []*Call{openA}}
+	r := newRand(target, rand.NewSource(1))
+
+	check := func(name string, c *Call) *Call {
+		t.Helper()
+		if c == nil || len(c.Args) == 0 {
+			t.Fatalf("%s: no call", name)
+		}
+		ra, ok := c.Args[0].(*ResultArg)
+		if !ok || ra.Res != openA.Ret {
+			t.Fatalf("%s: arg0 = %#v, want a ResultArg referencing open.Ret", name, c.Args[0])
+		}
+		if !openA.Ret.uses[ra] {
+			t.Fatalf("%s: open.Ret.uses does not record the consumer", name)
+		}
+		return c
+	}
+	check("pwrite64", genPwriteCallWithFd(p, r, sc, openA.Ret))
+	check("pread64", genPreadCallWithFd(p, r, sc, openA.Ret))
+	check("pread64At", genPreadCallWithFdAt(p, r, sc, openA.Ret, 0, 16))
+	check("fsync", genFsyncCallWithFd(p, r, sc, openA.Ret))
+	check("fdatasync", genFdatasyncCallWithFd(p, r, sc, openA.Ret))
+
+	for _, c := range []*Call{
+		genPwriteCallWithFd(p, r, sc, openA.Ret),
+		genPreadCallWithFd(p, r, sc, openA.Ret),
+	} {
+		q := &Prog{Target: target, Calls: []*Call{openA, c}}
+		if q.HasBrokenRefs() {
+			t.Fatalf("%s: broken refs after fd wrapping", c.Meta.CallName)
+		}
+		if out := q.Serialize(); len(out) == 0 {
+			t.Fatalf("%s: serialize returned empty", c.Meta.CallName)
+		}
+	}
+}
+
+// TestStashFdInsertCallLinkage sweeps insertStashCall and asserts every
+// inserted fd call references one of the program's opens.
+func TestStashFdInsertCallLinkage(t *testing.T) {
+	target := smokeTarget(t)
+	sc := hmdfsSmokeSpecialCalls(t, target)
+	openA := mkOpen(target, "merge_view/dirA/a")
+	openB := mkOpen(target, "merge_view/dirB/b")
+	closeA := mkClose(target, openA)
+	base := []*Call{openA, openB, closeA}
+
+	p := &Prog{Target: target, Calls: append([]*Call{}, base...), IsStash: true}
+	ps := []*Prog{p}
+	seen := map[string]bool{}
+	for seed := int64(0); seed < 300; seed++ {
+		p.Calls = append([]*Call{}, base...)
+		r := newRand(target, rand.NewSource(seed))
+		if !insertStashCall(ps, p, r, sc, nil) {
+			continue
+		}
+		openRets := map[*ResultArg]bool{}
+		for _, c := range p.Calls {
+			if strings.Contains(c.Meta.Name, "open") {
+				openRets[c.Ret] = true
+			}
+		}
+		for _, c := range p.Calls {
+			if c == openA || c == openB || c == closeA {
+				continue
+			}
+			if c.Args[0] == nil {
+				t.Fatalf("seed %d: inserted %s has no args", seed, c.Meta.CallName)
+			}
+			ra, ok := c.Args[0].(*ResultArg)
+			if !ok || ra.Res == nil || !openRets[ra.Res] {
+				t.Fatalf("seed %d: inserted %s fd = %#v, want an open.Ret reference", seed, c.Meta.CallName, c.Args[0])
+			}
+			seen[c.Meta.CallName] = true
+		}
+		if p.HasBrokenRefs() {
+			t.Fatalf("seed %d: broken refs after insertStashCall", seed)
+		}
+	}
+	for _, name := range []string{"pwrite64", "pread64", "fsync", "fdatasync"} {
+		if !seen[name] {
+			t.Errorf("no %s inserted across 300 seeds", name)
+		}
+	}
+}
+
+// TestStashFdInsertCallCloseBoundary pins the insertion window: a call that
+// references an open's fd must land before that fd's close, also when the
+// program interleaves several open/close blocks. (Historical bug: the close
+// lookup compared against a fresh wrapper, so the window always extended to
+// the program end and fd calls could land after their close -> EBADF.)
+func TestStashFdInsertCallCloseBoundary(t *testing.T) {
+	target := smokeTarget(t)
+	sc := hmdfsSmokeSpecialCalls(t, target)
+	openA := mkOpen(target, "merge_view/dirA/a")
+	pwA := mkPwrite64(target, openA, 8, 0)
+	closeA := mkClose(target, openA)
+	openB := mkOpen(target, "merge_view/dirB/b")
+	closeB := mkClose(target, openB)
+	base := []*Call{openA, pwA, closeA, openB, closeB}
+
+	inserted := 0
+	for seed := int64(0); seed < 300; seed++ {
+		p := &Prog{Target: target, Calls: append([]*Call{}, base...), IsStash: true}
+		ps := []*Prog{p}
+		r := newRand(target, rand.NewSource(seed))
+		if !insertStashCall(ps, p, r, sc, nil) {
+			continue
+		}
+		inserted++
+		// First close after each open, keyed by the original return object.
+		closeIdx := map[*ResultArg]int{}
+		for i, c := range p.Calls {
+			if c == nil || !strings.Contains(c.Meta.Name, "close") || len(c.Args) == 0 {
+				continue
+			}
+			if ra, ok := c.Args[0].(*ResultArg); ok && ra.Res != nil {
+				if _, seen := closeIdx[ra.Res]; !seen {
+					closeIdx[ra.Res] = i
+				}
+			}
+		}
+		for i, c := range p.Calls {
+			if c == openA || c == pwA || c == closeA || c == openB || c == closeB {
+				continue
+			}
+			if c == nil || len(c.Args) == 0 {
+				continue
+			}
+			ra, ok := c.Args[0].(*ResultArg)
+			if !ok || ra.Res == nil {
+				continue
+			}
+			if ci, ok := closeIdx[ra.Res]; ok && i > ci {
+				t.Fatalf("seed %d: inserted %s at %d lands after its close at %d",
+					seed, c.Meta.CallName, i, ci)
+			}
+		}
+		if p.HasBrokenRefs() {
+			t.Fatalf("seed %d: broken refs after insertStashCall", seed)
+		}
+	}
+	if inserted == 0 {
+		t.Fatal("no insertion across 300 seeds: test is vacuous")
+	}
+}
+
+// TestStashFdAddReadVerificationLinkage pins the added verification read's fd:
+// it must reference the reader's own open, not the raw Ret.
+func TestStashFdAddReadVerificationLinkage(t *testing.T) {
+	target := smokeTarget(t)
+	sc := hmdfsSmokeSpecialCalls(t, target)
+
+	writerOpen := mkOpen(target, "merge_view/dirA/a")
+	writer := &Prog{Target: target, Calls: []*Call{writerOpen, mkPwrite64(target, writerOpen, 8, 0)}, IsStash: true}
+	readerOpen := mkOpen(target, "merge_view/dirA/a")
+	reader := &Prog{Target: target, Calls: []*Call{readerOpen, mkPread64(target, readerOpen, 8, 0)}, IsStash: true}
+	ps := []*Prog{writer, reader}
+
+	before := len(reader.Calls)
+	r := newRand(target, rand.NewSource(1))
+	addStashReadVerification(ps, writer, "merge_view/dirA/a", r, sc, 0, 8)
+	if len(reader.Calls) != before+1 {
+		t.Fatalf("reader calls = %d, want %d", len(reader.Calls), before+1)
+	}
+	ins := reader.Calls[before]
+	ra, ok := ins.Args[0].(*ResultArg)
+	if !ok || ra.Res != readerOpen.Ret {
+		t.Fatalf("inserted %s fd = %#v, want reader open.Ret", ins.Meta.CallName, ins.Args[0])
+	}
+	if !readerOpen.Ret.uses[ra] {
+		t.Fatal("reader open.Ret.uses does not record the inserted read")
+	}
+	if reader.HasBrokenRefs() {
+		t.Fatal("broken refs after addStashReadVerification")
+	}
+	if out := reader.Serialize(); len(out) == 0 {
+		t.Fatal("serialize returned empty")
 	}
 }

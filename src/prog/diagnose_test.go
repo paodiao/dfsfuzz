@@ -145,3 +145,19 @@ func TestOutParamReferenceNotBroken(t *testing.T) {
 		t.Errorf("out-param uses not registered by MakeResultArg: %v", outParam.uses)
 	}
 }
+
+// assertSerializeSafe fails the test when p.Serialize() panics. HasBrokenRefs
+// only covers dangling/forward references; a uses-map desync (USES-MISSING)
+// also panics at Serialize ("no result"): the serializer allocates a var only
+// when len(uses) != 0, so a referrer whose owner does not record it panics.
+// Valid programs never trip this: MakeResultArg is the single constructor that
+// registers uses, and the clone/replace/remove paths all maintain it.
+func assertSerializeSafe(t *testing.T, ctx string, p *Prog) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("%s: Serialize panicked: %v\n%s", ctx, r, p.DumpRefDiagnosis())
+		}
+	}()
+	p.Serialize()
+}

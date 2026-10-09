@@ -484,7 +484,7 @@ func TestHintsRandom(t *testing.T) {
 	iters /= 10 // the test takes long
 	r := newRand(target, rs)
 	for i := 0; i < iters; i++ {
-		p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+		p, _ := target.Generate(rs, 5, ct, nil, false, nil, false, &Hmdfs_config{})
 		for i, c := range p.Calls {
 			vals := extractValues(c)
 			for j := 0; j < 5; j++ {
@@ -576,7 +576,7 @@ func BenchmarkHints(b *testing.B) {
 	rs := rand.NewSource(0)
 	r := newRand(target, rs)
 	ct := target.DefaultChoiceTable()
-	p, _ := target.Generate(rs, 30, ct, nil, false, nil, false, &Hmdfs_config{}, 0)
+	p, _ := target.Generate(rs, 30, ct, nil, false, nil, false, &Hmdfs_config{})
 	comps := make([]CompMap, len(p.Calls))
 	for i, c := range p.Calls {
 		vals := extractValues(c)

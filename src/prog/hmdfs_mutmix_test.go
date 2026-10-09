@@ -3,9 +3,12 @@ package prog
 import "testing"
 
 // TestMutateMixForSize verifies the size-banded mutation mix used by the
-// inodeops/fileops DCT mutators: tiny programs are insertion-heavy (they must
-// reach a size where modifier pairs exist), large ones removal-heavy (bounded
-// execution cost and pair space). Band boundaries must stay in sync with
+// fsops DCT mutator: tiny programs are insertion-heavy (they must reach a
+// size where modifier pairs exist), large ones removal-heavy (bounded
+// execution cost and pair space). The four weights are (insertion,
+// remove-one, remove-group, path/data group mutation); the insertion share
+// went back to the pre-reservoir distribution when the reservoir insertion
+// was removed (2026-09-28). Band boundaries must stay in sync with
 // RecommendedCalls (the size cap) and the docs on mutateMixForSize.
 func TestMutateMixForSize(t *testing.T) {
 	cases := []struct {
@@ -31,11 +34,13 @@ func TestMutateMixForSize(t *testing.T) {
 	}
 	for _, c := range cases {
 		ins, removeOne, removeGroup, mute := mutateMixForSize(c.size)
-		if ins != c.ins || removeOne != c.removeOne || removeGroup != c.removeGroup || mute != c.mute {
+		if ins != c.ins || removeOne != c.removeOne ||
+			removeGroup != c.removeGroup || mute != c.mute {
 			t.Errorf("mutateMixForSize(size=%d) = (%d,%d,%d,%d), want (%d,%d,%d,%d)",
-				c.size, ins, removeOne, removeGroup, mute, c.ins, c.removeOne, c.removeGroup, c.mute)
+				c.size, ins, removeOne, removeGroup, mute,
+				c.ins, c.removeOne, c.removeGroup, c.mute)
 		}
-		// Weights must always sum to 100 so the roll in the mutators spans
+		// Weights must always sum to 100 so the roll in the mutator spans
 		// the full [0,100) range.
 		if sum := ins + removeOne + removeGroup + mute; sum != 100 {
 			t.Errorf("mutateMixForSize(size=%d) weights sum to %d, want 100", c.size, sum)

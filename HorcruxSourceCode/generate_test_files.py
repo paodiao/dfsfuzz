@@ -6,6 +6,13 @@ import string
 import time
 import argparse
 
+# Shallow-tree entries added per node so that the fuzzer's depth-weighted
+# path selection (bucket 1/2/3) has candidates in every bucket. Root-level
+# entries land at depth 1 (merge_view/<name>); the nested files at depth 2.
+NUM_SHALLOW_DIRS = 3         # root-level directories (depth 1)
+NUM_SHALLOW_FILES = 6        # root-level files (depth 1)
+NUM_SHALLOW_NESTED_FILES = 6 # files inside the shallow directories (depth 2)
+
 
 def get_random_string(length):
     letters = string.ascii_lowercase
@@ -276,6 +283,51 @@ def main():
                 
                 print(f"  Created large directory with {len(large_dir_files)} files")
         
+        # Shallow entries: guarantee depth-1 files/dirs (bucket 1) and
+        # depth-2 files (bucket 2) per node, so depth-weighted path selection
+        # has candidates in every bucket. Placed AFTER the large-directory
+        # block on purpose: the persistence directory is picked from the
+        # original (deep) pool and must never land inside a shallow dir,
+        # otherwise its 1100 files would drop from depth bucket 3 to 2.
+        shallow_dirs = []
+        for _ in range(NUM_SHALLOW_DIRS):
+            for _attempt in range(100):
+                shallow_rel = os.path.relpath(generate_dir_name("."), ".")
+                if shallow_rel not in global_target_dirs:
+                    global_target_dirs.add(shallow_rel)
+                    os.makedirs(os.path.join(node_dir, shallow_rel), exist_ok=True)
+                    target_dirs.append(shallow_rel)
+                    current_dirs.append(shallow_rel)
+                    shallow_dirs.append(shallow_rel)
+                    break
+
+        for _ in range(NUM_SHALLOW_FILES):
+            for _attempt in range(100):
+                shallow_rel = os.path.relpath(generate_file_name("."), ".")
+                if shallow_rel not in global_target_files:
+                    global_target_files.add(shallow_rel)
+                    size_bytes = get_random_file_size_kb() * 1024
+                    with open(os.path.join(node_dir, shallow_rel), 'wb') as f:
+                        f.write(generate_random_content(size_bytes))
+                    target_files.append(shallow_rel)
+                    target_file_sizes.append(size_bytes)
+                    break
+
+        for _ in range(NUM_SHALLOW_NESTED_FILES):
+            if not shallow_dirs:
+                break
+            parent_dir = random.choice(shallow_dirs)
+            for _attempt in range(100):
+                nested_rel = os.path.relpath(generate_file_name(parent_dir), ".")
+                if nested_rel not in global_target_files:
+                    global_target_files.add(nested_rel)
+                    size_bytes = get_random_file_size_kb() * 1024
+                    with open(os.path.join(node_dir, nested_rel), 'wb') as f:
+                        f.write(generate_random_content(size_bytes))
+                    target_files.append(nested_rel)
+                    target_file_sizes.append(size_bytes)
+                    break
+
         for i in range(num_files):
             attempts = 0
             max_attempts = 100

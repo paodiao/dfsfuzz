@@ -34,3 +34,32 @@ func TestFilterNewDagPairsDedup(t *testing.T) {
 		t.Fatalf("mismatched lengths not guarded: %v", len(r))
 	}
 }
+
+// TestDagPairsObserved pins the 2b pending-resolution discriminator: the pair
+// payload is empty whenever the execution produced no pair, but only a set
+// DagComputed marker means the DAG pipeline observed the execution (a genuine
+// miss); missing markers (tracing outage, triage, executor error) must clear
+// the pending without a miss.
+func TestDagPairsObserved(t *testing.T) {
+	pairs := []prog.DAGPair{{A: &prog.DAGVertex{}, B: &prog.DAGVertex{}}}
+	cases := []struct {
+		name     string
+		infos    []*ipc.ProgInfo
+		wantN    int
+		observed bool
+	}{
+		{"nil infos", nil, 0, false},
+		{"nil entries", []*ipc.ProgInfo{nil, nil}, 0, false},
+		{"no marker", []*ipc.ProgInfo{{}}, 0, false},
+		{"marker with zero pairs", []*ipc.ProgInfo{{DagComputed: true}}, 0, true},
+		{"marker with pairs", []*ipc.ProgInfo{{DagComputed: true, DagPairs: pairs}}, 1, true},
+		{"pairs without marker", []*ipc.ProgInfo{{DagPairs: pairs}}, 1, false},
+	}
+	for _, tc := range cases {
+		got, observed := dagPairsObserved(tc.infos)
+		if len(got) != tc.wantN || observed != tc.observed {
+			t.Fatalf("%s: pairs=%d observed=%v, want pairs=%d observed=%v",
+				tc.name, len(got), observed, tc.wantN, tc.observed)
+		}
+	}
+}

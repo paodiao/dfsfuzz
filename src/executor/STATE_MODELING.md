@@ -189,8 +189,9 @@ predicate combination.
 | Zero new data collection — uses existing eBPF trace events | Predicate space must be manually curated or auto-mined |
 | Perfect for HMDFS-specific patterns (stash/writeback, dentry TTL, comrade conflicts) | Completeness depends on predicate coverage |
 
-**Data needed**: Already collected: eBPF kretprobe events (15 merge functions +
-`WRITEPAGE_CB`), `fsMd` per-node, `infos` (per-call errno/ret values).
+**Data needed**: Already collected: eBPF events — 15 merge functions captured by
+paired **entry kprobe + kretprobe** (return value only), plus the `WRITEPAGE_CB`
+**perf tracepoint**; `fsMd` per-node, `infos` (per-call errno/ret values).
 
 **References**: Daikon (dynamic invariant detection); TxF (EuroSys 2013); Liblit
 et al. (2005).
@@ -278,8 +279,11 @@ Same operation, different outcome means different behaviour:
 | `rename(A, B)` same dir vs cross dir | args[0] and args[2] differ | Cross-dir rename has different atomicity guarantees |
 | `lookup(dir)` succeeds vs fails (ENOENT) | dentry cache hit vs. miss | Different internal code paths |
 
-Our `HmdfsTraceEvent` already captures `{FuncID, Ret, Ino, Args[6]}` from
-eBPF kretprobes — differentiating by outcome requires **zero new data collection**.
+Our `HmdfsTraceEvent` already captures `{FuncID, Ret, Ino, Off, Size, EntryIno, Mode}`
+(func_id 0–15) — argument-derived values come from the **entry kprobes**
+(`Off/Size/EntryIno/Mode`), while the kretprobe supplies only the return value;
+`Args[6]` is reserved and always 0. Differentiating by outcome requires no new
+data collection.
 
 #### 3.10.2 Predicate Mining: Manual Granularity
 
@@ -311,7 +315,10 @@ After (outcome-aware):
 | `FuncID` | operation type (predicate template selector) |
 | `Ret` | success/failure/errno bucket |
 | `Ino` | "same file" identity (e.g., `WRITE_THEN_READ_SAME_FILE`) |
-| `Args[0..5]` | flags, offsets, lengths, parent inode pointers |
+| `Off` / `Size` | entry-time offset / size (skip-overlap distinctions) |
+| `EntryIno` | namespace-op dentry target inode (create/mkdir/rename/lookup) |
+| `Mode` | entry-time file mode for type classification |
+| `Args[0..5]` | **reserved, always 0** (declared but unfilled; not usable) |
 
 **Advantage**: You choose which distinctions matter. Feedback granularity is
 exactly what you define — no more, no less.
@@ -417,9 +424,10 @@ invariant, or discovery of a new invariant not seen before.
 | Complements predicate mining (Approach 6) | Requires per-variable instrumentation of HMDFS internal code paths |
 
 **Data needed**: Instrumentation of HMDFS internal functions to capture local
-variable values at function entry/exit (beyond what current eBPF kretprobes
-capture). Current `HmdfsTraceEvent.Args[6]` could serve as a starting point
-for pointer-level invariants.
+variable values at function entry/exit (beyond what the current eBPF entry
+kprobes / kretprobes capture). Current `HmdfsTraceEvent` fields
+(`Off/Size/EntryIno/Mode`) could serve as a starting point for pointer-level
+invariants (`Args[6]` is reserved and always 0).
 
 **References**: Daikon (Ernst et al., 2007); DIDUCE (Hangal & Lam, 2002);
 TerrAscope (Joshi et al., 2019).
@@ -559,8 +567,10 @@ concurrent events, or new event interleavings.
 
 **Data needed**: Per-call TSC start/end timestamps (already in `callReply`,
 already parsed into `CheckInfo.Stime/Etime`); per-VM `tsc_offset` (already
-in `argv[15]`); `WritePageCB` tracepoint timestamps (perf collection in
-progress). All data channels already built or being built.
+in `argv[15]`); `WritePageCB` tracepoint timestamps (**perf tracepoint
+collection implemented** — `perf_event_open` CPU0 + program window; see
+`EBPF_TRACE.md` 161-199 / `DAG_KNOWN_ISSUES.md` P7 补充). All data channels
+built.
 
 ---
 
@@ -824,20 +834,24 @@ that these alternatives attempt to approximate.
 Operation DAG construction from eBPF trace data uses these causal rules
 (already enumerated in Approach 3.3):
 
+> **（2026-10-02 更正）**：下表中基于 offset/length 重叠的规则**未实现**——当前 `determinePathRel`
+> 只做路径文本/ino 分类，`Off/Size` 仅作顶点特征（`dag.go`），不做区间重叠判定。实际实现：
+> SAME_PATH（路径相等）、SAME_INODE（同 prog 同非零 ino）、PARENT_CHILD（文本前缀）、SAME_PARENT。
+
 | Rule | Derivation from eBPF Data |
 |------|--------------------------|
-| Read-after-Write (same ino, overlapping range) | `FuncID ∈ {WRITE, READ}`, same `Ino`, `args[offset]`/`args[len]` overlap |
-| Write-after-Write (same ino, overlapping range) | `FuncID ∈ {WRITE, WRITE}`, same `Ino`, overlapping range |
+| Read/Write after Write (same ino) | `FuncID ∈ {WRITE, READ}`, same `ProgIdx`+`Ino`（无区间重叠判定） |
 | Fsync barrier (same ino, write before fsync) | `FuncID ∈ {WRITE} → FuncID ∈ {FSYNC}`, same `Ino` |
-| WRITEPAGE_CB anchor (ino, writeback completion before read) | `FuncID ∈ {WRITEPAGE_CB}` → `FuncID ∈ {READ}`, same `Ino` |
+| WRITEPAGE_CB anchor (ino, writeback completion before read) | `FuncID ∈ {WRITEPAGE_CB}` → `FuncID ∈ {READ}`, same `Ino`（point-in-time） |
 | Namespace: create before open | `FuncID ∈ {CREATE, MKDIR} → OPEN`, path relationship via `Ino` chain |
 | Namespace: delete / create conflict | `FuncID ∈ {UNLINK, RMDIR}` overlaps `FuncID ∈ {CREATE, MKDIR}`, same path/ino |
-| No relation | Different `Ino`, no parent-child naming relationship |
+| No relation | Different path/ino and no parent-child naming relationship |
 
-This requires zero new data collection — all fields (`FuncID`, `Ino`, `Args`,
-`Timestamp`) are already present in `HmdfsTraceEvent`.
+This requires zero new data collection — the fields actually used (`FuncID`, `Ino`,
+`ProgIdx`, `Path/CallName`, `Timestamp`) are present in `HmdfsTraceEvent`.
 
-**Phase 2 (optional enhancements if needed later)**:
+**Phase 2（历史规划，已被取代）**：以下三项是当时列出的候选增强（**未实施**）；实际落地的
+"Phase 2" 是定向覆盖 2a/2b（coverage board + directed plan，见 `docs/seed-optimization-plan.md` §8）。
 
 ```
 + Predicate Mining (semantic predicates layered on top of DAG)
@@ -930,8 +944,9 @@ A vertex represents a single eBPF-captured merge-view VFS function return.
 | `func_id` | `HmdfsTraceEvent.FuncID` | 16 operation types (MKDIR, WRITE, WRITEPAGE_CB, ...) |
 | `path` | `HmdfsTraceEvent.Ino` → fsMd reverse lookup | `merge_view/...` path; stable across nodes and schedules |
 | `ret_bucket` | `HmdfsTraceEvent.Ret` → bucket mapping | `SUCCESS / EEXIST / ENOENT / FAILURE / WRITEPAGE_DONE / WRITEPAGE_ERR` |
-| `off` | write/read: `kiocb->ki_pos`; truncate: `iattr->ia_size` (gated by `ATTR_SIZE`); else 0 | Input to `offset_bucket` (end position — see #22) |
-| `size` | fsMd `StatMd.Size` (post-exec) | Reference for `offset_bucket` (TAIL/BEYOND boundaries); **not a feature itself** |
+| `off` | write/read: `kiocb->ki_pos`; truncate: `iattr->ia_size` (gated by `ATTR_SIZE`); else 0 | Input to `offset_bucket` (**entry position** — captured by the entry kprobe) |
+| `size` | **entry-time** `i_size` from the event | Reference for `offset_bucket` (TAIL/BEYOND boundaries; BEYOND = `pos >= size` at entry); **not a feature itself** |
+| `stime`/`etime` | `[EntryTs, Timestamp]` | The **event's own** execution window (entry kprobe → return probe), in the global raw-TSC domain. The enclosing syscall window is used only for event→call attribution/filtering, never as the vertex time. `EntryTs == 0` (entry state lost) falls back to the syscall window |
 
 **Why `path` instead of `ino`**: HMDFS merge_view inode numbers differ across
 client nodes (see §2). The `path`, resolved from fsMd's `StatMd.Ino`,
@@ -939,12 +954,14 @@ provides a cross-node stable file identity.
 
 **`ino → path` resolution**:
 
-- kretprobe events: `BPF_CORE_READ(inode, i_ino)` gives the full merge_view
-  inode → matches `fsMd[path].StatMd.Ino` directly.
+- entry-kprobe events: the ino is read **at entry** (for namespace ops the
+  dentry pointer is stored at entry and `d_inode` read after return into
+  `EntryIno`) → matches `fsMd[path].StatMd.Ino` directly.
 - writepage events: the tracepoint's `ino_raw` field (low 32 bits) matches
   `fsMd[path].StatMd.Ino & 0xFFFFFFFF`.
 - Transient files (created then deleted within one schedule): the `path` is
-  extracted from the `creat`/`mkdir` arguments (`args[0]`) in the eBPF event.
+  resolved from the test program's call arguments (`extractPathFromCall`) and
+  the rename/delete timelines — not from eBPF args (which are zero).
 
 ### 6.2.1 Path Matching Strategy
 
@@ -962,7 +979,19 @@ simpler and more precise than inode-based lookup.
 | 2 — FD resolution | `write`, `read`, `fsync`, `open`, `release`, `getattr`, `setattr`, `iterate` | Same-prog `open`/`creat` call's path | `resolveFdToPath(prog, call)` — scan backward through the program for the `open`/`creat` that returned this fd |
 | 3 — Ino fallback | `writepage_cb`, unmatched events | fsMd: `{path → StatMd.Ino}` | `ino → path` reverse lookup (current design) |
 
-**Matching algorithm**:
+**路径快照时刻（2026-10-03）**：参数派生的路径就是执行时字面量（= 操作开始时刻的路径）；fd
+派生的路径（open 时的字面量）沿 rename 时间线只推进到**操作窗口起点 entry**——操作开始后才完成的
+并发 rename 不被追认，与"顶点路径 = 操作开始时文件路径"的统一口径一致（顶点时间见 §6.2）。
+writepage 是异步点事件，取回调时刻。
+
+**Matching algorithm（已实现口径，2026-10-03）**：实现是 **event→call** 的归因匹配
+（`matchEventToCall`，`src/prog/dag.go`）——候选 = 函数类型相容（`funcMatchesCall`）+ CheckInfo 非空 +
+事件自身窗口的两个端点 `[entry_ts, exit_ts]` 都落在调用窗口 `[stime-tol, etime+tol]` 内（tol 默认 60µs，
+executorlog 实测标定 gap 0.65–1.29µs）；无 tol 的精确 containment 优先，其次按较远端点的边距取最近、
+同距取更晚起点。无 d_name 匹配/候选回退链；路径在匹配后按函数各自解析（文件调用用 fd 回溯、目录/命名空间
+调用用调用参数与 rename/delete 时间线，lookup 用父 ino + EntryIno 分量解析，rename 同父终分量保留
+`{old,new}` 双候选供关系分类，见 R27/DAG_KNOWN_ISSUES §33）。顶点时间与调用窗口无关，
+见 §6.2。以下为历史（未实现）描述：
 
 ```
 for each call in ps[progIdx]:
@@ -971,26 +1000,10 @@ for each call in ps[progIdx]:
 
     candidates = eBPF events in [call.stime, call.etime]
                  with matching func_id
-
-    if len(candidates) == 1:
-        assign(candidate, path)
-
-    elif len(candidates) > 1:
-        // Name collision fallback — test programs use unique names
-        for candidate in candidates:
-            d_name = last component of candidate's path (from ino → path or args)
-            if d_name == last component of path:
-                assign; break
-        if still unmatched: fallback to first candidate in window
-
+    ...
 For rename: old_path and new_path are obtained directly from
-`call.Args[0]` and `call.Args[1]`. No reverse lookup needed.
+`call.Args[0]` and `call.Args[1]`.
 ```
-
-**Rationale**: Since Monarch generates unique file names per test (via
-`randomSuffix`), the d_name matching is highly reliable. The fallback chain
-(timestamp window → d_name → first candidate) ensures correctness even if
-name uniqueness is violated by a mutation.
 
 Vertices are NOT merged — every eBPF event becomes its own vertex. The
 abstraction layer handles de-duplication at signature time (§6.5).
@@ -1004,7 +1017,8 @@ A directed edge A→B exists when **three** conditions hold simultaneously:
    (e.g., `mkdir /A` returning `EEXIST`, `write` returning `ENOSPC`) does
    not change filesystem state and cannot causally influence later operations.
    Its outgoing edges are suppressed.
-3. **Temporal ordering**: A.etime < B.stime (intervals do not overlap).
+3. **Temporal ordering**: A.etime < B.stime (the vertices' own event
+   windows of §6.2 do not overlap).
 
 The HB DAG is a *partial order* derived from the *total order* of the TSC
 global timeline (§6.1). It contains only **direct** edges — every edge is
@@ -1019,17 +1033,14 @@ DAG edge; they are captured separately as concurrent pairs (§6.3.1).
 | Path Relation | Condition | Example |
 |--------------|-----------|---------|
 | **SAME_PATH** | `A.path == B.path` | `mkdir /A` → `rmdir /A` |
-| **SAME_INODE** | `A.ino == B.ino` AND A succeeded; if both have offset/length then overlap required, otherwise same ino suffices | `write /f(0→128)` → `read /f(64→192)`, `setattr /f` → `read /f` |
-| **BARRIER** | A or B is `fsync`/`fdatasync`. Note: `writepage_cb` extends write's effective etime, after which normal SAME_INODE handles interaction — BARRIER does not produce independent relation pairs | `write /f` → `fsync /f` |
-| **PARENT_CHILD** | One path is a prefix of the other AND the prefix path is a directory | `rmdir /A` → `mkdir /A/B` (direct), `mkdir /A` → `creat /A/B/C/file.txt` (indirect) |
+| **SAME_INODE** | same `ProgIdx` AND same non-zero `Ino`（**无 A 成功检查、无 offset/length 重叠检查**，见下） | `write /f` → `read /f` |
+| **PARENT_CHILD** | one path is a textual prefix of the other（**不检查目录类型**） | `rmdir /A` → `mkdir /A/B`, `mkdir /A` → `creat /A/B/C/file.txt` (indirect) |
 | **SAME_PARENT** | Paths share the same parent directory | `mkdir /A/X`, `mkdir /A/Y` |
 
-**SAME_INODE refinement for operations without offset/length**: `WRITE`
-and `READ` carry `offset`/`length` in `Args[1]`/`Args[2]`, enabling precise
-overlap detection. Operations like `SETATTR` (truncate, chmod) and
-`WRITEPAGE_CB` do not. When either operation lacks offset/length, any
-same-inode relationship is considered causal — the modifier changed the
-file, and all subsequent same-inode operations are affected.
+**SAME_INODE（实现口径）**：`determinePathRel`（`src/prog/dag.go:1038-1069`）在
+`A.ProgIdx == B.ProgIdx && A.Ino != 0 && A.Ino == B.Ino` 时返回 SAME_INODE——
+**不检查 A 是否成功、不做 offset/length 重叠判定**（成功只用于 HB 边的 A 侧
+`isSucceededModifier` 门）。`Off/Size` 仅作顶点特征参与签名哈希。
 
 **PARENT_CHILD covers any ancestor/descendant relationship**, not just
 direct parent-child. If `/A` is created and then `/A/B/C/file.txt` is
@@ -1038,23 +1049,15 @@ operated on. The DAG's transitive closure cannot capture this through
 intermediate operations that never happened. The prefix check covers
 all levels. Declaring only direct parents would leave gaps.
 
-Because only directories can have children in a filesystem, the prefix
-path must be a directory node type. Two regular files with a common path
-prefix (e.g., `/A/f1` and `/A/f2`) do NOT generate PARENT_CHILD — they
-fall under SAME_PARENT or no relation.
+**（2026-10-02 更正）**：实现只做文本 `strings.HasPrefix` 检查，**不检查前缀路径的
+节点类型**（`src/prog/dag.go:1051-1060`）；`/A/f1` 与 `/A/f2` 因互不为前缀不会误判，
+但类型不匹配（同名占位）不会被显式拒绝。
 
-**Rename dual-path edge rule**: a `RENAME` vertex carries both `old_path` and
-`new_path`, obtained directly from the call arguments (§6.2.1). For
-happens-before edge determination, the rename vertex's role is directional:
-
-| Comparison Direction | Path Used | Rationale |
-|---|---|---|
-| Other operation → RENAME | `old_path` | The earlier operation affected the file at its old location |
-| RENAME → Other operation | `new_path` | The rename has moved the file to a new location |
-
-For concurrent pairs, both paths are checked independently against the
-other operation's path. A concurrent pair may be recorded for `old_path`,
-`new_path`, both, or neither.
+**Rename dual-path edge rule（实现口径，2026-10-02 更正）**：当前实现
+**不做方向性 old/new 选择**——`determinePathRel`（`dag.go:1029-1037`）对
+`{Path, OldPath} × {Path, OldPath}` 全交叉比较，`ordered` 参数未使用，属无序近似。
+历史描述（未实现）：其它操作→RENAME 用 `old_path`、RENAME→其它用 `new_path`。
+并发对同样按两个路径各自比较。
 
 **SAME_PARENT does NOT produce an HB edge** — sibling files have no direct
 causal dependency. It DOES produce a concurrent pair in the signature
@@ -1072,9 +1075,10 @@ into two categories:
 influence later operations when they succeed. A modifier whose return code
 indicates failure (e.g., `-EEXIST`, `-ENOSPC`, `-EIO`) does not produce
 outgoing HB edges: `WRITE`, `MKDIR`, `CREAT`, `RMDIR`, `UNLINK`, `RENAME`,
-`SETATTR`, `FSYNC`. (Note: `WRITEPAGE_CB` is not an independent modifier —
-it extends the write operation's effective completion time; the extended
-write interval then interacts with other operations via normal SAME_INODE.)
+`SETATTR`, `FSYNC`. (**2026-10-02 更正**：`WRITEPAGE_CB` 已纳入 modifier——
+`isModifierFunc` 含 `FuncWritepage`、`isSucceededModifier` 接受 `RetWritepageDone`；
+它是 point-in-time modifier，参与 pair 位与 hb/cc 统计，但因 `callNameOfFunc`
+返回 "" 而不映射到 DCT/board 与定向构造。) 
 
 **Observers** — read filesystem state but do not change it. They cannot
 causally influence later operations: `READ`, `LOOKUP`, `ITERATE`, `GETATTR`,
@@ -1121,7 +1125,7 @@ rooted in the TSC global timeline (§6.1):
   the DAG.
 
 Both are abstracted through the same pipeline: abstract each vertex to its
-5-feature tuple, determine the relationship type, hash, and insert into
+6-feature tuple, determine the relationship type, hash, and insert into
 `maxDagSignal` (the dedicated DAG channel; see §5.3).
 
 For every vertex pair (A, B) that shares a path relation and satisfies
@@ -1154,8 +1158,8 @@ the modifier/observer rules (§6.3.1, including A succeeded for HB edges):
       behavioural distinction.
     - `length` — write length affects writeback merging, but its primary
       behavioural impact (crossing the file-size / page boundary) is already
-      captured by the `offset_bucket` (the kretprobe reads the end position
-      ki_pos ≈ pos+len, so boundary-crossing writes fall into BEYOND).
+      captured by the `offset_bucket` (entry semantics: BEYOND = `pos >= size`
+      at entry; `off` = entry `ki_pos`, `size` = entry `i_size`).
       Encoding raw length separately would add noise without new signal.
       (Note: the original design rejected `offset` too — as parameter-level
       noise with no signal. That is revisited: `offset_bucket` is not a
@@ -1184,7 +1188,7 @@ the modifier/observer rules (§6.3.1, including A succeeded for HB edges):
 6. **Schedule-level hash (dual granularity)**:
 
     ```
-    all_pair_hashes = sorted({hash(pair) for all pairs})
+    all_pair_hashes = sorted([hash(pair) for all pairs])   // 保留重复，非集合
     schedule_hash = hash(all_pair_hashes)  → uint64 → uint32 → maxDagSchedSignal
     ```
 
@@ -1227,45 +1231,33 @@ conflict. Both must produce distinguishable signature bits.
 
 **Automatic de-duplication via set semantics**: If 3 WRITE vertices all form
 the same relation pair with 1 READ vertex, each produces an identical hash →
-the sorted set collapses them to one entry. The signature captures *whether*
-a pattern occurred, not *how many times*.
+the per-pair signal set collapses them to one entry (the schedule hash sorts
+all hashes **including duplicates**, so multiplicities still influence the
+schedule hash). The per-pair signature captures *whether* a pattern occurred,
+not *how many times*.
 
 ### 6.5 Relationship to the Mutator
 
-The mutation design (DCT weights, path selection via the file tree, group
-mutation, time-aligned concurrent insertion — §6.5.2) generates diverse
-causal patterns. The Op DAG feedback is now **integrated into the mutation
-loop**: novel DAG pairs are fed back into the DCT tables (each novel pair is
-mapped to its `(rootCall, variant)` combo and marked as yielding signal).
-Triage successes enter the corpus without any static attribution — DCT
-learning is driven exclusively by the dynamic pair feedback (see
-`DAG_KNOWN_ISSUES.md` #20). The feedback loop is:
+> **⚠ 已过时（2026-10-02）**：本节描述的 DCT 学习回路与"三方向"中的
+> Directions 1/2（`Explored`/`NoYield`/`MarkYield`/`TickNoYield`/`TemporalWeights`/
+> `applyInsertFeedback`/`PendingInserts`）已随 Phase 3 整体移除；当前机制为 coverage
+> board（Phase 2a）+ 定向覆盖（Phase 2b，`PendingDirected`/`ResolveDirectedPending`），
+> 以 `docs/seed-optimization-plan.md` §8 为准。
 
-```
-insertCallFromDCT records the inserted (root, variant) → unexplored combos preferred
-ChooseTemporal picks the combo's insertion form (concurrent / causal) → execute
-→ new DAG feedback → MarkYield for every recorded combo + weight +1 (Explored = true)
-→ no new DAG feedback → TickNoYield per recorded combo；≥ threshold → down-weight
-→ pair temporal (CONCURRENT/HB) → UpdateTemporalWeight (second layer, per form)
-```
+The mutation design (DCT static weights, path selection via the file tree, group
+mutation, time-aligned concurrent insertion — §6.5.2) generates diverse causal
+patterns. The current DAG feedback pipeline is: novel pairs → corpus triage
+entry + `prog.RecordCoveragePairs`（coverage board）+ HB/CC 计数；**不存在 DCT
+学习**（`DAG_KNOWN_ISSUES.md` #20/#28）。
 
-Of the three enhancement directions identified in the original design, two
-are implemented and one is deferred:
-
-| Direction | Status | Implementation |
+| Direction | Status | Notes |
 |-----------|:--:|------|
-| Path-relation exploration tracking | **Implemented** | DCT keeps an `Explored` map per `(rootCall, variant)`; `chooseVariant` picks exclusively from combos that never produced signal and are still within their exploration budget (`NoYield < 10`). |
-| Adaptive weight damping | **Implemented** | DCT keeps a `NoYield` counter per combo: an insertion follow-up with no new DAG feedback (`TickNoYield`) bumps it, a yield (`MarkYield`) resets it, and reaching 10 consecutive no-yield attempts drops the weight by 5 (floor 1). |
-| Temporal form layer | **Implemented** | A second layer per combo: `TemporalWeights` (concurrent vs causal/HB form, 50/50 start). `insertCallFromDCT` picks the form (`ChooseTemporal`); the causal form inserts at `firstBoundaryAfter` (after the root finishes, favoring HB pairs). `feedbackDagPairs` updates the weights by the actually produced pair temporal; direction 1/2 rewards are driven separately by the recorded insertion combos (`applyInsertFeedback`), whatever form the produced pairs took (see `DAG_KNOWN_ISSUES.md` #16). |
-| Targeted mutation | Deferred | "I need a WRITE→READ SAME_INODE HB pair on a depth-3+ DIR but haven't seen one" → construct it specifically. Requires a synthesiser; revisit after evaluating the first two directions. See also `DAG_KNOWN_ISSUES.md` #17 for the broader modeling research (structure for concurrent/causal relations). |
+| Path-relation exploration tracking | **Removed (Phase 3)** | 历史：`Explored` map + 独占探索池（`NoYield < 10`）。 |
+| Adaptive weight damping | **Removed (Phase 3)** | 历史：`NoYield` 计数 + 阈值降权；现 DCT 权重为静态初始值。 |
+| Temporal form layer | **Removed (Phase 3)；由定向覆盖取代** | 历史：`TemporalWeights` 双权重 + `UpdateTemporalWeight`；现 Temporal 以 coverage board cell 维度 + Phase 2b 定向计划（`directed_plan.go` 的 HB/CC 放置）承担。 |
+| Targeted mutation | **由 Phase 2b 定向计划取代** | `PickDirectedBatch`/`insertDirectedBatch` 按未覆盖 cell 合成计划；`DAG_KNOWN_ISSUES.md` #17 的 α/β/γ 仍为调研项。 |
 
-Both implemented directions share one signal source: `applyInsertFeedback`
-(fuzzer-side, after each execution: the combos recorded by the most recent
-insertion are rewarded when the execution yields new DAG feedback, and tick
-one no-yield attempt otherwise). `feedbackDagPairs` keeps the temporal-form
-layer.
-
-**Direction 1 — Path-relation exploration tracking (implemented)**
+**Direction 1 — Path-relation exploration tracking（历史——已随 Phase 3 移除）**
 
 - Mechanism: the DCT table keeps an `Explored` flag per `(rootCall, variant)`;
   `chooseVariant` collects the combos that never produced signal and are
@@ -1282,7 +1274,7 @@ layer.
   feature buckets — the bias acts on generation/mutation combo selection,
   not on the pair space itself.
 
-**Direction 2 — Adaptive weight damping (implemented)**
+**Direction 2 — Adaptive weight damping（历史——已随 Phase 3 移除）**
 
 - Mechanism: a `NoYield` counter per combo (bumped once per execution that
   follows an insertion of the combo and produces no new DAG feedback);
@@ -1311,8 +1303,7 @@ layer.
   synthesis problem; ready-made building blocks: `generateCallByName`, fd
   chain construction, barrier/nanosleep timing control); ③ a verification
   loop (execute, check whether the target pair fired, adjust if not).
-- A weak form already exists: §6.5.3 call movement reorders existing calls
-  toward a target; the full form constructs from scratch.
+- **（2026-10-02 更正）**：该形态已由 Phase 2b 定向计划实现（`PickDirectedBatch`/`insertDirectedBatch` 按未覆盖 cell 合成插入）；§6.5.3 的 `MoveCallTimeAligned` 仍未建。
 - Priority: deferred — it depends on all three prerequisites and the first
   two directions' experimental data should first confirm that missing
   patterns are actually the exploration bottleneck.
@@ -1413,12 +1404,14 @@ Details:
 - **Cross-VM normalization**: windows are raw per-VM TSC; they are compared
   in the global domain by subtracting each VM's `tsc_offset` — the same
   normalization the DAG global timeline uses.
-- **fd constraints**: `findInsertPosition` aligns within the chosen
-  open/close fd range; `insertCallFromDCT` falls back to the index-aligned
-  position when time alignment would place an fd-required call before its
-  open.
-- **Coverage**: `insertCallFromPattern` (ops and verification calls) and
-  `insertCallFromDCT` (concurrent calls) both align; the generation path
+- **fd constraints**: `findOpenFdForPath` resolves the reusable fd within the
+  chosen open/close range (the old `findInsertPosition` is now test-only);
+  `insertCallFromDCT` falls back to the index-aligned position when time
+  alignment would place an fd-required call before its open.
+- **Coverage**: `insertCallFromDCT` aligns **both forms** — CC uses
+  `TimeAlignedInsertPos` (closest boundary), HB uses `firstBoundaryAfter`
+  (first boundary after the root); the dormant `insertCallFromPattern` was
+  deleted (P2-#12, 2026-10). The generation path
   (`generateFromDistributedChoiceTable`) is untouched — freshly generated
   programs have no execution history to align against.
 
@@ -1504,34 +1497,39 @@ exactly as on concurrent ones: data sharing yields sequential write→read on
 the same offset (consistency checks), path migration moves causal-chain
 members together, and removal deletes them with the group.
 
-**The four dynamic mutations** (invoked from `MutateInodeOpsWithDCT` /
-`MutateFileopsWithDCT`, distribution removeGroup 20% / removeOneInGroup 10% /
-path migrate 10% / data mutate 10% / insert 50%):
+**The four dynamic mutations**（**2026-10-02 更正**：入口为 `MutateFsopsWithDCT`；
+`MutateInodeOpsWithDCT`/`MutateFileopsWithDCT` 已删除。预算由 `mutateMixForSize` 按调用数分带：
+85/5/0/10、60/10/5/25、35/25/10/30、10/40/20/30（ins/removeOne/removeGroup/mutPathData），
+组内 path:data=70:30）：
 
 - `MutateGroupPathDynamic`: anchor -> new base path (`pickNewBasePath`);
-  concurrent peers resolve against it with their on-the-spot relations;
-  fd-required calls backtrack via `resolveFdTarget`; the non-concurrent
-  backbone stays in place (no second-pass follower logic needed).
-- `RemoveGroupDynamic`: deletes the anchor and its whole concurrent set.
+  **unified-group** peers (concurrent + direct causal successors) resolve
+  against it with their on-the-spot relations; fd-required calls backtrack via
+  `resolveFdTarget`; the non-group backbone stays in place (no second-pass
+  follower logic needed).
+- `RemoveGroupDynamic`: deletes the fd-safe subset of the anchor's unified
+  group (open/creat kept when an external fd user survives); directed arm in
+  `mutateGroupPathDirected`.
 - `RemoveReservoirDynamic`: reservoir-style cross-program deletion — each
   selected program loses at most one fd-safe call (`AnalyzeProgFds`,
   failure-injection pseudo calls kept). Candidates are pre-filtered to
   programs that have a removable call, so the target number of removals
   (scaling with their count) is always achieved; at least one call is
   removed whenever a removable call exists.
-- `MutateGroupDataDynamic`: the anchor must be a read/write call; all
-  read/write calls of the set share one random offset (and one write length
-  with `updateWriteDataBuf`) - the deterministic counterpart of the removed
-  probabilistic `OffsetSame` insertions. Range comes from the anchor path's
-  file size when available (1MB fallback).
+- `MutateGroupDataDynamic`: the anchor must be a **read/write/truncate** call;
+  all read/write (and truncate length) calls of the set share one random
+  offset/length (`applyGroupDataValues`) - the deterministic counterpart of
+  the removed probabilistic `OffsetSame` insertions. Range comes from the
+  anchor path's file size when available (1MB fallback). The directed arm
+  (`mutateGroupDataDirected`) biases the offset bucket by uncovered potential.
 
 **Why keep the relations on path migration (P1 decision)**: the path mutator
 generalizes a proven pattern to other path shapes, it does not reshape the
 relations - generating new rel combos is the job of `insertCallFromDCT`/
 `ChooseVariant`. Re-randomizing rels would (a) overlap with the generation
 mechanism, (b) tear apart concurrent same-path pairs (the core hmdfs conflict
-scenario), and (c) pollute DCT weight learning (path-dimension feedback would
-be attributed to the rel dimension).
+scenario), and (c) pollute the static DCT combo weights/sampling (path-dimension
+feedback would be attributed to the rel dimension; Phase 3 后无权重学习).
 
 **What was removed**: `CallProps.GroupID/PathRel/IsFromDCT/OffsetRel/LengthRel`
 (5 serialization keys), `Prog.Groups/LastGroupID`, `GroupMeta`/`GroupSourceType`,
@@ -1551,14 +1549,17 @@ window-overlap detection and anchor selection.
 
 ## 7. Data Dependencies
 
+> **2026-10-02 更正**：DAG 反馈现走 coverage board（`RecordCoveragePairs` + Phase 2b 定向；**无 DCT 学习**）；eBPF 侧为 15 个入口 kprobe+kretprobe 配对 + writepage perf tracepoint（16 func_ids）。
+
 ```
                      Monarch Data Pipeline
                             │
          ┌──────────────────┼──────────────────┐
          │                  │                   │
-    eBPF kretprobe      code coverage     callReply
-    (15 merge funcs      (KCOV)           (Stime/Etime
-     + writepage_cb)         │             + tsc_offset)
+    eBPF 15 merge funcs   code coverage     callReply
+    (entry kprobe +        (KCOV)           (Stime/Etime
+     kretprobe;                              + tsc_offset)
+     writepage = perf tracepoint)
          │                  │                   │
          │                  ▼                   │
          │            Edge Coverage             │
@@ -1574,7 +1575,7 @@ window-overlap detection and anchor selection.
                     └──────────┬────────────────┘
                                │
                 maxDagSignal / maxDagSchedSignal
-      (novel DAG pair = corpus entry + DCT feedback;
+      (novel DAG pair = corpus entry + coverage-board feedback;
        schedule bit = statistics only)
       — separate channel, never merged into the coverage maxSignal
 ```

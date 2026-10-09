@@ -54,15 +54,22 @@ var (
 	}
 )
 
-var FileopsSubCalls = []string{
-	"open", "close", "read", "write", "pread64", "pwrite64",
-	"fsync", "fdatasync", "truncate",
+// FsopsSubCalls is the merged seed-type call allowlist: every call the fsops
+// generator/mutator can build via generateCallByName (root or variant).
+var FsopsSubCalls = []string{
+	"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate",
+	"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "stat", "getdents64",
 }
 
-var InodeopsSubCalls = []string{
-	"mkdir", "rmdir", "creat", "unlink", "rename",
-	"chmod", "truncate", "stat",
-	"open", "getdents64", "close",
+// FsopsChoiceCalls is the allowlist of the DCT/pattern root-choice table. It
+// additionally enables close so that a bias sampled from a close call
+// (ubiquitous in fd self-contained sequences) is a legal bias source for
+// ChoiceTable.choose; chooseRootCallName never returns close as a root.
+// Mirrors the pre-merge sub-call tables, which both contained close.
+var FsopsChoiceCalls = []string{
+	"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate",
+	"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "stat", "getdents64",
+	"close",
 }
 
 func IsDirOnlyCall(callName string) bool {
@@ -176,7 +183,15 @@ type FileTree struct {
 	NodesByCid map[string][]*FileNode
 	FilesByCid map[string][]*FileNode
 	DirsByCid  map[string][]*FileNode
-	mu         sync.RWMutex
+
+	// Depth-bucket indexes: bucket 1 (merge_view/x) / 2 (depths 2-4) /
+	// 3 (depth >= 5) per cid. Rebuilt lazily after any tree mutation; used
+	// by the depth-weighted Select* APIs.
+	filesByBucket map[string][4][]*FileNode
+	dirsByBucket  map[string][4][]*FileNode
+	bucketDirty   bool
+
+	mu sync.RWMutex
 }
 
 func NewFileTree() *FileTree {
@@ -187,9 +202,10 @@ func NewFileTree() *FileTree {
 			Type:     NodeTypeDir,
 			Children: make(map[string]*FileNode),
 		},
-		NodesByCid: make(map[string][]*FileNode),
-		FilesByCid: make(map[string][]*FileNode),
-		DirsByCid:  make(map[string][]*FileNode),
+		NodesByCid:  make(map[string][]*FileNode),
+		FilesByCid:  make(map[string][]*FileNode),
+		DirsByCid:   make(map[string][]*FileNode),
+		bucketDirty: true,
 	}
 }
 
@@ -243,6 +259,7 @@ func (ft *FileTree) InitFromHmdfsConfig(hmcfg *Hmdfs_config) {
 }
 
 func (ft *FileTree) addNodeLocked(path string, nodeType FileNodeType, ownerCid string) *FileNode {
+	ft.bucketDirty = true
 	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
 	if cleanPath == "" {
 		return nil
@@ -261,6 +278,9 @@ func (ft *FileTree) addNodeLocked(path string, nodeType FileNodeType, ownerCid s
 		if child, exists := current.Children[part]; exists {
 			current = child
 			if isLast {
+				if current.Type != nodeType || current.OwnerCid != ownerCid {
+					ft.removeNodeFromCidLists(current)
+				}
 				current.Type = nodeType
 				current.OwnerCid = ownerCid
 			}
@@ -324,6 +344,7 @@ func (ft *FileTree) RemoveNode(path string) bool {
 }
 
 func (ft *FileTree) removeNodeLocked(path string) bool {
+	ft.bucketDirty = true
 	// Caller must hold ft.mu.
 	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
 	if cleanPath == "" {
@@ -344,44 +365,58 @@ func (ft *FileTree) removeNodeLocked(path string) bool {
 		}
 	}
 
-	if current.Parent != nil {
-		delete(current.Parent.Children, current.Name)
-	}
-
-	ft.removeNodeFromCidLists(current)
+	// A vanished directory takes its whole subtree with it: sweep the
+	// cid/type lists for the node and every descendant before detaching.
+	// Otherwise a child whose walk would later fail (its parent already
+	// removed) stays in the lists forever, and list-based selectors keep
+	// picking nonexistent paths.
+	ft.purgeSubtreeLocked(current)
 	return true
 }
 
+// purgeSubtreeLocked sweeps node and all descendants out of the cid/type
+// lists and detaches node from its parent. Caller must hold ft.mu.
+func (ft *FileTree) purgeSubtreeLocked(node *FileNode) {
+	var sweep func(*FileNode)
+	sweep = func(n *FileNode) {
+		ft.removeNodeFromCidLists(n)
+		for _, child := range n.Children {
+			sweep(child)
+		}
+	}
+	sweep(node)
+	if node.Parent != nil {
+		delete(node.Parent.Children, node.Name)
+	}
+}
+
+// removeNodesFromList removes every identity match of node from list and
+// returns the compacted slice (a node can be listed more than once after a
+// type flip without re-linking).
+func removeNodesFromList(list []*FileNode, node *FileNode) []*FileNode {
+	out := list[:0]
+	for _, n := range list {
+		if n != node {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 func (ft *FileTree) removeNodeFromCidLists(node *FileNode) {
+	ft.bucketDirty = true
 	// The node may appear in several cid lists (the same path registered
 	// under multiple cids) — sweep all of them, not just the current OwnerCid.
 	for cid, list := range ft.NodesByCid {
-		for i, n := range list {
-			if n == node {
-				ft.NodesByCid[cid] = append(list[:i], list[i+1:]...)
-				break
-			}
-		}
+		ft.NodesByCid[cid] = removeNodesFromList(list, node)
 	}
-
-	if node.Type == NodeTypeFile {
-		for cid, list := range ft.FilesByCid {
-			for i, n := range list {
-				if n == node {
-					ft.FilesByCid[cid] = append(list[:i], list[i+1:]...)
-					break
-				}
-			}
-		}
-	} else {
-		for cid, list := range ft.DirsByCid {
-			for i, n := range list {
-				if n == node {
-					ft.DirsByCid[cid] = append(list[:i], list[i+1:]...)
-					break
-				}
-			}
-		}
+	// A type flip without re-linking can leave the node in both type lists;
+	// purge both regardless of the current Type (identity is exact).
+	for cid, list := range ft.FilesByCid {
+		ft.FilesByCid[cid] = removeNodesFromList(list, node)
+	}
+	for cid, list := range ft.DirsByCid {
+		ft.DirsByCid[cid] = removeNodesFromList(list, node)
 	}
 }
 
@@ -398,6 +433,7 @@ func containsNode(list []*FileNode, node *FileNode) bool {
 // NodesByCid — the node stays in the tree on a type change). Caller must
 // hold ft.mu.
 func (ft *FileTree) removeNodeFromTypeList(node *FileNode) {
+	ft.bucketDirty = true
 	cid := node.OwnerCid
 	if node.Type == NodeTypeFile {
 		if list, ok := ft.FilesByCid[cid]; ok {
@@ -420,58 +456,79 @@ func (ft *FileTree) removeNodeFromTypeList(node *FileNode) {
 	}
 }
 
+// RenameNode moves oldPath to newPath under strict rename(2) semantics: every
+// precondition is resolved before any mutation (a failed rename leaves the
+// tree untouched), a directory cannot move into its own subtree, and an
+// existing destination is overwritten only when the classes match and a
+// directory target is empty (ENOTDIR/EISDIR/ENOTEMPTY otherwise). The target
+// subtree is purged from the cid/type lists before the source is relinked, so
+// no ghost node survives an overwrite.
 func (ft *FileTree) RenameNode(oldPath, newPath string) bool {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
 
 	cleanOldPath := strings.TrimPrefix(oldPath, MergeViewPrefix)
 	cleanNewPath := strings.TrimPrefix(newPath, MergeViewPrefix)
-
 	if cleanOldPath == "" || cleanNewPath == "" {
 		return false
 	}
 
-	oldParts := strings.Split(cleanOldPath, "/")
-	current := ft.Root
-
-	for _, part := range oldParts {
-		if part == "" {
-			continue
-		}
-		if child, exists := current.Children[part]; exists {
-			current = child
-		} else {
-			return false
-		}
+	// Resolve the source and the destination parent before touching anything.
+	current := ft.findNodeLocked(cleanOldPath)
+	if current == nil || current == ft.Root {
+		return false
 	}
-
-	if current.Parent != nil {
-		delete(current.Parent.Children, current.Name)
-	}
-
 	newParts := strings.Split(cleanNewPath, "/")
+	newName := newParts[len(newParts)-1]
+	if newName == "" {
+		return false // trailing slash: no terminal name
+	}
 	newParent := ft.Root
 	for i := 0; i < len(newParts)-1; i++ {
 		part := newParts[i]
 		if part == "" {
 			continue
 		}
-		if child, exists := newParent.Children[part]; exists {
-			newParent = child
-		} else {
+		child, exists := newParent.Children[part]
+		if !exists {
+			return false
+		}
+		newParent = child
+	}
+	if !nodeIsDir(newParent) {
+		return false // ENOTDIR
+	}
+	// A directory must not move into its own subtree.
+	for p := newParent; p != nil; p = p.Parent {
+		if p == current {
 			return false
 		}
 	}
+	if existing, ok := newParent.Children[newName]; ok {
+		if existing == current {
+			return true // rename onto its own path: no-op success
+		}
+		if nodeIsDir(current) != nodeIsDir(existing) {
+			return false // EISDIR / ENOTDIR
+		}
+		if nodeIsDir(existing) && len(existing.Children) != 0 {
+			return false // ENOTEMPTY
+		}
+		ft.purgeSubtreeLocked(existing)
+	}
 
-	newName := newParts[len(newParts)-1]
+	// Commit: unlink the source and relink it under the destination parent.
+	if current.Parent != nil {
+		delete(current.Parent.Children, current.Name)
+	}
 	current.Name = newName
 	current.FullPath = newParent.FullPath + "/" + newName
 	current.PathLength = len(current.FullPath)
 	current.Parent = newParent
 	newParent.Children[newName] = current
 
+	ft.bucketDirty = true
 	ft.updateChildPaths(current)
-
 	return true
 }
 
@@ -513,6 +570,30 @@ func (ft *FileTree) findNodeLocked(path string) *FileNode {
 	return current
 }
 
+// parentNodeLocked resolves the parent directory of path: the tree node when
+// present, or the synthetic merge-view root for depth-1 paths. A depth-1
+// path's parent string is "merge_view" (no trailing slash), which
+// findNodeLocked cannot map (MergeViewPrefix carries the slash), so that one
+// form is resolved to Root explicitly. Caller must hold ft.mu.
+func (ft *FileTree) parentNodeLocked(path string) *FileNode {
+	parent := GetParentDir(path)
+	if n := ft.findNodeLocked(parent); n != nil {
+		return n
+	}
+	if parent == strings.TrimSuffix(MergeViewPrefix, "/") {
+		return ft.Root
+	}
+	return nil
+}
+
+// FindParent returns the parent directory node of path (the merge-view root
+// included), or nil when the parent does not resolve in the tree.
+func (ft *FileTree) FindParent(path string) *FileNode {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+	return ft.parentNodeLocked(path)
+}
+
 func (ft *FileTree) GetParent(node *FileNode) *FileNode {
 	if node == nil || node.Parent == nil {
 		return nil
@@ -548,7 +629,7 @@ func (ft *FileTree) GetEntriesUnderDir(dirPath string) []string {
 func (ft *FileTree) GetFileEntriesUnderDir(dirPath string) []string {
 	ft.mu.RLock()
 	defer ft.mu.RUnlock()
-	node := ft.FindNode(dirPath)
+	node := ft.findNodeLocked(dirPath)
 	if node == nil {
 		return nil
 	}
@@ -564,7 +645,7 @@ func (ft *FileTree) GetFileEntriesUnderDir(dirPath string) []string {
 func (ft *FileTree) GetNonTmpDirEntriesUnderDir(dirPath string) []string {
 	ft.mu.RLock()
 	defer ft.mu.RUnlock()
-	node := ft.FindNode(dirPath)
+	node := ft.findNodeLocked(dirPath)
 	if node == nil {
 		return nil
 	}
@@ -573,6 +654,27 @@ func (ft *FileTree) GetNonTmpDirEntriesUnderDir(dirPath string) []string {
 		if child.Type == NodeTypeDir || child.Type == NodeTypeEmptyDir {
 			entries = append(entries, child.FullPath)
 		}
+	}
+	return entries
+}
+
+// GetNonTmpDirSiblings returns the non-TmpDir children of srcPath's parent,
+// excluding srcPath itself (the candidate pool of an existing rename
+// destination). The order follows map iteration; callers that need
+// determinism must sort.
+func (ft *FileTree) GetNonTmpDirSiblings(srcPath string) []string {
+	ft.mu.RLock()
+	defer ft.mu.RUnlock()
+	node := ft.findNodeLocked(srcPath)
+	if node == nil || node.Parent == nil {
+		return nil
+	}
+	var entries []string
+	for _, child := range node.Parent.Children {
+		if child == nil || child == node || child.Type == NodeTypeTmpDir {
+			continue
+		}
+		entries = append(entries, child.FullPath)
 	}
 	return entries
 }
@@ -590,82 +692,168 @@ func (ft *FileTree) GetSibling(node *FileNode) []*FileNode {
 	return siblings
 }
 
-func (ft *FileTree) GetRandomFile(r *rand.Rand, cid string) *FileNode {
-	ft.mu.RLock()
-	defer ft.mu.RUnlock()
+// DepthBucketWeights is the path-depth bucket distribution for path
+// selection: bucket 1 (merge_view/x) 15%, bucket 2 (depths 2-4) 45%,
+// bucket 3 (depth >= 5) 40%. Bucket 0 is unreachable for tree paths.
+var DepthBucketWeights = [3]float64{0.15, 0.45, 0.40}
 
-	files, ok := ft.FilesByCid[cid]
-	if !ok || len(files) == 0 {
+// ensureBucketIndexLocked rebuilds the depth-bucket indexes when the tree
+// changed. O(nodes) ~1700; runs at most once per mutation round. The caller
+// must hold ft.mu for writing: the selector holds the same lock across the
+// rebuild and the pick, so a pick can never observe a stale index (no
+// two-phase ensure/read window).
+func (ft *FileTree) ensureBucketIndexLocked() {
+	if !ft.bucketDirty && ft.filesByBucket != nil {
+		return
+	}
+	ft.filesByBucket = make(map[string][4][]*FileNode)
+	ft.dirsByBucket = make(map[string][4][]*FileNode)
+	var walk func(n *FileNode)
+	walk = func(n *FileNode) {
+		if n != ft.Root {
+			b := int(DepthBucketOf(n.FullPath))
+			if b < 0 {
+				b = 0
+			}
+			if b > 3 {
+				b = 3
+			}
+			m := ft.dirsByBucket
+			if n.Type == NodeTypeFile {
+				m = ft.filesByBucket
+			}
+			lst := m[n.OwnerCid]
+			lst[b] = append(lst[b], n)
+			m[n.OwnerCid] = lst
+		}
+		for _, c := range n.Children {
+			walk(c)
+		}
+	}
+	walk(ft.Root)
+	ft.bucketDirty = false
+}
+
+// dirBucketFilter is the directory filter of the selectors: TmpDir is always
+// excluded; EmptyDir is excluded when allowEmpty is false.
+func dirBucketFilter(allowEmpty bool) func(*FileNode) bool {
+	return func(n *FileNode) bool {
+		if n.Type == NodeTypeTmpDir {
+			return false
+		}
+		if !allowEmpty && n.Type == NodeTypeEmptyDir {
+			return false
+		}
+		return true
+	}
+}
+
+// pickByBucket picks a depth bucket by weights over the non-empty (and
+// non-zero-weight) candidate buckets, then a uniform node inside it. When no
+// bucket is weighted, the non-empty buckets are used uniformly.
+func pickByBucket(r *rand.Rand, buckets [4][]*FileNode, weights [3]float64, filter func(*FileNode) bool) *FileNode {
+	var cands [3][]*FileNode
+	for i := 1; i <= 3; i++ {
+		for _, n := range buckets[i] {
+			if filter == nil || filter(n) {
+				cands[i-1] = append(cands[i-1], n)
+			}
+		}
+	}
+	var ws [3]float64
+	total := 0.0
+	for i := 0; i < 3; i++ {
+		if len(cands[i]) > 0 && weights[i] > 0 {
+			ws[i] = weights[i]
+			total += ws[i]
+		}
+	}
+	if total <= 0 {
+		for i := 0; i < 3; i++ {
+			if len(cands[i]) > 0 {
+				ws[i] = 1
+				total += 1
+			}
+		}
+	}
+	if total <= 0 {
 		return nil
 	}
-	return files[r.Intn(len(files))]
+	x := r.Float64() * total
+	cum := 0.0
+	for i := 0; i < 3; i++ {
+		cum += ws[i]
+		if ws[i] > 0 && x < cum {
+			return cands[i][r.Intn(len(cands[i]))]
+		}
+	}
+	for i := 2; i >= 0; i-- {
+		if len(cands[i]) > 0 {
+			return cands[i][r.Intn(len(cands[i]))]
+		}
+	}
+	return nil
+}
+
+// SelectFile picks a file of cid with the depth-bucket weight distribution.
+// The rebuild-if-dirty and the pick happen under one write lock so the index
+// cannot go stale between them.
+func (ft *FileTree) SelectFile(r *rand.Rand, cid string, weights [3]float64) *FileNode {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.ensureBucketIndexLocked()
+	return pickByBucket(r, ft.filesByBucket[cid], weights, nil)
+}
+
+// SelectDir picks a directory of cid with the depth-bucket weight
+// distribution; allowEmpty=false excludes empty dirs (TmpDir always excluded).
+func (ft *FileTree) SelectDir(r *rand.Rand, cid string, allowEmpty bool, weights [3]float64) *FileNode {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.ensureBucketIndexLocked()
+	return pickByBucket(r, ft.dirsByBucket[cid], weights, dirBucketFilter(allowEmpty))
+}
+
+func (ft *FileTree) GetRandomFile(r *rand.Rand, cid string) *FileNode {
+	return ft.SelectFile(r, cid, DepthBucketWeights)
 }
 
 func (ft *FileTree) GetRandomFileExcluding(r *rand.Rand, excludeCid string) *FileNode {
-	ft.mu.RLock()
-	defer ft.mu.RUnlock()
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.ensureBucketIndexLocked()
 
-	var candidates []*FileNode
-	for cid, files := range ft.FilesByCid {
-		if cid != excludeCid {
-			candidates = append(candidates, files...)
-		}
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	return candidates[r.Intn(len(candidates))]
-}
-
-func (ft *FileTree) GetRandomDir(r *rand.Rand, cid string, allowEmpty bool) *FileNode {
-	ft.mu.RLock()
-	defer ft.mu.RUnlock()
-
-	dirs, ok := ft.DirsByCid[cid]
-	if !ok || len(dirs) == 0 {
-		return nil
-	}
-	CandidatesDirs := make([]*FileNode, 0)
-	if allowEmpty {
-		for _, d := range dirs {
-			if d.Type != NodeTypeTmpDir {
-				CandidatesDirs = append(CandidatesDirs, d)
-			}
-		}
-		//return dirs[r.Intn(len(dirs))]
-	} else {
-		for _, d := range dirs {
-			if d.Type != NodeTypeEmptyDir && d.Type != NodeTypeTmpDir {
-				CandidatesDirs = append(CandidatesDirs, d)
-			}
-		}
-	}
-
-	if len(CandidatesDirs) == 0 {
-		return nil
-	}
-	return CandidatesDirs[r.Intn(len(CandidatesDirs))]
-}
-
-func (ft *FileTree) GetRandomDirExcluding(r *rand.Rand, excludeCid string) *FileNode {
-	ft.mu.RLock()
-	defer ft.mu.RUnlock()
-
-	var candidates []*FileNode
-	for cid, dirs := range ft.DirsByCid {
+	var buckets [4][]*FileNode
+	for cid, byBucket := range ft.filesByBucket {
 		if cid == excludeCid {
 			continue
 		}
-		for _, d := range dirs {
-			if d.Type != NodeTypeEmptyDir && d.Type != NodeTypeTmpDir {
-				candidates = append(candidates, d)
-			}
+		for b := 1; b <= 3; b++ {
+			buckets[b] = append(buckets[b], byBucket[b]...)
 		}
 	}
-	if len(candidates) == 0 {
-		return nil
+	return pickByBucket(r, buckets, DepthBucketWeights, nil)
+}
+
+func (ft *FileTree) GetRandomDir(r *rand.Rand, cid string, allowEmpty bool) *FileNode {
+	return ft.SelectDir(r, cid, allowEmpty, DepthBucketWeights)
+}
+
+func (ft *FileTree) GetRandomDirExcluding(r *rand.Rand, excludeCid string) *FileNode {
+	ft.mu.Lock()
+	defer ft.mu.Unlock()
+	ft.ensureBucketIndexLocked()
+
+	var buckets [4][]*FileNode
+	for cid, byBucket := range ft.dirsByBucket {
+		if cid == excludeCid {
+			continue
+		}
+		for b := 1; b <= 3; b++ {
+			buckets[b] = append(buckets[b], byBucket[b]...)
+		}
 	}
-	return candidates[r.Intn(len(candidates))]
+	return pickByBucket(r, buckets, DepthBucketWeights, dirBucketFilter(false))
 }
 
 func (ft *FileTree) GetAllFileNodesExcluding(excludeCid string) []*FileNode {
@@ -763,30 +951,38 @@ func nodeMatchesConstraint(node *FileNode, constraint int) bool {
 	return true
 }
 
-// basePathCompatible reports whether basePath's type matches the variant
-// call's target constraint (used before falling back to the base path when no
-// relation path could be produced).
-func basePathCompatible(ft *FileTree, basePath string, constraint int) bool {
-	switch constraint {
-	case relTargetFile:
-		return !isDirPath(ft, basePath)
-	case relTargetDir:
-		return isDirPath(ft, basePath)
+// nodeTypeConstraint is the tree-node counterpart of callNameConstraint: it
+// maps a node to the type constraint its class satisfies (file -> File; the
+// directory families, TmpDir included, -> Dir), so relation availability and
+// relation resolution share one class rule. nil defaults to Dir.
+func nodeTypeConstraint(node *FileNode) int {
+	if node != nil && node.Type == NodeTypeFile {
+		return relTargetFile
 	}
-	return true
+	return relTargetDir
+}
+
+// nodeIsDir is the physical directory predicate of the flags/classification
+// layer: any node that is not a file (Dir/EmptyDir/TmpDir) is a directory.
+// It mirrors nodeMatchesConstraint(relTargetDir)/nodeTypeConstraint/
+// countNodesByType so relation availability and open-flag computation share
+// one rule (a TmpDir is a real directory; omitting it makes open() fail
+// EISDIR at the VFS before the hmdfs trace point).
+func nodeIsDir(n *FileNode) bool {
+	return n != nil && n.Type != NodeTypeFile
 }
 
 // patternBaseMatches reports whether an extracted base path suits the seed
-// type of a pattern insertion (fileops patterns operate on files, inodeops
+// type of a pattern insertion (file-kind patterns operate on files, dir-kind
 // ones on directories). Paths outside the tree are excluded: an unbuilt
 // target (e.g. a not-yet-created mkdir directory) would make creation ops
 // hit the directory path itself and fail.
-func patternBaseMatches(ft *FileTree, seedType, basePath string) bool {
+func patternBaseMatches(ft *FileTree, baseKind, basePath string) bool {
 	node := ft.FindNode(basePath)
 	if node == nil {
 		return false
 	}
-	if seedType == "fileops" {
+	if baseKind == "file" {
 		return node.Type == NodeTypeFile
 	}
 	return node.Type != NodeTypeFile
@@ -827,14 +1023,16 @@ func (ft *FileTree) GetPathByRelation(basePath string, basePath2 string, relatio
 		case PathSelf, PathSelfTwo, PathSame:
 			return basePath
 		}
-		parent := ft.FindNode(GetParentDir(basePath))
+		parent := ft.FindParent(basePath)
 		if parent == nil {
 			return ""
 		}
 		switch relation {
 		case PathParent:
-			if constraint == relTargetFile {
-				return "" // a parent is always a directory
+			if constraint == relTargetFile || parent == ft.Root {
+				// A parent is always a directory; the merge-view root is not a
+				// legal rename/rmdir source (VFS EBUSY on the mount point).
+				return ""
 			}
 			return parent.FullPath
 		case PathSibling:
@@ -859,7 +1057,9 @@ func (ft *FileTree) GetPathByRelation(basePath string, basePath2 string, relatio
 			return "" // a parent is always a directory
 		}
 		parent := ft.GetParent(baseNode)
-		if parent == nil {
+		if parent == nil || parent == ft.Root {
+			// The merge-view root is not a legal rename/rmdir source (EBUSY on
+			// the mount point), so a depth-1 base has no Parent relation.
 			return ""
 		}
 		return parent.FullPath
@@ -912,6 +1112,21 @@ func (ft *FileTree) getRandomUnrelatedPath(excludePath string, r *rand.Rand, con
 
 	if len(candidates) == 0 {
 		return ""
+	}
+	// Depth-weighted pick over the unrelated candidates.
+	var buckets [4][]*FileNode
+	for _, n := range candidates {
+		b := int(DepthBucketOf(n.FullPath))
+		if b < 0 {
+			b = 0
+		}
+		if b > 3 {
+			b = 3
+		}
+		buckets[b] = append(buckets[b], n)
+	}
+	if picked := pickByBucket(r, buckets, DepthBucketWeights, nil); picked != nil {
+		return picked.FullPath
 	}
 	return candidates[r.Intn(len(candidates))].FullPath
 }
@@ -982,6 +1197,14 @@ func (ft *FileTree) UpdateHmdfsConfig(hmcfg *Hmdfs_config) {
 
 type ConcurrentOp struct {
 	CallName string
+	// PathArgs names the op's path arguments: single-path ops carry one entry;
+	// a rename carries two slots, [0] the source relation resolved against the
+	// pattern base and [1] the destination relation resolved against the
+	// source. PathSelfTwo is the rename-pair token (the first path in [0], the
+	// derived fresh second path in [1]); PathSibling destinations are
+	// geometric (same parent, fresh fallback via pickRenameDst); PathSame
+	// denotes the pattern base itself and requires a same-class sibling as
+	// source (see renameDstKindOf).
 	PathArgs []PathArgSpec
 }
 
@@ -992,261 +1215,189 @@ type PathArgSpec struct {
 type ConcurrentPattern struct {
 	Name        string
 	ClientCount int
-	SharedRes   string
 	Operations  [][]ConcurrentOp
-	TestPoint   string
-	SeedType    string
+	BaseKind    string // "file" or "dir": the node type the pattern's base needs
 	OffsetRel   OffsetRelationType
-	LengthRel   OffsetRelationType
 }
 
 type PredefinedPatterns struct {
-	FileopsPatterns  []ConcurrentPattern
-	InodeopsPatterns []ConcurrentPattern
+	Patterns []ConcurrentPattern
 }
 
 func NewPredefinedPatterns() *PredefinedPatterns {
-	pp := &PredefinedPatterns{
-		FileopsPatterns:  make([]ConcurrentPattern, 0),
-		InodeopsPatterns: make([]ConcurrentPattern, 0),
-	}
+	pp := &PredefinedPatterns{Patterns: make([]ConcurrentPattern, 0, 15)}
 
-	pp.initFileopsPatterns()
-	pp.initInodeopsPatterns()
+	pp.initFilePatterns()
+	pp.initDirPatterns()
 
 	return pp
 }
 
-func (pp *PredefinedPatterns) initFileopsPatterns() {
-	pp.FileopsPatterns = []ConcurrentPattern{
+func (pp *PredefinedPatterns) initFilePatterns() {
+	pp.Patterns = append(pp.Patterns, []ConcurrentPattern{
 		{
 			Name:        "write_write_diff_offset",
 			ClientCount: 2,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"write", []PathArgSpec{{PathSelf}}}},
 				{{"write", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "async_writeback_merge",
-			SeedType:  "fileops",
+			BaseKind:  "file",
 			OffsetRel: OffsetDifferent,
-			LengthRel: OffsetDifferent,
 		},
 		{
 			Name:        "write_write_same_offset",
 			ClientCount: 2,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"write", []PathArgSpec{{PathSelf}}}},
 				{{"write", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "write_conflict_resolution",
-			SeedType:  "fileops",
+			BaseKind:  "file",
 			OffsetRel: OffsetSame,
-			LengthRel: OffsetSame,
 		},
 		{
 			Name:        "write_read_concurrent",
 			ClientCount: 2,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"write", []PathArgSpec{{PathSelf}}}},
 				{{"read", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "read_visibility",
-			SeedType:  "fileops",
+			BaseKind:  "file",
 			OffsetRel: OffsetSame,
-			LengthRel: OffsetSame,
 		},
 		{
 			Name:        "truncate_read_write_concurrent",
-			ClientCount: 2,
-			SharedRes:   "same_file",
+			ClientCount: 3,
 			Operations: [][]ConcurrentOp{
 				{{"truncate", []PathArgSpec{{PathSelf}}}},
 				{{"read", []PathArgSpec{{PathSame}}}},
 				{{"write", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "truncate_during_read",
-			SeedType:  "fileops",
+			BaseKind:  "file",
 			OffsetRel: OffsetUnspecified,
-			LengthRel: OffsetUnspecified,
 		},
-	}
+	}...)
 
-	pp.FileopsPatterns = append(pp.FileopsPatterns,
+	pp.Patterns = append(pp.Patterns,
 		ConcurrentPattern{
 			Name:        "fsync_concurrent",
 			ClientCount: 2,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"write", []PathArgSpec{{PathSelf}}},
 					{"fsync", []PathArgSpec{}}},
 				{{"read", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "fsync_visibility",
-			SeedType:  "fileops",
+			BaseKind:  "file",
 			OffsetRel: OffsetUnspecified,
-			LengthRel: OffsetUnspecified,
 		},
 	)
 }
 
-func (pp *PredefinedPatterns) initInodeopsPatterns() {
-	pp.InodeopsPatterns = []ConcurrentPattern{
+func (pp *PredefinedPatterns) initDirPatterns() {
+	pp.Patterns = append(pp.Patterns, []ConcurrentPattern{
 		{
 			Name:        "concurrent_mkdir_same",
 			ClientCount: 3,
-			SharedRes:   "same_dir",
 			Operations: [][]ConcurrentOp{
 				{{"mkdir", []PathArgSpec{{PathSelf}}}},
 				{{"mkdir", []PathArgSpec{{PathSame}}}},
 				{{"mkdir", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "mkdir_atomicity",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		{
 			Name:        "create_unlink_same",
 			ClientCount: 2,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"creat", []PathArgSpec{{PathSelf}}}},
 				{{"unlink", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "create_unlink_consistency",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		{
 			Name:        "mkdir_stat_concurrent",
 			ClientCount: 2,
-			SharedRes:   "same_dir",
 			Operations: [][]ConcurrentOp{
 				{{"mkdir", []PathArgSpec{{PathSelf}}}},
 				{{"stat", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "mkdir_stat_consistency",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		{
 			Name:        "rename_open_concurrent",
 			ClientCount: 2,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"rename", []PathArgSpec{{PathSelfTwo}, {PathSelfTwo}}}},
 				{{"open", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "rename_open_atomicity",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		{
 			Name:        "rename_rename_concurrent",
 			ClientCount: 2,
-			SharedRes:   "two_files",
 			Operations: [][]ConcurrentOp{
 				{{"rename", []PathArgSpec{{PathSelfTwo}, {PathSelfTwo}}}},
-				{{"rename", []PathArgSpec{{PathSame}, {PathSibling}}}},
+				{{"rename", []PathArgSpec{{PathSibling}, {PathSame}}}},
 			},
-			TestPoint: "rename_rename_conflict",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		{
 			Name:        "readdir_creat_concurrent",
 			ClientCount: 2,
-			SharedRes:   "same_dir",
 			Operations: [][]ConcurrentOp{
 				{{"getdents64", []PathArgSpec{{PathSelf}}}},
 				{{"creat", []PathArgSpec{{PathChild}}}},
 			},
-			TestPoint: "readdir_creat_consistency",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		{
 			Name:        "chmod_getattr_concurrent",
 			ClientCount: 2,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"chmod", []PathArgSpec{{PathSelf}}}},
 				{{"stat", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "chmod_stat_consistency",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		{
 			Name:        "rmdir_mkdir_child_concurrent",
 			ClientCount: 2,
-			SharedRes:   "parent_child",
 			Operations: [][]ConcurrentOp{
 				{{"rmdir", []PathArgSpec{{PathSelf}}}},
 				{{"mkdir", []PathArgSpec{{PathChild}}}},
 			},
-			TestPoint: "rmdir_mkdir_child_conflict",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
-	}
+	}...)
 
-	pp.InodeopsPatterns = append(pp.InodeopsPatterns,
+	pp.Patterns = append(pp.Patterns,
 		ConcurrentPattern{
 			Name:        "multi_rename_same_file",
 			ClientCount: 3,
-			SharedRes:   "same_file",
 			Operations: [][]ConcurrentOp{
 				{{"rename", []PathArgSpec{{PathSelfTwo}, {PathSelfTwo}}}},
 				{{"rename", []PathArgSpec{{PathSame}, {PathSibling}}}},
 				{{"rename", []PathArgSpec{{PathSame}, {PathSibling}}}},
 			},
-			TestPoint: "multi_rename_conflict",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 		ConcurrentPattern{
 			Name:        "rmdir_mkdir_same_name",
 			ClientCount: 2,
-			SharedRes:   "same_dir",
 			Operations: [][]ConcurrentOp{
 				{{"rmdir", []PathArgSpec{{PathSelf}}}},
 				{{"mkdir", []PathArgSpec{{PathSame}}}},
 			},
-			TestPoint: "rmdir_mkdir_same_name_recreation",
-			SeedType:  "inodeops",
+			BaseKind: "dir",
 		},
 	)
 }
 
-func (pp *PredefinedPatterns) GetRandomPattern(seedType string, r *rand.Rand) *ConcurrentPattern {
-	var patterns []ConcurrentPattern
-	switch seedType {
-	case "fileops":
-		patterns = pp.FileopsPatterns
-	case "inodeops":
-		patterns = pp.InodeopsPatterns
-	default:
+func (pp *PredefinedPatterns) GetRandomPattern(r *rand.Rand) *ConcurrentPattern {
+	if len(pp.Patterns) == 0 {
 		return nil
 	}
-
-	if len(patterns) == 0 {
-		return nil
-	}
-	return &patterns[r.Intn(len(patterns))]
-}
-
-func (pp *PredefinedPatterns) GetPatternsForNodeCount(seedType string, nodeCount int) []ConcurrentPattern {
-	var patterns []ConcurrentPattern
-	switch seedType {
-	case "fileops":
-		patterns = pp.FileopsPatterns
-	case "inodeops":
-		patterns = pp.InodeopsPatterns
-	default:
-		return nil
-	}
-
-	result := make([]ConcurrentPattern, 0)
-	for _, p := range patterns {
-		if p.ClientCount <= nodeCount {
-			result = append(result, p)
-		}
-	}
-	return result
+	return &pp.Patterns[r.Intn(len(pp.Patterns))]
 }
 
 type DistributedChoiceTable struct {
@@ -1257,56 +1408,13 @@ type DistributedChoiceTable struct {
 	Variants map[string][]CallVariant
 
 	Weights map[string]map[CallVariant]int
-
-	// Explored marks (rootCall, variant) combos that have produced new
-	// feedback signal; unexplored combos are preferred (direction 1).
-	Explored map[string]map[CallVariant]bool
-	// NoYield counts consecutive selections without new signal; combos
-	// reaching the threshold are down-weighted (direction 2).
-	NoYield map[string]map[CallVariant]int
-
-	// TemporalWeights models the second layer of the choice strategy: for
-	// each (rootCall, variant) combo, how likely its concurrent form vs its
-	// causal (HB) form is to produce the corresponding DAG pair. Initialized
-	// lazily to 50/50; updated by feedback from the actually produced pair
-	// temporal (see UpdateTemporalWeight). Independent of the direction-1/2
-	// mechanisms: produced pairs only update these weights (and pair
-	// statistics); they never drive direction 1/2.
-	TemporalWeights map[string]map[CallVariant]TemporalWeight
-
-	seedType string
 }
 
-// TemporalWeight holds the selection weights of the two insertion forms of a
-// combo: concurrent (time-aligned) and causal (after the root finishes).
-type TemporalWeight struct {
-	Concurrent int
-	HB         int
-}
-
-const temporalInitWeight = 1
-
-// Direction-2 parameters: after noYieldThreshold consecutive failed
-// insertion attempts without new DAG feedback, a combo loses noYieldDelta
-// weight (only while its weight exceeds noYieldDelta, so the effective floor
-// is noYieldDelta+1). The same threshold bounds a never-explored combo's
-// exploration budget in chooseVariant. maxComboWeight caps the MarkYield
-// reward (defensive symmetric counterpart).
-const (
-	noYieldThreshold = 10
-	noYieldDelta     = 5
-	maxComboWeight   = 100
-)
-
-func NewDistributedChoiceTable(seedType string) *DistributedChoiceTable {
+func NewDistributedChoiceTable() *DistributedChoiceTable {
 	dct := &DistributedChoiceTable{
-		RootCalls:       make(map[string]bool),
-		Variants:        make(map[string][]CallVariant),
-		Weights:         make(map[string]map[CallVariant]int),
-		Explored:        make(map[string]map[CallVariant]bool),
-		NoYield:         make(map[string]map[CallVariant]int),
-		TemporalWeights: make(map[string]map[CallVariant]TemporalWeight),
-		seedType:        seedType,
+		RootCalls: make(map[string]bool),
+		Variants:  make(map[string][]CallVariant),
+		Weights:   make(map[string]map[CallVariant]int),
 	}
 
 	dct.initDefaultConfig()
@@ -1314,16 +1422,8 @@ func NewDistributedChoiceTable(seedType string) *DistributedChoiceTable {
 }
 
 func (dct *DistributedChoiceTable) initDefaultConfig() {
-	var rootCallNames []string
-	var variantCallNames []string
-
-	if dct.seedType == "fileops" {
-		rootCallNames = []string{"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate"}
-		variantCallNames = []string{"open", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "truncate", "stat"}
-	} else {
-		rootCallNames = []string{"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "truncate", "stat", "open", "getdents64"}
-		variantCallNames = []string{"mkdir", "rmdir", "creat", "unlink", "rename", "chmod", "truncate", "stat", "open", "getdents64", "write", "read", "pwrite64", "pread64"}
-	}
+	rootCallNames := FsopsSubCalls
+	variantCallNames := FsopsSubCalls
 	//TODO: root and variant call may need optimization
 	for _, callName := range rootCallNames {
 		dct.RootCalls[callName] = true
@@ -1363,77 +1463,110 @@ func (dct *DistributedChoiceTable) initDefaultConfig() {
 
 		dct.Variants[rootCall] = variants
 		dct.Weights[rootCall] = weights
-		dct.Explored[rootCall] = make(map[CallVariant]bool)
-		dct.NoYield[rootCall] = make(map[CallVariant]int)
 	}
 }
 
-func (dct *DistributedChoiceTable) getInitialWeight(rootCall string, variant CallVariant) int {
-	baseWeight := 10
+// Seed-call categories for the initial weight formula.
+var (
+	nsCalls      = map[string]bool{"mkdir": true, "rmdir": true, "creat": true, "unlink": true, "rename": true}
+	datamodCalls = map[string]bool{"write": true, "pwrite64": true, "truncate": true, "fsync": true, "fdatasync": true}
+	dataobsCalls = map[string]bool{"read": true, "pread64": true, "stat": true, "getdents64": true, "chmod": true}
+)
 
-	if variant.PathRelation == PathSame {
-		baseWeight = 30
-	} else if variant.PathRelation == PathSibling {
-		baseWeight = 20
-	} else if variant.PathRelation == PathParent || variant.PathRelation == PathChild {
-		baseWeight = 15
-	} else if variant.PathRelation == PathNoRel {
-		baseWeight = 5
+// relBaseOf is the relation base weight: Same 30 / Parent-Child-Sibling 20 /
+// NoRel (and anything else) 10.
+func relBaseOf(rel PathRelation) int {
+	switch rel {
+	case PathSame:
+		return 30
+	case PathParent, PathChild, PathSibling:
+		return 20
+	default:
+		return 10
 	}
+}
 
-	conflictPairs := map[string]map[string]int{
-		"mkdir":     {"rmdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15, "open": 20, "getdents64": 20},
-		"rmdir":     {"mkdir": 25, "creat": 20, "unlink": 15, "write": 15, "read": 15, "getdents64": 25},
-		"creat":     {"unlink": 30, "rmdir": 20, "mkdir": 20, "creat": 25, "write": 25, "read": 25},
-		"unlink":    {"creat": 30, "mkdir": 15, "rmdir": 15, "write": 30, "read": 20},
-		"rename":    {"rename": 35, "unlink": 25, "creat": 20, "write": 20, "read": 20},
-		"chmod":     {"read": 15, "write": 15, "truncate": 20},
-		"truncate":  {"write": 25, "read": 20, "chmod": 20},
-		"stat":      {"write": 10, "read": 10},
-		"open":      {"read": 25, "write": 25, "truncate": 20, "pread64": 20, "pwrite64": 20, "unlink": 25, "rename": 20, "rmdir": 20},
-		"write":     {"read": 30, "write": 25, "truncate": 20, "unlink": 30, "creat": 25, "mkdir": 15, "rmdir": 15, "pread64": 25, "pwrite64": 25, "fsync": 20},
-		"read":      {"write": 30, "truncate": 15, "unlink": 20, "creat": 25, "mkdir": 15, "rmdir": 15, "pread64": 20, "pwrite64": 20},
-		"fsync":     {"write": 25, "read": 15, "truncate": 20},
-		"fdatasync": {"write": 25, "read": 15, "truncate": 20},
-		"pwrite64":  {"read": 25, "write": 25, "pread64": 20, "truncate": 20},
-		"pread64":   {"write": 30, "pwrite64": 20, "truncate": 15},
-		"getdents64": {"creat": 25, "rmdir": 25, "unlink": 20, "mkdir": 20, "rename": 20,
-			"write": 5, "read": 5, "pread64": 5, "pwrite64": 5, "fsync": 5, "fdatasync": 5},
+// conflictCoeffOf returns the pair conflict coefficient in percent:
+// same call 150; namespace x namespace 150; namespace x data-modifier 120;
+// namespace x data-observer 100; data-modifier x data-modifier 120
+// (write x truncate 150); data-modifier x data-observer 120; any pair
+// involving open 120; data-observer x data-observer 50.
+func conflictCoeffOf(rootCall, variantCall string) int {
+	if rootCall == variantCall {
+		return 150
 	}
-
-	if conflictGroup, ok := conflictPairs[rootCall]; ok {
-		if w, ok := conflictGroup[variant.CallName]; ok {
-			baseWeight = w
+	if rootCall == "open" || variantCall == "open" {
+		return 120
+	}
+	rNS, vNS := nsCalls[rootCall], nsCalls[variantCall]
+	rDM, vDM := datamodCalls[rootCall], datamodCalls[variantCall]
+	rOB, vOB := dataobsCalls[rootCall], dataobsCalls[variantCall]
+	switch {
+	case rNS && vNS:
+		return 150
+	case (rNS && vDM) || (rDM && vNS):
+		return 120
+	case (rNS && vOB) || (rOB && vNS):
+		return 100
+	case rDM && vDM:
+		if (rootCall == "write" && variantCall == "truncate") || (rootCall == "truncate" && variantCall == "write") {
+			return 150
 		}
+		return 120
+	case (rDM && vOB) || (rOB && vDM):
+		return 120
+	case rOB && vOB:
+		return 50
 	}
+	return 100
+}
 
-	return baseWeight
+// getInitialWeight computes relBase * conflictCoeff, clamped to [5, 45].
+func (dct *DistributedChoiceTable) getInitialWeight(rootCall string, variant CallVariant) int {
+	w := relBaseOf(variant.PathRelation) * conflictCoeffOf(rootCall, variant.CallName) / 100
+	if w < 5 {
+		w = 5
+	}
+	if w > 45 {
+		w = 45
+	}
+	return w
 }
 
 func (dct *DistributedChoiceTable) ChooseVariant(rootCall string, r *rand.Rand) *CallVariant {
 	dct.mu.Lock()
 	defer dct.mu.Unlock()
 
-	return dct.chooseVariant(rootCall, r, false, nil)
+	return dct.chooseVariant(rootCall, r, false, "", nil, true, true)
 }
 
-func (dct *DistributedChoiceTable) ChooseVariantFiltered(rootCall string, r *rand.Rand, baseIsFile bool, relOKByType map[int]map[PathRelation]bool) *CallVariant {
+func (dct *DistributedChoiceTable) ChooseVariantFiltered(rootCall string, r *rand.Rand, baseIsFile bool, basePath string, relOKByType map[int]map[PathRelation]bool, sibParentOK bool, allowDirected bool) *CallVariant {
 	dct.mu.Lock()
 	defer dct.mu.Unlock()
 
-	return dct.chooseVariant(rootCall, r, baseIsFile, relOKByType)
+	return dct.chooseVariant(rootCall, r, baseIsFile, basePath, relOKByType, sibParentOK, allowDirected)
 }
 
-// chooseVariant picks a variant for rootCall. Direction 1: combos that never
-// produced signal (and are still within their exploration budget) are
-// preferred. Direction 2: the picked combo's consecutive no-yield counter is
-// bumped and it is down-weighted once the threshold is reached.
-// relOKByType (may be nil = all relations allowed) restricts the candidate
-// set per variant-call type (relTargetAny/File/Dir) to path relations that
-// can currently produce a path of a compatible type for the base, so the
-// picked combo is always generatable downstream.
-// The caller must hold dct.mu (write lock).
-func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, baseIsFile bool, relOKByType map[int]map[PathRelation]bool) *CallVariant {
+// chooseVariant picks a variant for rootCall. Phase 3: candidates are all
+// eligible (root, variant, relation) combos weighted by their static initial
+// weight (the weight dynamics and explore-first pool are gone). Direction 3
+// (directed coverage): with directedBiasProb and an initialized coverage
+// board, a candidate is sampled proportionally to its uncovered target-cell
+// count (potential roulette via pickWeightedIndex, zero-potential entries
+// never picked); exhausted or suppressed candidates (potential 0) fall back
+// to the normal sampler. relOKByType (may be nil = all relations allowed)
+// restricts the candidate set per variant-call type (relTargetAny/File/Dir) to
+// path relations that can currently produce a path of a compatible type for
+// the base, so the picked combo is always generatable downstream.
+// allowDirected gates Direction 3: Phase 2b keeps it on the generation side
+// and disables it for the mutation path (whose directed budget is dispatched
+// by MutateFsopsWithDCT). A picked candidate whose cells can only reproduce
+// already-known event shapes on this base path (shape-drain guard, memoized
+// by the board's shape epoch) falls back to the static sampler instead of
+// spending a directed pick. basePath is the root call's target path
+// (generation side); the mutation path may pass anything since Direction 3 is
+// disabled there. The caller must hold dct.mu (write lock).
+func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, baseIsFile bool, basePath string, relOKByType map[int]map[PathRelation]bool, sibParentOK bool, allowDirected bool) *CallVariant {
 	variants, ok := dct.Variants[rootCall]
 	if !ok || len(variants) == 0 {
 		return nil
@@ -1448,17 +1581,23 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 		// Child creates a fresh child inside the base, Sibling creates a
 		// fresh sibling inside the parent, NoRel creates inside an unrelated
 		// directory. Child/Sibling/NoRel build new names and need no existing
-		// nodes; Same/Child need a directory base; Parent/Sibling
-		// additionally need the parent to exist.
+		// nodes; Same/Child land on or inside the base itself and therefore
+		// need a directory base, while Parent/Sibling/NoRel target elsewhere
+		// (the parent, a fresh sibling, an unrelated dir), so they only need
+		// that location to exist and are valid for a file-typed base too.
+		// Parent additionally needs a non-root parent (the merge root is not
+		// a valid target); Sibling only needs the parent directory to exist
+		// (the fresh name is what makes it viable; the merge root counts).
 		if cv.CallName == "mkdir" {
-			if baseIsFile {
-				return false
-			}
 			switch cv.PathRelation {
-			case PathSame, PathChild, PathNoRel:
+			case PathSame, PathChild:
+				return !baseIsFile
+			case PathNoRel:
 				return true
-			case PathParent, PathSibling:
+			case PathParent:
 				return relOKByType == nil || relOKByType[relTargetDir][PathParent]
+			case PathSibling:
+				return relOKByType == nil || sibParentOK
 			}
 			return false
 		}
@@ -1482,22 +1621,30 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 	}
 
 	all := make([]CallVariant, 0, len(variants))
-	unexplored := make([]CallVariant, 0)
 	for _, cv := range variants {
-		if !eligible(cv) {
-			continue
-		}
-		all = append(all, cv)
-		if !dct.Explored[rootCall][cv] && dct.NoYield[rootCall][cv] < noYieldThreshold {
-			unexplored = append(unexplored, cv)
+		if eligible(cv) {
+			all = append(all, cv)
 		}
 	}
-	cand := all
-	if len(unexplored) > 0 {
-		cand = unexplored
-	}
-	if len(cand) == 0 {
+	if len(all) == 0 {
 		return nil
+	}
+
+	// Phase 3: the explore-first pool and the weight dynamics are gone; every
+	// eligible candidate is selectable with its static initial weight.
+	cand := all
+
+	// Direction 3 (directed coverage): with directedBiasProb, sample the
+	// candidate proportionally to its uncovered target cells (potential
+	// roulette); exhausted/unreachable candidates fall back to the normal
+	// sampler (never aim at a combo with nothing left to offer).
+	if allowDirected && CoverageBoardReady() && r.Float64() < directedBiasProb {
+		if v, pot := pickByCoveragePotential(cand, rootCall, r); v != nil {
+			if !covBoard.direction3ShapeDrain(rootCall, v.CallName, v.PathRelation, basePath, !baseIsFile) {
+				covBoard.noteDirectedPick(comboKey{Root: rootCall, Variant: v.CallName, Rel: v.PathRelation}, pot)
+				return v
+			}
+		}
 	}
 
 	total := 0
@@ -1526,31 +1673,6 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 	return picked
 }
 
-// noYieldTick bumps the consecutive no-yield counter of a selected combo and
-// down-weights it once the threshold is reached (direction 2). Combos above
-// noYieldDelta lose noYieldDelta weight (gentle decay); combos in (1,
-// noYieldDelta] are dropped straight to 1 on the next trigger (no frozen
-// mid-range states); weight 1 is the floor. The caller must hold dct.mu
-// (write lock).
-func (dct *DistributedChoiceTable) noYieldTick(rootCall string, cv CallVariant) {
-	if dct.NoYield[rootCall] == nil {
-		return
-	}
-	n := dct.NoYield[rootCall][cv] + 1
-	if n < noYieldThreshold {
-		dct.NoYield[rootCall][cv] = n
-		return
-	}
-	dct.NoYield[rootCall][cv] = 0
-	if w, ok := dct.Weights[rootCall][cv]; ok {
-		if w > noYieldDelta {
-			dct.Weights[rootCall][cv] = w - noYieldDelta
-		} else if w > 1 {
-			dct.Weights[rootCall][cv] = 1
-		}
-	}
-}
-
 // HasRoot reports whether rootCall has a variant table in this DCT.
 func (dct *DistributedChoiceTable) HasRoot(rootCall string) bool {
 	dct.mu.RLock()
@@ -1567,31 +1689,6 @@ func (dct *DistributedChoiceTable) WeightOf(rootCall string, variant CallVariant
 		return weights[variant]
 	}
 	return 0
-}
-
-// MarkYield records that (rootCall, variant) produced new feedback signal:
-// the combo is marked explored (direction 1), its consecutive no-yield
-// counter is reset (direction 2), and its weight is rewarded by +1 (capped at
-// maxComboWeight as a defensive symmetric counterpart of the down-weight
-// floor; the natural bound is the combo's novel-pair space anyway).
-func (dct *DistributedChoiceTable) MarkYield(rootCall string, variant CallVariant) {
-	dct.mu.Lock()
-	defer dct.mu.Unlock()
-	if _, ok := dct.Weights[rootCall]; !ok {
-		return
-	}
-	if _, ok := dct.Weights[rootCall][variant]; !ok {
-		return
-	}
-	if dct.Explored[rootCall] != nil {
-		dct.Explored[rootCall][variant] = true
-	}
-	if dct.NoYield[rootCall] != nil {
-		dct.NoYield[rootCall][variant] = 0
-	}
-	if w := dct.Weights[rootCall][variant]; w < maxComboWeight {
-		dct.Weights[rootCall][variant] = w + 1
-	}
 }
 
 func isDirOnlyCall(callName string) bool {
@@ -1635,63 +1732,21 @@ func basePathIsFile(ft *FileTree, rootCallName, basePath string) bool {
 }
 
 func isDirPath(ft *FileTree, path string) bool {
-	node := ft.FindNode(path)
-	return node != nil && (node.Type == NodeTypeDir || node.Type == NodeTypeEmptyDir)
+	return nodeIsDir(ft.FindNode(path))
 }
 
-// temporalWeightLocked returns the (lazily initialized) temporal weights of a
-// combo; the caller must hold dct.mu.
-func (dct *DistributedChoiceTable) temporalWeightLocked(rootCall string, variant CallVariant) *TemporalWeight {
-	byRoot, ok := dct.TemporalWeights[rootCall]
-	if !ok {
-		byRoot = make(map[CallVariant]TemporalWeight)
-		dct.TemporalWeights[rootCall] = byRoot
-	}
-	tw, ok := byRoot[variant]
-	if !ok {
-		tw = TemporalWeight{Concurrent: temporalInitWeight, HB: temporalInitWeight}
-		byRoot[variant] = tw
-	}
-	return &tw
-}
-
-// ChooseTemporal picks the insertion form of a combo by its learned weights:
-// concurrent (time-aligned, favoring CONCURRENT pairs) or causal (after the
-// root finishes, favoring HB pairs). New combos start at 50/50.
+// ChooseTemporal picks the insertion form of a combo. Phase 3: no learning.
+// Modifier roots are 50/50; non-modifier roots always use the concurrent form
+// (an HB placement after such a root cannot produce an HB pair of this combo:
+// the earlier vertex would be the non-modifier root).
 func (dct *DistributedChoiceTable) ChooseTemporal(rootCall string, variant CallVariant, r *rand.Rand) TemporalRel {
-	dct.mu.Lock()
-	tw := dct.temporalWeightLocked(rootCall, variant)
-	total := tw.Concurrent + tw.HB
-	if total <= 0 {
-		tw.Concurrent = temporalInitWeight
-		tw.HB = temporalInitWeight
-		total = tw.Concurrent + tw.HB
-		dct.TemporalWeights[rootCall][variant] = *tw
-	}
-	if r.Intn(total) < tw.Concurrent {
-		dct.mu.Unlock()
+	if !isModifierCall(rootCall) {
 		return TemporalConcurrent
 	}
-	dct.mu.Unlock()
-	return TemporalHB
-}
-
-// UpdateTemporalWeight rewards the form that actually produced a pair of the
-// given temporal: a CONCURRENT pair rewards the concurrent form, an HB pair
-// the causal form. Cross outcomes (the intended form produced the other
-// temporal) are not rewarded — the weights thus learn which form reliably
-// produces its corresponding pair.
-func (dct *DistributedChoiceTable) UpdateTemporalWeight(rootCall string, variant CallVariant, actual TemporalRel) {
-	dct.mu.Lock()
-	defer dct.mu.Unlock()
-	tw := dct.temporalWeightLocked(rootCall, variant)
-	switch actual {
-	case TemporalConcurrent:
-		tw.Concurrent++
-	case TemporalHB:
-		tw.HB++
+	if r.Intn(2) == 0 {
+		return TemporalConcurrent
 	}
-	dct.TemporalWeights[rootCall][variant] = *tw
+	return TemporalHB
 }
 
 func (dct *DistributedChoiceTable) ChoosePathRelation(rootCall, variantCallName string, r *rand.Rand) PathRelation {
@@ -1728,7 +1783,6 @@ func (dct *DistributedChoiceTable) ChoosePathRelation(rootCall, variantCallName 
 	return PathSelf
 }
 
-
 func (dct *DistributedChoiceTable) IsRootCall(callName string) bool {
 	dct.mu.RLock()
 	defer dct.mu.RUnlock()
@@ -1748,43 +1802,34 @@ func (dct *DistributedChoiceTable) GetVariants(rootCall string) []CallVariant {
 }
 
 type LayeredChoiceStrategy struct {
-	PredefinedPatterns  *PredefinedPatterns
-	DCTInodeops         *DistributedChoiceTable
-	DCTFileops          *DistributedChoiceTable
-	FileTree            *FileTree
-	SeedType            string
-	FileopsChoiceTable  *ChoiceTable
-	InodeopsChoiceTable *ChoiceTable
+	PredefinedPatterns *PredefinedPatterns
+	DCTFsops           *DistributedChoiceTable
+	FileTree           *FileTree
 
+	// FsopsChoiceTable selects root calls for DCT insertion, built from the
+	// fsops allowlist (close enabled as a legal bias source, never a root).
+	FsopsChoiceTable *ChoiceTable
+
+	// patternProbability is the seed-generation probability of building a
+	// program from a predefined pattern (generateFromPredefinedPattern). The
+	// mutation insertion path no longer uses patterns (removed 2026-09-28).
 	patternProbability float64
 	// Per-VM TSC offsets for normalizing call timing across VMs when
 	// aligning concurrent insertions by execution time.
 	tscoffs []int64
 
-	// PendingInserts records the (root, variant) combos of the most recent
-	// insertion mutation. The fuzzer resolves them after the following
-	// execution (reward when the execution yields new DAG feedback, one
-	// no-yield attempt otherwise) and then clears the list.
-	PendingInserts []InsertedCombo
+	// PendingDirected is the Phase 2b exact-cell pending batch (one entry per
+	// inserted variant), resolved by ResolveDirectedPending after the
+	// following execution.
+	PendingDirected []DirectedPending
 }
 
-// InsertedCombo is one (root, variant) DCT combo actually inserted by the
-// most recent insertion mutation(s).
-type InsertedCombo struct {
-	Root    string
-	Variant CallVariant
-}
-
-func NewLayeredChoiceStrategy(seedType string, hmcfg *Hmdfs_config, target *Target) *LayeredChoiceStrategy {
+func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoiceStrategy {
 	lcs := &LayeredChoiceStrategy{
-		PredefinedPatterns:  NewPredefinedPatterns(),
-		DCTInodeops:         NewDistributedChoiceTable("inodeops"),
-		DCTFileops:          NewDistributedChoiceTable("fileops"),
-		FileTree:            nil,
-		SeedType:            seedType,
-		FileopsChoiceTable:  nil,
-		InodeopsChoiceTable: nil,
-		patternProbability:  0.2,
+		PredefinedPatterns: NewPredefinedPatterns(),
+		DCTFsops:           NewDistributedChoiceTable(),
+		FileTree:           nil,
+		patternProbability: 0.15,
 	}
 
 	if hmcfg != nil && hmcfg.FileTree != nil {
@@ -1795,8 +1840,7 @@ func NewLayeredChoiceStrategy(seedType string, hmcfg *Hmdfs_config, target *Targ
 	}
 
 	if target != nil {
-		lcs.FileopsChoiceTable = buildSubChoiceTable(target, FileopsSubCalls)
-		lcs.InodeopsChoiceTable = buildSubChoiceTable(target, InodeopsSubCalls)
+		lcs.FsopsChoiceTable = buildSubChoiceTable(target, FsopsChoiceCalls)
 	}
 
 	return lcs
@@ -1815,15 +1859,15 @@ func buildSubChoiceTable(target *Target, callNames []string) *ChoiceTable {
 	return target.BuildChoiceTable(nil, enabled)
 }
 
+// ShouldUsePattern reports whether seed generation takes the predefined
+// pattern path. Only GenerateProgsForHmdfsFsops consults it now; the mutation
+// insertion path no longer calls it (removed 2026-09-28).
 func (lcs *LayeredChoiceStrategy) ShouldUsePattern(r *rand.Rand) bool {
 	return r.Float64() < lcs.patternProbability
 }
 
 func (lcs *LayeredChoiceStrategy) GetDCT() *DistributedChoiceTable {
-	if lcs.SeedType == "fileops" {
-		return lcs.DCTFileops
-	}
-	return lcs.DCTInodeops
+	return lcs.DCTFsops
 }
 
 func (lcs *LayeredChoiceStrategy) ChooseConcurrentCall(rootCallName string, r *rand.Rand) *CallVariant {
@@ -1831,10 +1875,10 @@ func (lcs *LayeredChoiceStrategy) ChooseConcurrentCall(rootCallName string, r *r
 	return dct.ChooseVariant(rootCallName, r)
 }
 
-func (lcs *LayeredChoiceStrategy) ChooseConcurrentCallFiltered(rootCallName string, r *rand.Rand, baseIsFile bool, basePath string) *CallVariant {
+func (lcs *LayeredChoiceStrategy) ChooseConcurrentCallFiltered(rootCallName string, r *rand.Rand, baseIsFile bool, basePath string, allowDirected bool) *CallVariant {
 	dct := lcs.GetDCT()
-	relOKByType := lcs.availableRelationsForBase(basePath)
-	return dct.ChooseVariantFiltered(rootCallName, r, baseIsFile, relOKByType)
+	relOKByType, sibParentOK := lcs.availableRelationsForBase(basePath)
+	return dct.ChooseVariantFiltered(rootCallName, r, baseIsFile, basePath, relOKByType, sibParentOK, allowDirected)
 }
 
 // countNodesByType counts file vs directory nodes in a candidate set
@@ -1855,12 +1899,17 @@ func countNodesByType(nodes []*FileNode) (files, dirs int) {
 // (relTargetAny/File/Dir), which path relations can currently produce a path
 // of a compatible type relative to basePath. The checks are deterministic (no
 // RNG consumption) and mirror the empty semantics of GetPathByRelation —
-// including the fresh-base parent anchoring — so a combo picked under these
-// sets is always generatable downstream. Same and NoRel are always available;
-// a parent is always a directory, so file-typed calls never get Parent;
-// Child/Sibling availability is type-aware (file-typed calls need existing
-// file children/siblings, dir-typed calls need directory ones).
-func (lcs *LayeredChoiceStrategy) availableRelationsForBase(basePath string) map[int]map[PathRelation]bool {
+// including the fresh-base parent anchoring and the merge-view root never
+// being a Parent target — so a combo picked under these sets is generatable
+// downstream. Same is always available; NoRel is normally available but can
+// come back empty on a degenerate tree with no unrelated node, in which case
+// callers keep their stat/skip fallback. A parent is always a directory, so
+// file-typed calls never get Parent; Child/Sibling availability is type-aware
+// (file-typed calls need existing file children/siblings, dir-typed calls need
+// directory ones). The second return value reports whether basePath's parent
+// directory exists (the merge-view root counts): mkdir Sibling builds a fresh
+// name inside that parent and therefore needs no existing sibling.
+func (lcs *LayeredChoiceStrategy) availableRelationsForBase(basePath string) (map[int]map[PathRelation]bool, bool) {
 	relOKByType := map[int]map[PathRelation]bool{
 		relTargetAny:  {PathSame: true, PathNoRel: true},
 		relTargetFile: {PathSame: true, PathNoRel: true, PathParent: false},
@@ -1868,14 +1917,16 @@ func (lcs *LayeredChoiceStrategy) availableRelationsForBase(basePath string) map
 	}
 	ft := lcs.FileTree
 	if ft == nil {
-		return relOKByType
+		return relOKByType, false
 	}
 	ft.mu.RLock()
 	defer ft.mu.RUnlock()
 
 	baseNode := ft.findNodeLocked(basePath)
 	if baseNode != nil {
-		hasParent := ft.GetParent(baseNode) != nil
+		parent := ft.GetParent(baseNode)
+		parentOK := parent != nil
+		hasParent := parent != nil && parent != ft.Root
 		relOKByType[relTargetAny][PathParent] = hasParent
 		relOKByType[relTargetDir][PathParent] = hasParent
 		// relTargetFile: PathParent stays false (parent is a directory).
@@ -1887,45 +1938,27 @@ func (lcs *LayeredChoiceStrategy) availableRelationsForBase(basePath string) map
 		relOKByType[relTargetAny][PathSibling] = sf+sd > 0
 		relOKByType[relTargetFile][PathSibling] = sf > 0
 		relOKByType[relTargetDir][PathSibling] = sd > 0
-		return relOKByType
+		return relOKByType, parentOK
 	}
-	// Fresh base (outside the tree): anchor on the parent directory.
-	parent := ft.findNodeLocked(GetParentDir(basePath))
+	// Fresh base (outside the tree): anchor on the parent directory. A fresh
+	// path directly under the merge-view root has no legal Parent relation
+	// (the root is not a rename/rmdir source), but its Sibling relation (the
+	// other depth-1 nodes) is still available, so the early return only
+	// triggers when the parent itself is outside the tree.
+	parent := ft.parentNodeLocked(basePath)
 	if parent == nil {
-		return relOKByType // only Same and NoRel
+		return relOKByType, false // only Same and NoRel
 	}
-	relOKByType[relTargetAny][PathParent] = true
-	relOKByType[relTargetDir][PathParent] = true
+	if parent != ft.Root {
+		relOKByType[relTargetAny][PathParent] = true
+		relOKByType[relTargetDir][PathParent] = true
+	}
 	// Child stays false for every type: a fresh base has no existing children.
 	files, dirs := countNodesByType(ft.GetChildren(parent))
 	relOKByType[relTargetAny][PathSibling] = files+dirs > 0
 	relOKByType[relTargetFile][PathSibling] = files > 0
 	relOKByType[relTargetDir][PathSibling] = dirs > 0
-	return relOKByType
-}
-
-// MarkYield propagates a yield signal (new DAG pair / new coverage) into the
-// active DCT table: the combo is marked explored and its no-yield counter is
-// reset.
-func (lcs *LayeredChoiceStrategy) MarkYield(rootCallName string, variant CallVariant) {
-	lcs.GetDCT().MarkYield(rootCallName, variant)
-}
-
-// TickNoYield records one no-yield attempt for the combo (bumps the
-// consecutive counter, down-weights at the threshold). Called by the fuzzer
-// after an execution with no new DAG feedback for the pending combos.
-func (lcs *LayeredChoiceStrategy) TickNoYield(rootCallName string, variant CallVariant) {
-	dct := lcs.GetDCT()
-	dct.mu.Lock()
-	defer dct.mu.Unlock()
-	dct.noYieldTick(rootCallName, variant)
-}
-
-// UpdateTemporalWeight propagates the actually produced pair temporal into the
-// temporal-form weights of the combo (second layer, see
-// DistributedChoiceTable.UpdateTemporalWeight).
-func (lcs *LayeredChoiceStrategy) UpdateTemporalWeight(rootCallName string, variant CallVariant, actual TemporalRel) {
-	lcs.GetDCT().UpdateTemporalWeight(rootCallName, variant, actual)
+	return relOKByType, true
 }
 
 // SetTscOffsets configures per-VM TSC offsets used to normalize call timing
@@ -1957,14 +1990,92 @@ func (lcs *LayeredChoiceStrategy) GetPathsForRenameVariant(basePath string, base
 		// 保持——空路径 rename 恒 ENOENT 且退化会改变路径关系。
 		return "", ""
 	}
-	srcPathExt := filepath.Ext(srcPath)
-	if strings.Contains(srcPathExt, "._renamed_") {
-		siblingPath := srcPath[:len(srcPath)-len(srcPathExt)]
-		siblingPath = siblingPath + "._renamed_" + randomSuffix(r)
-		return srcPath, siblingPath
+	return srcPath, lcs.pickRenameDst(srcPath, r)
+}
+
+// renameExistingDstProb is the probability that a DCT-generated rename picks
+// an existing same-parent destination (the E overwrite shape) instead of a
+// fresh sibling name.
+const renameExistingDstProb = 0.30
+
+// renameSuffixBase strips one trailing "._renamed_*" extension (the historical
+// rename-destination convention) from path. It is the single normalization
+// step shared by the DCT destination chooser and the 2b batch assembler, so a
+// name cannot accumulate one suffix per rename round.
+func renameSuffixBase(path string) string {
+	ext := filepath.Ext(path)
+	if strings.Contains(ext, "._renamed_") {
+		return path[:len(path)-len(ext)]
 	}
-	//退化为PathSame了
-	return srcPath, srcPath + "._renamed_" + randomSuffix(r)
+	return path
+}
+
+// freshRenameDst returns the fresh sibling destination name of src, reusing the
+// historical "._renamed_<suffix>" convention and stripping a previous suffix so
+// repeated renames never accumulate extensions.
+func freshRenameDst(src string, r *rand.Rand) string {
+	return renameSuffixBase(src) + "._renamed_" + randomSuffix(r)
+}
+
+// pickRenameDst chooses the destination path of a DCT rename: with probability
+// renameExistingDstProb an existing non-TmpDir sibling of the same class
+// (file -> file; dir -> dir, empty or not), uniformly among the candidates
+// sorted by path; otherwise a fresh sibling name. Same-parent is a hard hmdfs
+// requirement (hmdfs_rename_merge compares the parent paths before tracing), so
+// cross-parent destinations are never generated.
+func (lcs *LayeredChoiceStrategy) pickRenameDst(src string, r *rand.Rand) string {
+	if r == nil {
+		return src + "._renamed_000000"
+	}
+	if lcs == nil || lcs.FileTree == nil {
+		return freshRenameDst(src, r)
+	}
+	if r.Float64() >= renameExistingDstProb {
+		return freshRenameDst(src, r)
+	}
+	if sib := lcs.existingRenameDstSibling(src, r); sib != "" {
+		return sib
+	}
+	return freshRenameDst(src, r)
+}
+
+// existingRenameDstSibling returns an existing non-TmpDir sibling of src with
+// the same file/dir class, or "" when none exists. It is the strict
+// counterpart of pickRenameDst's existing-destination branch (no fresh
+// fallback): the non-TmpDir filter is the deliberate E-destination policy
+// (B/variant-side relations may land on TmpDir, an existing rename destination
+// may not). It is a destination helper only — source selection uses
+// GetPathByRelation with nodeTypeConstraint instead.
+func (lcs *LayeredChoiceStrategy) existingRenameDstSibling(src string, r *rand.Rand) string {
+	if r == nil || lcs == nil || lcs.FileTree == nil {
+		return ""
+	}
+	ft := lcs.FileTree
+	srcNode := ft.FindNode(src)
+	if srcNode == nil {
+		return ""
+	}
+	srcClass := nodeTypeConstraint(srcNode)
+	cands := ft.GetNonTmpDirSiblings(src)
+	if len(cands) == 0 {
+		return ""
+	}
+	sort.Strings(cands)
+	var pick []string
+	for _, c := range cands {
+		n := ft.FindNode(c)
+		if n == nil {
+			continue
+		}
+		if nodeTypeConstraint(n) != srcClass {
+			continue
+		}
+		pick = append(pick, c)
+	}
+	if len(pick) == 0 {
+		return ""
+	}
+	return pick[r.Intn(len(pick))]
 }
 
 func randomSuffix(r *rand.Rand) string {
@@ -2083,10 +2194,7 @@ func isPathInEmptyDirList(path string, hmcfg *Hmdfs_config) bool {
 }
 
 func isPathInPersistenceDir(path string, hmcfg *Hmdfs_config) bool {
-	if hmcfg.Persistence_dir == "" {
-		return false
-	}
-	return strings.HasPrefix(path, hmcfg.Persistence_dir)
+	return pathInDir(path, hmcfg.Persistence_dir)
 }
 
 func updateFileSizeInHmdfsConfig(path string, cid string, size uint64, hmcfg *Hmdfs_config) {
@@ -2183,11 +2291,10 @@ func renameInHmdfsConfig(oldPath, newPath, cid string, hmcfg *Hmdfs_config) {
 	//empty dir和普通dir的处理，可能还会有其它地方做得不对
 }
 
-
 type CreateCallType int
 
 const (
-	CreateTypeFile   CreateCallType = iota
+	CreateTypeFile CreateCallType = iota
 	CreateTypeMkdir
 	CreateTypeOpen
 	CreateTypeRename
@@ -2345,7 +2452,9 @@ func SyncFileTreeFromFsMd(fsMd map[string]FileMetadata, ownerMap map[string]stri
 					cid = c
 				}
 			}
-			if oldNode.OwnerCid != cid {
+			ownerChanged := oldNode.OwnerCid != cid
+			typeChanged := oldNode.Type != nodeType
+			if ownerChanged {
 				// Ownership change: re-link NodesByCid unconditionally
 				// (independent of type/size changes — a pure owner
 				// re-resolution must stick).
@@ -2353,10 +2462,12 @@ func SyncFileTreeFromFsMd(fsMd map[string]FileMetadata, ownerMap map[string]stri
 				oldNode.OwnerCid = cid
 				hmcfg.FileTree.NodesByCid[cid] = append(hmcfg.FileTree.NodesByCid[cid], oldNode)
 			}
-			if oldNode.OwnerCid != cid || oldNode.Type != nodeType {
-				// Owner or type change: re-link Files/DirsByCid exactly once
-				// (the node stays in the tree, so NodesByCid is untouched on
-				// a pure type change).
+			if ownerChanged || typeChanged {
+				// Owner or type change: re-link Files/DirsByCid exactly once.
+				// The flags are captured BEFORE OwnerCid is overwritten:
+				// testing oldNode.OwnerCid != cid here would be false after
+				// the assignment above, so a pure owner change would drop the
+				// node from every type list (lost for list-based selectors).
 				hmcfg.FileTree.removeNodeFromTypeList(oldNode)
 				if nodeType == NodeTypeFile {
 					hmcfg.FileTree.FilesByCid[oldNode.OwnerCid] = append(hmcfg.FileTree.FilesByCid[oldNode.OwnerCid], oldNode)
