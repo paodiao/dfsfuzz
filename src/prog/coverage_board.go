@@ -146,13 +146,25 @@ const directedBiasProb = 0.75
 // (recordPairs), so the effective rule is "threshold consecutive picks since
 // the last produced cell"; a combo producing more often than that is never
 // suppressed.
-const unreachableThreshold = 8
+//
+// Calibrated to 6 (from 8, 2026-10): one unit is one directed variant pick and
+// one insertion event carries len(ps)-1 picks, so 6 is about three insertion
+// events of exclusive attention; aimed at retiring dead combos during the
+// late-run pool shrink instead of only at run end.
+const unreachableThreshold = 6
 
 // cellMissThreshold is the number of consecutive directed plans for one
 // concrete cell that executed without matching before the cell is marked
 // unreachable and drops out of the Phase 2b plan enumeration. A hit (or a
 // fresh discovery of the cell) resets the counter.
-const cellMissThreshold = 8
+//
+// Calibrated to 4 (from 8, 2026-10): cell misses are diluted by the global
+// pickable pool (a batch samples one seed uniformly among all uncovered
+// cells), so the expected batches needed to retire one cell scale with the
+// pool size; 4 makes retirement reachable within a run once the pool shrinks
+// while keeping the wrong-retirement probability low. Recovery stays
+// observation-only (or reset()) -- no tree/shape relaxation (V4-8).
+const cellMissThreshold = 4
 
 // freshSameCombo reports whether the fresh-fresh construction table has a
 // form for (root, variant): both sides operate on the same freshly created

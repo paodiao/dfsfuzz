@@ -274,8 +274,8 @@ func TestDirectedCellMissAccounting(t *testing.T) {
 	NoteDirectedCfgErr()
 	plans, hits, misses, noPlans, insertFails := DirectedCellStats()
 	if plans != 1 || hits != 1 || misses != 2*cellMissThreshold || noPlans != 1 || insertFails != 1 {
-		t.Fatalf("directCell stats = %d/%d/%d/%d/%d, want 1/1/16/1/1",
-			plans, hits, misses, noPlans, insertFails)
+		t.Fatalf("directCell stats = %d/%d/%d/%d/%d, want 1/1/%d/1/1",
+			plans, hits, misses, noPlans, insertFails, 2*cellMissThreshold)
 	}
 	if batches := DirectedBatchStats(); batches != 1 {
 		t.Fatalf("directCell batches = %d, want 1", batches)
@@ -294,7 +294,7 @@ func TestDirectedCellMissAccounting(t *testing.T) {
 func TestCoverageUnreachableRebaseline(t *testing.T) {
 	newTestCoverageBoard(t)
 	ck := comboKey{Root: "write", Variant: "truncate", Rel: PathSame}
-	const cadence = 7 // < unreachableThreshold: production before the window closes
+	const cadence = unreachableThreshold - 1 // production strictly before the window closes
 	paths := []string{"merge_view/d", "merge_view/d/e", "merge_view/a/b/c/d/e"}
 	for i := 0; i < cadence*len(paths); i++ {
 		if i%cadence == 0 {

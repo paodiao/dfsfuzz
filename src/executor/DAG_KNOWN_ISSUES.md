@@ -649,6 +649,8 @@ if proc.fuzzer.config.EnableDagScheduleFb &&
 - 树每轮 `SyncFileTreeFromFsMd` 都结构变化，"树变即清"的 epoch 松弛会每轮清空退休账本（8 次阈值失效、反复重试时序死格）；`depths` 域 init 固定，新节点大多不改模型；
 - 已知误 miss 来源：V4-1 HB 插入时序（接受）；P2-a 空变体执行仍记 miss（整轮 `observed` 连坐：`ResolveDirectedPending` 只看全轮归因，不看变体自身是否出手；延后，若批后 `cellUnreach` 居高再单独修 executed 判定）。
 
+> **状态更新（2026-10-10）**：`cellMissThreshold` 8→4、组合级 `unreachableThreshold` 8→6（`coverage_board.go`）；恢复语义与本节裁定不变（仍只认真观测/`reset()`，不设树态松弛）。
+
 ---
 
 ## 35. 三路代码冷读 review 遗留与决定（2026-10-05）
@@ -658,7 +660,7 @@ if proc.fuzzer.config.EnableDagScheduleFb &&
 ### 语义决定（保持现状）
 
 - **FreshSame `(creat,creat)` 的 HB cell 可被同一次 creat 内部的 create→file_open 对命中**（R22 起即真实 HB）。接受为语义：`recordPairs` 本就会发现该 cell，pending 不排除同调用顶点对。
-- **组合级 discovery 不重置该 combo 其他 cell 的 `cellAttempts`**：细胞级"连续 8 次"各自独立（`noteDirectedMiss`/`markDiscoveredLocked` 只重置命中的那个 cell）；F1 只管组合级 D3 退休账目。
+- **组合级 discovery 不重置该 combo 其他 cell 的 `cellAttempts`**：细胞级"连续 N 次"（当前阈值 4）各自独立（`noteDirectedMiss`/`markDiscoveredLocked` 只重置命中的那个 cell）；F1 只管组合级 D3 退休账目。
 - **`destructiveHBDoomed`/`destructiveCCExclusive` 是 planner 侧"可构造性"取舍，不是可观测性断言**（目标弱一致视图下陈旧条目可能仍在）；相关注释已补（`destructiveSameRoot`、`variantKindsFor`）。
 
 ### 登记不改（P3 尾项）
