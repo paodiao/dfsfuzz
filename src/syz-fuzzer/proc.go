@@ -1507,9 +1507,9 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	directedPicks, directedScore := prog.DirectedPickStats()
 	dcPlans, dcHits, dcMisses, dcNoPlans, dcInsertFails := prog.DirectedCellStats()
 	dcBatches := prog.DirectedBatchStats()
-	appendDiagLog("hmdfs trace events=%d csanPassed=%v stat=%d tscRatio=%f dataMiss=%d anchorMiss=%d alignMiss=%d failShape=%d/%d directed=%d/%d directCell=%d/%d/%d/%d/%d dcBatch=%d cfgErr=%d",
+	appendDiagLog("hmdfs trace events=%d csanPassed=%v stat=%d tscRatio=%f dataMiss=%d anchorMiss=%d alignMiss=%d failShape=%d/%d directed=%d/%d directCell=%d/%d/%d/%d/%d dcBatch=%d cfgErr=%d lastMut=%s",
 		len(hmdfsTraceEvents), csanPassed, stat, tscRatio, prog.DataMutateMissCount(), prog.AnchorMissCount(), prog.TimingAlignMissCount(), failHit, failSkip,
-		directedPicks, directedScore, dcPlans, dcHits, dcMisses, dcNoPlans, dcInsertFails, dcBatches, prog.DirectedCfgErrCount())
+		directedPicks, directedScore, dcPlans, dcHits, dcMisses, dcNoPlans, dcInsertFails, dcBatches, prog.DirectedCfgErrCount(), prog.LastMutation())
 	if proc.fuzzer.config.DFSName == "hmdfs" && proc.lcsFsops != nil {
 		if now := time.Now(); now.Sub(proc.lastDCTBoardLog) >= dctBoardLogInterval {
 			proc.lastDCTBoardLog = now
