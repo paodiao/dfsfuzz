@@ -316,13 +316,17 @@ func (r *randGen) expandWithDCT(ps []*Prog, sCalls *SpecialCalls, hmcfg *Hmdfs_c
 	if len(ps) == 0 {
 		return
 	}
+	if lcs == nil || lcs.FileTree == nil ||
+		len(collectSeedAnchors(ps[0], lcs.FileTree, false)) == 0 {
+		return
+	}
 	target := 7 + r.Intn(4) // 7-10
 	failed := 0
 	for round := 0; round < 9 && failed < 3; round++ {
 		if avgCalls(ps) >= target {
 			break
 		}
-		if !insertCallFromDCT(ps, r, sCalls, hmcfg, lcs, true) {
+		if !insertDerivedCallFromDCT(ps, r, sCalls, hmcfg, lcs, true, true) {
 			failed++ // stop after 3 consecutive failures
 			continue
 		}

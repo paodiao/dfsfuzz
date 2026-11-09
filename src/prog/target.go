@@ -163,19 +163,26 @@ func (target *Target) initTarget() {
 }
 
 func (target *Target) GetConst(name string) uint64 {
+	if v, ok := target.LookupConst(name); ok {
+		return v
+	}
+	panic(fmt.Sprintf("const %v is not defined for %v/%v", name, target.OS, target.Arch))
+}
+
+func (target *Target) LookupConst(name string) (uint64, bool) {
+	if target == nil {
+		return 0, false
+	}
 	if target.ConstMap != nil {
 		v, ok := target.ConstMap[name]
-		if ok {
-			return v
-		}
-		panic(fmt.Sprintf("const %v is not defined for %v/%v", name, target.OS, target.Arch))
+		return v, ok
 	}
 	for _, c := range target.Consts {
 		if c.Name == name {
-			return c.Value
+			return c.Value, true
 		}
 	}
-	panic(fmt.Sprintf("const %v is not defined for %v/%v", name, target.OS, target.Arch))
+	return 0, false
 }
 
 func (target *Target) sanitize(c *Call, fix bool) error {

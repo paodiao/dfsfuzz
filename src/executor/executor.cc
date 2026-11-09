@@ -22,6 +22,7 @@
 #include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 // #include <stdatomic.h>
@@ -1227,6 +1228,216 @@ static void wait_hmdfs_peers_ready(void) {
   }
 }
 
+#define RESTORE_BASELINE_HMDFS "/home/baseline/non_account/"
+#define RESTORE_TARGET_HMDFS "/data/service/el2/100/non_account/"
+#define RESTORE_BARRIER_TIMEOUT_MS 120000
+
+static int run_restore_cmd(const char *cmd) {
+  FILE *f = popen(cmd, "r");
+  if (!f) {
+    fprintf(stderr, "executor %lld restore: popen failed: %s\n",
+            executor_index, cmd);
+    return -1;
+  }
+  char buf[1024];
+  while (fgets(buf, sizeof(buf), f))
+    fputs(buf, stderr);
+  int status = pclose(f);
+  if (status == -1) {
+    fprintf(stderr, "executor %lld restore: pclose failed: %s\n",
+            executor_index, cmd);
+    return -1;
+  }
+  if (!WIFEXITED(status)) {
+    fprintf(stderr, "executor %lld restore: command terminated abnormally: %s\n",
+            executor_index, cmd);
+    return -1;
+  }
+  return WEXITSTATUS(status);
+}
+
+static bool drop_caches() {
+  sync();
+  int fd = open("/proc/sys/vm/drop_caches", O_WRONLY);
+  if (fd < 0) {
+    fprintf(stderr, "executor %lld restore: open drop_caches failed: %d\n",
+            executor_index, errno);
+    return false;
+  }
+  const char *drop = "3\n";
+  ssize_t n = write(fd, drop, 2);
+  close(fd);
+  if (n != 2) {
+    fprintf(stderr, "executor %lld restore: write drop_caches failed: %d\n",
+            executor_index, errno);
+    return false;
+  }
+  sync();
+  return true;
+}
+
+static bool hmdfs_agent_running() {
+  return run_restore_cmd(
+             "ps -eo args | grep -E '/home/[h]mdfs_agent/hmdfs_agent' "
+             ">/dev/null") == 0;
+}
+
+static bool wait_hmdfs_agent_exit() {
+  for (int i = 0; i < 50; i++) {
+    if (!hmdfs_agent_running())
+      return true;
+    usleep(100 * 1000);
+  }
+  fprintf(stderr, "executor %lld restore: hmdfs agent did not exit\n",
+          executor_index);
+  return false;
+}
+
+#define RESTORE_READY 1
+#define RESTORE_DONE 2
+#define RESTORE_FAILED 3
+
+static void restore_start_barrier() {
+  if (vm_count > SUPPORT_VMS)
+    fail("restore barrier: too many VMs");
+  if (vm_count <= 1)
+    return;
+
+  sync_lock();
+  execCtl->restoreStart[executor_index] = RESTORE_READY;
+  sync_unlock();
+  __sync_synchronize();
+
+  int64_t waited = 0;
+  for (;;) {
+    bool all_ready = true;
+    for (uint64 i = 0; i < vm_count; i++) {
+      if (execCtl->restoreStart[i] != RESTORE_READY) {
+        all_ready = false;
+        break;
+      }
+    }
+    if (all_ready)
+      return;
+    usleep(1000);
+    if (++waited >= RESTORE_BARRIER_TIMEOUT_MS) {
+      fprintf(stderr, "executor %lld restore: start barrier timeout\n",
+              executor_index);
+      fail("restore start barrier timeout");
+    }
+  }
+}
+
+static void restore_finish_barrier(bool restore_ok) {
+  if (vm_count > SUPPORT_VMS)
+    fail("restore barrier: too many VMs");
+  if (vm_count <= 1) {
+    if (!restore_ok)
+      fail("initial file tree restore failed");
+    return;
+  }
+
+  sync_lock();
+  execCtl->restoreState[executor_index] =
+      restore_ok ? RESTORE_DONE : RESTORE_FAILED;
+  sync_unlock();
+  __sync_synchronize();
+
+  if (!restore_ok)
+    fprintf(stderr,
+            "executor %lld restore: local failure, waiting for peers\n",
+            executor_index);
+
+  int64_t waited = 0;
+  for (;;) {
+    bool all_done = true;
+    bool failed = false;
+    for (uint64 i = 0; i < vm_count; i++) {
+      unsigned char state = execCtl->restoreState[i];
+      if (state < RESTORE_DONE) {
+        all_done = false;
+        break;
+      }
+      if (state == RESTORE_FAILED)
+        failed = true;
+    }
+    if (all_done) {
+      if (failed || !restore_ok)
+        fail("initial file tree restore failed");
+      return;
+    }
+    usleep(1000);
+    if (++waited >= RESTORE_BARRIER_TIMEOUT_MS) {
+      fprintf(stderr, "executor %lld restore: finish barrier timeout\n",
+              executor_index);
+      fail("restore finish barrier timeout");
+    }
+  }
+}
+
+static bool restore_hmdfs_file_tree() {
+  if (strcmp(dfs_name, "hmdfs"))
+    return true;
+
+  uint64 start = current_time_ms();
+  fprintf(stderr, "executor %lld restore: start\n", executor_index);
+  sync();
+  if (chdir("/")) {
+    fprintf(stderr, "executor %lld restore: chdir / failed: %d\n",
+            executor_index, errno);
+    return false;
+  }
+
+  if (run_restore_cmd("timeout 30s /root/hmdfs-node-down.sh") != 0)
+    return false;
+  if (!wait_hmdfs_agent_exit())
+    return false;
+  if (umount2(mnt_dir, MNT_DETACH) != 0 && errno != EINVAL &&
+      errno != ENOENT) {
+    fprintf(stderr, "executor %lld restore: umount2 %s failed: %d\n",
+            executor_index, mnt_dir, errno);
+    return false;
+  }
+  sync();
+
+  char cmd[4096];
+  snprintf(cmd, sizeof(cmd),
+           "timeout 180s rsync -aHAX --numeric-ids --delete "
+           "--one-file-system --checksum %s %s",
+           RESTORE_BASELINE_HMDFS, RESTORE_TARGET_HMDFS);
+  if (run_restore_cmd(cmd) != 0)
+    return false;
+  if (!drop_caches())
+    return false;
+
+  snprintf(cmd, sizeof(cmd),
+           "timeout 90s /root/%s-node-up.sh %s \"%s\" %lld", dfs_name,
+           init_ip, dfs_setup_params, executor_index);
+  if (run_restore_cmd(cmd) != 0)
+    return false;
+
+  wait_hmdfs_agent_ready();
+  if (executor_index == vm_count - 1)
+    usleep(HMDFS_SETTLE_MS * 1000);
+  fprintf(stderr, "executor %lld restore: local done in %lld ms\n",
+          executor_index, current_time_ms() - start);
+  return true;
+}
+
+static bool restore_initial_file_tree() {
+  if (is_restarting)
+    return true;
+  if (strcmp(dfs_name, "hmdfs"))
+    return true;
+
+  restore_start_barrier();
+  bool restore_ok = restore_hmdfs_file_tree();
+  restore_finish_barrier(restore_ok);
+
+  wait_hmdfs_peers_ready();
+  return true;
+}
+
 void reconfigure_dfs() {
 
 // wait servers before current node are already setupped
@@ -1623,14 +1834,6 @@ uint64 receive_execute() {
   fprintf(stderr, "executor %lld: prog_data_offset %lld, prog_size %lld\n",
           executor_index, prog_data_offset, prog_size);
 
-  // Recalibrate the ktime->TSC anchor every round. Guest ktime (used by the
-  // eBPF tracer via bpf_ktime_get_ns) and the TSC drift apart at a ppm-level
-  // rate (NTP slewing / kvmclock adjustments), which otherwise accumulates to
-  // milliseconds over hours and pushes in-window events outside the match
-  // tolerance. A fresh anchor bounds the drift to the round duration
-  // (~4us at 20ppm with the 5ms sampling window).
-  calibrate_tsc();
-
   // update file ops offset and size from execute_req
   file_ops_offset = req.file_ops_offset;
   file_ops_size = req.file_ops_size;
@@ -1675,6 +1878,16 @@ uint64 receive_execute() {
       slowdown_scale == 0)
     failmsg("bad timeouts", "syscall=%llu, program=%llu, scale=%llu",
             syscall_timeout_ms, program_timeout_ms, slowdown_scale);
+
+  restore_initial_file_tree();
+
+  // Recalibrate the ktime->TSC anchor every round. Guest ktime (used by the
+  // eBPF tracer via bpf_ktime_get_ns) and the TSC drift apart at a ppm-level
+  // rate (NTP slewing / kvmclock adjustments), which otherwise accumulates to
+  // milliseconds over hours and pushes in-window events outside the match
+  // tolerance. A fresh anchor bounds the drift to the round duration
+  // (~4us at 20ppm with the 5ms sampling window).
+  calibrate_tsc();
 
   if (SYZ_EXECUTOR_USES_SHMEM) {
     if (!req.prog_sizes[executor_index] && is_dfs_client)

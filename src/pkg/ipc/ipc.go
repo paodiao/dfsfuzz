@@ -1578,6 +1578,8 @@ type executeControl struct {
 	lockByte2         byte
 	lockByte3         byte
 	servSetupBit      uint64
+	restoreState      [64]byte
+	restoreStart      [64]byte
 }
 
 type CallOrderControl struct {

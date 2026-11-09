@@ -11,6 +11,7 @@ import (
 
 	//"runtime/debug"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -36,22 +37,21 @@ import (
 
 // Proc represents a single fuzzing process (executor).
 type Proc struct {
-	fuzzer                *Fuzzer
-	pid                   int
-	env                   *ipc.Env
-	rnd                   *rand.Rand
-	execOpts              *ipc.ExecOpts
-	execOptsCover         *ipc.ExecOpts
-	execOptsComps         *ipc.ExecOpts
-	execOptsNoCollide     *ipc.ExecOpts
-	execOptsLight         *ipc.ExecOpts
-	execOptsLightMinimize *ipc.ExecOpts
-	freqCov               int32
-	cltTick               chan bool
-	hmcfg                 prog.Hmdfs_config
-	lcsFsops              *prog.LayeredChoiceStrategy
-	tscoffs               []int64 // per-proc copy; only the owning goroutine reads/writes it
-	lastDCTBoardLog       time.Time
+	fuzzer            *Fuzzer
+	pid               int
+	env               *ipc.Env
+	rnd               *rand.Rand
+	execOpts          *ipc.ExecOpts
+	execOptsCover     *ipc.ExecOpts
+	execOptsComps     *ipc.ExecOpts
+	execOptsNoCollide *ipc.ExecOpts
+	execOptsLight     *ipc.ExecOpts
+	freqCov           int32
+	cltTick           chan bool
+	hmcfg             prog.Hmdfs_config
+	lcsFsops          *prog.LayeredChoiceStrategy
+	tscoffs           []int64 // per-proc copy; only the owning goroutine reads/writes it
+	lastDCTBoardLog   time.Time
 }
 
 func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
@@ -66,21 +66,8 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	execOptsCover.Flags |= ipc.FlagCollectCover
 	execOptsComps := execOptsNoCollide
 	execOptsComps.Flags |= ipc.FlagCollectComps
-	// Light mode for triage/minimize rounds (Monarch §3.4): reduction is
-	// judged purely by coverage/signal equivalence, so skip the post-exec
-	// file-tree metadata collection in the executor.
-	// Two variants, mirroring each site's original opts (per upstream and
-	// this repo's Initial commit):
-	//   execOptsLight         — triage sites that ran execOptsCover (the
-	//     !triageDag first-pass loop, the triageDag signalRuns loop, and
-	//     triageFailure all keep cover collection);
-	//   execOptsLightMinimize — only the prog.Minimize loop, which ran
-	//     execOptsNoCollide (its consumer discards cover) and now also
-	//     skips fsMd.
 	execOptsLight := execOptsCover
 	execOptsLight.Flags |= ipc.FlagSkipFsMd
-	execOptsLightMinimize := execOptsNoCollide
-	execOptsLightMinimize.Flags |= ipc.FlagSkipFsMd
 
 	freqCov := int32(10)
 	cltTick := make(chan bool)
@@ -327,21 +314,20 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	}
 
 	proc := &Proc{
-		fuzzer:                fuzzer,
-		pid:                   pid,
-		env:                   env,
-		rnd:                   rnd,
-		execOpts:              fuzzer.execOpts,
-		execOptsCover:         &execOptsCover,
-		execOptsComps:         &execOptsComps,
-		execOptsNoCollide:     &execOptsNoCollide,
-		execOptsLight:         &execOptsLight,
-		execOptsLightMinimize: &execOptsLightMinimize,
-		freqCov:               freqCov,
-		cltTick:               cltTick,
-		hmcfg:                 hc,
-		lcsFsops:              lcsFsops,
-		tscoffs:               procTsc,
+		fuzzer:            fuzzer,
+		pid:               pid,
+		env:               env,
+		rnd:               rnd,
+		execOpts:          fuzzer.execOpts,
+		execOptsCover:     &execOptsCover,
+		execOptsComps:     &execOptsComps,
+		execOptsNoCollide: &execOptsNoCollide,
+		execOptsLight:     &execOptsLight,
+		freqCov:           freqCov,
+		cltTick:           cltTick,
+		hmcfg:             hc,
+		lcsFsops:          lcsFsops,
+		tscoffs:           procTsc,
 	}
 	return proc, nil
 }
@@ -459,125 +445,154 @@ func (proc *Proc) loop() {
 	}
 }
 
-func (proc *Proc) triageInput(item *WorkTriage) {
-	log.Logf(1, "#%v: triaging type=%x", proc.pid, item.flags)
+type triageTargetState struct {
+	target    TriageTarget
+	pending   signal.Signal
+	cliSignal signal.Signal
+	srvSignal signal.Signal
+	cliCover  cover.Cover
+	srvCover  cover.Cover
+}
 
-	callName := ".extra"
-	logCallName := "extra"
-	if item.triageDag {
-		logCallName = "dag"
-	} else if item.call != -1 {
-		callName = item.ps[item.subNum].Calls[item.call].Meta.Name
-		logCallName = fmt.Sprintf("call #%v %v", item.call, callName)
+func makeTriageTarget(info ipc.CallInfo, callIndex, subNum int) TriageTarget {
+	// info.Signal points to the output shmem region, detach it before queueing.
+	info.Signal = append([]uint32{}, info.Signal...)
+	info.Cover = nil
+	return TriageTarget{call: callIndex, subNum: subNum, info: info}
+}
+
+func dedupTriageTargets(targets []TriageTarget) []TriageTarget {
+	if len(targets) < 2 {
+		return targets
 	}
-	appendDiagLog("triage begin: %s dag=%v flags=%x subNum=%d", logCallName, item.triageDag, item.flags, item.subNum)
-
-	var newSignal signal.Signal
-	if !item.triageDag {
-		prio := signalPrio(item.ps[item.subNum], &item.info, item.call)
-		inputSignal := signal.FromRaw(item.info.Signal, prio)
-		newSignal = proc.fuzzer.corpusSignalDiff(inputSignal)
-		if newSignal.Empty() {
-			appendDiagLog("triage skip: corpusSignalDiff empty %s", logCallName)
-			return
+	seen := make(map[[2]int]bool, len(targets))
+	out := targets[:0]
+	for _, target := range targets {
+		key := [2]int{target.subNum, target.call}
+		if seen[key] {
+			continue
 		}
-		log.Logf(3, "1 triaging input for %v (new signal=%v)", logCallName, newSignal.Len())
+		seen[key] = true
+		out = append(out, target)
 	}
-	// Program-level dedup, stage 1 (pre-minimization prefilter):
-	// corpusSignalDiff only compares against the signal set, so errno/execution-
-	// result fluctuations of an already-corpus program keep reporting "new
-	// signal" and run the whole triage->smash chain only to fail
-	// addInputToCorpus. This check uses the as-received bytes; the authoritative
-	// check runs again after prog.Minimize (stage 2), against the bytes that are
-	// actually sent to the manager and stored in corpus.
-	var data [][]byte
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].subNum != out[j].subNum {
+			return out[i].subNum < out[j].subNum
+		}
+		return out[i].call < out[j].call
+	})
+	return out
+}
+
+func serializeTriageProgram(ps []*prog.Prog) ([][]byte, hash.Sig) {
+	data := make([][]byte, 0, len(ps))
 	var dataForHash []byte
-	for _, p := range item.ps {
-		prog := p.Serialize()
-		data = append(data, prog)
-		dataForHash = append(dataForHash, prog...)
+	for _, p := range ps {
+		ser := p.Serialize()
+		data = append(data, ser)
+		dataForHash = append(dataForHash, ser...)
 	}
-	sig := hash.Hash(dataForHash)
-	proc.fuzzer.corpusMu.RLock()
-	_, dup := proc.fuzzer.corpusHashes[sig]
-	proc.fuzzer.corpusMu.RUnlock()
-	if dup {
-		appendDiagLog("triage skip: program already in corpus %s", logCallName)
-		return
+	return data, hash.Hash(dataForHash)
+}
+
+func collectTriageTargetResult(ps []*prog.Prog, infos []*ipc.ProgInfo, target TriageTarget,
+	triageClient bool, srvNum int) (triageTargetState, bool) {
+	if target.subNum < 0 || target.subNum >= len(infos) || infos[target.subNum] == nil {
+		return triageTargetState{}, false
 	}
-	var SrvCover, CliCover cover.Cover
-	const (
-		signalRuns       = 3
-		minimizeAttempts = 3
-	)
-	// Compute input coverage and non-flaky signal for minimization.
-	notexecuted := 0
-	if !item.triageDag {
-		for i := 0; i < signalRuns; i++ {
-			infos, _, _, err := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage)
-			if err != nil {
-				log.Logf(0, "triage: execution error, aborting this input: %v", err)
-				return
-			}
-			if !reexecutionSuccess(infos[item.subNum], &item.info, item.call) {
-				// The call was not executed or failed.
-				notexecuted++
-				if notexecuted > signalRuns/2+1 {
-					log.Logf(0, "----- triage return due to unsuccessful execution %s", logCallName)
-					appendDiagLog("triage return: unsuccessful execution %s", logCallName)
-					return // if happens too often, give up
-				}
+	thisSignal, thisCover := getSignalAndCover(ps[target.subNum], infos[target.subNum], target.call)
+	res := triageTargetState{target: target}
+	if triageClient {
+		res.cliSignal.Merge(thisSignal)
+		res.cliCover.Merge(thisCover)
+		for idx := 0; idx < srvNum && idx < len(infos); idx++ {
+			if infos[idx] == nil {
 				continue
 			}
-			thisSignal, _ := getSignalAndCover(item.ps[item.subNum], infos[item.subNum], item.call)
-			newSignal = newSignal.Intersection(thisSignal)
-			// Without !minimized check manager starts losing some considerable amount
-			// of coverage after each restart. Mechanics of this are not completely clear.
-			if newSignal.Empty() && item.flags&ProgMinimized == 0 {
-				log.Logf(0, "----- triage return due to empty signal %s", logCallName)
-				appendDiagLog("triage return: empty signal %s", logCallName)
-				return
-			}
+			sig, cov := getSignalAndCover(ps[idx], infos[idx], -1)
+			res.srvSignal.Merge(sig)
+			res.srvCover.Merge(cov)
 		}
-
-		// Stash programs keep their structural orchestration (sync/fault
-		// positions tracked in GeneralFailPos, which RemoveCall does not
-		// maintain): minimizing them would break the stash layout and defeat
-		// further stash testing, so stash candidates skip minimization and
-		// merge their coverage feedback as-is.
-		if item.flags&ProgMinimized == 0 && item.subNum >= proc.fuzzer.config.ServNum && !item.ps[0].IsStash {
-			//修改：minimize是不是也要定制一下？
-			//定制：是的——minimize 的判据同样只依赖覆盖/信号等价（Monarch
-			//§3.4），且 minimizeAttempts 次迭代是 triage 中最贵的一段，切到
-			//轻量执行（跳 fsMd 收集；csan 门在 executeRaw 内对 StatMinimize
-			//同样豁免）。
-			item.ps, item.call = prog.Minimize(item.ps, item.call, item.subNum, false, proc.fuzzer.config.ServNum,
-				func(ps1 []*prog.Prog, call1 int) bool {
-					for i := 0; i < minimizeAttempts; i++ {
-						infos := proc.execute(proc.execOptsLightMinimize, ps1, ProgNormal, StatMinimize)
-						if infos == nil {
-							// Execution error (executor crash/hang): the
-							// environment is unusable for minimization —
-							// keep the original program, executor restarts
-							// on the next Exec.
-							appendDiagLog("minimize abort: execution error on attempt %d", i)
-							return false
-						}
-						if !reexecutionSuccess(infos[item.subNum], &item.info, call1) {
-							// The call was not executed or failed.
-							continue
-						}
-						thisSignal, _ := getSignalAndCover(ps1[item.subNum], infos[item.subNum], call1)
-						if newSignal.Intersection(thisSignal).Len() == newSignal.Len() {
-							return true
-						}
-					}
-					return false
-				})
+	} else {
+		res.srvSignal.Merge(thisSignal)
+		res.srvCover.Merge(thisCover)
+		for idx := srvNum; idx < len(infos); idx++ {
+			if infos[idx] == nil {
+				continue
+			}
+			sig, cov := getAllSignalAndCover(ps[idx], infos[idx])
+			res.cliSignal.Merge(sig)
+			res.cliCover.Merge(cov)
 		}
 	}
+	return res, true
+}
 
-	//#issue: why the testcase after minimized is empty.
+func (proc *Proc) enqueueTriageTargets(ps []*prog.Prog, flags ProgTypes, targets []TriageTarget,
+	triageClient bool) {
+	targets = dedupTriageTargets(targets)
+	if len(targets) == 0 {
+		return
+	}
+	proc.fuzzer.workQueue.enqueue(&WorkTriage{
+		ps:           prog.Clones(ps),
+		targets:      targets,
+		flags:        flags,
+		triageClient: triageClient,
+	})
+}
+
+func (proc *Proc) directDagTriage(ps []*prog.Prog, infos []*ipc.ProgInfo, subNum int, flags ProgTypes) {
+	atomic.AddUint64(&proc.fuzzer.dagCorpusCount, 1)
+
+	var cliSignal, srvSignal signal.Signal
+	var cliCover, srvCover cover.Cover
+	targetSignal, targetCover := getSignalAndCover(ps[subNum], infos[subNum], -1)
+	cliSignal.Merge(targetSignal)
+	cliCover.Merge(targetCover)
+	srvNum := proc.fuzzer.config.ServNum
+	for idx := 0; idx < srvNum && idx < len(infos); idx++ {
+		if infos[idx] == nil {
+			continue
+		}
+		sig, cov := getSignalAndCover(ps[idx], infos[idx], -1)
+		srvSignal.Merge(sig)
+		srvCover.Merge(cov)
+	}
+
+	data, sig := serializeTriageProgram(ps)
+	proc.fuzzer.sendInputToManager(rpctype.RPCInput{
+		Call:      rpctype.DagCall,
+		Prog:      data,
+		CliSignal: cliSignal.Serialize(),
+		SrvSignal: srvSignal.Serialize(),
+		SrvCover:  srvCover.Serialize(),
+		CliCover:  cliCover.Serialize(),
+		Timings:   prog.ProgTimings(ps),
+	})
+
+	added := proc.fuzzer.addInputToCorpus(ps, cliSignal, srvSignal, sig)
+	if !added {
+		return
+	}
+	atomic.AddUint64(&proc.fuzzer.dagCorpusEntries, 1)
+	if flags&ProgSmashed == 0 {
+		proc.fuzzer.workQueue.enqueue(&WorkSmash{ps, -1, subNum})
+	}
+}
+
+func (proc *Proc) triageInput(item *WorkTriage) {
+	log.Logf(1, "#%v: triaging type=%x", proc.pid, item.flags)
+	if len(item.targets) == 0 {
+		return
+	}
+	side := "server"
+	if item.triageClient {
+		side = "client"
+	}
+	logCallName := fmt.Sprintf("%s targets=%d", side, len(item.targets))
+	appendDiagLog("triage begin: %s flags=%x", logCallName, item.flags)
+
 	totalLen := 0
 	for _, p := range item.ps {
 		totalLen += len(p.Calls)
@@ -587,105 +602,112 @@ func (proc *Proc) triageInput(item *WorkTriage) {
 		return
 	}
 
-	// Stage 2 dedup: prog.Minimize may have rewritten item.ps, so recompute the
-	// serialized payload and hash for the bytes actually sent to the manager
-	// and stored in corpus (the pre-minimization data/sig would mismatch the
-	// minimized program and its timings). A minimized program already in corpus
-	// is skipped here, before the coverage runs.
-	preSig := sig
-	data = data[:0]
-	dataForHash = dataForHash[:0]
-	for _, p := range item.ps {
-		ser := p.Serialize()
-		data = append(data, ser)
-		dataForHash = append(dataForHash, ser...)
-	}
-	sig = hash.Hash(dataForHash)
+	data, sig := serializeTriageProgram(item.ps)
 	proc.fuzzer.corpusMu.RLock()
-	_, dup = proc.fuzzer.corpusHashes[sig]
+	_, alreadyInCorpus := proc.fuzzer.corpusHashes[sig]
 	proc.fuzzer.corpusMu.RUnlock()
-	if dup {
-		appendDiagLog("triage skip: minimized program already in corpus %s", logCallName)
+
+	var states []triageTargetState
+	for _, target := range item.targets {
+		prio := signalPrio(item.ps[target.subNum], &target.info, target.call)
+		inputSignal := signal.FromRaw(target.info.Signal, prio)
+		pending := inputSignal
+		if !alreadyInCorpus {
+			pending = proc.fuzzer.corpusSignalDiff(inputSignal)
+		}
+		if pending.Empty() {
+			continue
+		}
+		states = append(states, triageTargetState{target: target, pending: pending})
+	}
+	if len(states) == 0 {
+		appendDiagLog("triage skip: corpusSignalDiff empty %s", logCallName)
 		return
 	}
 
-	//Merge server coverage
-	var inputCliSignal, inputSrvSignal signal.Signal
+	infos, _, _, err := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage)
+	if err != nil {
+		log.Logf(0, "triage: execution error, aborting this input: %v", err)
+		appendDiagLog("triage return: execution error %s", logCallName)
+		return
+	}
+
 	srvNum := proc.fuzzer.config.ServNum
-	for i := 0; i < signalRuns; i++ {
-		infos, _, _, err := proc.executeRaw(proc.execOptsLight, item.ps, StatTriage) //TODO
-		if err != nil {
-			log.Logf(0, "triage: execution error during coverage run, aborting: %v", err)
-			return
+	valid := states[:0]
+	for _, st := range states {
+		target := st.target
+		if target.subNum < 0 || target.subNum >= len(infos) || infos[target.subNum] == nil {
+			continue
 		}
-		thisSignal, thisCover := getSignalAndCover(item.ps[item.subNum], infos[item.subNum], item.call)
+		if !reexecutionSuccess(infos[target.subNum], &target.info, target.call) {
+			continue
+		}
+		res, ok := collectTriageTargetResult(item.ps, infos, target, item.triageClient, srvNum)
+		if !ok {
+			continue
+		}
+		var targetSignal signal.Signal
 		if item.triageClient {
-			CliCover.Merge(thisCover)
-			inputCliSignal.Merge(thisSignal)
-			for idx, info := range infos[:srvNum] {
-				//proc.fuzzer.checkNewSignal(item.ps[idx], info)
-				thisSignal, thisCover := getSignalAndCover(item.ps[idx], info, -1)
-				inputSrvSignal.Merge(thisSignal)
-				SrvCover.Merge(thisCover)
-			}
+			targetSignal = res.cliSignal
 		} else {
-			SrvCover.Merge(thisCover)
-			inputSrvSignal.Merge(thisSignal)
-			for idx, info := range infos {
-				if idx < srvNum {
-					continue
-				}
-				//proc.fuzzer.checkNewSignal(item.ps[idx], info)
-				thisSignal, thisCover := getAllSignalAndCover(item.ps[idx], info)
-				inputCliSignal.Merge(thisSignal)
-				CliCover.Merge(thisCover)
-			}
+			targetSignal = res.srvSignal
+		}
+		pending := st.pending.Intersection(targetSignal)
+		if pending.Empty() && item.flags&ProgMinimized == 0 {
+			continue
+		}
+		st.pending = pending
+		st.cliSignal = res.cliSignal
+		st.srvSignal = res.srvSignal
+		st.cliCover = res.cliCover
+		st.srvCover = res.srvCover
+		valid = append(valid, st)
+	}
+	if len(valid) == 0 {
+		appendDiagLog("triage return: no valid target %s", logCallName)
+		return
+	}
+
+	allCliSignal := make(signal.Signal)
+	allSrvSignal := make(signal.Signal)
+	firstSubNum := -1
+	hasClientCall := false
+	timings := prog.ProgTimings(item.ps)
+	for _, st := range valid {
+		callName := ".extra"
+		if st.target.call != -1 {
+			callName = item.ps[st.target.subNum].Calls[st.target.call].Meta.Name
+		}
+		proc.fuzzer.sendInputToManager(rpctype.RPCInput{
+			Call:      callName,
+			Prog:      data,
+			CliSignal: st.cliSignal.Serialize(),
+			SrvSignal: st.srvSignal.Serialize(),
+			SrvCover:  st.srvCover.Serialize(),
+			CliCover:  st.cliCover.Serialize(),
+			Timings:   timings,
+		})
+		allCliSignal.Merge(st.cliSignal)
+		allSrvSignal.Merge(st.srvSignal)
+		if firstSubNum < 0 {
+			firstSubNum = st.target.subNum
+		}
+		if item.triageClient && st.target.call != -1 {
+			hasClientCall = true
 		}
 	}
 
-	log.Logf(2, "added new input for %v to corpus:\n%s", logCallName, dataForHash)
-	proc.fuzzer.sendInputToManager(rpctype.RPCInput{
-		Call:      callName,
-		Prog:      data,
-		CliSignal: inputCliSignal.Serialize(),
-		SrvSignal: inputSrvSignal.Serialize(),
-		SrvCover:  SrvCover.Serialize(),
-		CliCover:  CliCover.Serialize(),
-		Timings:   prog.ProgTimings(item.ps),
-	})
-
-	if item.call != -1 {
+	log.Logf(2, "added new input for %s to corpus", logCallName)
+	if hasClientCall {
 		proc.cltTick <- true
 	}
-
-	log.Logf(0, "triageInput addInputToCorpus: HasCrashFail: %v, HasNetFail: %v", item.ps[0].HasCrashFail, item.ps[0].HasNetFail)
-	if item.triageDag {
-		atomic.AddUint64(&proc.fuzzer.dagCorpusCount, 1)
-	}
-	added := proc.fuzzer.addInputToCorpus(item.ps, inputCliSignal, inputSrvSignal, sig)
-	if preSig != sig {
-		// Keep the pre-minimization key for early-skip of re-delivered
-		// candidates (the set has no 1:1 entry invariant).
-		proc.fuzzer.corpusMu.Lock()
-		proc.fuzzer.corpusHashes[preSig] = struct{}{}
-		proc.fuzzer.corpusMu.Unlock()
-	}
+	added := proc.fuzzer.addInputToCorpus(item.ps, allCliSignal, allSrvSignal, sig)
 	proc.fuzzer.corpusMu.RLock()
 	corpusLen := len(proc.fuzzer.corpus)
 	proc.fuzzer.corpusMu.RUnlock()
-	{
-		total := 0
-		for _, p := range item.ps {
-			total += len(p.Calls)
-		}
-		appendDiagLog("triage success: %s added=%v corpus=%d total=%d dag=%v", logCallName, added, corpusLen, total, item.triageDag)
-	}
-	if item.triageDag && added {
-		atomic.AddUint64(&proc.fuzzer.dagCorpusEntries, 1)
-	}
-
+	appendDiagLog("triage success: %s added=%v corpus=%d total=%d", logCallName, added, corpusLen, totalLen)
 	if added && item.flags&ProgSmashed == 0 {
-		proc.fuzzer.workQueue.enqueue(&WorkSmash{item.ps, item.call, item.subNum})
+		proc.fuzzer.workQueue.enqueue(&WorkSmash{item.ps, -1, firstSubNum})
 	}
 }
 
@@ -1226,7 +1248,8 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 	servNum := proc.fuzzer.config.ServNum
 	clientHasNew := false
 	covEnqueues := 0
-	dagEnqueues := 0
+	dagDirect := 0
+	var clientTargets, serverTargets []TriageTarget
 	if proc.fuzzer.config.EnableClientFb {
 		for idx, info := range infos {
 			//TODO: how to check the signal from servers and clients
@@ -1236,12 +1259,12 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				calls, extra := proc.fuzzer.checkNewSignal(ps[idx], info)
 				appendDiagLog("feedback: idx=%d EnableClientFb=%v calls=%d extra=%v", idx, proc.fuzzer.config.EnableClientFb, len(calls), extra)
 				for _, callIndex := range calls {
-					proc.enqueueCallTriage(ps, flags, callIndex, info.Calls[callIndex], idx, true) //idx -> subNum
+					clientTargets = append(clientTargets, makeTriageTarget(info.Calls[callIndex], callIndex, idx)) //idx -> subNum
 					covEnqueues++
 					clientHasNew = true
 				}
 				if extra {
-					proc.enqueueCallTriage(ps, flags, -1, info.Extra, idx, true)
+					clientTargets = append(clientTargets, makeTriageTarget(info.Extra, -1, idx))
 					covEnqueues++
 				}
 			}
@@ -1258,7 +1281,7 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 			_, extra := proc.fuzzer.checkNewSignal(nil, info)
 			if extra {
 				log.Logf(0, "----- enqueue testcases with server coveraged")
-				proc.enqueueCallTriage(ps, flags, -1, info.Extra, idx, false)
+				serverTargets = append(serverTargets, makeTriageTarget(info.Extra, -1, idx))
 				covEnqueues++
 			}
 		}
@@ -1287,8 +1310,8 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 				atomic.AddUint64(&proc.fuzzer.dagPairCount, uint64(n))
 				maxDag := proc.fuzzer.config.MaxDagCorpus
 				if maxDag == 0 || atomic.LoadUint64(&proc.fuzzer.dagCorpusEntries) < uint64(maxDag) {
-					proc.enqueueDagTriage(ps, flags, idx)
-					dagEnqueues++
+					proc.directDagTriage(ps, infos, idx, flags)
+					dagDirect++
 				}
 				newPairs := filterNewDagPairs(info, newBits)
 				proc.feedbackDagPairs(newPairs)
@@ -1309,6 +1332,9 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 		}
 	}
 
+	proc.enqueueTriageTargets(ps, flags, clientTargets, true)
+	proc.enqueueTriageTargets(ps, flags, serverTargets, false)
+
 	//Execute again for crash consistency bugs
 	//TODO
 	if proc.fuzzer.config.EnableC2san &&
@@ -1327,8 +1353,7 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 	}
 
 	// Outcome summary: per-node call counts (growth tracking, all nodes not
-	// just ps[0]) plus which feedback channel the product earned (coverage
-	// enqueue vs DAG enqueue; both zero means the product is dropped).
+	// just ps[0]) plus which feedback channel the product earned.
 	{
 		calls := make([]int, len(ps))
 		total := 0
@@ -1336,41 +1361,11 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 			calls[i] = len(p.Calls)
 			total += len(p.Calls)
 		}
-		appendDiagLog("exec outcome: stat=%v calls=%v total=%d covEnq=%d dagEnq=%d",
-			statNames[stat], calls, total, covEnqueues, dagEnqueues)
+		appendDiagLog("exec outcome: stat=%v calls=%v total=%d covEnq=%d dagDirect=%d",
+			statNames[stat], calls, total, covEnqueues, dagDirect)
 	}
 
 	return infos
-}
-
-func (proc *Proc) enqueueCallTriage(ps []*prog.Prog, flags ProgTypes, callIndex int, info ipc.CallInfo, subNum int,
-	triageClient bool) {
-	// info.Signal points to the output shmem region, detach it before queueing.
-	info.Signal = append([]uint32{}, info.Signal...)
-	// None of the caller use Cover, so just nil it instead of detaching.
-	// Note: triage input uses executeRaw to get coverage.
-	info.Cover = nil
-	proc.fuzzer.workQueue.enqueue(&WorkTriage{
-		ps:           prog.Clones(ps),
-		call:         callIndex,
-		subNum:       subNum,
-		info:         info,
-		flags:        flags,
-		triageClient: triageClient,
-	})
-}
-
-// enqueueDagTriage queues a corpus entry whose interestingness comes from the
-// DAG feedback (new operation pair), not from coverage.
-func (proc *Proc) enqueueDagTriage(ps []*prog.Prog, flags ProgTypes, subNum int) {
-	proc.fuzzer.workQueue.enqueue(&WorkTriage{
-		ps:           prog.Clones(ps),
-		call:         -1,
-		subNum:       subNum,
-		flags:        flags,
-		triageClient: true,
-		triageDag:    true,
-	})
 }
 
 func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]*ipc.ProgInfo, []map[string]prog.FileMetadata, uint64, error) {
@@ -1483,19 +1478,21 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		}
 	}
 
-	clientIdx := -1
-	if csanPassed && proc.fuzzer.config.DFSName == "hmdfs" && len(ps) > 0 && len(fsMds) > proc.fuzzer.config.ServNum {
-		clientIdx = len(fsMds) - 1
-		for ; clientIdx >= proc.fuzzer.config.ServNum; clientIdx-- {
-			if fsMds[clientIdx] != nil && len(fsMds[clientIdx]) > 0 {
-				break
-			}
-		}
-		if clientIdx >= proc.fuzzer.config.ServNum {
-			ownerMap := collectCreateCallOwners(ps, infos, proc.hmcfg.Cids, &proc.hmcfg)
-			prog.SyncFileTreeFromFsMd(prog.CanonicalizeFsMd(fsMds[clientIdx]), ownerMap, &proc.hmcfg)
-		}
-	}
+	// ===== DISABLED: FileTree sync (per-exec restore keeps baseline) =====
+	// clientIdx := -1
+	// if csanPassed && proc.fuzzer.config.DFSName == "hmdfs" && len(ps) > 0 && len(fsMds) > proc.fuzzer.config.ServNum {
+	// 	clientIdx = len(fsMds) - 1
+	// 	for ; clientIdx >= proc.fuzzer.config.ServNum; clientIdx-- {
+	// 		if fsMds[clientIdx] != nil && len(fsMds[clientIdx]) > 0 {
+	// 			break
+	// 		}
+	// 	}
+	// 	if clientIdx >= proc.fuzzer.config.ServNum {
+	// 		ownerMap := collectCreateCallOwners(ps, infos, proc.hmcfg.Cids, &proc.hmcfg)
+	// 		prog.SyncFileTreeFromFsMd(prog.CanonicalizeFsMd(fsMds[clientIdx]), ownerMap, &proc.hmcfg)
+	// 	}
+	// }
+	// ===== END DISABLED: FileTree sync =====
 
 	// DAG feedback: pair novelty bits + schedule bit (only for regular
 	// executions; triage and minimize re-runs are excluded to avoid
@@ -1521,8 +1518,8 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
 		// DAG vertices intentionally use RAW fsMds (no CanonicalizeFsMd):
 		// conflict/remote-directory suffixes are kernel-visible truth here,
-		// and DAG paths never flow back into generation. The FileTree sync
-		// above and the checker canonicalize instead.
+		// and DAG paths never flow back into generation. The checker
+		// canonicalizes fsMd, while FileTree stays at the restored baseline.
 		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.tscoffs)
 		hbPairs, ccPairs := prog.ExtractPairs(vertices, dagDiag)
 		allPairs := append(hbPairs, ccPairs...)

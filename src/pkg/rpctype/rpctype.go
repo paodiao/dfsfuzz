@@ -11,6 +11,8 @@ import (
 	"monarch/pkg/signal"
 )
 
+const DagCall = "dag"
+
 type RPCInput struct {
 	Call      string
 	Prog      [][]byte

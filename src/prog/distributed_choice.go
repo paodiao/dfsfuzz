@@ -1802,9 +1802,10 @@ func (dct *DistributedChoiceTable) GetVariants(rootCall string) []CallVariant {
 }
 
 type LayeredChoiceStrategy struct {
-	PredefinedPatterns *PredefinedPatterns
-	DCTFsops           *DistributedChoiceTable
-	FileTree           *FileTree
+	PredefinedPatterns    *PredefinedPatterns
+	DCTFsops              *DistributedChoiceTable
+	CausalDerivationTable *CausalDerivationTable
+	FileTree              *FileTree
 
 	// FsopsChoiceTable selects root calls for DCT insertion, built from the
 	// fsops allowlist (close enabled as a legal bias source, never a root).
@@ -1826,10 +1827,11 @@ type LayeredChoiceStrategy struct {
 
 func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoiceStrategy {
 	lcs := &LayeredChoiceStrategy{
-		PredefinedPatterns: NewPredefinedPatterns(),
-		DCTFsops:           NewDistributedChoiceTable(),
-		FileTree:           nil,
-		patternProbability: 0.15,
+		PredefinedPatterns:    NewPredefinedPatterns(),
+		DCTFsops:              NewDistributedChoiceTable(),
+		CausalDerivationTable: newCausalDerivationTable(),
+		FileTree:              nil,
+		patternProbability:    0.15,
 	}
 
 	if hmcfg != nil && hmcfg.FileTree != nil {
@@ -2322,14 +2324,20 @@ func GetCreateInfo(call *Call) (path string, oldPath string, ctype CreateCallTyp
 	return "", "", -1
 }
 
+func parseOpenFlags(call *Call) (uint64, bool) {
+	if call == nil || len(call.Args) < 2 {
+		return 0, false
+	}
+	flagsArg, ok := call.Args[1].(*ConstArg)
+	if !ok {
+		return 0, false
+	}
+	return flagsArg.Val, true
+}
+
 func extractOpenFlags(call *Call) uint64 {
-	if len(call.Args) < 2 {
-		return 0
-	}
-	if flagsArg, ok := call.Args[1].(*ConstArg); ok {
-		return flagsArg.Val
-	}
-	return 0
+	flags, _ := parseOpenFlags(call)
+	return flags
 }
 
 func IsUnlinkCall(callName string) bool {

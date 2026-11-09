@@ -20,7 +20,7 @@ type WorkQueue struct {
 	candidate       []*WorkCandidate
 	triage          []*WorkTriage
 	smash           []*WorkSmash
-	fsmash			[]*WorkFSmash
+	fsmash          []*WorkFSmash
 
 	procs          int
 	needCandidates chan struct{}
@@ -35,23 +35,23 @@ const (
 	ProgNormal ProgTypes = 0
 )
 
+type TriageTarget struct {
+	call   int
+	subNum int
+	info   ipc.CallInfo
+}
+
 // WorkTriage are programs for which we noticed potential new coverage during
 // first execution. But we are not sure yet if the coverage is real or not.
-// During triage we understand if these programs in fact give new coverage,
-// and if yes, minimize them and add to corpus.
+// During triage we verify all targets in one execution and add the program to
+// corpus once. All targets in one WorkTriage belong to the same side.
 type WorkTriage struct {
 	//tao modified
 	ps []*prog.Prog
 	//tao end
-	call   int
-	subNum int
-	//infos  []*ipc.ProgInfo
-	info         ipc.CallInfo
+	targets      []TriageTarget
 	flags        ProgTypes
 	triageClient bool
-	// triageDag marks a DAG-driven corpus entry: the coverage gate,
-	// re-execution verification and minimization are skipped.
-	triageDag bool
 }
 
 // WorkCandidate are programs from hub.
@@ -72,7 +72,7 @@ type WorkSmash struct {
 }
 
 type WorkFSmash struct {
-	ps	   []*prog.Prog
+	ps []*prog.Prog
 }
 
 func newWorkQueue(procs int, needCandidates chan struct{}) *WorkQueue {

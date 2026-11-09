@@ -154,6 +154,8 @@ struct executeControl {
   volatile atomic<unsigned char> lockByte2; // for concurrent call lock
   volatile atomic<unsigned char> lockByte3; // for sync lock
   volatile uint64_t srvSetupBit;
+  volatile unsigned char restoreState[SUPPORT_VMS];
+  volatile unsigned char restoreStart[SUPPORT_VMS];
 };
 //修改：MAXCLT还需要扩充吗？
 #define MAXCLT 3

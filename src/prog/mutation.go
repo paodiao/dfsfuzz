@@ -2758,15 +2758,19 @@ func pathSatisfiesType(ft *FileTree, path string, constraint int) bool {
 	return nodeMatchesConstraint(node, constraint)
 }
 
-// MutateGroupPathDynamic migrates the dynamic concurrent set of a random
-// anchor call to a new base path, keeping the relative path relations between
-// the anchor and its concurrent peers ("same pattern, new location"). Calls
-// that did not overlap the anchor (the non-concurrent backbone) stay in place.
+// MutateGroupPathDynamic first tries the path-relation component around an
+// anchor (PathSet), then falls back to the legacy dynamic concurrent set.
+// PathSet migration keeps path relations across call order and is the broad
+// path mutation; the legacy set is retained while the directed target arm is
+// being migrated.
 func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) bool {
 	if lcs == nil || lcs.FileTree == nil {
 		return false
 	}
 	if CoverageBoardReady() && r.Float64() < directedBiasProb {
+		if mutatePathSetDirected(ps, lcs, r) {
+			return true
+		}
 		if mutateGroupPathDirected(ps, lcs, r) {
 			return true
 		}
@@ -2775,6 +2779,14 @@ func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 	anchor, anchorPath, ok := pickAnchor(ps, r, false)
 	if !ok {
 		return false
+	}
+	anchorPos := resolveFdTarget(ps, anchor)
+	if set, ok := buildPathSet(ps, anchorPos, lcs.FileTree); ok {
+		notePathSetBuilt(set, pathSetRoots(set), false)
+		if relocatePathSet(ps, lcs, set, r) {
+			recordLastMutation("MutatePathSet")
+			return true
+		}
 	}
 	conc := findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs)
 	if len(conc) == 0 {
@@ -3736,7 +3748,7 @@ func MutateFsopsWithDCT(ps []*Prog, rs rand.Source, sCalls *SpecialCalls, hmcfg 
 				NoteDirectedNoPlan()
 			}
 		}
-		return insertCallFromDCT(ps, r, sCalls, hmcfg, lcs, false)
+		return insertDerivedCallFromDCT(ps, r, sCalls, hmcfg, lcs, false, false)
 	case roll < ins+removeOne:
 		return RemoveReservoirDynamic(ps, r)
 	case roll < ins+removeOne+removeGroup:
@@ -4256,6 +4268,10 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int) map[string]int {
 			set(extractPathFromCall(c), relTargetDir)
 		case "creat":
 			set(extractPathFromCall(c), relTargetFile)
+		case "open":
+			if created, known := openCallCreatesFile(p.Target, c); known && created {
+				set(extractPathFromCall(c), relTargetFile)
+			}
 		case "rename":
 			src, dst := extractRenamePaths(c)
 			if k, ok := kindOf(src); ok {
@@ -4644,6 +4660,180 @@ func progHaveFd(p *Prog) bool {
 // refTime. Times are in the global TSC domain (raw TSC minus the VM's TSC
 // offset). refTime < 0 means "no reference": random behavior. Returns -1
 // when refTime >= 0 but no call has timing info.
+func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, allowDirected, insertAfterAnchor bool) bool {
+	recordLastMutation("insertDerivedCallFromDCT")
+	if len(ps) == 0 || lcs == nil || lcs.FileTree == nil || hmcfg == nil || len(hmcfg.Cids) < len(ps) {
+		return false
+	}
+	p0 := ps[0]
+	ft := lcs.FileTree
+	derivation, ok := sampleSeedDerivation(p0, ft, lcs.CausalDerivationTable, r, !insertAfterAnchor)
+	if !ok {
+		return false
+	}
+	rootCallName := derivation.RootCall
+	basePath := derivation.RootSource
+	basePath2 := derivation.RootDest
+	if basePath == "" {
+		return false
+	}
+	insertPos := r.biasedRand(len(p0.Calls)+1, 5)
+	if insertAfterAnchor {
+		insertPos = derivation.Anchor.Pos.CallIdx + 1
+	}
+	if insertPos < 0 {
+		insertPos = 0
+	}
+	if insertPos > len(p0.Calls) {
+		insertPos = len(p0.Calls)
+	}
+
+	freshKinds := freshPathKindsBefore(p0, ft, insertPos)
+	switch rootCallName {
+	case "mkdir", "creat", "rename":
+		if kind := seedFreshPathKind(derivation); kind != 0 {
+			freshKinds[basePath2] = kind
+			if rootCallName != "rename" {
+				freshKinds[basePath] = kind
+			}
+		}
+	}
+
+	rootFileSize := directedNodeSize(lcs, basePath)
+	rootFlags := directedNodeFlags(r, lcs, basePath)
+	var rootFd *ResultArg
+	rootUseFd := false
+	if IsFdRequiredCall(rootCallName) {
+		rootFd = findOpenFdForPath(p0, basePath, insertPos, capNeeded(rootCallName))
+		rootUseFd = rootFd != nil
+	}
+	rootCalls := r.generateCallByName(stateFromProg(p0), sCalls, rootCallName,
+		basePath, basePath2, hmcfg.Cids[0], rootFd, rootUseFd, rootFileSize, rootFlags)
+	if len(rootCalls) == 0 || hasNilCall(rootCalls) {
+		return false
+	}
+	if insertPos >= len(p0.Calls) {
+		p0.Calls = append(p0.Calls, rootCalls...)
+	} else {
+		p0.Calls = append(p0.Calls[:insertPos], append(rootCalls, p0.Calls[insertPos:]...)...)
+	}
+	rootStart := insertPos
+	rootEnd := rootStart + len(rootCalls)
+
+	refTime := int64(-1)
+	if insertAfterAnchor {
+		if derivation.Anchor.Pos.CallIdx < len(p0.Calls) && p0.Calls[derivation.Anchor.Pos.CallIdx].CheckInfo != nil {
+			refTime = int64(p0.Calls[derivation.Anchor.Pos.CallIdx].CheckInfo.Etime) - lcs.tscoffFor(0)
+		}
+	} else if rootStart == 0 {
+		refTime = 0
+	} else if p0.Calls[rootStart-1].CheckInfo != nil {
+		refTime = int64(p0.Calls[rootStart-1].CheckInfo.Etime) - lcs.tscoffFor(0)
+	}
+
+	rootObservedPath := derivation.RootDest
+	baseIsFile := basePathIsFileHinted(ft, rootCallName, rootObservedPath, freshKinds)
+
+	for nodeIdx := 1; nodeIdx < len(ps); nodeIdx++ {
+		p := ps[nodeIdx]
+		cid := hmcfg.Cids[nodeIdx]
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, baseIsFile, rootObservedPath, allowDirected)
+		if variant == nil {
+			continue
+		}
+		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, *variant, r.Rand)
+
+		variantPos := rootStart
+		if temporal == TemporalHB {
+			variantPos = rootEnd
+		}
+		if !insertAfterAnchor {
+			aligned := -1
+			if temporal == TemporalHB {
+				aligned = firstBoundaryAfter(p, refTime, lcs.tscoffFor(nodeIdx))
+			} else {
+				aligned = TimeAlignedInsertPos(p, refTime, lcs.tscoffFor(nodeIdx))
+			}
+			if aligned >= 0 {
+				variantPos = aligned
+			} else if temporal == TemporalHB {
+				variantPos = rootEnd
+			} else {
+				variantPos = rootStart
+			}
+		}
+		if variantPos < 0 {
+			variantPos = 0
+		}
+		if variantPos > len(p.Calls) {
+			variantPos = len(p.Calls)
+		}
+
+		variantPath := ""
+		variantPath2 := ""
+		switch variant.CallName {
+		case "mkdir":
+			switch variant.PathRelation {
+			case PathChild:
+				if baseIsFile {
+					continue
+				}
+				variantPath = r.freshChildPath(rootObservedPath, "mkdir")
+			case PathSibling:
+				variantPath = r.freshChildPath(GetParentDir(rootObservedPath), "mkdir")
+			case PathNoRel:
+				if dir := ft.getRandomUnrelatedPath(rootObservedPath, r.Rand, relTargetDir); dir != "" {
+					variantPath = r.freshChildPath(dir, "mkdir")
+				}
+			}
+		case "rename":
+			variantPath, variantPath2 = lcs.GetPathsForRenameVariant(rootObservedPath, "", variant.PathRelation, r.Rand, false)
+		default:
+			constraint := callNameConstraint(variant.CallName)
+			variantPath = ft.GetPathByRelation(rootObservedPath, "", variant.PathRelation, r.Rand, false, constraint)
+		}
+		// mkdir Same/Parent target existing tree paths (the root itself or its
+		// parent), not a fresh child/sibling. Mirror the generic relation
+		// fallback used by insertCallFromDCT instead of silently dropping the
+		// DCT-selected variant.
+		if variantPath == "" && variant.CallName == "mkdir" &&
+			(variant.PathRelation == PathSame || variant.PathRelation == PathParent) {
+			constraint := callNameConstraint(variant.CallName)
+			variantPath = ft.GetPathByRelation(rootObservedPath, "", variant.PathRelation, r.Rand, false, constraint)
+		}
+		if variantPath == "" {
+			continue
+		}
+
+		var variantFd *ResultArg
+		variantUseFd := true
+		if IsFdRequiredCall(variant.CallName) {
+			variantFd = findOpenFdForPath(p, variantPath, variantPos, capNeeded(variant.CallName))
+			if variantFd == nil {
+				variantUseFd = false
+			}
+		}
+		variantSize := directedNodeSize(lcs, variantPath)
+		variantFlags := directedNodeFlags(r, lcs, variantPath)
+		if !baseIsFile {
+			if n := ft.FindNode(variantPath); n == nil {
+				variantFlags = r.target.GetConst("O_DIRECTORY")
+			}
+		}
+		calls := r.generateCallByName(stateFromProg(p), sCalls, variant.CallName,
+			variantPath, variantPath2, cid, variantFd, variantUseFd, variantSize, variantFlags)
+		if len(calls) == 0 || hasNilCall(calls) {
+			continue
+		}
+		if variantPos >= len(p.Calls) {
+			p.Calls = append(p.Calls, calls...)
+		} else {
+			p.Calls = append(p.Calls[:variantPos], append(calls, p.Calls[variantPos:]...)...)
+		}
+	}
+	return true
+}
+
 func TimeAlignedInsertPos(p *Prog, refTime int64, tscoff int64) int {
 	return timeAlignedInRange(p, refTime, tscoff, 0, len(p.Calls))
 }

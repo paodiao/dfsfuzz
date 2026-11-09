@@ -327,7 +327,7 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 	if !genuine && f != nil && f.rotated {
 		rotated = !f.rotatedSignal.Diff(inputCliSignal).Empty() || !f.rotatedSignal.Diff(inputSrvSignal).Empty()
 	}
-	if !genuine && !rotated {
+	if !genuine && !rotated && a.Call != rpctype.DagCall {
 		return nil
 	}
 

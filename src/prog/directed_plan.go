@@ -88,10 +88,16 @@ type directedPlan struct {
 	BOffset uint64 // explicit entry offset (pread64/pwrite64)
 	BLen    uint64 // pread read size / pwrite data length / truncate new size
 
-	FreshA    bool
-	FreshA2   bool
-	FreshB    bool
-	FreshSame bool
+	FreshA             bool
+	FreshA2            bool
+	FreshB             bool
+	FreshSame          bool
+	FreshRenameDst     bool
+	RootRenameReplace  bool
+	Causal             bool
+	RootParentKind     AnchorPathKind
+	RootParentIsDir    bool
+	RootParentIsAnchor bool
 	// RenameReplace marks the E rename form (existing same-class same-parent
 	// destination, Success); F (fresh destination) and B (ENOTEMPTY) leave it
 	// false. Explicit because the live recheck must not infer the shape from
@@ -107,10 +113,18 @@ type directedPlan struct {
 // assigned 1..M at assembly; M is capped by len(ps)-1 and by the number of
 // pickable cells sharing the root.
 type directedBatch struct {
-	Root   string
-	BaseA  string
-	BaseA2 string
-	Plans  []directedPlan
+	Root              string
+	BaseA             string
+	BaseA2            string
+	RootOffset        uint64
+	RootLen           uint64
+	RootKind          causalRootKind
+	RootParent        string
+	RootSource        string
+	RootDest          string
+	RootRenameReplace bool
+	Plans             []directedPlan
+	Anchor            *causalAnchor
 }
 
 // directedRootCalls is the planned root set. mkdir/creat/rename roots are the
@@ -131,10 +145,6 @@ var directedVariantCalls = []string{
 	"read", "write", "pread64", "pwrite64", "truncate", "rmdir", "rename",
 	"unlink", "mkdir", "creat",
 }
-
-// sizeChangingRoots mutate the base file's size; a variant pinning an offset
-// bucket on the same path cannot be predicted after them.
-var sizeChangingRoots = map[string]bool{"write": true, "pwrite64": true, "truncate": true}
 
 // offsetVariants carry an explicit offset or length (the only way to pin a
 // non-zero entry bucket).
@@ -1120,6 +1130,13 @@ func batchBaseBAuthorityOK(plans []directedPlan) bool {
 // the caller how to account for a nil batch: nothing to target
 // (directedPlanNone) or a precondition/config anomaly (directedPlanCfgErr).
 func PickDirectedBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, r *randGen) (*directedBatch, directedPlanStatus) {
+	if batch, ok := pickCausalRootBatch(ps, lcs, hmcfg, r); ok {
+		return batch, directedPlanFound
+	}
+	return pickDirectedBatchNormal(ps, lcs, hmcfg, r)
+}
+
+func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, r *randGen) (*directedBatch, directedPlanStatus) {
 	if lcs == nil || lcs.FileTree == nil || hmcfg == nil || r == nil || len(ps) < 2 {
 		return nil, directedPlanCfgErr
 	}
@@ -1583,9 +1600,6 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 					continue
 				}
 				for _, root := range roots {
-					if rel == PathSame && offsetVariants[variant] && sizeChangingRoots[root] {
-						continue // entry size not predictable after the root
-					}
 					if root == "mkdir" || root == "creat" || root == "rename" {
 						continue // fresh-path roots have their own passes
 					}
@@ -2016,6 +2030,9 @@ func insertProgCalls(p *Prog, pos int, calls []*Call) {
 // that cannot produce the planned cell, and the post-execution miss
 // accounting would eventually blacklist a reachable cell.
 func validateDirectedPlanLive(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *directedPlan) bool {
+	if plan.Causal {
+		return validateCausalPlan(hmcfg, lcs, plan)
+	}
 	ft := lcs.FileTree
 	if ft == nil {
 		return false
@@ -2023,7 +2040,7 @@ func validateDirectedPlanLive(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, p
 	if plan.Cell.Combo.Variant != "rename" && plan.BaseB2 != "" && !plan.FreshB {
 		return false
 	}
-	if plan.FreshA || plan.FreshA2 || plan.FreshB || plan.FreshSame {
+	if plan.FreshA || plan.FreshA2 || plan.FreshB || plan.FreshSame || plan.FreshRenameDst {
 		return validateFreshPlanLive(ft, hmcfg, plan)
 	}
 	a := ft.FindNode(plan.BaseA)
@@ -2275,6 +2292,25 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 		return true
 	}
 	switch {
+	case plan.FreshRenameDst:
+		if plan.Cell.Combo.Variant != "rename" || plan.BaseB2 == "" || plan.BaseB == "" {
+			return false
+		}
+		src := ft.FindNode(plan.BaseB2)
+		if src == nil || ft.FindNode(plan.BaseB) != nil || !renameSameParent(plan.BaseB2, plan.BaseB) {
+			return false
+		}
+		if (src.Type == NodeTypeFile) != !plan.Cell.TypeB {
+			return false
+		}
+		if DepthBucketOf(plan.BaseB) != plan.Cell.DepthB ||
+			pathInDir(plan.BaseB, hmcfg.Persistence_dir) != plan.Cell.PersistB {
+			return false
+		}
+		if plan.Cell.RetB != RetSuccess {
+			return false
+		}
+		return true
 	case plan.FreshSame:
 		parent := ft.FindNode(plan.BaseA2)
 		if parent == nil || parent.Type == NodeTypeFile || parent.Type == NodeTypeTmpDir {
@@ -2315,13 +2351,22 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 		}
 		return pathRelBetween(plan.BaseA, plan.BaseB) == plan.Cell.Combo.Rel
 	case plan.FreshA2:
-		// Rename root: existing source, fresh same-parent destination.
+		// Rename root: existing source, F fresh or E existing destination.
 		src := ft.FindNode(plan.BaseA)
 		if src == nil || src.Type == NodeTypeTmpDir || plan.Cell.Combo.Root != "rename" {
 			return false
 		}
-		if plan.BaseA2 == "" || ft.FindNode(plan.BaseA2) != nil ||
-			!renameSameParent(plan.BaseA, plan.BaseA2) {
+		if plan.BaseA2 == "" || !renameSameParent(plan.BaseA, plan.BaseA2) {
+			return false
+		}
+		if plan.RootRenameReplace {
+			dst := ft.FindNode(plan.BaseA2)
+			if dst == nil || dst.Type == NodeTypeTmpDir ||
+				(dst.Type == NodeTypeFile) != (src.Type == NodeTypeFile) ||
+				(dst.Type != NodeTypeFile && len(dst.Children) > 0) {
+				return false
+			}
+		} else if ft.FindNode(plan.BaseA2) != nil {
 			return false
 		}
 		b := ft.FindNode(plan.BaseB)
@@ -2358,9 +2403,11 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 		if DepthBucketOf(plan.BaseB) != plan.Cell.DepthB || persistOf(plan.BaseB) != plan.Cell.PersistB {
 			return false
 		}
-		a := ft.FindNode(plan.BaseA)
-		if a == nil || !nodeFitsConstraint(mkNode(a), plan.Cell.Combo.Root) {
-			return false
+		if !plan.FreshA {
+			a := ft.FindNode(plan.BaseA)
+			if a == nil || !nodeFitsConstraint(mkNode(a), plan.Cell.Combo.Root) {
+				return false
+			}
 		}
 		return pathRelBetween(plan.BaseA, plan.BaseB) == plan.Cell.Combo.Rel
 	}
@@ -2417,7 +2464,13 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 	p0 := ps[0]
 	insertPos := r.biasedRand(len(p0.Calls)+1, 5)
 	refTime := int64(-1)
-	if insertPos == 0 {
+	if batch.Anchor != nil {
+		if !validateCausalAnchor(p0, batch.Anchor, lcs) {
+			return false
+		}
+		insertPos = batch.Anchor.InsertPos
+		refTime = batch.Anchor.RefTime
+	} else if insertPos == 0 {
 		refTime = 0
 	} else if p0.Calls[insertPos-1].CheckInfo != nil {
 		refTime = int64(p0.Calls[insertPos-1].CheckInfo.Etime) - lcs.tscoffFor(0)
@@ -2432,7 +2485,9 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 		cid0 = hmcfg.Cids[0]
 	}
 	var rootCalls []*Call
-	if batch.Root == "rename" {
+	if batch.Anchor != nil {
+		rootCalls = causalRootCallsSeq(r, sCalls, lcs, hmcfg, clone0, batch)
+	} else if batch.Root == "rename" {
 		if batch.BaseA2 == "" {
 			return false
 		}

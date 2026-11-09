@@ -1408,7 +1408,20 @@ func (mgr *Manager) minimizeCorpus() {
 		inp := ctx.(rpctype.RPCInput)
 		newCorpus[hash.String(inp.Prog...)] = inp
 	}
-	log.Logf(1, "minimized corpus: %v -> %v", len(mgr.corpus), len(newCorpus))
+	dagRetained := 0
+	for sig, inp := range mgr.corpus {
+		if inp.Call != rpctype.DagCall {
+			continue
+		}
+		if _, kept := newCorpus[sig]; kept {
+			continue
+		}
+		if sig[0] < '8' {
+			newCorpus[sig] = inp
+			dagRetained++
+		}
+	}
+	log.Logf(1, "minimized corpus: %v -> %v (dag retained %v)", len(mgr.corpus), len(newCorpus), dagRetained)
 	mgr.corpus = newCorpus
 	mgr.lastMinCorpus = len(newCorpus)
 

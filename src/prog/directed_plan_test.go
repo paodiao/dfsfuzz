@@ -2342,3 +2342,23 @@ func TestPlanStateEffectMkdir(t *testing.T) {
 		t.Fatal("truncate Success must stay a size writer")
 	}
 }
+
+func TestDirectedPlannerKeepsSizeChangingSameOffsetCells(t *testing.T) {
+	target, hmcfg, _, lcs := directedPlanFixture(t)
+	ps := directedPlanBaseProgs(target)
+	plans, _ := planDirectedCells(ps, lcs, hmcfg, newRand(target, rand.NewSource(1)))
+	found := false
+	for _, p := range plans {
+		if p.Cell.Combo.Root != "truncate" || p.Cell.Combo.Rel != PathSame {
+			continue
+		}
+		if !offsetVariants[p.Cell.Combo.Variant] {
+			continue
+		}
+		found = true
+		break
+	}
+	if !found {
+		t.Fatal("truncate-root Same offset cells were filtered out")
+	}
+}
