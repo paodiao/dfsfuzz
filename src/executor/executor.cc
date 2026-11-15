@@ -1230,7 +1230,8 @@ static void wait_hmdfs_peers_ready(void) {
 
 #define RESTORE_BASELINE_HMDFS "/home/baseline/non_account/"
 #define RESTORE_TARGET_HMDFS "/data/service/el2/100/non_account/"
-#define RESTORE_BARRIER_TIMEOUT_MS 120000
+#define RESTORE_START_BARRIER_TIMEOUT_MS 30000
+#define RESTORE_FINISH_BARRIER_TIMEOUT_MS 90000
 
 static int run_restore_cmd(const char *cmd) {
   FILE *f = popen(cmd, "r");
@@ -1320,7 +1321,7 @@ static void restore_start_barrier() {
     if (all_ready)
       return;
     usleep(1000);
-    if (++waited >= RESTORE_BARRIER_TIMEOUT_MS) {
+    if (++waited >= RESTORE_START_BARRIER_TIMEOUT_MS) {
       fprintf(stderr, "executor %lld restore: start barrier timeout\n",
               executor_index);
       fail("restore start barrier timeout");
@@ -1367,7 +1368,7 @@ static void restore_finish_barrier(bool restore_ok) {
       return;
     }
     usleep(1000);
-    if (++waited >= RESTORE_BARRIER_TIMEOUT_MS) {
+    if (++waited >= RESTORE_FINISH_BARRIER_TIMEOUT_MS) {
       fprintf(stderr, "executor %lld restore: finish barrier timeout\n",
               executor_index);
       fail("restore finish barrier timeout");
@@ -1388,7 +1389,7 @@ static bool restore_hmdfs_file_tree() {
     return false;
   }
 
-  if (run_restore_cmd("timeout 30s /root/hmdfs-node-down.sh") != 0)
+  if (run_restore_cmd("timeout 15s /root/hmdfs-node-down.sh") != 0)
     return false;
   if (!wait_hmdfs_agent_exit())
     return false;
@@ -1402,7 +1403,7 @@ static bool restore_hmdfs_file_tree() {
 
   char cmd[4096];
   snprintf(cmd, sizeof(cmd),
-           "timeout 180s rsync -aHAX --numeric-ids --delete "
+           "timeout 60s rsync -a --numeric-ids --delete "
            "--one-file-system --checksum %s %s",
            RESTORE_BASELINE_HMDFS, RESTORE_TARGET_HMDFS);
   if (run_restore_cmd(cmd) != 0)
@@ -1411,7 +1412,7 @@ static bool restore_hmdfs_file_tree() {
     return false;
 
   snprintf(cmd, sizeof(cmd),
-           "timeout 90s /root/%s-node-up.sh %s \"%s\" %lld", dfs_name,
+           "timeout 30s /root/%s-node-up.sh %s \"%s\" %lld", dfs_name,
            init_ip, dfs_setup_params, executor_index);
   if (run_restore_cmd(cmd) != 0)
     return false;
