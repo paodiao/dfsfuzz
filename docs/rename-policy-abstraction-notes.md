@@ -1,6 +1,6 @@
 # Rename Policy 抽象记录
 
-> 状态：设计记录（2026-10-28；2026-11-09 对齐 A+ rename anchor role 边界），暂不实现。
+> 状态：设计记录（2026-10-28；2026-11-09 对齐 A+ rename anchor role 边界；2026-11-15 定 GlusterFS v1 policy/PathSet 迁移，代码待实现）。
 > 范围：rename 的 source/destination 路径规则如何跨文件系统复用。
 > 关联：`docs/seed-derivation-design.md`、`docs/causal-root-cell-design.md`、`docs/cross-node-fresh-path-notes.md`。
 > 本文只记录抽象方向和接口草案，不修改代码。
@@ -143,6 +143,59 @@ Validate:
 
 保持 `rootPre = source`、`rootPost = dest` 的双路径语义不变。
 
+### 4.1 GlusterFS v1 Policy 与 PathSet 迁移
+
+GlusterFS v1 的 policy 更宽松：
+
+```text
+SourceRelations:
+  沿用 anchor→source 的 Same/Parent/Child/Sibling/NoRel；source 子树过滤仍由
+  C1/seed 层负责
+
+DestParentCandidates:
+  source parent
+  其他已存在且不是 source 后代的目录
+
+DestCandidates:
+  fresh child name
+  existing same-class file / empty dir（replace）
+
+Validate:
+  source 存在
+  destination parent 存在
+  source != destination
+  destination 不是 source 后代
+  file -> dir = EISDIR，dir -> file = ENOTDIR
+  dir -> 非空目录 = ENOTEMPTY，dir -> 空目录 = Success
+  file -> existing file = Success（replace）
+  所有路径在测试根/同一 volume 内
+```
+
+PathSet 的 rename 迁移必须在**生成阶段**调用 policy，而不是先 generic
+`mapPathSetPath` 再验证：
+
+```text
+1. mapped existing dst（保持原路径关系）
+2. 其他能保持关系的 existing dst
+3. policy 允许的 fresh dst（parent 为已有目录或同一 plan 中更早的 mkdir）
+4. reject
+```
+
+- existing replace 还要检查目标没有被同一 PathSet 其他成员依赖；精确规则：
+  任一其他成员的 `pathSpec.Path == dst`，或任一 fd-only 成员的 owner 路径
+  `== dst`，就拒绝 existing，改用 fresh；
+- fresh dst 是 total fallback：source parent 在 plan 中有效时，fresh sibling 总能
+  构造；existing dst 不存在不应让 rename 失败；
+- `pathSetFallbackPath` 对 rename dst 不能绕过 policy；无候选就失败；
+- 最终仍跑 `pathSetSpecValid` / `pathSetMemberValid` / `pathSetConnected`；
+- HMDFS policy 只返回 same-parent 候选，PathSet 现有行为不变；
+- GlusterFS policy 允许 cross-parent/fresh/replace；
+- legacy path fallback（`updateCallPathInProg`）的 rename 也调用同一 policy：
+  HMDFS 复现现有 same-parent `._renamed_` suffix 行为，GlusterFS 可选
+  cross-parent/fresh/replace；不能硬编码 HMDFS same-parent。
+- PathSet directed target arm v1 不选 rename；跨目录 rename 只作为 broad
+  relocation 成员。
+
 ---
 
 ## 5. Future DFS Policy
@@ -182,12 +235,16 @@ Validate:
 
 ---
 
-## 7. 当前不做
+## 7. 当前不做 / v1 边界
 
-- 不重构 `renameSameParent`；
-- 不拆分 `pickRenameDst`；
-- 不修改 C1/C2、DCT 或 seed derivation；
-- 不新增跨目录 rename 支持；
-- 不修改测试、论文或 PPT。
+- HMDFS 的 `renameSameParent`/`pickRenameDst` 行为不变；内部可以保留现有实现，
+  由 policy wrapper 调用，不要求先做无行为重构。
+- HMDFS 不新增跨目录 rename。
+- GlusterFS v1 启用跨目录 rename；DCT seed/mutation/derived、C1/C2 和 PathSet
+  的 rename dst 统一走 policy hook，不能各写一套。
+- Policy 只负责 candidate/validate；anchor→root relation、source 子树过滤、
+  C1/C2 cell、PathSet 连通性仍由各自层次负责。
+- 不修改测试、论文或 PPT；测试在实现阶段补。
 
-本记录只固定后续抽象方向：**RenamePolicy = source relation + destination parent candidates + destination candidates + validate**，而不是单一 relation 集合。
+本记录固定抽象边界：**RenamePolicy = source relation + destination parent
+candidates + destination candidates + validate**，而不是单一 relation 集合。

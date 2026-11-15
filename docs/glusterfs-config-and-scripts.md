@@ -1,0 +1,440 @@
+# GlusterFS 配置、初始树与脚本
+
+> 状态：设计定稿（P1 已收敛），代码/脚本未实施
+> 日期：2026-11-15
+> 范围：GlusterFS 3-3 replica 3 的 config、InitialDir 加载、generate_test_files、
+> prefill/restore、node-up/node-down、mount 选项
+> 相关：`docs/glusterfs-adaptation-plan.md`、`docs/executor-file-tree-restore.md`
+
+## 0. 结论摘要
+
+- `enable_syscalls` 固定为 22 个（见 §1）；不启用
+  `readv/writev/preadv/pwritev`，也不做 alias。
+- GlusterFS config **不传 cid**；profile 固定路径所有者为 `shared`。
+- `InitialDir` 仍然要读，但 GlusterFS 只读 `shared.file/.dir/.tmpdir` 和
+  `empty_dirs.info`，不读 `large_dir.info`。
+- `Cids` 由 profile 生成：重复 `"shared"` 到 `ClientNum`；只用于长度兼容，
+  不参与 client identity。
+- `generate_test_files.py` 用唯一 `shared` 作为 node id，输出 `shared.*` 清单；
+  `--num-large-files 0` 时应跳过整个 large-dir 块。
+- baseline 只复制 `shared/` 的内容到 `/home/baseline/glusterfs/`，不要带
+  `shared/` 这层目录。
+- `glusterfs-config.sh` 负责 volume create/start 和 client mount；
+  `glusterfs-node-up.sh` 负责 server glusterd/client remount；
+  `glusterfs-node-down.sh` 只在 failure/crash 场景使用。
+- normal restore 只做 client 侧 `rm -rf + rsync`，不重启 server/volume。
+
+## 1. 3-3 config
+
+新增 GlusterFS 3-3 normal 配置，例如：
+
+```json
+{
+  "target": "linux/amd64",
+  "workdir": "ROOTDIR/fuzzing-dir/",
+  "image": "ROOTDIR/dimage-kernel/glusterfs/focal.qcow2",
+  "sshkey": "ROOTDIR/dimage-kernel/glusterfs/focal.id_rsa",
+  "monarch": "ROOTDIR/src/",
+  "enable_syscalls": [
+    "open", "read", "write", "close", "stat", "pread64", "pwrite64",
+    "fsync", "fdatasync", "truncate", "getdents64",
+    "rename", "mkdir", "rmdir", "creat", "unlink", "chmod",
+    "link", "symlink", "readlink", "getxattr", "setxattr"
+  ],
+  "disable_syscalls": [
+    "bpf$*", "mount", "ioctl$*", "fcntl$setlease", "openat$*", "write$P9*"
+  ],
+  "server_num": 3,
+  "fuzzing_vms": 6,
+  "dfs_name": "glusterfs",
+  "dfs_setup_params": "3 3 'replica 3'",
+  "kernel_server": false,
+  "kernel_client": false,
+  "net_failure": false,
+  "node_crash": false,
+  "enable_csan": true,
+  "enable_c2san": false,
+  "enable_server_feedback": false,
+  "enable_client_feedback": true,
+  "vm": {
+    "cmdline": "net.ifnames=0",
+    "count": 6,
+    "cpu": 2,
+    "mem": 10240,
+    "kernel": "ROOTDIR/dimage-kernel/glusterfs/kernel-5.15-glusterfs-bzImage"
+  }
+}
+```
+
+约束：
+
+- `server_num + client_num == fuzzing_vms == vm.count == len(Executor)`；
+- `DfsSetupParams` 的第一个数是 server 数，第二个数是 client 数；
+- GlusterFS 必须有至少 1 个 client，且 client 数不超过 `MAXCLT=3`；
+- `enable_syscalls` 必须与上面的 22 个逐字一致；profile 启动校验遇到
+  `readv/writev/preadv/pwritev`、at 变体或其它列表外调用时报告
+  unsupported/ignored，不能静默保留；
+- v1 不启用 mknod、stash、dcache、persistence、failure/C2san；
+  C2san 代码未完成，HMDFS 当前也未启用；GlusterFS 不把它作为能力开关；
+- `data.img` 仍只挂 server，但当前不使用；brick 在 server rootfs；
+- `initial_dir` 指向 manifest 目录，而不是 baseline 树目录。
+
+推荐的 manifest 目录布局：
+
+```text
+<InitialDir>/
+  shared.file
+  shared.dir
+  shared.tmpdir
+  empty_dirs.info
+```
+
+`large_dir.info` 不放在 GlusterFS manifest 目录；即使存在也由 profile 忽略。
+
+## 2. generate_test_files
+
+### 2.1 命令
+
+在 host 上生成一棵共享树：
+
+```bash
+python3 HorcruxSourceCode/generate_test_files.py shared \
+  --num-large-files 0 \
+  --seed 1
+```
+
+可选参数按需要调整：
+
+```text
+--num-files
+--num-dirs
+--max-depth
+--num-empty-dirs
+```
+
+GlusterFS 不使用：
+
+```text
+large_dir.info
+Persistence_dir
+Node_idx_of_persistence
+```
+
+### 2.2 输出
+
+脚本当前输出：
+
+```text
+HorcruxSourceCode/
+  shared/                 # 实际文件树
+  shared.file             # 相对路径 + 大小
+  shared.dir              # 普通目录
+  shared.tmpdir           # 中间目录
+  empty_dirs.info         # node_id: shared + 空目录列表
+  large_dir.info          # 当前会生成，GlusterFS 应跳过
+```
+
+`shared.file` 的路径相对于 `shared/`，例如：
+
+```text
+Eris_xxx_123.txt 1024
+dirA/Eris_yyy_456.txt 4096
+```
+
+`shared.dir` / `shared.tmpdir` / `empty_dirs.info` 也是相对路径。
+
+### 2.3 脚本需要的小改动
+
+1. **`num_large_files <= 0` 跳过整个 large-dir 块**  
+   当前即使 `--num-large-files 0` 也会创建空 large directory 并写
+   `large_dir.info`。GlusterFS 不需要这一块。
+
+2. **可选 `--shared` 校验**  
+   设置 `--shared` 时强制：
+
+   ```python
+   node_ids = ["shared"]
+   ```
+
+   并跳过 large-dir。这样调用方不会误传多个 cid。不是文件名映射必需；
+   文件名本来就会按唯一 node id 生成。
+
+3. **保持 `shared.file/.dir/.tmpdir` 文件名**  
+   不需要在脚本里硬编码 `shared` 的特殊分支；唯一 node id 自然得到统一文件名。
+
+### 2.4 baseline 复制
+
+脚本输出 `shared/` 树和清单。复制到 client 镜像时：
+
+```bash
+# 正确：复制 shared/ 的内容
+cp -a HorcruxSourceCode/shared/. /path/to/client-image/home/baseline/glusterfs/
+
+# 错误：会把 shared/ 这层目录带进去，manifest 相对路径会错位
+cp -a HorcruxSourceCode/shared /path/to/client-image/home/baseline/glusterfs/
+```
+
+清单文件放在 `InitialDir` 指向的 host 目录，供 manager/fuzzer 加载。
+
+baseline 保留空目录，但不含 xattr/symlink/hardlink；运行期创建的链接由每轮
+restore 清掉，不写回 FileTree。
+
+## 3. InitialDir 加载
+
+### 3.1 HMDFS
+
+保持现状：
+
+- 对每个 cid 读 `<cid>.file/.dir/.tmpdir`；
+- 路径加 `merge_view/`；
+- 读 `empty_dirs.info`；
+- 读 `large_dir.info`，初始化 `Persistence_dir`、
+  `Node_idx_of_persistence`；
+- `FileTree` owner 使用 cid。
+
+### 3.2 GlusterFS
+
+新增 profile 分支：
+
+- 只读 `shared.file/.dir/.tmpdir`；
+- 只读 `empty_dirs.info`，其中 `node_id: shared`；
+- 不读 `large_dir.info`；
+- 路径不加 `merge_view/`，直接使用相对路径；
+- `Init_file["shared"]`、`Init_dir["shared"]`、`Init_tmpdir["shared"]`、
+  `Init_empty_dir["shared"]`、`FileSize["shared"]`；
+- `FileTree` 使用空前缀，owner=`shared`；
+- `FileTree` 只加载普通文件/目录/空目录/TmpDir，不加载也不建模
+  symlink/hardlink；
+- `Cids` 重复 `"shared"` 到 `ClientNum`，但只加载一次 shared 清单；
+- `Node_idx_of_persistence=-1`，`Persistence_dir=""`；
+- `File_in_persistence_dir` 为空。
+
+### 3.3 加载伪代码
+
+```go
+func LoadInitialTree(cfg *DFSConfig, initDir string) error {
+    switch cfg.Profile.Name {
+    case "hmdfs":
+        return loadPerCidInitialTree(cfg, initDir, "merge_view/")
+    case "glusterfs":
+        return loadSharedInitialTree(cfg, initDir, "")
+    default:
+        return loadSharedInitialTree(cfg, initDir, "")
+    }
+}
+```
+
+`loadSharedInitialTree` 只处理：
+
+```text
+shared.file
+shared.dir
+shared.tmpdir
+empty_dirs.info
+```
+
+`InitFromConfig` 对 shared owner 去重，避免 `Cids` 重复导致重复 `addNodeLocked`。
+
+### 3.4 空目录和 large dir
+
+- `empty_dirs.info` 是全局文件名，内容按 `node_id: shared` 分组；
+- GlusterFS 只接受 `shared` 组；
+- `large_dir.info` 不进入盘；如果存在，profile 直接忽略并记录日志；
+- 不初始化 persistence/dcache；persistence 不是 seed family，GlusterFS 只是
+  关闭 `Persistence_dir`/`Node_idx_of_persistence` 和 coverage 的 persist 维度。
+
+## 4. prefill 与 restore
+
+### 4.1 prefill
+
+只在 volume 首次挂载后执行一次：
+
+```bash
+#!/bin/sh
+set -e
+TARGET=/root/glusterfs-client/eifuzz_root
+BASELINE=/home/baseline/glusterfs/
+
+mkdir -p "$TARGET"
+rm -rf "$TARGET"/*
+timeout 60s rsync -a --numeric-ids --delete \
+  "$BASELINE" "$TARGET"/
+sync
+```
+
+要求：
+
+- 由 client1（3-3 下 `executor_index == 3`）执行；
+- 其他 client 等 prefill finish barrier；
+- prefill 和每轮 restore 使用同一份 baseline；
+- 不直接写 server brick。
+
+### 4.2 normal restore
+
+每次 `receive_execute` 前（含普通 fuzz、triage、light、DAG replay）：
+
+```text
+reset client: rm -rf /root/glusterfs-client/eifuzz_root
+               timeout 60s rsync baseline -> eifuzz_root
+               sync
+other clients: wait restore finish barrier
+server:        wait barrier only; no restore, no volume stop/start
+```
+
+GlusterFS restore barrier：start 30s、finish 90s；metadata delay 10s 起步；
+不使用 `rsync --timeout=300`。详见 `glusterfs-adaptation-plan.md` §10.4。
+
+规则：
+
+- normal restore 不调用 `glusterfs-node-down.sh`；
+- 不重启 glusterd/volume；
+- 不恢复 server brick；
+- `is_restarting` 的 crash recovery 路径跳过 restore；
+- restore 失败时 barrier 统一失败，不允许在未恢复状态执行；
+- 每轮 restore 后 FileTree 保持 baseline；`SyncFileTreeFromFsMd` 停用，fsMd
+  只用于 CSAN/DAG。
+
+### 4.3 crash/failure
+
+当前 v1 不启用 failure/C2san/NetFailure/NodeCrash。C2san 代码未完成，
+HMDFS 当前也未启用；NodeCrash 在 HMDFS 代码中存在，但当前 config 为 false。
+
+未来 failure 模式才允许：
+
+- client `umount`；
+- server `systemctl restart glusterd`；
+- `glusterfs-node-down.sh`；
+- 重新 `glusterfs-node-up.sh`。
+
+## 5. 脚本参数
+
+### 5.1 glusterfs-config.sh
+
+参数：
+
+```text
+$1 start_ip
+$2 srv_cnt
+$3 client_cnt
+$4 mode
+```
+
+职责：
+
+- 启动/重启所有 server 的 glusterd；
+- peer probe；
+- `gluster volume create test-volume <mode> ... force`；
+- `gluster volume start test-volume force`；
+- volume 性能选项；
+- 在每个 client 上挂载：
+
+```bash
+mount -t glusterfs \
+  -o attribute-timeout=0,entry-timeout=0 \
+  $start_ip:/test-volume /root/glusterfs-client
+```
+
+当前脚本的 `mount ... glusterfs-client` 相对路径要统一为绝对路径。
+挂载完成后增加 client mount barrier；不能只依赖 `popen` 返回。
+
+### 5.2 glusterfs-node-up.sh
+
+统一参数：
+
+```text
+$1 start_ip
+$2 srv_cnt
+$3 client_cnt
+$4 mode
+$5 cur_idx
+```
+
+server：
+
+```bash
+systemctl restart glusterd
+```
+
+client：
+
+```bash
+umount -f /root/glusterfs-client
+mkdir -p /root/glusterfs-client
+mount -t glusterfs \
+  -o attribute-timeout=0,entry-timeout=0 \
+  $start_ip:/test-volume /root/glusterfs-client
+```
+
+当前 executor 的 `node-up` 调用是 HMDFS 参数格式：
+
+```text
+node-up.sh start_ip "<dfs_setup_params>" cur_idx
+```
+
+对 GlusterFS 会错位。必须由 `DfsRuntimeOps::node_up_command` 按 profile 生成：
+
+```text
+node-up.sh start_ip srv_cnt client_cnt "mode" cur_idx
+```
+
+### 5.3 glusterfs-node-down.sh
+
+当前脚本只 kill gluster 进程；需要区分角色：
+
+- client：`umount -f /root/glusterfs-client`；
+- server：仅 failure/crash 模式重启 glusterd 或 kill；
+- normal restore 不调用。
+
+### 5.4 executor cwd/metadata
+
+- client cwd：`/root/glusterfs-client/eifuzz_root`
+- server cwd：`/root`
+- client metadata root：`/root/glusterfs-client/eifuzz_root`
+- server metadata：跳过
+- `testdirIno`：client cwd 的 `st_ino`
+- trace：client-only
+- 路径模型：所有调用参数是相对测试根的 canonical 路径；`symlink` target 在
+  调用物化时转换为相对 linkpath 父目录的 payload；target 必须在测试根内。
+  PathSet/DCT/`RootPaths` 只保存 canonical target，不保存 payload。
+
+### 5.5 executor timing
+
+timing 由 profile 解析，HMDFS 现有值不变：
+
+| 项 | HMDFS | GlusterFS v1 |
+|---|---|---|
+| metadata delay | 30s | **10s** |
+| agent ready | 30s | no-op |
+| peer/settle | 3×3s / 3s | no-op / 0 |
+| startup barrier | stagger + 30s | client mount barrier 60s |
+| restore start/finish barrier | 30s / 90s | 30s / 90s |
+| rsync 总超时 | 60s | 60s |
+| node-down/node-up | 15s / 30s | normal restore 不调用 |
+
+- `MetadataDelayMs` config 未显式设置时取 profile 默认值，显式值优先；
+- GlusterFS rsync 命令为 `timeout 60s rsync -a --numeric-ids --delete ...`；
+- 完整字段表见 `glusterfs-adaptation-plan.md` §10.4。
+
+## 6. 验收
+
+- 3-3 config 启动后：
+  - `enable_syscalls` 与 §1 的 22 个一致，没有 `readv/writev/preadv/pwritev`；
+  - executor 0–2 没有 fuzz 程序；
+  - executor 3–5 cwd 指向 `eifuzz_root`；
+  - `mount` 选项包含 `attribute-timeout=0,entry-timeout=0`；
+  - `InitialDir` 只加载 shared 清单；
+  - FileTree 中没有 server cid，也没有 link/symlink 节点；linkpath 只在
+    program-local bindings；所有调用路径是相对测试根 canonical 路径，
+    symlink target 在调用物化时转 payload 且不逃出测试根；
+  - `large_dir.info` 未被读取；
+  - prefill 后 baseline 内容在 volume 根；
+  - 每次 execute 前 restore 后树回到 baseline（含 triage/light）；server 只
+    参与 barrier；FileTree 保持 baseline，`SyncFileTreeFromFsMd` 停用；
+  - metadata delay 未显式配置时取 GlusterFS profile 的 10s，rsync 总超时 60s，
+    restore barrier 30s/90s；
+  - server fsMd 不进入 CSAN；
+  - A 类字段检查通过。
+- HMDFS config 回归：
+  - 仍按 cid 加载；
+  - `merge_view` 前缀不变；
+  - `large_dir.info`/persistence 仍只对 HMDFS 生效。

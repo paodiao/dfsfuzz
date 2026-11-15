@@ -1,6 +1,6 @@
 # 因果根与 root→variant 两层种子构造设计
 
-> 状态：设计定稿（2026-10-27）；普通/fd/fresh/rename root、FreshB、C2 combo filter、完整 pre/post relation 已实现；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-10-28 补充 C1 anchor PathKind、fresh anchor 关系矩阵、C2 fresh-parent 与 `open(O_CREAT)` 支持；已实现，Ubuntu runtime 待验证。2026-11-09 设计复核：补充 rename anchor 的 source 子树 root path 约束、1 层 fresh/nested fresh parent 边界、C2 FreshA normal parent 的 `aEligible` 防御，并把 anchor success 偏好文档与当前实现对齐；复核项代码已落，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。
+> 状态：设计定稿（2026-10-27）；普通/fd/fresh/rename root、FreshB、C2 combo filter、完整 pre/post relation 已实现；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-10-28 补充 C1 anchor PathKind、fresh anchor 关系矩阵、C2 fresh-parent 与 `open(O_CREAT)` 支持；已实现，Ubuntu runtime 待验证。2026-11-09 设计复核：补充 rename anchor 的 source 子树 root path 约束、1 层 fresh/nested fresh parent 边界、C2 FreshA normal parent 的 `aEligible` 防御，并把 anchor success 偏好文档与当前实现对齐；复核项代码已落，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 的 link/symlink target/linkpath、canonical/payload、readlink follower 与 PathSet 双路径边界。
 > 范围：`PickDirectedBatch` 的根节点因果锚定、固定 root 的 variant 规划、rename 支持。
 > 术语：本文的 C1/C2 指 causal 两层（anchor→root、root→variant），不是论文中的 C1/C2 两个挑战。
 > 关联：Seed 纯派生设计见 `docs/seed-derivation-design.md`；PathSet/数据/删除部分见 `docs/seed-construction-causal-chain-notes.md`；本文不修改论文或 PPT。
@@ -295,6 +295,50 @@ nested fresh parent 限制（2026-11-09 复核）：
 - C1 `addFreshPlan` 不应使用 `freshPathParentEligible` 放宽 nested；应与 C2 一样使用 `freshParentNodeEligible`；
 - `freshPathParentEligible` 是 future nested fresh helper；当前 C1/C2/seed derivation 生产路径均使用 `freshParentNodeEligible`，不重新引入 nested fresh 前不得作为生产 gate；
 - 2026-11-09 已修正：C1 与 C2 的 fresh-root parent 均按 1 层 fresh 处理，不再出现 C1 过度接受 nested、C2 拒绝的不一致。
+
+#### 2.5.1 GlusterFS v1：link / symlink / readlink
+
+GlusterFS v1 的链接路径分两层：
+
+```text
+link:     target = 测试根内普通文件 canonical（baseline existing，或同一程序/plan
+                  更早 creator 的 fresh 路径）
+          linkpath = fresh binding（可在任意已有父目录）
+
+symlink:  target = 测试根内文件/目录 canonical（baseline existing，或同一程序/plan
+                  更早 creator 的 fresh 路径）
+          linkpath = fresh binding（可在任意已有父目录）
+          payload = relpath(target, dirname(linkpath))
+
+readlink: path = symlink 的 linkpath
+          返回 payload，不独立选择 target
+```
+
+规则：
+
+- `AnchorPathKind` 增加 `AnchorPathFreshSymlink`；`anchorPathInfo`/`seedAnchor`
+  增加 `FollowIsDir`，但 fresh symlink 本身不作为目录 parent。
+- `collectSeedAnchors` 同时收集 link/symlink 的 target 和 linkpath 两个 role；
+  `symlink` 的 arg0 是 payload，必须用 `symlinkCanonicalTarget(linkpath, payload)`
+  还原 canonical target。
+- `causalAnchor` 的兼容投影：
+  ```text
+  link:    Path=linkpath, Source=target, Dest=linkpath
+  symlink: Path=linkpath, Source=target, Dest=linkpath
+  readlink: 不做 C1 anchor
+  ```
+- C1/C2 cell 的 B 侧使用 target；linkpath 只用于生成/readlink，不进 cell。
+- link/symlink target 是 **anchor 关系派生** 的 canonical 路径，不是 fixed
+  baseline；映射/迁移后必须仍在测试根内、存在且类型匹配。
+- `RootPaths`/`seedAnchor`/PathSet 只保存 canonical target；symlink payload
+  只在构造调用时生成。
+- `readlink` 只读一跳；DAG/checker 用 `linkpath + payload` 还原 canonical
+  target，不能把 payload 当 FileTree 路径。
+- 禁止嵌套链接：link/symlink target 不能是已有 linkpath/symlink。
+- PathSet broad 的 link/symlink/readlink 双路径规则见
+  `docs/seed-construction-causal-chain-notes.md` §1.5；C1/C2 不另写一套绑定逻辑。
+- C2 FreshB/FreshSame、fresh root + fresh child、nested fresh parent 的限制不变；
+  GlusterFS v1 不扩展这些形态。
 
 ### 2.6 Rename anchor 的 root 路径时间语义
 
@@ -601,6 +645,11 @@ C1 已选出但 C2 失败时，不把 C1 cell 记为 miss。
 - `open` 无 `O_CREAT` / 路径已存在 / `O_TMPFILE` -> 不按 fresh 处理；
 - `open O_CREAT` 不进入 C1 anchor 候选，后续 modifier 可使用该路径；
 - 后续 modifier anchor 通过更早的 `open O_CREAT`/mkdir/creat/rename creator 分类为 fresh；
+- GlusterFS link/symlink anchor：target/linkpath 两个 role 都收集；C1 cell 只用 target；
+- link/symlink target 由 anchor 关系派生，不是 fixed baseline；映射后仍在测试根内；
+- symlink payload 由 canonical target/linkpath 计算，解析后不逃出测试根；
+- readlink 跟随 symlink linkpath；payload 能还原 canonical target；
+- PathSet broad 双路径 link/symlink/readlink/rename 与 rename policy 顺序回归；
 - both fresh Child：`RootParent == anchor.Path` 的 fresh parent validation 通过；
 - C2 both-fresh Child：`planCausalC2Cells` 接受同一 anchor path 的 fresh dir parent；
 - C2 both-fresh Child：`validateCausalPlan` 的 `FreshA` 放行同一 fresh parent；

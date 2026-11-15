@@ -1,6 +1,6 @@
 # 跨节点 fresh 路径插入记录
 
-> 状态：设计记录 / 已知边界（2026-10-28；2026-11-09 对齐 seed derivation / derived insertion），跨节点 fresh child 仍暂不实现。
+> 状态：设计记录 / 已知边界（2026-10-28；2026-11-09 对齐 seed derivation / derived insertion；2026-11-15 增加 GlusterFS v1 决策），跨节点 fresh child 仍暂不实现。
 > 范围：C2（固定 root 的 variant 规划）与 DCT/derived 跨节点插入中的 fresh 路径。
 > 关联：`docs/causal-root-cell-design.md`、`docs/seed-derivation-design.md`。
 > 本文只记录现状、边界和待研究项，不修改 C1/C2/DCT 代码或现有设计文档。
@@ -146,6 +146,25 @@ fresh same-path 与 fresh child 分开处理：
   - fresh root child：待跨节点可见性模型确定后再设计。
 ```
 
+### 5.1 GlusterFS v1
+
+GlusterFS 是共享 volume，但 v1 仍按上面的保守规则执行：
+
+- 不实现 C2/DCT 的 fresh root + fresh child；root 在 node 0 创建目录、variant
+  在 node X 创建 child 的组合不生成；
+- `FreshSame` 只保留现有 `creat`/`mkdir` 固定形态；
+- `FreshB` 只允许 baseline 已有 parent；fresh sibling 的 parent 必须已存在；
+- C1 both-fresh Child 只支持同一 p0/C1+C2 本地链路；
+- 只支持 1 层 fresh：fresh anchor/root 的 parent 必须在 FileTree 中已存在；
+  nested fresh parent 不生成；
+- `open(O_CREAT)` 作为 anchor path 的 fresh file creator 可以使用，但不新增
+  fresh-root + fresh-child 的 C2/DCT 形态；
+- PathSet 迁移 fresh path 后仍走同一 `freshParentNodeEligible`/
+  `pathSetPlanParentValid` 校验，不因为 GlusterFS 共享 volume 放宽。
+
+理由：`HB` 只表达时间意图，不保证目录已跨 client 可见；共享 volume 的缓存/xattr
+异步状态也不能替代可见性证明。等跨节点可见性模型和 runtime 测试完成后再放开。
+
 ---
 
 ## 6. 后续测试清单
@@ -162,7 +181,9 @@ fresh same-path 与 fresh child 分开处理：
 - `insertDerivedCallFromDCT` 的 fresh base / rename destination 跨节点负向测试；
 - nested fresh parent 不生成 fresh-root / both-fresh Child related plan 的负向测试；
 - fresh base rename source 的跨节点行为测试；
-- 跨节点 parent 可见性/时序的 runtime 测试，需 Ubuntu 环境。
+- 跨节点 parent 可见性/时序的 runtime 测试，需 Ubuntu 环境；
+- GlusterFS v1 负向测试：C2/DCT fresh root + fresh child 不生成；
+- GlusterFS v1 正向测试：FreshSame、FreshB、C1 本地 both-fresh 1 层仍生成。
 
 ---
 

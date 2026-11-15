@@ -1,9 +1,9 @@
 # Triage / Minimize 重设计
 
-> 状态：Go 侧已实现，待运行验证
+> 状态：Go 侧已实现，待运行验证；2026-11-15 补充 GlusterFS v1 profile/gate 说明
 > 日期：2026-11-08
 > 范围：coverage/DAG triage、WorkTriage、minimize、dedup、corpus 合并
-> 相关：`docs/executor-file-tree-restore.md`
+> 相关：`docs/executor-file-tree-restore.md`、`docs/glusterfs-adaptation-plan.md` §10.5
 
 ## 0. 摘要
 
@@ -676,6 +676,23 @@ MaxDagCorpus 检查
 - 删除 `execOptsLightMinimize`、`signalRuns`、`minimizeAttempts`、`notexecuted`；
 - 删除旧的 3 次 signal / 3 次 coverage 循环；
 - 保留 `addInputToCorpus`、`totalLen` 兜底、`WorkSmash`、`cltTick`。
+
+### 7.6 GlusterFS v1 profile/gate
+
+本文的 triage/minimize 算法本身是 DFS 无关的，GlusterFS 只补 profile/gate：
+
+- `EnableDagFb`、DAG build、coverage board 初始化不能只对
+  `DFSName == "hmdfs"` 开启；GlusterFS 同样启用。
+- DAG 只消费 client events（`infos[ServNum:]`），过滤 server slots。
+- `directDagTriage` 的 `subNum` 是绝对 executor index；第一个非 nil client
+  就是 DAG feedback 的 owner。
+- server programs 为空，`serverTargets` 自然为空；不能把 server slot 当成
+  client target。
+- `MaxDagCorpus`、`DagCall`、`saturatedCalls["dag"]` 保持全局语义，不做
+  per-DFS 特判。
+- `minimizeCorpus` 的 DAG 保留策略不改。
+- `WorkTriage` target list 仍然按同一侧聚合；client/server 不混在一个 list 里。
+- minimize 已全局停用，不再为 GlusterFS 增加 client-view minimize 分支。
 
 ## 8. 验证
 

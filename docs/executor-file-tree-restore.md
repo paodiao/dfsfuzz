@@ -1,18 +1,26 @@
 # Executor 文件树恢复设计
 
-> 状态：代码已写入，待 Linux 编译与实测；方案为离线 rsync  
-> 日期：2026-11-08  
+> 状态：HMDFS 代码已写入，待 Linux 编译与实测；GlusterFS 恢复/角色细节见总计划
+> 日期：2026-11-08（2026-11-15 补充 GlusterFS runtime/initial loading/role 决策）
 > 范围：executor 每次执行前的文件树恢复；triage/minimize 简化；corpus 时间线保留  
-> 相关：`docs/glusterfs-nfs-adaptation-plan.md`、`docs/seed-optimization-plan.md`
+> 相关：`docs/glusterfs-adaptation-plan.md`、`docs/glusterfs-config-and-scripts.md`、`docs/glusterfs-tracer-implementation-spec.md`、`docs/seed-optimization-plan.md`
+>
+> 2026-11-15 修订：GlusterFS normal restore 只做 client 侧 `rm -rf + rsync`；
+> 不重启 server/volume；`glusterfs-node-down.sh` 只在 failure/crash 使用；
+> executor 使用 `DfsRuntimeOps`，cwd 为 `/root/glusterfs-client/eifuzz_root`，
+> server 跳过 metadata/trace；初始树加载使用 shared 清单，不读 `large_dir.info`。
+> `restore_initial_file_tree` 在每次 `receive_execute` 前执行（含 triage/light），
+> 不只是普通 fuzz round；server 只参与 barrier，FileTree 始终是 baseline。
 
 ## 0. 摘要
 
 - 恢复点放在 **executor 的每次 `receive_execute()`**，不是 Go 侧 triage/minimize。
-- 每次执行前恢复到每个节点自己的 baseline；不区分普通 fuzz、triage、coverage 采集或其它执行类型。
-- 每个 VM 的 baseline 内容不同，但 VM 内路径相同。
+- 每次执行前恢复到 baseline；不区分普通 fuzz、triage、coverage 采集或其它执行类型。
+- HMDFS 每个 VM 的 baseline 内容可以不同，但 VM 内路径相同。
 - HMDFS baseline 映射：`/home/baseline/non_account/` -> `/data/service/el2/100/non_account/`。
-- 未来其他 DFS 使用 `/home/baseline/<dfs-specific-dir>/`，分别映射到各自的恢复目标。
-- 采用离线 unmount/remount + rsync，不使用 QEMU/qcow2 快照。
+- GlusterFS 使用所有 client 共享的一份 baseline：`/home/baseline/glusterfs/`。
+- HMDFS 采用离线 unmount/remount + rsync，不使用 QEMU/qcow2 快照。
+- GlusterFS 不使用本文件的 HMDFS brick 恢复方案；采用 client-side logical restore：固定测试根、单个 reset client、baseline `rm -rf + rsync`，不恢复 server brick。详见 `glusterfs-nfs-adaptation-plan.md` §2.9 和 §4.4。
 - 多节点 restore 使用独立 `restoreStart` / `restoreState` barrier，不复用 `srvSetupBit`。
 - `is_restarting` 的 crash recovery 路径跳过整个 restore；该路径恢复同一个 testcase，不能把崩溃现场恢复到 baseline。
 - `barrierCount` / `syz_failure_barrier()` 属于 guest 程序级同步，不属于 restore 生命周期；当前不注入该伪调用，本轮不改。
@@ -45,8 +53,7 @@
 
 ### 1.3 非目标
 
-- 本文不实现恢复机制本身；
-- 本文不实现 GlusterFS/NFS 的具体恢复脚本；
+- 本文只记录 HMDFS 的恢复实现；GlusterFS/NFS 的具体恢复见 `glusterfs-nfs-adaptation-plan.md` §2.9；
 - 本文不修改 `prog.Minimize` 的实现源码；
 - 本文不改变 DAG、FileTree、覆盖板的语义。
 
@@ -138,7 +145,7 @@ GlusterFS/HMDFS 是多节点文件系统。若每个 executor 收到请求后各
 - Go 侧在 `executeControl` 中同步增加 `restoreState [64]byte` 和 `restoreStart [64]byte`；
 - start barrier：每个节点置 `restoreStart=1`，等待所有节点都等于 `1`；
 - finish barrier：每个节点置 `restoreState=2` 或 `3`，等待所有节点都 `>=2`；
-- barrier 超时建议 120 秒，超时让本轮失败；
+- start barrier 超时 **30 秒**，finish barrier 超时 **90 秒**；超时让本轮失败；
 - readiness 超时记录日志和耗时；默认继续，strict 模式才失败（见 3.4）；
 - barrier 通过后再创建测试目录/`chdir`。
 
@@ -153,6 +160,9 @@ GlusterFS/HMDFS 是多节点文件系统。若每个 executor 收到请求后各
 - peer readiness 放在 finish barrier 之后执行，等所有节点完成 mount/agent 启动后再统一检查；
 - 若统计显示每轮恢复经常超时，再启用 strict 模式：超时让本轮失败，可重试一轮；
 - strict 模式作为可选开关，不改变当前运行语义。
+- 这些等待只属于 HMDFS：GlusterFS 下 agent/peer/settle 全部 no-op，
+  不执行 `wait_hmdfs_agent_ready()` / `wait_hmdfs_peers_ready()`，改用
+  client mount barrier；timing 由 profile 决定，见总计划 §10.4。
 
 ## 4. 恢复方式：离线 unmount/remount + rsync
 
@@ -174,16 +184,16 @@ baseline 映射：
 restore start barrier
 sync
 chdir("/")
-timeout 30s /root/hmdfs-node-down.sh
+timeout 15s /root/hmdfs-node-down.sh
 wait_hmdfs_agent_exit()
 umount2(mnt_dir, MNT_DETACH) 校验
 sync
-timeout 180s rsync -aHAX --numeric-ids --delete --one-file-system --checksum \
+timeout 60s rsync -a --numeric-ids --delete --one-file-system --checksum \
       /home/baseline/non_account/ \
       /data/service/el2/100/non_account/
 sync
 echo 3 > /proc/sys/vm/drop_caches
-timeout 90s /root/hmdfs-node-up.sh <init_ip> "<dfs_setup_params>" <executor_index>
+timeout 30s /root/hmdfs-node-up.sh <init_ip> "<dfs_setup_params>" <executor_index>
 wait_hmdfs_agent_ready()
 if (executor_index == vm_count - 1)
     usleep(HMDFS_SETTLE_MS * 1000)
@@ -197,12 +207,17 @@ wait_hmdfs_peers_ready()
 - 复用 `/root/hmdfs-node-down.sh` 和 `/root/hmdfs-node-up.sh`，不要重复 mount 参数；
 - node-down 后等待旧 agent 退出（最多 5 秒），避免旧 agent 与新 agent/rsync 竞争；
 - node-down 后必须用 `umount2` 或 mount 状态检查确认挂载点已卸载；`umount -l` 失败不能静默继续；
-- restore 命令加 timeout，避免 rsync/mount 卡死；
+- restore 命令加 timeout，避免 rsync/mount 卡死；当前为 node-down 15s、rsync 60s、node-up 30s，start/finish barrier 分别为 30s/90s；
+- HMDFS baseline 不含 xattr、ACL、hardlink、symlink，且 fuzz 调用面未启用相关 syscall，因此 rsync 不需要 `-H/-A/-X`；`-a` 已包含权限、时间、owner/group 和空目录。
+- 第一版保留 `--checksum` 作为数据正确性基线；若实测发现其开销明显，再评估去掉。`--delete` 已启用时不需要 `--force`。
 - peer readiness 在 finish barrier 之后执行；
 - `is_restarting` 的 recovery 路径跳过 restore，保留 crash 现场；
 - `barrierCount` / `syz_failure_barrier()` 不纳入 restore 生命周期；当前不注入该伪调用；
-- 第一版只实现 HMDFS；其他 DFS 的 restore 直接返回成功；
-- 未来其他 DFS 使用 `/home/baseline/<dfs-specific-dir>/` 作为 baseline；
+- HMDFS restore 已实现；GlusterFS 按 §4.4 做 client-side logical restore；
+  NFS 暂不实现；
+- 非 HMDFS 使用 `/home/baseline/<dfs-specific-dir>/` 作为 baseline；
+- `restore_initial_file_tree`、cwd、metadata、trace、config、node-up/down 统一走
+  `DfsRuntimeOps`（见 `glusterfs-adaptation-plan.md` §10），不要保留 HMDFS-only 分支；
 - 镜像必须包含 `rsync`。`create-image-new.sh` 和 `create-image.sh` 都已加入 `rsync` 和 `iptables`。
 
 ### 4.2 未采用备选：QEMU/qcow2 快照回滚
@@ -226,8 +241,60 @@ wait_hmdfs_peers_ready()
 - 恢复必须覆盖本轮会读写的所有节点；
 - 只恢复 client 可见目录不等于恢复分布式 FS 状态；
 - restore 命令失败不能静默继续；readiness 超时按 3.4 的 soft/strict 策略处理；
-- GlusterFS 不能只恢复单个 client 目录，server/brick 状态也要覆盖；
+- GlusterFS 第一版采用 client-side logical restore，只重置客户端可见命名空间，不恢复 server brick；详见 `glusterfs-nfs-adaptation-plan.md` §2.9。若出现 server 侧残留导致不可复现，再评估 brick-level restore。
 - NFS 要覆盖 client 挂载点和 server 导出状态。
+
+### 4.4 GlusterFS prefill 与 restore
+
+GlusterFS 的 baseline 烤在 client 镜像中：
+
+```text
+/home/baseline/glusterfs/
+```
+
+prefill 在 volume 挂载后只执行一次，由 client1 执行：
+
+```bash
+rm -rf /root/glusterfs-client/eifuzz_root
+mkdir -p /root/glusterfs-client/eifuzz_root
+timeout 60s rsync -a --numeric-ids --delete \
+  /home/baseline/glusterfs/ \
+  /root/glusterfs-client/eifuzz_root/
+sync
+```
+
+每轮 restore 复用同一份 baseline 和同一命令。reset client 固定为：
+
+```text
+executor_index == server_num
+```
+
+3-3 下即 index 3。其他 client 只参与 barrier，server 不执行 restore。
+
+约束：
+
+- 不把树直接写进 server brick 或 `data.img`；GlusterFS 需要正确的 GFID/xattr/replica 元数据。
+- 旧 `dfs-*`、`lost+found` 和 server brick 路径不进入 FileTree/CSAN。
+- prefill 和 restore 共用 baseline，避免 prefill 树与恢复树漂移。
+- prefill 幂等：先清空固定测试根，再 rsync。
+- GlusterFS rsync 总超时 60s，不使用 `--timeout=300`；restore finish
+  barrier 90s，start barrier 30s。详见 `glusterfs-adaptation-plan.md` §10.4。
+- GlusterFS baseline 约 100 文件，restore 不应比 HMDFS 的 1000 文件大目录
+  给更长超时。
+- GlusterFS baseline 不含 symlink/hardlink/xattr；运行期创建的链接由
+  `rm -rf + rsync` 清掉，FileTree 始终是 baseline，不把 linkpath 写回树。
+- normal restore 不重启 server/volume，不调用 `glusterfs-node-down.sh`；
+  node-down 只在 failure/crash 场景使用。
+- restore 在每次 `receive_execute` 前执行，包括 triage/light/DAG replay；
+  server 只参与 restore barrier，不执行 rm/rsync；client 中只有 reset client
+  执行 rm/rsync，其他 client 等 barrier。
+- 恢复后 FileTree 保持 baseline；`SyncFileTreeFromFsMd` 停用，`fsMd` 只用于
+  CSAN/DAG，不回写 FileTree。
+- `restore_initial_file_tree`、cwd、metadata、trace、config、node-up/down 统一走
+  `DfsRuntimeOps`，不要只保留 HMDFS 分支；见 `glusterfs-adaptation-plan.md` §10。
+- InitialDir 对 GlusterFS 只加载 `shared.file/.dir/.tmpdir` 和 `empty_dirs.info`，
+  不加载 `large_dir.info`；baseline 只复制 `shared/` 的内容。详见
+  `glusterfs-config-and-scripts.md` §2–§3。
 
 ## 5. fuzzer 侧简化
 
@@ -295,7 +362,8 @@ minimize 候选执行数为 0。
 
 ### 5.5 停用 fuzzer 侧 SyncFileTreeFromFsMd
 
-前提：`InitialDir` 的 manifest 与每个 VM 的 `/home/baseline/non_account` 完全一致。
+前提：`InitialDir` 的 manifest 与每个 VM 的 baseline 完全一致：
+HMDFS `/home/baseline/non_account`，GlusterFS `/home/baseline/glusterfs`。
 
 每轮 execute 前恢复文件树后，`FileTree` 应始终保持 baseline：
 
@@ -461,7 +529,7 @@ executor reply stime/etime
 1. 实测 restore + barrier 总耗时，确认是否落在 10–20 秒预算内；
 2. 在 3 节点 HMDFS 上验证 barrier、agent ready 和 peer ready；
 3. 单次 triage 的 coverage 收益是否足够；不足时是否回退到“3 次干净执行”；
-4. 后续补 GlusterFS、NFS 的 baseline 映射和恢复脚本。
+4. GlusterFS 按 `glusterfs-nfs-adaptation-plan.md` §2.9 实现 client-side logical restore；NFS 的 baseline 映射和恢复脚本后续再定。
 
 ## 10. 变更记录
 
@@ -473,3 +541,10 @@ executor reply stime/etime
 - 2026-11-08：增加 restore start/finish 两阶段 barrier、node-down 后 mount 校验、restore 命令 timeout，并将 peer readiness 移到 finish barrier 之后。
 - 2026-11-08：拆分 `restoreStart` 与 `restoreState`，修复 start/finish 共用状态导致的死锁；增加旧 agent 退出等待。
 - 2026-11-08：`is_restarting` recovery 路径跳过 restore，保留 crash 现场；`barrierCount` 不纳入 restore 生命周期，本轮不改。
+- 2026-11-13：补充 GlusterFS 边界：采用 client-side logical restore，不恢复 server brick；固定测试根 + reset client + baseline `rm -rf + rsync`，详见 `glusterfs-nfs-adaptation-plan.md` §2.9。
+- 2026-11-13：HMDFS rsync 去掉 `-H/-A/-X`（baseline 与 fuzz 调用面均无 xattr/ACL/hardlink/symlink），保留 `-a --checksum`；`--delete` 已启用，不使用 `--force`。
+- 2026-11-13：收紧 restore 超时：node-down 15s、rsync 60s、node-up 30s；barrier 拆分为 start 30s / finish 90s。
+- 2026-11-14：补充 GlusterFS 3-3 replica 部署决定：baseline 烤 client 镜像、client1 prefill、reset client 固定 index 3、prefill/restore 共用 baseline、data.img 不启用。
+- 2026-11-15：明确 GlusterFS baseline 不含 symlink/hardlink/xattr；FileTree 不建模链接，link/symlink 的 linkpath 是 program-local binding，restore 后不写回树。
+- 2026-11-15：收敛 GlusterFS timing：rsync 总超时 60s、start/finish barrier 30s/90s，不用 `--timeout=300`；metadata delay 10s 起步，详见总计划 §10.4。
+- 2026-11-15：明确 restore 在每次 `receive_execute`（含 triage/light/DAG replay）前执行；server 只参与 barrier；FileTree 始终 baseline，`SyncFileTreeFromFsMd` 停用。

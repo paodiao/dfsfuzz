@@ -1,6 +1,6 @@
 # Seed 纯派生构造设计
 
-> 状态：设计讨论稿（2026-10-28）；初版代码已实现，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-09 复核项代码已落，补充 rename anchor A+、derived mkdir Same/Parent fallback、1 层 fresh 边界和 fresh anchor + rename root Child 负向覆盖；部分计划测试待补，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。
+> 状态：设计讨论稿（2026-10-28）；初版代码已实现，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-09 复核项代码已落，补充 rename anchor A+、derived mkdir Same/Parent fallback、1 层 fresh 边界和 fresh anchor + rename root Child 负向覆盖；部分计划测试待补，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 link/symlink target/linkpath、canonical/payload、open O_CREAT 与 PathSet 边界。
 > 范围：from-scratch seed 的路径派生、`insertCallFromDCT` 的 base 路径选择，以及 mutation/seed expansion 的边界。
 > 关联：`docs/causal-root-cell-design.md`、`docs/seed-optimization-plan.md`、`docs/seed-construction-causal-chain-notes.md`。
 > 本文只记录设计与待讨论项，不修改论文或代码。
@@ -276,9 +276,18 @@ p0-only 是已接受的初版限制：不加入 p1..pn anchor，也不为此引�
 - rename：同时收集 source 和 destination，并记录 Role：
   - source -> `seedAnchorRenameSrc`；
   - destination -> `seedAnchorRenameDst`；
-- fresh path：按 §5.4 现场分类 PathKind，并用 `freshPathKindsBefore`/`freshKinds` 补充类型。
+- link：同时收集 target 和 linkpath，分别使用
+  `seedAnchorLinkTarget` / `seedAnchorLinkPath`；
+- symlink：同时收集 canonical target 和 linkpath，分别使用
+  `seedAnchorSymlinkTarget` / `seedAnchorSymlinkLinkPath`；
+- readlink：linkpath 只作为 symlink 的 follower，不作为独立 anchor/root；
+- fresh path：按 §5.4 现场分类 PathKind，并用 `freshPathKindsBefore`/`freshKinds`
+  补充类型；`open(O_CREAT)` 与 `creat` 一样产生 fresh file。
 
-跳过空路径；按 `(CallName, Path)` 去重。rename source/destination 属于同一个 anchor call，但后续按 Role 使用不同 relation 集合，见 §6.3。
+跳过空路径；按 `(CallName, Path)` 去重。rename source/destination 属于同一个
+anchor call，但后续按 Role 使用不同 relation 集合，见 §6.3。link/symlink 的
+target/linkpath 都属于同一个 anchor call，target 使用完整 relation 集合，
+linkpath 主要作为 fresh binding 和 readlink 的观察路径。
 
 ### 5.3 类型
 
@@ -291,6 +300,10 @@ const (
     seedAnchorNormal seedAnchorRole = iota
     seedAnchorRenameSrc
     seedAnchorRenameDst
+    seedAnchorLinkTarget
+    seedAnchorLinkPath
+    seedAnchorSymlinkTarget
+    seedAnchorSymlinkLinkPath
 )
 
 type seedAnchor struct {
@@ -303,7 +316,11 @@ type seedAnchor struct {
 }
 ```
 
-普通 anchor 使用 `seedAnchorNormal`；rename 的 source/destination 分别使用 `seedAnchorRenameSrc` / `seedAnchorRenameDst`。
+普通 anchor 使用 `seedAnchorNormal`；rename 的 source/destination 分别使用
+`seedAnchorRenameSrc` / `seedAnchorRenameDst`；link/symlink 的 target/linkpath
+使用对应的 `seedAnchorLink*`/`seedAnchorSymlink*` role。GlusterFS 的 target 是
+相对测试根的 canonical 路径，linkpath 是 fresh binding；symlink payload 不进入
+`seedAnchor.Path`，只在构造调用时生成。
 
 `PathKind` 和 `IsDir` 都是现场分类结果，不是 seed/call 上持久记录的字段；`IsDir` 由路径 creator 类型决定，不能从 anchor call 名猜。定义见 §5.4。
 
@@ -348,7 +365,8 @@ unknown:
 - 找不到 creator，或 creator 失败 → unknown；
 - 不能只看 anchor 自身 call 名就判 unknown，否则 `open O_CREAT` 之后 modifier anchor 的 fresh path 会丢失。
 
-现有 `freshPathKindsBefore` 只扫描 `mkdir`/`creat`/`rename` destination，必须扩展 `open O_CREAT`；否则不能用于本节的 open 判定。
+`freshPathKindsBefore` 扫描 `mkdir`/`creat`/`rename` destination，并支持
+`open O_CREAT`；实现和测试要保证 `open O_CREAT` 不会被当成 existing。
 
 PathKind 必须同时给出 `IsDir`，不能只保留 fresh bool：
 
@@ -360,6 +378,18 @@ PathKind 必须同时给出 `IsDir`，不能只保留 fresh bool：
 | rename destination | `freshRenameDst` | 取 source 类型 |
 | 已有 FileTree 节点 | `existing` | `FileNode.Type != NodeTypeFile` |
 | 无法确定 creator | `unknown` | 不参与派生 |
+
+GlusterFS link/symlink：
+
+- `link/symlink` 的 target 是 canonical FileTree 路径，PathKind 按上表分类：
+  link target 必须是 existing/fresh regular file；symlink target 可为 file/dir；
+- `linkpath` 是 fresh binding，不在 FileTree；其 PathKind 由对应 link/symlink
+  的 creator 决定，`AnchorPathKind` 需增加 `AnchorPathFreshSymlink`；
+- `readlink` 的 linkpath 是 binding follower，不作为独立 creator；其 PathKind
+  取对应 symlink 的 linkpath；
+- `symlink` 的 payload 不参与 PathKind 分类；只保存 canonical target。
+- `open(O_CREAT)` 的 fresh file 识别继续使用 `openCallCreatesFile`/`LookupConst`，
+  不能把无法解析 flags 的情况当 fresh。
 
 `seedAnchor.IsDir` 必须由这张表的 creator 类型填充；both fresh 的 `Child` 要求 `PathKind == freshDir`，或 `PathKind == freshRenameDst && IsDir == true`。`freshRenameDst` 在关系矩阵中按 `IsDir` 归入 fresh dir 或 fresh file。
 
@@ -521,6 +551,38 @@ rename 的 source/destination 都进入 anchor 池，但 Role 不同：
 - destination anchor 不受 source 过滤影响。
 
 第一版接受 source/destination 同父时产生的重复候选，不做去重；如果后续 benchmark 显示 rename anchor 权重过高，再按 `(RootCall, Relation, RootSource, RootDest)` 去重。
+
+#### link / symlink / readlink
+
+GlusterFS v1 的派生规则：
+
+- `link` root：
+  ```text
+  target   = anchor 关系派生的测试根内普通文件 canonical 路径
+             （baseline existing，或同一程序/plan 更早 creator 的 fresh 路径）
+  linkpath = fresh，可在任意已有父目录
+  root call = link(target, linkpath)
+  ```
+- `symlink` root：
+  ```text
+  target   = anchor 关系派生的测试根内文件/目录 canonical 路径
+             （baseline existing，或同一程序/plan 更早 creator 的 fresh 路径）
+  linkpath = fresh，可在任意已有父目录
+  actual call = symlink(relpath(target, dirname(linkpath)), linkpath)
+  ```
+- `symlink` 调用参数中的 arg0 是 payload；`collectSeedAnchors`/`baseCandidate`
+  必须用共享 `symlinkCanonicalTarget(linkpath, payload)` 还原 canonical target，
+  不能把 payload 当 FileTree 路径。
+- target 是 anchor-relative，不是 fixed baseline；生成后必须仍在测试根内且类型
+  匹配；不能把已有 linkpath/symlink 当 target。
+- `linkpath` 是 fresh binding；生成后写入 `freshLinks`（hardlink/symlink、
+  `FollowIsDir`、canonical Target、CreatorIdx）。
+- `readlink` root 不支持；只作为 symlink root 的 variant，路径取 root LinkPath。
+- `RootPaths` 保存 canonical target/linkpath；symlink payload 只在构造调用时
+  计算，不能进入 anchor/pathSpec/DCT key。
+- PathSet broad 迁移 link/symlink/readlink 的规则见
+  `docs/seed-construction-causal-chain-notes.md` §1.5；derived 只负责生成，
+  不重复实现 PathSet 的双路径映射。
 
 ### 6.4 失败处理
 
@@ -820,6 +882,16 @@ derived 模式不再执行：
 - `TestDerivedRenameSourceInsertion`（待补）：
   - seed expansion 选中 source anchor + Parent/Sibling 时，root 插在 rename 后且路径仍有效；
   - destination anchor 的 insertion 行为不变。
+- `TestDerivedLinkSymlinkAnchors`（待补）：
+  - `collectSeedAnchors` 返回 link/symlink 的 target/linkpath 两个 role；
+  - link target 只能是普通文件，symlink target 可为文件/目录；
+  - target 由 anchor 关系派生且仍在测试根内；
+  - symlink payload 由 canonical target/linkpath 计算，解析后不逃出测试根；
+  - readlink 只作为 symlink linkpath 的 follower，不作为 root/anchor。
+- `TestDerivedSymlinkPayload`（待补）：
+  - linkpath 在测试根时 payload == target；
+  - linkpath 在子目录时 payload 为相对 linkpath parent 的路径；
+  - PathSet 迁移 target/linkpath 后 payload 重算且 canonical target 不变。
 - `TestDerivedInsertUsesP0Anchor`：
   - root base 与 p0 anchor 相关；
   - seed expansion root 在 anchor 后。
@@ -983,14 +1055,23 @@ append-only：仅作为 initial group / fallback 的简化策略，不作为主�
   - `LayeredChoiceStrategy` 字段和初始化
   - 表项仅作权重候选；采样前调用 PathKind/root/relation feasibility 过滤
 - `src/prog/seed_derivation.go`
-  - `seedAnchorRole`：`normal` / `renameSrc` / `renameDst`
+  - `seedAnchorRole`：`normal` / `renameSrc` / `renameDst` /
+    `linkTarget` / `linkPath` / `symlinkTarget` / `symlinkLinkPath`
   - `seedAnchor.Role` 与 `collectSeedAnchors` 的 rename source/destination 标记
+  - `collectSeedAnchors` 同时收集 link/symlink 的 target 和 linkpath；readlink
+    只作为 follower，不作为独立 anchor
   - 每轮 rescan p0 / 更新 `CallIdx`
-  - `classifyAnchorPath` / 共享 PathKind
-  - creator 类型回填 `seedAnchor.IsDir`
+  - `classifyAnchorPath` / 共享 PathKind；`AnchorPathKind` 增加
+    `AnchorPathFreshSymlink`
+  - creator 类型回填 `seedAnchor.IsDir`；linkpath 的 `FollowIsDir` 由对应
+    link/symlink 决定
   - `seedRelationAllowed` 的 source anchor 过滤：排除 `Same` / `Child`
   - `deriveSeedRootPath` 的 source 子树 `pathUnderRoot` 兜底过滤
   - `seedRenameSource` 的 source/destination 双路径派生
+  - `deriveSeedRootPath` 增加 link/symlink target 派生；canonical target 不存
+    symlink payload
+  - 共享 `symlinkCanonicalTarget(linkpath, payload)`：`collectSeedAnchors`、
+    `baseCandidate`、DAG/checker 都使用；不能把 payload 当 FileTree 路径
   - 第一版 fresh parent 限制：`collectSeedAnchors` 使用 `freshParentNodeEligible`；nested fresh parent 不进入 anchor 池
   - `deriveSeedRootPath` 只支持 1 层 fresh；不把 `freshKinds` 作为 fresh-parent 放行输入
   - `freshPathParentEligible` 标注为 future nested fresh helper；当前 C1 / seed derivation 生产路径统一使用 `freshParentNodeEligible`，不重新引入 nested fresh 前不得作为生产 gate
@@ -1000,6 +1081,8 @@ append-only：仅作为 initial group / fallback 的简化策略，不作为主�
   - 普通 `insertCallFromDCT` 入口保留兼容
   - `freshPathKindsBefore` 支持 `open(O_CREAT)`
   - rename 返回 `rootSource` / `rootDest`；destination 只接受 `freshRenameDst`
+  - link/symlink 返回 canonical target/linkpath；构造 `symlink` 调用时生成
+    payload，`readlink` 跟随 linkpath
   - `insertDerivedCallFromDCT`：root 用 source→dest，variants 用 destination
   - `insertDerivedCallFromDCT`：mkdir Same/Parent 使用 `GetPathByRelation(rootObservedPath, ...)` 的 generic fallback；Child/Sibling/NoRel 保持 fresh path
   - variant 放置逻辑内联在 `insertDerivedCallFromDCT`，不新增 `placeDerivedVariants`
