@@ -355,49 +355,79 @@ func TestGlusterfsDirectedPlansArePlannable(t *testing.T) {
 
 // TestGlusterfsNormalDualRootBatchInsert pins the execution-side wiring: a
 // normal dual-root batch is accepted by insertDirectedBatch, which materializes
-// the link call from RootSource (target) and RootDest (linkpath).
+// the link call from RootSource (target) and RootDest (linkpath). Like the
+// other insert tests, it loops seeds and tolerates insertFail: the batch
+// assembler deliberately rejects a batch whose timing anchors or live
+// preconditions do not line up, and only requires one constructible seed.
 func TestGlusterfsNormalDualRootBatchInsert(t *testing.T) {
 	target := hmdfsSmokeTarget(t)
 	if _, ok := target.SyscallMap["link"]; !ok {
 		t.Skip("target has no link")
 	}
+	if _, ok := target.SyscallMap["stat"]; !ok {
+		t.Skip("target has no stat")
+	}
 	hmcfg := glusterfsCoverageConfig(t, true)
 	lcs := NewLayeredChoiceStrategy(hmcfg, target)
 	sc := hmdfsSmokeSpecialCalls(t, target)
-	r := newRand(target, rand.NewSource(101))
-	plans, _ := planDirectedCells(glusterfsCoverageBaseProgs(target), lcs, hmcfg, r)
+	insertFails := 0
+	for seed := int64(0); seed < 200; seed++ {
+		ps := glusterfsCoverageBaseProgs(target)
+		plans, cells := planDirectedCells(ps, lcs, hmcfg,
+			newRand(target, rand.NewSource(seed)))
 
-	var dual, ccDual *directedPlan
-	for _, p := range plans {
-		if p.Cell.Combo.Root != "link" ||
-			(p.Cell.Combo.Variant != "open" && p.Cell.Combo.Variant != "stat") {
-			continue
+		var dual, ccDual *directedPlan
+		for _, ck := range cells {
+			p := plans[ck]
+			if p == nil || p.Cell.Combo.Root != "link" ||
+				(p.Cell.Combo.Variant != "open" && p.Cell.Combo.Variant != "stat") {
+				continue
+			}
+			cp := *p
+			if p.Cell.Temporal == TemporalConcurrent {
+				ccDual = &cp
+				break
+			}
+			if dual == nil {
+				dual = &cp
+			}
 		}
-		cp := *p
-		if p.Cell.Temporal == TemporalConcurrent {
-			ccDual = &cp
-			break
+		if ccDual != nil {
+			dual = ccDual
 		}
 		if dual == nil {
-			dual = &cp
+			continue
 		}
+		dual.NodeX = 1
+		batch := &directedBatch{
+			Root: dual.Cell.Combo.Root, BaseA: dual.BaseA,
+			RootSource: dual.BaseA, RootDest: dual.RootLinkPath,
+			Plans: []directedPlan{*dual},
+		}
+		if !insertDirectedBatch(ps, newRand(target, rand.NewSource(seed+1000)),
+			sc, hmcfg, lcs, batch) {
+			insertFails++
+			continue
+		}
+
+		// The actual assertion: the materialized root call must be
+		// link(target=BaseA, linkpath=RootLinkPath).
+		for _, c := range ps[0].Calls {
+			if c == nil || c.Meta == nil || c.Meta.Name != "link" {
+				continue
+			}
+			if got := extractPathFromCallByArgIdx(c, 0); got != dual.BaseA {
+				t.Fatalf("link target = %q, want %q", got, dual.BaseA)
+			}
+			if got := extractPathFromCallByArgIdx(c, 1); got != dual.RootLinkPath {
+				t.Fatalf("link linkpath = %q, want %q", got, dual.RootLinkPath)
+			}
+			return
+		}
+		t.Fatalf("inserted normal dual-root batch has no link call")
 	}
-	if ccDual != nil {
-		dual = ccDual
-	}
-	if dual == nil {
-		t.Fatal("no normal link-root plan with an open/stat variant")
-	}
-	dual.NodeX = 1
-	batch := &directedBatch{
-		Root: dual.Cell.Combo.Root, BaseA: dual.BaseA,
-		RootSource: dual.BaseA, RootDest: dual.RootLinkPath,
-		Plans: []directedPlan{*dual},
-	}
-	ps := glusterfsCoverageBaseProgs(target)
-	if !insertDirectedBatch(ps, r, sc, hmcfg, lcs, batch) {
-		t.Fatal("normal dual-root batch failed to insert")
-	}
+	t.Fatalf("no insertable normal dual-root batch in 200 seeds (insertFails=%d)",
+		insertFails)
 }
 
 // TestGlusterfsNormalDualRootPlans pins the normal dual-root pass: with the
