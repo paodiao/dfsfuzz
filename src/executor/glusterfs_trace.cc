@@ -63,9 +63,7 @@ struct pending_req {
 	bool has_r = false;
 	bool out_of_root = false;
 	uint64_t d_ts = 0;
-	uint64_t r_ts = 0;
 	uint32_t opcode = 0;
-	uint32_t pid = 0;
 	uint64_t nodeid = 0;
 	uint64_t off = 0;
 	uint64_t size = 0;
@@ -228,6 +226,7 @@ static uint64_t g_missing_r;
 static uint64_t g_missing_s;
 static uint64_t g_drop_xattr;
 static uint64_t g_out_of_root;
+static uint64_t g_path2_out_of_root;
 static uint64_t g_unmapped_opcode;
 
 static void append_event(struct pending_req &p, const struct glusterfs_ctl_event &s)
@@ -315,7 +314,6 @@ static void process_merged_events(void)
 			const auto &r = m.path;
 			auto &p = g_pending[r.unique];
 			p.has_r = true;
-			p.r_ts = r.ts;
 			p.off = r.off;
 			p.size = r.size;
 			p.mode = r.mode;
@@ -346,7 +344,6 @@ static void process_merged_events(void)
 			p.has_d = true;
 			p.d_ts = c.ts;
 			p.opcode = c.opcode;
-			p.pid = c.pid;
 			p.nodeid = c.nodeid;
 			continue;
 		}
@@ -360,7 +357,6 @@ static void process_merged_events(void)
 		auto &p = it->second;
 		/* S is authoritative for the opcode when D was lost. */
 		p.opcode = c.opcode;
-		p.pid = c.pid;
 		p.nodeid = c.nodeid;
 		if (!p.has_d)
 			g_missing_d++;
@@ -388,10 +384,12 @@ static void process_merged_events(void)
 		/* Interpret the raw R fields once the opcode is known. */
 		if (p.opcode == GF_OP_RENAME || p.opcode == GF_OP_LINK) {
 			std::string norm2;
-			if (!normalize_trace_path(p.path2_raw, norm2))
+			if (!normalize_trace_path(p.path2_raw, norm2)) {
 				p.path2.clear();
-			else
+				g_path2_out_of_root++;
+			} else {
 				p.path2 = norm2;
+			}
 		} else if (p.opcode == GF_OP_SYMLINK) {
 			p.path2 = p.path2_raw;
 		} else {
@@ -421,11 +419,13 @@ static void process_merged_events(void)
 
 	fprintf(stderr,
 		"glusterfs_trace: merged=%zu final=%zu missing_d=%llu missing_r=%llu "
-		"missing_s=%llu drop_xattr=%llu out_root=%llu unmapped=%llu dropped=%llu\n",
+		"missing_s=%llu drop_xattr=%llu out_root=%llu path2_out_root=%llu "
+		"unmapped=%llu dropped=%llu\n",
 		merged.size(), g_final_events.size(),
 		(unsigned long long)g_missing_d, (unsigned long long)g_missing_r,
 		(unsigned long long)g_missing_s, (unsigned long long)g_drop_xattr,
 		(unsigned long long)g_out_of_root,
+		(unsigned long long)g_path2_out_of_root,
 		(unsigned long long)g_unmapped_opcode,
 		(unsigned long long)g_dropped_events);
 
@@ -589,6 +589,13 @@ static bool find_symbol_offsets(const char *path, struct symbol_offset *syms,
 	}
 
 	ok = true;
+	for (size_t j = 0; j < nsyms; j++) {
+		if (syms[j].found)
+			continue;
+		fprintf(stderr, "glusterfs_trace: symbol %s not found or not mapped\n",
+			syms[j].name);
+		ok = false;
+	}
 out:
 	if (elf)
 		elf_end(elf);
@@ -680,11 +687,6 @@ void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attac
 		return;
 	}
 	for (const auto &s : syms) {
-		if (!s.found) {
-			fprintf(stderr, "glusterfs_trace: symbol %s not found\n",
-				s.name);
-			return;
-		}
 		fprintf(stderr,
 			"glusterfs_trace: %s st_value=0x%llx file_offset=0x%llx\n",
 			s.name, (unsigned long long)s.st_value,
@@ -753,6 +755,7 @@ void stop_collect_glusterfs_trace(void)
 	g_missing_s = 0;
 	g_drop_xattr = 0;
 	g_out_of_root = 0;
+	g_path2_out_of_root = 0;
 	g_unmapped_opcode = 0;
 	process_merged_events();
 	write_events();
