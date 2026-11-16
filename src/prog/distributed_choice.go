@@ -180,6 +180,7 @@ type FileNode struct {
 
 type FileTree struct {
 	Root       *FileNode
+	Prefix     string
 	NodesByCid map[string][]*FileNode
 	FilesByCid map[string][]*FileNode
 	DirsByCid  map[string][]*FileNode
@@ -195,18 +196,83 @@ type FileTree struct {
 }
 
 func NewFileTree() *FileTree {
+	return NewFileTreeWithPrefix(MergeViewPrefix)
+}
+
+// NewFileTreeWithPrefix builds a tree whose namespace root is prefix
+// ("merge_view/" for HMDFS, "" for GlusterFS). The empty-prefix root has
+// an empty FullPath so children are "file" and "a/b", not "/file".
+func NewFileTreeWithPrefix(prefix string) *FileTree {
+	rootName, rootPath := "", ""
+	if prefix != "" {
+		rootPath = strings.TrimSuffix(prefix, "/")
+		rootName = rootPath
+	}
 	return &FileTree{
 		Root: &FileNode{
-			Name:     "merge_view",
-			FullPath: "merge_view",
+			Name:     rootName,
+			FullPath: rootPath,
 			Type:     NodeTypeDir,
 			Children: make(map[string]*FileNode),
 		},
+		Prefix:      prefix,
 		NodesByCid:  make(map[string][]*FileNode),
 		FilesByCid:  make(map[string][]*FileNode),
 		DirsByCid:   make(map[string][]*FileNode),
 		bucketDirty: true,
 	}
+}
+
+// RootPath returns the logical namespace root without a trailing slash.
+func (ft *FileTree) RootPath() string {
+	if ft == nil {
+		return ""
+	}
+	return strings.TrimSuffix(ft.Prefix, "/")
+}
+
+// JoinRoot joins a relative path to the tree's logical root. It never emits
+// a leading slash or "./" and returns the relative path unchanged when the
+// root is empty.
+func (ft *FileTree) JoinRoot(rel string) string {
+	rel = normalizeRelativePath(rel)
+	if ft == nil || ft.Prefix == "" || rel == "" {
+		return rel
+	}
+	root := strings.TrimSuffix(ft.Prefix, "/")
+	return root + "/" + rel
+}
+
+func (ft *FileTree) DepthBucketOf(path string) uint64 {
+	prefix := ""
+	if ft != nil {
+		prefix = ft.Prefix
+	}
+	return DepthBucketOfWithPrefix(path, prefix)
+}
+
+func normalizeRelativePath(path string) string {
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "/")
+	return path
+}
+
+func (ft *FileTree) normalizePath(path string) string {
+	if ft == nil {
+		return normalizeRelativePath(path)
+	}
+	if ft.Prefix != "" {
+		path = strings.TrimPrefix(path, ft.Prefix)
+		path = strings.TrimPrefix(path, strings.TrimSuffix(ft.Prefix, "/")+"/")
+	}
+	return normalizeRelativePath(path)
+}
+
+func (ft *FileTree) fullPath(parent *FileNode, name string) string {
+	if parent == nil || parent.FullPath == "" {
+		return name
+	}
+	return parent.FullPath + "/" + name
 }
 
 func (ft *FileTree) InitFromHmdfsConfig(hmcfg *Hmdfs_config) {
@@ -260,7 +326,7 @@ func (ft *FileTree) InitFromHmdfsConfig(hmcfg *Hmdfs_config) {
 
 func (ft *FileTree) addNodeLocked(path string, nodeType FileNodeType, ownerCid string) *FileNode {
 	ft.bucketDirty = true
-	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
+	cleanPath := ft.normalizePath(path)
 	if cleanPath == "" {
 		return nil
 	}
@@ -287,7 +353,7 @@ func (ft *FileTree) addNodeLocked(path string, nodeType FileNodeType, ownerCid s
 		} else {
 			newNode := &FileNode{
 				Name:     part,
-				FullPath: current.FullPath + "/" + part,
+				FullPath: ft.fullPath(current, part),
 				Parent:   current,
 				Children: make(map[string]*FileNode),
 			}
@@ -346,7 +412,7 @@ func (ft *FileTree) RemoveNode(path string) bool {
 func (ft *FileTree) removeNodeLocked(path string) bool {
 	ft.bucketDirty = true
 	// Caller must hold ft.mu.
-	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
+	cleanPath := ft.normalizePath(path)
 	if cleanPath == "" {
 		return false
 	}
@@ -467,8 +533,8 @@ func (ft *FileTree) RenameNode(oldPath, newPath string) bool {
 	ft.mu.Lock()
 	defer ft.mu.Unlock()
 
-	cleanOldPath := strings.TrimPrefix(oldPath, MergeViewPrefix)
-	cleanNewPath := strings.TrimPrefix(newPath, MergeViewPrefix)
+	cleanOldPath := ft.normalizePath(oldPath)
+	cleanNewPath := ft.normalizePath(newPath)
 	if cleanOldPath == "" || cleanNewPath == "" {
 		return false
 	}
@@ -522,7 +588,7 @@ func (ft *FileTree) RenameNode(oldPath, newPath string) bool {
 		delete(current.Parent.Children, current.Name)
 	}
 	current.Name = newName
-	current.FullPath = newParent.FullPath + "/" + newName
+	current.FullPath = ft.fullPath(newParent, newName)
 	current.PathLength = len(current.FullPath)
 	current.Parent = newParent
 	newParent.Children[newName] = current
@@ -534,7 +600,7 @@ func (ft *FileTree) RenameNode(oldPath, newPath string) bool {
 
 func (ft *FileTree) updateChildPaths(node *FileNode) {
 	for _, child := range node.Children {
-		child.FullPath = node.FullPath + "/" + child.Name
+		child.FullPath = ft.fullPath(node, child.Name)
 		child.PathLength = len(child.FullPath)
 		ft.updateChildPaths(child)
 	}
@@ -548,7 +614,7 @@ func (ft *FileTree) FindNode(path string) *FileNode {
 
 func (ft *FileTree) findNodeLocked(path string) *FileNode {
 	// Caller must hold ft.mu (read or write).
-	cleanPath := strings.TrimPrefix(path, MergeViewPrefix)
+	cleanPath := ft.normalizePath(path)
 	if cleanPath == "" {
 		return ft.Root
 	}
@@ -570,20 +636,22 @@ func (ft *FileTree) findNodeLocked(path string) *FileNode {
 	return current
 }
 
-// parentNodeLocked resolves the parent directory of path: the tree node when
-// present, or the synthetic merge-view root for depth-1 paths. A depth-1
-// path's parent string is "merge_view" (no trailing slash), which
-// findNodeLocked cannot map (MergeViewPrefix carries the slash), so that one
-// form is resolved to Root explicitly. Caller must hold ft.mu.
+// parentNodeLocked resolves the parent directory of path. A depth-1 path is
+// a child of Root for both HMDFS ("merge_view/file") and GlusterFS ("file").
+// Caller must hold ft.mu.
 func (ft *FileTree) parentNodeLocked(path string) *FileNode {
-	parent := GetParentDir(path)
-	if n := ft.findNodeLocked(parent); n != nil {
-		return n
+	cleanPath := ft.normalizePath(path)
+	if cleanPath == "" || (ft.RootPath() != "" && cleanPath == ft.RootPath()) {
+		return nil
 	}
-	if parent == strings.TrimSuffix(MergeViewPrefix, "/") {
-		return ft.Root
+	if i := strings.LastIndexByte(cleanPath, '/'); i >= 0 {
+		parent := cleanPath[:i]
+		if parent == "" {
+			return ft.Root
+		}
+		return ft.findNodeLocked(parent)
 	}
-	return nil
+	return ft.Root
 }
 
 // FindParent returns the parent directory node of path (the merge-view root
@@ -1411,19 +1479,39 @@ type DistributedChoiceTable struct {
 }
 
 func NewDistributedChoiceTable() *DistributedChoiceTable {
+	return BuildDefaultDCT(hmdfsProfile)
+}
+
+// BuildDefaultDCT builds the DCT for a profile. HMDFS keeps the historical
+// root/variant list; GlusterFS uses its explicit 19/21 lists.
+func BuildDefaultDCT(profile *DFSProfile) *DistributedChoiceTable {
 	dct := &DistributedChoiceTable{
 		RootCalls: make(map[string]bool),
 		Variants:  make(map[string][]CallVariant),
 		Weights:   make(map[string]map[CallVariant]int),
 	}
-
-	dct.initDefaultConfig()
+	rootCalls, variantCalls := FsopsSubCalls, FsopsSubCalls
+	if profile != nil {
+		if len(profile.Calls.RootCalls) > 0 {
+			rootCalls = profile.Calls.RootCalls
+		} else if len(profile.Calls.SubCalls) > 0 {
+			rootCalls = profile.Calls.SubCalls
+		}
+		if len(profile.Calls.VariantCalls) > 0 {
+			variantCalls = profile.Calls.VariantCalls
+		} else if len(profile.Calls.SubCalls) > 0 {
+			variantCalls = profile.Calls.SubCalls
+		}
+	}
+	dct.initConfig(rootCalls, variantCalls)
 	return dct
 }
 
 func (dct *DistributedChoiceTable) initDefaultConfig() {
-	rootCallNames := FsopsSubCalls
-	variantCallNames := FsopsSubCalls
+	dct.initConfig(FsopsSubCalls, FsopsSubCalls)
+}
+
+func (dct *DistributedChoiceTable) initConfig(rootCallNames, variantCallNames []string) {
 	//TODO: root and variant call may need optimization
 	for _, callName := range rootCallNames {
 		dct.RootCalls[callName] = true
@@ -1828,7 +1916,7 @@ type LayeredChoiceStrategy struct {
 func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoiceStrategy {
 	lcs := &LayeredChoiceStrategy{
 		PredefinedPatterns:    NewPredefinedPatterns(),
-		DCTFsops:              NewDistributedChoiceTable(),
+		DCTFsops:              BuildDefaultDCT(hmcfg.ProfileOrDefault()),
 		CausalDerivationTable: newCausalDerivationTable(),
 		FileTree:              nil,
 		patternProbability:    0.15,
@@ -1842,7 +1930,11 @@ func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoic
 	}
 
 	if target != nil {
-		lcs.FsopsChoiceTable = buildSubChoiceTable(target, FsopsChoiceCalls)
+		choiceCalls := FsopsChoiceCalls
+		if hmcfg != nil && hmcfg.Profile != nil && len(hmcfg.Profile.Calls.ChoiceCalls) > 0 {
+			choiceCalls = hmcfg.Profile.Calls.ChoiceCalls
+		}
+		lcs.FsopsChoiceTable = buildSubChoiceTable(target, choiceCalls)
 	}
 
 	return lcs
@@ -2130,6 +2222,29 @@ func IsPathInMergeView(path string) bool {
 	return strings.HasPrefix(path, MergeViewPrefix)
 }
 
+// NormalizePath normalizes a path to prefix-relative form. An empty prefix
+// yields a relative path with no leading slash or "./".
+func NormalizePath(prefix, path string) string {
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "/")
+	if prefix == "" {
+		return path
+	}
+	root := strings.TrimSuffix(prefix, "/")
+	path = strings.TrimPrefix(path, prefix)
+	path = strings.TrimPrefix(path, root+"/")
+	return path
+}
+
+func IsUnderRoot(prefix, path string) bool {
+	if prefix == "" {
+		return true
+	}
+	root := strings.TrimSuffix(prefix, "/")
+	return path == root || strings.HasPrefix(path, prefix) || strings.HasPrefix(path, root+"/")
+}
+
+// NormalizeMergeViewPath preserves the historical HMDFS wrapper.
 func NormalizeMergeViewPath(path string) string {
 	path = strings.TrimPrefix(path, "./") // fsMd relative keys carry a leading "./"
 	if !strings.HasPrefix(path, MergeViewPrefix) {

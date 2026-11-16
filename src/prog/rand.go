@@ -384,11 +384,17 @@ func (r *randGen) filenameImpl(s *state) string {
 		return specialFiles[r.Intn(len(specialFiles))]
 	}
 	if len(s.files) == 0 || r.oneOf(2) {
-		// Generate a new name.
-		dir := "."
-		if r.hmcfg.DfsName == "hmdfs" {
-			dir = "merge_view"
+		// Generate a new name. The logical root is profile-dependent:
+		// merge_view for HMDFS, empty for GlusterFS.
+		rootDir := ""
+		if r.hmcfg != nil {
+			if r.hmcfg.FileTree != nil {
+				rootDir = r.hmcfg.FileTree.RootPath()
+			} else {
+				rootDir = strings.TrimSuffix(r.hmcfg.NamespacePrefix(), "/")
+			}
 		}
+		dir := rootDir
 		if r.oneOf(2) && len(s.files) != 0 {
 			dir = r.randFromMap(s.files)
 			if dir != "" && dir[len(dir)-1] == 0 {
@@ -402,9 +408,12 @@ func (r *randGen) filenameImpl(s *state) string {
 			*/
 		}
 		for i := 0; ; i++ {
-			//idx := rand.Intn(100)
-			//f := fmt.Sprintf("%v/file%v", dir, idx)
-			f := fmt.Sprintf("%v/file%v", dir, i)
+			var f string
+			if dir == "" {
+				f = fmt.Sprintf("file%v", i)
+			} else {
+				f = fmt.Sprintf("%v/file%v", dir, i)
+			}
 			if !s.files[f] {
 				return f
 			}

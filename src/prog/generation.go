@@ -271,7 +271,11 @@ func (target *Target) GenerateProgsForHmdfsFsops(rs rand.Source, sCalls *Special
 	if len(ps) == 0 {
 		testDir := r.selectRemoteDir(hmcfg, hmcfg.Cids[0])
 		if testDir == "" {
-			testDir = "merge_view"
+			if hmcfg != nil && hmcfg.FileTree != nil {
+				testDir = hmcfg.FileTree.RootPath()
+			} else {
+				testDir = "merge_view"
+			}
 		}
 
 		// Uniformly pick one of the legacy fallback generators (6 dir-centric
@@ -303,6 +307,24 @@ func (target *Target) GenerateProgsForHmdfsFsops(rs rand.Source, sCalls *Special
 		p.IsFsops = true
 	}
 	return ps
+}
+
+// GenerateProgsForGlusterfsFsops is the GlusterFS client-only fsops seed
+// entry. It reuses the DCT/pattern pipeline with the GlusterFS profile DCT;
+// GlusterFS-only calls are added incrementally by the call generators.
+func (target *Target) GenerateProgsForGlusterfsFsops(rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config) []*Prog {
+	ps := target.GenerateProgsForHmdfsFsops(rs, sCalls, hmcfg)
+	for _, p := range ps {
+		p.IsFsops = true
+	}
+	return ps
+}
+
+func (target *Target) GenerateProgsForDfsFsops(rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config) []*Prog {
+	if hmcfg != nil && hmcfg.ProfileOrDefault().Name == "glusterfs" {
+		return target.GenerateProgsForGlusterfsFsops(rs, sCalls, hmcfg)
+	}
+	return target.GenerateProgsForHmdfsFsops(rs, sCalls, hmcfg)
 }
 
 // expandWithDCT inserts further root+variant groups (via insertCallFromDCT)

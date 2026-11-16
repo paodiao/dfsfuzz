@@ -1424,6 +1424,26 @@ func DepthBucketOf(path string) uint64 {
 	}
 }
 
+// DepthBucketOfWithPrefix maps a path relative to prefix to the same bucket
+// as DepthBucketOf does for merge_view paths.
+func DepthBucketOfWithPrefix(path, prefix string) uint64 {
+	if prefix != "" && path == strings.TrimSuffix(prefix, "/") {
+		return 0
+	}
+	rel := NormalizePath(prefix, path)
+	if rel == "" {
+		return 0
+	}
+	switch n := strings.Count(rel, "/"); {
+	case n == 0:
+		return 1
+	case n <= 3:
+		return 2
+	default:
+		return 3
+	}
+}
+
 func hashPair(p DAGPair, hmcfg *Hmdfs_config) uint64 {
 	return hashShape(p.Temporal, p.PathRel, featuresOf(p.A, hmcfg), featuresOf(p.B, hmcfg))
 }

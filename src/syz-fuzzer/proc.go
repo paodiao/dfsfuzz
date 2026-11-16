@@ -85,6 +85,12 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	}()
 	var hc prog.Hmdfs_config
 	hc.DfsName = fuzzer.config.DFSName
+	hc.Profile = prog.ProfileForName(hc.DfsName)
+	hc.TotalNum = fuzzer.config.FuzzingVMs
+	hc.Serv_num = fuzzer.config.ServNum
+	hc.RootProgIdx = hc.Serv_num
+	hc.ClientNum = hc.TotalNum - hc.Serv_num
+	hc.InitIp = fuzzer.config.InitIp
 	if hc.DfsName == "hmdfs" {
 		parts := strings.Split(fuzzer.config.DfsSetupParams, " ")
 		if len(parts) != 2 {
@@ -288,6 +294,11 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		} else {
 			log.Logf(0, "InitDir is not configured, skipping initial files loading")
 		}
+	} else if hc.DfsName == "glusterfs" {
+		if err := loadGlusterfsConfig(&hc, fuzzer.config.DfsSetupParams,
+			fuzzer.config.FuzzingVMs, fuzzer.config.ServNum, fuzzer.config.InitialDir); err != nil {
+			return nil, err
+		}
 	}
 
 	// The execution protocol is one program per executor; the manager builds
@@ -298,15 +309,24 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		return nil, fmt.Errorf("executor count %d does not match Node_num %d",
 			len(fuzzer.config.Executor), hc.Node_num)
 	}
+	if hc.DfsName == "glusterfs" {
+		if len(fuzzer.config.Executor) != hc.TotalNum {
+			return nil, fmt.Errorf("executor count %d does not match TotalNum %d",
+				len(fuzzer.config.Executor), hc.TotalNum)
+		}
+		if hc.Serv_num <= 0 || hc.ClientNum <= 0 {
+			return nil, fmt.Errorf("glusterfs needs server and client programs")
+		}
+	}
 
-	hc.FileTree = prog.NewFileTree()
+	hc.FileTree = prog.NewFileTreeForConfig(&hc)
 	hc.FileTree.InitFromHmdfsConfig(&hc)
 
 	// Per-proc TSC offsets: seeded from the immutable fuzzer config slice and
 	// refreshed in place from this proc's own exec report (see executeRaw).
 	procTsc := append([]int64(nil), fuzzer.tscoffs...)
 	var lcsFsops *prog.LayeredChoiceStrategy
-	if hc.DfsName == "hmdfs" {
+	if hc.DfsName == "hmdfs" || hc.DfsName == "glusterfs" {
 		lcsFsops = prog.NewLayeredChoiceStrategy(&hc, fuzzer.target)
 		lcsFsops.SetTscOffsets(procTsc)
 		prog.InitCoverageBoard(&hc)
@@ -375,6 +395,15 @@ func (proc *Proc) loop() {
 					ps = proc.fuzzer.target.GenerateProgsForHmdfsFsops(proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)
 				}
 				proc.execute(proc.execOpts, ps, ProgNormal, StatGenerate)
+			} else if proc.fuzzer.config.DFSName == "glusterfs" {
+				for idx := 0; idx < proc.fuzzer.config.ServNum; idx++ {
+					p, _ := proc.fuzzer.target.Generate(proc.rnd, 0, nil, nil, true,
+						proc.fuzzer.sCalls, proc.fuzzer.config.EnableC2san, &proc.hmcfg)
+					ps = append(ps, p)
+				}
+				ps = append(ps, proc.fuzzer.target.GenerateProgsForDfsFsops(
+					proc.rnd, proc.fuzzer.sCalls, &proc.hmcfg)...)
+				proc.execute(proc.execOpts, ps, ProgNormal, StatGenerate)
 			} else {
 				//Generate empty subtestcase for servers
 				for idx := 0; idx < proc.fuzzer.config.ServNum; idx++ {
@@ -410,6 +439,12 @@ func (proc *Proc) loop() {
 				seedPS := fuzzerSnapshot.chooseProgram(proc.rnd)
 				ps := prog.Clones(seedPS)
 				proc.mutateHmdfs(ps, fuzzerSnapshot.corpus)
+				log.Logf(1, "#%v: mutated", proc.pid)
+				proc.execute(proc.execOpts, ps, ProgNormal, StatFuzz)
+			} else if proc.fuzzer.config.DFSName == "glusterfs" {
+				seedPS := fuzzerSnapshot.chooseProgram(proc.rnd)
+				ps := prog.Clones(seedPS)
+				proc.mutateDfs(ps, fuzzerSnapshot.corpus)
 				log.Logf(1, "#%v: mutated", proc.pid)
 				proc.execute(proc.execOpts, ps, ProgNormal, StatFuzz)
 			} else {
@@ -779,7 +814,7 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 		*/
 		//Tao TODO
 		log.Logf(0, "NetFailure, Node crash: %v %v", proc.fuzzer.config.NetFailure, proc.fuzzer.config.NodeCrash)
-		proc.mutateHmdfs(ps, fuzzerSnapshot.corpus)
+		proc.mutateDfs(ps, fuzzerSnapshot.corpus)
 		infos := proc.execute(proc.execOpts, ps, ProgNormal, StatSmash)
 		if infos == nil {
 			// Execution error (executor crash/hang): stop smashing this
@@ -795,6 +830,30 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 // structured mutator (stash/dcache/fsops); the fsops one is DCT-based (root
 // call inserted into ps[0], concurrent calls spread over the other nodes).
 // Everything falls back to the standard per-client Mutate.
+func (proc *Proc) clientView(ps []*prog.Prog) []*prog.Prog {
+	return proc.hmcfg.ClientView(ps)
+}
+
+func (proc *Proc) mutateDfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
+	if proc.fuzzer.config.DFSName == "glusterfs" {
+		cps := proc.clientView(ps)
+		if len(cps) == 0 {
+			return
+		}
+		mutated := prog.MutateFsopsWithDCT(cps, proc.rnd,
+			proc.fuzzer.sCalls, &proc.hmcfg, proc.lcsFsops)
+		if mutated {
+			return
+		}
+		for _, p := range cps {
+			p.Mutate(proc.rnd, prog.RecommendedCalls, proc.fuzzer.choiceTable, corpus,
+				proc.fuzzer.sCalls, 0, false, proc.fuzzer.config.EnableC2san, &proc.hmcfg)
+		}
+		return
+	}
+	proc.mutateHmdfs(ps, corpus)
+}
+
 func (proc *Proc) mutateHmdfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
 	if len(ps) == 0 {
 		return
@@ -1388,6 +1447,20 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			log.Logf(0, "MUTATION-DEBUG: %v (stat=%v lastMut=%s)", err, stat, prog.LastMutation())
 			appendDiagLog("MUTATION-DEBUG: %v stat=%d lastMut=%s", err, stat, prog.LastMutation())
 			return nil, nil, 0, err
+		}
+	}
+	if proc.fuzzer.config.DFSName == "glusterfs" {
+		want := len(proc.fuzzer.config.Executor)
+		if len(ps) != want {
+			return nil, nil, 0, fmt.Errorf("glusterfs batch has %d programs, want %d", len(ps), want)
+		}
+		for i := 0; i < proc.fuzzer.config.ServNum && i < len(ps); i++ {
+			if len(ps[i].Calls) != 0 {
+				return nil, nil, 0, fmt.Errorf("glusterfs server program %d is not empty", i)
+			}
+		}
+		if proc.fuzzer.config.ServNum >= len(ps) {
+			return nil, nil, 0, fmt.Errorf("glusterfs batch has no client programs")
 		}
 	}
 

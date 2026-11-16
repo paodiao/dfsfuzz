@@ -1,10 +1,15 @@
 package prog
 
-type Hmdfs_config struct {
+type DFSConfig struct {
+	Profile                 *DFSProfile
 	DfsName                 string
 	Cids                    []string
 	Node_num                int
 	Serv_num                int
+	ClientNum               int
+	TotalNum                int
+	RootProgIdx             int
+	RootPrefix              string
 	InitIp                  string
 	Init_file               map[string][]string
 	Init_dir                map[string][]string
@@ -16,3 +21,5 @@ type Hmdfs_config struct {
 	FileSize                map[string]map[string]uint64
 	FileTree                *FileTree
 }
+
+type Hmdfs_config = DFSConfig
