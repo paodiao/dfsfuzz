@@ -271,11 +271,7 @@ func (target *Target) GenerateProgsForHmdfsFsops(rs rand.Source, sCalls *Special
 	if len(ps) == 0 {
 		testDir := r.selectRemoteDir(hmcfg, hmcfg.Cids[0])
 		if testDir == "" {
-			if hmcfg != nil && hmcfg.FileTree != nil {
-				testDir = hmcfg.FileTree.RootPath()
-			} else {
-				testDir = "merge_view"
-			}
+			testDir = defaultTestDir(hmcfg)
 		}
 
 		// Uniformly pick one of the legacy fallback generators (6 dir-centric
@@ -310,12 +306,80 @@ func (target *Target) GenerateProgsForHmdfsFsops(rs rand.Source, sCalls *Special
 }
 
 // GenerateProgsForGlusterfsFsops is the GlusterFS client-only fsops seed
-// entry. It reuses the DCT/pattern pipeline with the GlusterFS profile DCT;
-// GlusterFS-only calls are added incrementally by the call generators.
+// entry. It reuses the DCT/pattern pipeline with the GlusterFS profile DCT,
+// then enforces the executor's batch invariant: exactly Node_num (= ClientNum)
+// non-empty client programs. DCT, pattern and legacy fallbacks can each return
+// a short/empty batch, so the boundary normalizes instead of trusting any one
+// generator.
 func (target *Target) GenerateProgsForGlusterfsFsops(rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config) []*Prog {
 	ps := target.GenerateProgsForHmdfsFsops(rs, sCalls, hmcfg)
+	want := 0
+	if hmcfg != nil {
+		want = hmcfg.Node_num
+	}
+
+	var fallback *randGen
+	var fallbackState *state
+	makeFallback := func() *Prog {
+		if fallback == nil {
+			fallback = newRand(target, rs)
+			fallback.hmcfg = hmcfg
+			fallbackState = newState(target, nil, nil)
+		}
+		dir := defaultTestDir(hmcfg)
+		if dir == "" {
+			dir = "." // GlusterFS executor cwd is the test root
+		}
+		if p := fallback.fallbackStatNode(fallbackState, sCalls, dir); p != nil {
+			p.IsFsops = true
+			return p
+		}
+		// Last resort (stat entry missing): Generate always emits at least
+		// one call when ncalls > 0.
+		p, _ := target.Generate(rs, 1, nil, nil, false, sCalls, false, hmcfg)
+		if p != nil {
+			p.IsFsops = true
+		}
+		return p
+	}
+
+	// Pattern generation can append an empty node program (a failed op still
+	// keeps its slot); replace it without changing the slot order.
+	ps = normalizeGlusterfsClientProgs(ps, want, makeFallback)
 	for _, p := range ps {
-		p.IsFsops = true
+		if p != nil {
+			p.IsFsops = true
+		}
+	}
+	return ps
+}
+
+// normalizeGlusterfsClientProgs enforces the GlusterFS batch invariant:
+// exactly want non-empty client programs. Extra programs are truncated (the
+// first slots keep the root/order), empty slots are replaced, and short
+// batches are padded with makeFallback. The fallback may return nil only when
+// the target cannot build any call; in that case the count stays short and the
+// caller's batch validation reports the config error.
+func normalizeGlusterfsClientProgs(ps []*Prog, want int, makeFallback func() *Prog) []*Prog {
+	if want < 0 {
+		want = 0
+	}
+	if len(ps) > want {
+		ps = ps[:want]
+	}
+	for i := 0; i < len(ps); i++ {
+		if ps[i] == nil || len(ps[i].Calls) == 0 {
+			if p := makeFallback(); p != nil {
+				ps[i] = p
+			}
+		}
+	}
+	for len(ps) < want {
+		p := makeFallback()
+		if p == nil {
+			break
+		}
+		ps = append(ps, p)
 	}
 	return ps
 }

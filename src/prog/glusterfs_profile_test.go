@@ -92,6 +92,39 @@ func TestGlusterfsFuncClass(t *testing.T) {
 	}
 }
 
+func TestNormalizeGlusterfsClientProgs(t *testing.T) {
+	mk := func() *Prog { return &Prog{Calls: []*Call{{}}} }
+	ps := normalizeGlusterfsClientProgs([]*Prog{{}, {Calls: []*Call{{}}}}, 4, mk)
+	if len(ps) != 4 {
+		t.Fatalf("normalized count = %d, want 4", len(ps))
+	}
+	for i, p := range ps {
+		if p == nil || len(p.Calls) == 0 {
+			t.Fatalf("slot %d is empty after normalization", i)
+		}
+	}
+
+	ps = normalizeGlusterfsClientProgs([]*Prog{
+		{Calls: []*Call{{}}}, {Calls: []*Call{{}}}, {Calls: []*Call{{}}},
+	}, 2, mk)
+	if len(ps) != 2 {
+		t.Fatalf("truncated count = %d, want 2", len(ps))
+	}
+}
+
+func TestGlusterfsEmptyRootPath(t *testing.T) {
+	cfg := &Hmdfs_config{Profile: glusterfsProfile, FileTree: NewFileTreeWithPrefix("")}
+	if got := defaultTestDir(cfg); got != "" {
+		t.Fatalf("defaultTestDir(glusterfs) = %q, want empty", got)
+	}
+	if got := joinTestPath("", "q0"); got != "q0" {
+		t.Fatalf("joinTestPath(empty) = %q, want q0", got)
+	}
+	if got := joinTestPath("dir/", "q0"); got != "dir/q0" {
+		t.Fatalf("joinTestPath(dir) = %q, want dir/q0", got)
+	}
+}
+
 func TestGlusterfsOffsetAndRetModel(t *testing.T) {
 	if isOffsetCall("readlink") {
 		t.Fatalf("readlink must not carry offset buckets")

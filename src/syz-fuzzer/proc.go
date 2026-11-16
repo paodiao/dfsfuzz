@@ -784,6 +784,7 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 	if proc.fuzzer.comparisonTracingEnabled && item.call != -1 {
 		proc.executeHintSeed(item.ps, item.call, item.subNum)
 	}
+	root := proc.rootProg(item.ps)
 	//
 	fuzzerSnapshot := proc.fuzzer.snapshot()
 
@@ -795,12 +796,13 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 			total += len(p.Calls)
 		}
 		appendDiagLog("smash begin: fsops=%v stash=%v dcache=%v calls=%v total=%d",
-			item.ps[0].IsFsops, item.ps[0].IsStash, item.ps[0].IsDCache,
+			root != nil && root.IsFsops, root != nil && root.IsStash, root != nil && root.IsDCache,
 			calls, total)
 	}
 
 	//Failure enumeration
-	if (proc.fuzzer.config.NetFailure || proc.fuzzer.config.NodeCrash) && !(item.ps[0].HasNetFail || item.ps[0].HasCrashFail) {
+	if (proc.fuzzer.config.NetFailure || proc.fuzzer.config.NodeCrash) &&
+		root != nil && !(root.HasNetFail || root.HasCrashFail) {
 		//proc.enumFailures(item.ps)
 	}
 
@@ -832,6 +834,18 @@ func (proc *Proc) smashInput(item *WorkSmash) {
 // Everything falls back to the standard per-client Mutate.
 func (proc *Proc) clientView(ps []*prog.Prog) []*prog.Prog {
 	return proc.hmcfg.ClientView(ps)
+}
+
+// rootProg returns the first client program (GlusterFS) or ps[0] (HMDFS,
+// where ServNum=0 makes the client view the whole batch).
+func (proc *Proc) rootProg(ps []*prog.Prog) *prog.Prog {
+	if p := proc.hmcfg.RootProg(ps); p != nil {
+		return p
+	}
+	if len(ps) > 0 {
+		return ps[0]
+	}
+	return nil
 }
 
 func (proc *Proc) mutateDfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
@@ -1288,7 +1302,10 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 	if len(ps) == 0 {
 		return nil
 	}
-	log.Logf(0, "HasCrashFail: %v, .HasNetFail: %v", ps[0].HasCrashFail, ps[0].HasNetFail)
+	rootProg := proc.rootProg(ps)
+	if rootProg != nil {
+		log.Logf(0, "HasCrashFail: %v, .HasNetFail: %v", rootProg.HasCrashFail, rootProg.HasNetFail)
+	}
 	infos, _, _, err := proc.executeRaw(execOpts, ps, stat)
 	if err != nil {
 		log.Logf(0, "execute: execution error (fuzzer survives): %v", err)
@@ -1334,7 +1351,8 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 
 	//(1). With failures, exploit server feedback
 	//(2). Client doesn't have feedback for a while
-	if proc.fuzzer.config.EnableSrvFb && ((!clientHasNew && proc.useSrvCovNow()) || ps[0].HasNetFail || ps[0].HasCrashFail) {
+	if proc.fuzzer.config.EnableSrvFb && ((!clientHasNew && proc.useSrvCovNow()) ||
+		(rootProg != nil && (rootProg.HasNetFail || rootProg.HasCrashFail))) {
 		log.Logf(0, "----- no new client coverage: %v, %v", clientHasNew, proc.fuzzer.config.EnableEval)
 		for idx, info := range infos[:servNum] {
 			_, extra := proc.fuzzer.checkNewSignal(nil, info)
@@ -1432,6 +1450,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	if len(ps) == 0 {
 		return nil, nil, 0, nil
 	}
+	rootProg := proc.rootProg(ps)
 
 	if opts.Flags&ipc.FlagDedupCover == 0 {
 		log.Fatalf("dedup cover is not enabled")
@@ -1478,7 +1497,8 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 				i, stat, prog.LastMutation())
 			refDiag := p.DumpRefDiagnosis()
 			appendDiagLog("MUTATION-DEBUG: broken refs copy %d stat=%d lastMut=%s meta: IsStash=%v IsDCache=%v IsFsops=%v\n%s",
-				i, stat, prog.LastMutation(), ps[0].IsStash, ps[0].IsDCache, ps[0].IsFsops, refDiag)
+				i, stat, prog.LastMutation(), rootProg != nil && rootProg.IsStash,
+				rootProg != nil && rootProg.IsDCache, rootProg != nil && rootProg.IsFsops, refDiag)
 			return nil, nil, 0, fmt.Errorf("broken refs in program copy %d", i)
 		}
 	}
@@ -1487,7 +1507,11 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	ticket := proc.fuzzer.gate.Enter()
 	defer proc.fuzzer.gate.Leave(ticket)
 
-	if ps[0].HasCrashFail || ps[0].HasNetFail || proc.fuzzer.config.EnableCsan {
+	rootCallCount := 0
+	if rootProg != nil {
+		rootCallCount = len(rootProg.Calls)
+	}
+	if rootProg != nil && (rootProg.HasCrashFail || rootProg.HasNetFail || proc.fuzzer.config.EnableCsan) {
 		local := *opts
 		local.Flags &^= ipc.FlagCollide | ipc.FlagThreaded
 		opts = &local
@@ -1598,7 +1622,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		allPairs := append(hbPairs, ccPairs...)
 		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg, dagDiag)
 		log.Logf(0, "hmdfs dag: vertices=%d ps0Len=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d mfDistIn=%v mfDistOut=%v tol=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
-			len(vertices), len(ps[0].Calls), len(hbPairs), len(ccPairs), len(pairBits),
+			len(vertices), rootCallCount, len(hbPairs), len(ccPairs), len(pairBits),
 			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
 			dagDiag.MatchFailFunc, dagDiag.MatchFailRetOK, dagDiag.MatchFailNoFunc, dagDiag.MatchFailNoCI, dagDiag.MatchFailTime,
 			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly, dagDiag.MFGap, dagDiag.MFShift,
@@ -1606,7 +1630,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
 			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
 		appendDiagLog("hmdfs dag: vertices=%d ps0Len=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d mfDistIn=%v mfDistOut=%v tol=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
-			len(vertices), len(ps[0].Calls), len(hbPairs), len(ccPairs), len(pairBits),
+			len(vertices), rootCallCount, len(hbPairs), len(ccPairs), len(pairBits),
 			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
 			dagDiag.MatchFailFunc, dagDiag.MatchFailRetOK, dagDiag.MatchFailNoFunc, dagDiag.MatchFailNoCI, dagDiag.MatchFailTime,
 			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly, dagDiag.MFGap, dagDiag.MFShift,
@@ -1827,8 +1851,9 @@ func dagRetComboString(m [6][6]int) string {
 // differences and the involved files' full metadata.
 func (proc *Proc) saveCsanBug(ps []*prog.Prog, output []byte, diffs []string,
 	fsMds []map[string]prog.FileMetadata, stat Stat, infos []*ipc.ProgInfo) {
+	root := proc.rootProg(ps)
 	log.Logf(0, "==== CSAN BUG detected (stat=%v) ====", stat)
-	log.Logf(0, "HasNetFail=%v HasCrashFail=%v", ps[0].HasNetFail, ps[0].HasCrashFail)
+	log.Logf(0, "HasNetFail=%v HasCrashFail=%v", root != nil && root.HasNetFail, root != nil && root.HasCrashFail)
 	for i, p := range ps {
 		log.Logf(0, "node %d prog:\n%s", i, p.Serialize())
 	}
@@ -2084,7 +2109,8 @@ func (proc *Proc) logProgram(opts *ipc.ExecOpts, ps []*prog.Prog) {
 		data = append(data, delimiter...)
 	}
 
-	log.Logf(0, "HasCrashFail:%v HasNetFail:%v\n", ps[0].HasCrashFail, ps[0].HasNetFail)
+	root := proc.rootProg(ps)
+	log.Logf(0, "HasCrashFail:%v HasNetFail:%v\n", root != nil && root.HasCrashFail, root != nil && root.HasNetFail)
 	// The following output helps to understand what program crashed kernel.
 	// It must not be intermixed.
 	switch proc.fuzzer.outputType {

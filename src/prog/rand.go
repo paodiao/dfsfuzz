@@ -282,14 +282,14 @@ func (r *randGen) generateFileName(baseDir string) string {
 	middle := r.randomString(10)
 	suffix := r.timeStampMicro()
 	fileType := r.randomString(3)
-	return baseDir + "/" + prefix + middle + "_" + suffix + "." + fileType
+	return joinTestPath(baseDir, prefix+middle+"_"+suffix+"."+fileType)
 }
 
 func (r *randGen) generateDirName(baseDir string) string {
 	prefix := "Eris_"
 	middle := r.randomString(10)
 	suffix := r.timeStampMicro()
-	return baseDir + "/" + prefix + middle + "_" + suffix + ".d"
+	return joinTestPath(baseDir, prefix+middle+"_"+suffix+".d")
 }
 
 func (r *randGen) randomString(length int) string {
@@ -1253,7 +1253,7 @@ func (r *randGen) selectFileInOneNode(hmcfg *Hmdfs_config, localCid string) stri
 			return node.FullPath
 		}
 	}
-	return "merge_view/default_test_file_" + randomSuffix(r.Rand) + ".txt"
+	return joinTestPath(defaultTestDir(hmcfg), "default_test_file_"+randomSuffix(r.Rand)+".txt")
 }
 
 func (r *randGen) selectRemoteFile(hmcfg *Hmdfs_config, localCid string) string {
@@ -1263,7 +1263,7 @@ func (r *randGen) selectRemoteFile(hmcfg *Hmdfs_config, localCid string) string 
 			return node.FullPath
 		}
 	}
-	return "merge_view/default_test_file.txt"
+	return joinTestPath(defaultTestDir(hmcfg), "default_test_file.txt")
 }
 
 func (r *randGen) generateWriteCallsWithoutNetCallForHmdfsStash(s *state, p *Prog, sCalls *SpecialCalls,
@@ -1565,7 +1565,7 @@ func (r *randGen) generateProgsForDcacheTimeout(s *state, sCalls *SpecialCalls, 
 
 	parentDir := r.selectRemoteDir(hmcfg, hmcfg.Cids[0])
 	if parentDir == "" {
-		parentDir = "merge_view"
+		parentDir = defaultTestDir(hmcfg)
 	}
 
 	testDir := ""
@@ -1750,7 +1750,7 @@ func (r *randGen) generateProgsForDropPush(s *state, sCalls *SpecialCalls, hmcfg
 
 	parentDir := r.selectRemoteDir(hmcfg, hmcfg.Cids[0])
 	if parentDir == "" {
-		parentDir = "merge_view"
+		parentDir = defaultTestDir(hmcfg)
 	}
 
 	testFile := ""
@@ -2360,9 +2360,9 @@ func (r *randGen) generateFromPredefinedPattern(s *state, sCalls *SpecialCalls, 
 func (r *randGen) preprocessPatternRootOp(basePath, cid, opName string, ft *FileTree) (string, bool) {
 	switch opName {
 	case "mkdir":
-		return basePath + "/mut_dir_" + randomSuffix(r.Rand), true
+		return joinTestPath(basePath, "mut_dir_"+randomSuffix(r.Rand)), true
 	case "creat":
-		return basePath + "/._creat_" + randomSuffix(r.Rand) + ".txt", true
+		return joinTestPath(basePath, "._creat_"+randomSuffix(r.Rand)+".txt"), true
 	case "rmdir":
 		emptyDir := ft.GetRandomEmptyDir(r.Rand, cid)
 		if emptyDir == nil {
@@ -2379,9 +2379,9 @@ func (r *randGen) preprocessPatternRootOp(basePath, cid, opName string, ft *File
 // that directory reads such as getdents64 observe the new entry).
 func (r *randGen) freshChildPath(dirPath, kind string) string {
 	if kind == "creat" {
-		return dirPath + "/._creat_" + randomSuffix(r.Rand) + ".txt"
+		return joinTestPath(dirPath, "._creat_"+randomSuffix(r.Rand)+".txt")
 	}
-	return dirPath + "/mut_dir_" + randomSuffix(r.Rand)
+	return joinTestPath(dirPath, "mut_dir_"+randomSuffix(r.Rand))
 }
 
 func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op ConcurrentOp, basePath string, cid string, lcs *LayeredChoiceStrategy, ExistingFd *ResultArg, UseExistFd bool, offsetRel OffsetRelationType, sharedOffset uint64) ([]*Call, []*WriteInfo, string) {
@@ -2761,9 +2761,9 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 	// 变体随后按各自语义生成：mkdir 变体按其几何位置建新名（见节点循环的
 	// freshChildPath 分支）；其余变体走关系路径 + 类型约束/保底。
 	if rootCallName == "mkdir" {
-		basePath = basePath + "/mut_dir_" + randomSuffix(r.Rand)
+		basePath = joinTestPath(basePath, "mut_dir_"+randomSuffix(r.Rand))
 	} else if rootCallName == "creat" {
-		basePath = basePath + "._creat_" + randomSuffix(r.Rand) + ".txt"
+		basePath = strings.TrimSuffix(basePath, "/") + "._creat_" + randomSuffix(r.Rand) + ".txt"
 	} else if rootCallName == "rmdir" {
 		emptyDir := lcs.FileTree.GetRandomEmptyDir(r.Rand, hmcfg.Cids[0])
 		if emptyDir == nil {
@@ -4151,7 +4151,7 @@ func (r *randGen) generateProgsForConcurrentRW(s *state, sCalls *SpecialCalls, h
 
 	filePath := r.selectRemoteFile(hmcfg, hmcfg.Cids[0])
 	if filePath == "" {
-		filePath = "merge_view"
+		filePath = defaultTestDir(hmcfg)
 		filePath = r.generateFileName(filePath)
 	}
 
@@ -4206,7 +4206,7 @@ func (r *randGen) generateProgsForFsyncTest(s *state, sCalls *SpecialCalls, hmcf
 
 	filePath := r.selectRemoteFile(hmcfg, hmcfg.Cids[0])
 	if filePath == "" {
-		filePath = "merge_view"
+		filePath = defaultTestDir(hmcfg)
 		filePath = r.generateFileName(filePath)
 	}
 
@@ -4239,7 +4239,7 @@ func (r *randGen) generateProgsForAppendTest(s *state, sCalls *SpecialCalls, hmc
 
 	filePath := r.selectRemoteFile(hmcfg, hmcfg.Cids[0])
 	if filePath == "" {
-		filePath = "merge_view"
+		filePath = defaultTestDir(hmcfg)
 		filePath = r.generateFileName(filePath)
 	}
 

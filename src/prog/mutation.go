@@ -4457,11 +4457,11 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 				basePath = dir.FullPath
 			}
 		}
-		basePath = basePath + "/mut_dir_" + randomSuffix(r.Rand)
+		basePath = joinTestPath(basePath, "mut_dir_"+randomSuffix(r.Rand))
 	} else if rootCallName == "creat" {
-		// creat 后缀拼在路径后（同目录新文件——父 = dirname(basePath)，
-		// 来自真实调用故父通常存在；树外目录引用偶发 ENOENT 无害）。
-		basePath = basePath + "._creat_" + randomSuffix(r.Rand) + ".txt"
+		// creat appends to the base name; keep it relative when the
+		// GlusterFS test root is the empty prefix.
+		basePath = strings.TrimSuffix(basePath, "/") + "._creat_" + randomSuffix(r.Rand) + ".txt"
 	}
 
 	var ExistingFd *ResultArg = nil
@@ -5851,7 +5851,7 @@ func extractDirFromTree(hmcfg *Hmdfs_config, p *Prog, r *randGen) string {
 	}
 	dir := extractDirPath(p)
 	if dir == "" {
-		dir = "merge_view"
+		dir = defaultTestDir(hmcfg)
 	}
 	return dir
 }
@@ -5875,7 +5875,7 @@ func genMkdirCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config
 	s := stateFromProg(p)
 
 	parentDir := extractDirFromTree(hmcfg, p, r)
-	newDir := fmt.Sprintf("%s/mut_dir_%s", parentDir, randomSuffix(r.Rand))
+	newDir := joinTestPath(parentDir, "mut_dir_"+randomSuffix(r.Rand))
 
 	return genPathCall(meta, newDir, r, s)
 }
@@ -5898,9 +5898,9 @@ func genRmdirCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config
 	if targetDir == "" {
 		testDir := extractDirPath(p)
 		if testDir == "" {
-			testDir = "merge_view/test_dir"
+			testDir = defaultTestDir(hmcfg)
 		}
-		targetDir = fmt.Sprintf("%s/rmdir_%s", testDir, randomSuffix(r.Rand))
+		targetDir = joinTestPath(testDir, "rmdir_"+randomSuffix(r.Rand))
 	}
 
 	return genPathCall(meta, targetDir, r, s)
@@ -5908,7 +5908,7 @@ func genRmdirCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config
 
 func genCreatCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config) *Call {
 	parentDir := extractDirFromTree(hmcfg, p, r)
-	fileName := fmt.Sprintf("%s/creat_file_%s.txt", parentDir, randomSuffix(r.Rand))
+	fileName := joinTestPath(parentDir, "creat_file_"+randomSuffix(r.Rand)+".txt")
 	return genCreatCallWithPath(p, r, sCalls, fileName)
 }
 
@@ -5949,9 +5949,9 @@ func genUnlinkCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_confi
 	if targetFile == "" {
 		testDir := extractDirPath(p)
 		if testDir == "" {
-			testDir = "merge_view/test_dir"
+			testDir = defaultTestDir(hmcfg)
 		}
-		targetFile = fmt.Sprintf("%s/unlink_file_%s.txt", testDir, randomSuffix(r.Rand))
+		targetFile = joinTestPath(testDir, "unlink_file_"+randomSuffix(r.Rand)+".txt")
 	}
 	return genUnlinkCallWithPath(p, r, sCalls, targetFile)
 }
@@ -5984,9 +5984,9 @@ func genRenameCall(p *Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_confi
 	if oldPath == "" {
 		testDir := extractDirPath(p)
 		if testDir == "" {
-			testDir = "merge_view/test_dir"
+			testDir = defaultTestDir(hmcfg)
 		}
-		oldPath = fmt.Sprintf("%s/old_%s.txt", testDir, randomSuffix(r.Rand))
+		oldPath = joinTestPath(testDir, "old_"+randomSuffix(r.Rand)+".txt")
 	}
 
 	newPath := oldPath[:strings.LastIndex(oldPath, "/")+1] + "new_" + randomSuffix(r.Rand) + ".txt"

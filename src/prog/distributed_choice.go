@@ -256,6 +256,26 @@ func (ft *FileTree) DepthBucketOf(path string) uint64 {
 	return DepthBucketOfWithPrefix(path, prefix)
 }
 
+// defaultTestDir returns the root-relative directory fallback used by legacy
+// generators when the tree has no candidate. GlusterFS uses an empty prefix
+// (the executor's cwd is the test root), so it returns "".
+func defaultTestDir(c *Hmdfs_config) string {
+	if c != nil && c.FileTree != nil {
+		return c.FileTree.RootPath()
+	}
+	return strings.TrimSuffix(MergeViewPrefix, "/")
+}
+
+// joinTestPath joins a root-relative directory and a leaf without producing a
+// leading slash for the empty GlusterFS root.
+func joinTestPath(dir, name string) string {
+	dir = strings.TrimSuffix(dir, "/")
+	if dir == "" {
+		return name
+	}
+	return dir + "/" + name
+}
+
 func normalizeRelativePath(path string) string {
 	path = strings.TrimPrefix(path, "./")
 	path = strings.TrimPrefix(path, "/")
