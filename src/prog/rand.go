@@ -3163,6 +3163,10 @@ func (r *randGen) generateGetxattrCallWithPath(s *state, sCalls *SpecialCalls, p
 }
 
 func (r *randGen) generateSetxattrCallWithPath(s *state, sCalls *SpecialCalls, path, name, value string) *Call {
+	return r.generateSetxattrCallFull(s, sCalls, path, name, value, 0)
+}
+
+func (r *randGen) generateSetxattrCallFull(s *state, sCalls *SpecialCalls, path, name, value string, xflags uint64) *Call {
 	meta := r.specialCallMeta(sCalls, func() int {
 		if sCalls == nil {
 			return 0
@@ -3189,7 +3193,7 @@ func (r *randGen) generateSetxattrCallWithPath(s *state, sCalls *SpecialCalls, p
 	if !ok {
 		return nil
 	}
-	flagsArg := MakeConstArg(flagsType, DirIn, 0)
+	flagsArg := MakeConstArg(flagsType, DirIn, xflags)
 	if pathArg == nil || nameArg == nil {
 		return nil
 	}
@@ -3326,9 +3330,17 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 	case "readlink":
 		calls = append(calls, r.generateReadlinkCallWithPath(s, sCalls, path))
 	case "getxattr":
-		calls = append(calls, r.generateGetxattrCallWithPath(s, sCalls, path, r.randomXattrName()))
+		xname := path2
+		if xname == "" {
+			xname = r.randomXattrName()
+		}
+		calls = append(calls, r.generateGetxattrCallWithPath(s, sCalls, path, xname))
 	case "setxattr":
-		calls = append(calls, r.generateSetxattrCallWithPath(s, sCalls, path, r.randomXattrName(), "bar"))
+		xname := path2
+		if xname == "" {
+			xname = r.randomXattrName()
+		}
+		calls = append(calls, r.generateSetxattrCallWithPath(s, sCalls, path, xname, "bar"))
 	case "mkdir":
 		calls = append(calls, r.generateMkdirCallWithPath(s, sCalls, path))
 	case "rmdir":

@@ -231,6 +231,48 @@ func TestGlusterfsDCTReadlinkFollower(t *testing.T) {
 	}
 }
 
+func TestGlusterfsCoverageProfileRules(t *testing.T) {
+	cases := []struct {
+		call string
+		want []RetBucket
+	}{
+		{"link", []RetBucket{RetSuccess}},
+		{"symlink", []RetBucket{RetSuccess}},
+		{"readlink", []RetBucket{RetSuccess}},
+		{"getxattr", []RetBucket{RetSuccess, RetFailure}},
+		{"setxattr", []RetBucket{RetSuccess, RetEEXIST}},
+		{"rmdir", []RetBucket{RetSuccess, RetFailure}},
+		{"rename", []RetBucket{RetSuccess, RetFailure}},
+		{"unlink", []RetBucket{RetSuccess}},
+	}
+	for _, tc := range cases {
+		got := producibleRetsFor(glusterfsProfile, tc.call)
+		if len(got) != len(tc.want) {
+			t.Fatalf("producibleRets(%q) = %v, want %v", tc.call, got, tc.want)
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Fatalf("producibleRets(%q) = %v, want %v", tc.call, got, tc.want)
+			}
+		}
+	}
+	if got := producibleTypesFor(glusterfsProfile, "link"); len(got) != 1 || got[0] {
+		t.Fatalf("link types = %v, want file only", got)
+	}
+	if got := producibleTypesFor(glusterfsProfile, "symlink"); len(got) != 2 {
+		t.Fatalf("symlink types = %v, want file+dir", got)
+	}
+	if got := producibleTypesFor(glusterfsProfile, "readlink"); len(got) != 1 || got[0] {
+		t.Fatalf("readlink types = %v, want non-dir", got)
+	}
+	if comboStaticallyUnreachableFor(glusterfsProfile, "symlink", "link", PathSame) {
+		t.Fatal("symlink(dir) x link(Same) must stay reachable")
+	}
+	if !comboStaticallyUnreachableFor(glusterfsProfile, "link", "mkdir", PathSame) {
+		t.Fatal("link(file) x mkdir(Same) must be statically unreachable")
+	}
+}
+
 func TestGlusterfsConflictWeights(t *testing.T) {
 	cases := []struct {
 		root, variant string

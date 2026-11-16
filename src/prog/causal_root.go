@@ -152,13 +152,33 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 		RootParent:        c1.RootParent,
 		RootSource:        c1.RootSource,
 		RootDest:          c1.RootDest,
+		RootXattrName:     "",
 		RootRenameReplace: c1.RootRenameReplace,
 		Anchor:            &c1.Anchor,
 		Plans:             make([]directedPlan, 0, len(group)),
 	}
+	if c1.RootCall == "setxattr" {
+		batch.RootXattrName = "user.eifuzz"
+	}
 	for i, p := range group {
 		q := *p
 		q.NodeX = i + 1
+		switch q.Cell.Combo.Variant {
+		case "setxattr":
+			if q.Cell.Combo.Root == "setxattr" && q.Cell.Combo.Rel == PathSame &&
+				batch.RootXattrName != "" {
+				q.XattrName = batch.RootXattrName
+			} else {
+				q.XattrName = "user.eifuzz_set"
+			}
+		case "getxattr":
+			if q.Cell.Combo.Root == "setxattr" && q.Cell.Combo.Rel == PathSame &&
+				batch.RootXattrName != "" {
+				q.XattrName = batch.RootXattrName
+			} else {
+				q.XattrName = "user.eifuzz_missing"
+			}
+		}
 		batch.Plans = append(batch.Plans, q)
 	}
 	batch.Plans = filterBaseBAuthority(batch.Plans)
@@ -206,15 +226,28 @@ func causalPairRelation(rootPre, rootPost, varPre, varPost string) (PathRelation
 // causalC2ComboLive returns the selectable combos for the fixed C2 root.
 // The second return value is false when the coverage board is not ready; in
 // that case the caller must not apply the filter.
-func causalC2ComboLive(root string) (map[comboKey]bool, bool) {
+func causalC2ComboLive(profile *DFSProfile, root string) (map[comboKey]bool, bool) {
 	if !covBoard.isReady() {
 		return nil, false
 	}
+	if profile == nil {
+		profile = hmdfsProfile
+	}
 	variants := make(map[string]bool)
-	for _, variant := range directedVariantCalls {
+	for _, variant := range profile.DirectedVariantCalls() {
+		if (variant == "link" || variant == "symlink" || variant == "readlink") &&
+			!profile.DualPathCausalEnabled() {
+			continue
+		}
+		if variant == "readlink" && root != "symlink" {
+			continue
+		}
 		variants[variant] = true
 	}
 	for _, fp := range freshSameForms {
+		if profile.Name == "glusterfs" && fp.ret == RetENOENT {
+			continue
+		}
 		variants[fp.variant] = true
 	}
 	rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
@@ -243,6 +276,8 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		return planByCell, cells
 	}
 	ft := lcs.FileTree
+	profile := lcs.profileOrDefault()
+	variantCalls := profile.DirectedVariantCalls()
 	var dn directedNode
 	switch rootKind {
 	case causalRootFresh:
@@ -314,11 +349,11 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 	default:
 		return planByCell, cells
 	}
-	if !nodeFitsConstraint(dn, rootCall) {
+	if !nodeFitsConstraintFor(profile, dn, rootCall) {
 		return planByCell, cells
 	}
 	supportedRoot := false
-	for _, c := range directedRootCalls {
+	for _, c := range profile.DirectedRootCalls() {
 		if c == rootCall {
 			supportedRoot = true
 			break
@@ -335,14 +370,27 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		freshA2 = true
 	}
 	rootPre, rootPost := causalRootRelPaths(rootKind, rootPath, rootSource, rootDest)
+	if (rootCall == "link" || rootCall == "symlink") && rootSource != "" && rootDest != "" {
+		rootPre, rootPost = rootSource, rootDest
+	}
 	destructiveSame := func(varPre string, rel PathRelation) bool {
 		if rel != PathSame {
 			return false
 		}
 		return rootCall == "unlink" || (rootKind == causalRootRename && rootPre != "" && rootPre == varPre)
 	}
-	liveCombos, filterCombos := causalC2ComboLive(rootCall)
+	liveCombos, filterCombos := causalC2ComboLive(profile, rootCall)
 	addC2 := func(cell directedCell, baseB, baseB2 string, off, blen uint64, freshRenameDst, freshB, freshSame bool) {
+		if (cell.Combo.Variant == "link" || cell.Combo.Variant == "symlink" ||
+			cell.Combo.Variant == "readlink") && !profile.DualPathCausalEnabled() {
+			return
+		}
+		if cell.Combo.Variant == "readlink" {
+			if rootCall != "symlink" || cell.Temporal != TemporalHB ||
+				cell.RetB != RetSuccess {
+				return
+			}
+		}
 		ck := cell.toKey()
 		if filterCombos && !liveCombos[cell.Combo] {
 			return
@@ -352,6 +400,10 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		}
 		if _, exists := planByCell[ck]; exists {
 			return
+		}
+		planRootLink := ""
+		if rootCall == "link" || rootCall == "symlink" {
+			planRootLink = rootDest
 		}
 		planByCell[ck] = &directedPlan{
 			Cell:               cell,
@@ -371,12 +423,16 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			RootParentKind:     rootParentKind,
 			RootParentIsDir:    rootParentIsDir,
 			RootParentIsAnchor: rootParentIsAnchor,
+			RootLinkPath:       planRootLink,
 		}
 		cells = append(cells, ck)
 	}
 	if rootKind == causalRootFresh {
 		for _, fp := range freshSameForms {
 			if fp.root != rootCall {
+				continue
+			}
+			if profile.Name == "glusterfs" && fp.ret == RetENOENT {
 				continue
 			}
 			cell := directedCell{
@@ -403,7 +459,7 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 				continue
 			}
 			variant := bn.freshBCall
-			kinds, ok := variantKindsFor(variant, rootCall, rel, destructiveSame(bn.path, rel), bn.isDir)
+			kinds, ok := variantKindsFor(variant, rootCall, rel, destructiveSame(bn.path, rel), bn.isDir, profile)
 			if !ok {
 				continue
 			}
@@ -439,7 +495,7 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			if !ok {
 				continue
 			}
-			kinds, ok := variantKindsFor(variant, rootCall, rel, destructiveSame(varPre, rel), bn.isDir)
+			kinds, ok := variantKindsFor(variant, rootCall, rel, destructiveSame(varPre, rel), bn.isDir, profile)
 			if !ok {
 				continue
 			}
@@ -481,14 +537,21 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		if !ok {
 			continue
 		}
-		for _, variant := range directedVariantCalls {
+		for _, variant := range variantCalls {
 			if variant == "rename" {
 				continue // rename is a later stage
 			}
-			if !nodeFitsConstraint(bn.directedNode, variant) {
+			if (variant == "link" || variant == "symlink" || variant == "readlink") &&
+				!profile.DualPathCausalEnabled() {
 				continue
 			}
-			kinds, ok := variantKindsFor(variant, rootCall, rel, destructiveSame(varPre, rel), bn.isDir)
+			if variant == "readlink" && rootCall != "symlink" {
+				continue
+			}
+			if !nodeFitsConstraintFor(profile, bn.directedNode, variant) {
+				continue
+			}
+			kinds, ok := variantKindsFor(variant, rootCall, rel, destructiveSame(varPre, rel), bn.isDir, profile)
 			if !ok {
 				continue
 			}
@@ -521,6 +584,23 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			}
 		}
 	}
+	if profile.DualPathCausalEnabled() && rootCall == "symlink" && rootDest != "" {
+		if rel, ok := causalPairRelation(rootPre, rootPost, rootDest, rootDest); ok {
+			cell := directedCell{
+				Combo:    comboKey{Root: rootCall, Variant: "readlink", Rel: rel},
+				Temporal: TemporalHB,
+				RetB:     RetSuccess,
+				OffB:     offsetBucketNA,
+				PersistB: pathInDir(rootDest, hmcfg.Persistence_dir),
+				DepthB:   DepthBucketOf(rootDest),
+				TypeB:    false,
+			}
+			addC2(cell, rootDest, "", 0, 0, false, false, false)
+			if p := planByCell[cell.toKey()]; p != nil {
+				p.RootLinkPath = rootDest
+			}
+		}
+	}
 	return planByCell, cells
 }
 
@@ -534,6 +614,11 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 	ft := lcs.FileTree
 	if p0 == nil || ft == nil || hmcfg == nil || p0.Target == nil {
 		return nil
+	}
+	profile := lcs.profileOrDefault()
+	rootCalls := profile.Calls.CausalRootCalls
+	if len(rootCalls) == 0 {
+		rootCalls = causalRootCalls
 	}
 	byCell := make(map[cellKey]*causalRootPlan)
 	for ci, call := range p0.Calls {
@@ -649,7 +734,11 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 				byCell[ck] = plan
 			}
 		}
-		for _, rootCall := range causalRootCalls {
+		for _, rootCall := range rootCalls {
+			if (rootCall == "link" || rootCall == "symlink") &&
+				!profile.DualPathCausalEnabled() {
+				continue
+			}
 			for _, rel := range rels {
 				paths := pathsByRel[rel]
 				for _, rootPath := range paths {
@@ -660,7 +749,51 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 					if rootNode == nil || rootNode == ft.Root || !aEligible(rootNode, ft.Root) {
 						continue
 					}
-					if !causalRootFits(rootCall, rootNode) {
+					if !causalRootFitsFor(profile, rootCall, rootNode) {
+						continue
+					}
+					if rootCall == "link" || rootCall == "symlink" {
+						linkPath := r.freshLinkPath(rootPath, rootCall)
+						if linkPath == "" || ft.FindNode(linkPath) != nil ||
+							!causalRenameRootPathAllowed(anchor, linkPath) {
+							continue
+						}
+						actualRel, ok := causalPairRelation(anchor.Source, anchor.Path,
+							rootPath, linkPath)
+						if !ok {
+							continue
+						}
+						isDir := rootNode.Type != NodeTypeFile
+						ck := cellKey{
+							Root:     call.Meta.CallName,
+							Variant:  rootCall,
+							Rel:      actualRel,
+							Temporal: TemporalHB,
+							RetA:     RetSuccess,
+							RetB:     RetSuccess,
+							OffB:     offsetBucketNA,
+							PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
+							DepthB:   DepthBucketOf(rootPath),
+							TypeB:    isDir,
+						}
+						if !covBoard.cellUncovered(ck) {
+							continue
+						}
+						a := anchor
+						a.Relation = actualRel
+						plan := &causalRootPlan{
+							Anchor:     a,
+							Cell:       ck,
+							RootCall:   rootCall,
+							RootPath:   rootPath,
+							RootKind:   causalRootNormal,
+							RootParent: GetParentDir(rootPath),
+							RootSource: rootPath,
+							RootDest:   linkPath,
+						}
+						if _, ok := byCell[ck]; !ok {
+							byCell[ck] = plan
+						}
 						continue
 					}
 					actualRel, ok := causalPairRelation(anchor.Source, anchor.Path, "", rootPath)
@@ -675,7 +808,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 						persist:  pathInDir(rootPath, hmcfg.Persistence_dir),
 						nonEmpty: len(rootNode.Children) > 0,
 					}
-					if !nodeFitsConstraint(dn, rootCall) {
+					if !nodeFitsConstraintFor(profile, dn, rootCall) {
 						continue
 					}
 					for _, args := range causalRootArgs(rootCall, dn, r) {
@@ -930,16 +1063,20 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 }
 
 func causalRootFits(rootCall string, node *FileNode) bool {
+	return causalRootFitsFor(hmdfsProfile, rootCall, node)
+}
+
+func causalRootFitsFor(profile *DFSProfile, rootCall string, node *FileNode) bool {
 	if node == nil {
 		return false
 	}
 	isDir := node.Type != NodeTypeFile
 	switch rootCall {
-	case "read", "write", "pread64", "pwrite64", "truncate", "unlink":
+	case "read", "write", "pread64", "pwrite64", "truncate", "unlink", "link":
 		return !isDir
 	case "getdents64":
 		return isDir
-	case "open", "stat", "chmod", "fsync", "fdatasync":
+	case "open", "stat", "chmod", "fsync", "fdatasync", "symlink", "setxattr":
 		return true
 	}
 	return false
@@ -1123,6 +1260,29 @@ func causalRootCallsSeq(r *randGen, sCalls *SpecialCalls, lcs *LayeredChoiceStra
 			return nil
 		}
 		return []*Call{c}
+	case "link", "symlink":
+		if batch.RootSource == "" || batch.RootDest == "" ||
+			batch.RootSource == batch.RootDest {
+			return nil
+		}
+		calls := r.generateCallByName(s, sCalls, batch.Root, batch.RootDest,
+			batch.RootSource, cid, nil, false,
+			directedNodeSize(lcs, batch.RootSource),
+			directedNodeFlags(r, lcs, batch.RootSource))
+		if len(calls) == 0 || hasNilCall(calls) {
+			return nil
+		}
+		return calls
+	case "setxattr":
+		name := batch.RootXattrName
+		if name == "" {
+			name = "user.eifuzz"
+		}
+		c := r.generateSetxattrCallFull(s, sCalls, path, name, "bar", 0)
+		if c == nil {
+			return nil
+		}
+		return []*Call{c}
 	default:
 		return r.generateCallByName(s, sCalls, batch.Root, path, "", cid, nil, false,
 			directedNodeSize(lcs, path), directedNodeFlags(r, lcs, path))
@@ -1225,6 +1385,19 @@ func causalAnchorPaths(p *Prog, pos GroupPosition) (string, string, string) {
 		src, dst := extractRenamePaths(call)
 		return dst, src, dst
 	}
+	switch call.Meta.CallName {
+	case "link":
+		target := extractPathFromCallByArgIdx(call, 0)
+		linkPath := extractPathFromCallByArgIdx(call, 1)
+		return linkPath, target, linkPath
+	case "symlink":
+		linkPath := extractPathFromCallByArgIdx(call, 1)
+		target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(call, 0))
+		return linkPath, target, linkPath
+	case "readlink":
+		linkPath := extractPathFromCallByArgIdx(call, 0)
+		return linkPath, linkPath, linkPath
+	}
 	path := causalEffectivePath(p, pos)
 	return path, path, path
 }
@@ -1298,6 +1471,7 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 		return false
 	}
 	ft := lcs.FileTree
+	profile := lcs.profileOrDefault()
 	// Root side.
 	switch {
 	case plan.FreshA2:
@@ -1346,7 +1520,7 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 			return false
 		}
 		root, ok := causalPlanNode(ft, plan.BaseA, hmcfg.Persistence_dir)
-		if !ok || !nodeFitsConstraint(root, plan.Cell.Combo.Root) {
+		if !ok || !nodeFitsConstraintFor(profile, root, plan.Cell.Combo.Root) {
 			return false
 		}
 	}
@@ -1417,9 +1591,20 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 			b.depth != plan.Cell.DepthB || b.persist != plan.Cell.PersistB {
 			return false
 		}
+	} else if plan.Cell.Combo.Variant == "readlink" {
+		if plan.Cell.Combo.Root != "symlink" || plan.RootLinkPath == "" ||
+			plan.BaseB != plan.RootLinkPath ||
+			plan.Cell.RetB != RetSuccess || plan.Cell.OffB != offsetBucketNA ||
+			plan.Cell.TypeB {
+			return false
+		}
+		if DepthBucketOf(plan.BaseB) != plan.Cell.DepthB ||
+			pathInDir(plan.BaseB, hmcfg.Persistence_dir) != plan.Cell.PersistB {
+			return false
+		}
 	} else {
 		b, ok := causalPlanNode(ft, plan.BaseB, hmcfg.Persistence_dir)
-		if !ok || !nodeFitsConstraint(b, plan.Cell.Combo.Variant) ||
+		if !ok || !nodeFitsConstraintFor(profile, b, plan.Cell.Combo.Variant) ||
 			b.isDir != plan.Cell.TypeB || b.depth != plan.Cell.DepthB ||
 			b.persist != pathInDir(plan.BaseB, hmcfg.Persistence_dir) {
 			return false
@@ -1447,6 +1632,10 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 	rootPre, rootPost := plan.BaseA, plan.BaseA
 	if plan.FreshA2 {
 		rootPost = plan.BaseA2
+	}
+	if (plan.Cell.Combo.Root == "link" || plan.Cell.Combo.Root == "symlink") &&
+		plan.RootLinkPath != "" {
+		rootPost = plan.RootLinkPath
 	}
 	varPre, varPost := plan.BaseB, plan.BaseB
 	if plan.Cell.Combo.Variant == "rename" {

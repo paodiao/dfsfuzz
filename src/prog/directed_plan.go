@@ -98,6 +98,11 @@ type directedPlan struct {
 	RootParentKind     AnchorPathKind
 	RootParentIsDir    bool
 	RootParentIsAnchor bool
+	// RootLinkPath is the C1 symlink root's program-local linkpath. It is the
+	// B side of a readlink C2 variant and is never a FileTree node.
+	RootLinkPath string
+	// XattrName is the shared key for getxattr/setxattr variant construction.
+	XattrName string
 	// RenameReplace marks the E rename form (existing same-class same-parent
 	// destination, Success); F (fresh destination) and B (ENOTEMPTY) leave it
 	// false. Explicit because the live recheck must not infer the shape from
@@ -122,6 +127,7 @@ type directedBatch struct {
 	RootParent        string
 	RootSource        string
 	RootDest          string
+	RootXattrName     string
 	RootRenameReplace bool
 	Plans             []directedPlan
 	Anchor            *causalAnchor
@@ -144,6 +150,20 @@ var directedVariantCalls = []string{
 	"open", "stat", "chmod", "fsync", "fdatasync", "getdents64",
 	"read", "write", "pread64", "pwrite64", "truncate", "rmdir", "rename",
 	"unlink", "mkdir", "creat",
+}
+
+// directedVariantAllowed applies the profile's dual-path gate and the
+// readlink-root restriction.
+func directedVariantAllowed(profile *DFSProfile, root, variant string) bool {
+	if variant == "link" || variant == "symlink" || variant == "readlink" {
+		if profile == nil || !profile.DualPathCausalEnabled() {
+			return false
+		}
+	}
+	if variant == "readlink" && root != "symlink" {
+		return false
+	}
+	return true
 }
 
 // offsetVariants carry an explicit offset or length (the only way to pin a
@@ -631,7 +651,14 @@ func pickWitness(c *witnessCands, root string, r *rand.Rand) (string, bool) {
 
 // nodeFitsConstraint checks a node against the call's type constraint.
 func nodeFitsConstraint(n directedNode, call string) bool {
-	switch callNameConstraint(call) {
+	return nodeFitsConstraintFor(hmdfsProfile, n, call)
+}
+
+func nodeFitsConstraintFor(profile *DFSProfile, n directedNode, call string) bool {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
+	switch profile.TargetConstraint(call) {
 	case relTargetFile:
 		return !n.isDir
 	case relTargetDir:
@@ -651,7 +678,11 @@ type directedKind struct {
 
 // directedVariantKinds returns the realizable (offset bucket, return bucket)
 // forms of a v1 variant call. ok=false when the call is out of scope.
-func directedVariantKinds(call string) (kinds []directedKind, ok bool) {
+func directedVariantKinds(call string, profiles ...*DFSProfile) (kinds []directedKind, ok bool) {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
 	switch call {
 	case "pread64", "pwrite64", "truncate":
 		return []directedKind{
@@ -660,14 +691,31 @@ func directedVariantKinds(call string) (kinds []directedKind, ok bool) {
 		}, true
 	case "read", "write":
 		return []directedKind{{offsetBucketZero, RetSuccess}}, true
-	case "open", "stat", "chmod", "fsync", "fdatasync", "getdents64":
+	case "open", "stat", "chmod", "fsync", "fdatasync", "getdents64",
+		"link", "symlink", "readlink":
 		return []directedKind{{offsetBucketNA, RetSuccess}}, true
+	case "getxattr":
+		return []directedKind{
+			{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetFailure},
+		}, true
+	case "setxattr":
+		return []directedKind{
+			{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetEEXIST},
+		}, true
 	case "rmdir":
+		if profile.Name == "glusterfs" {
+			return []directedKind{
+				{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetFailure},
+			}, true
+		}
 		return []directedKind{
 			{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetFailure},
 			{offsetBucketNA, RetENOENT},
 		}, true
 	case "unlink":
+		if profile.Name == "glusterfs" {
+			return []directedKind{{offsetBucketNA, RetSuccess}}, true
+		}
 		return []directedKind{
 			{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetENOENT},
 		}, true
@@ -678,6 +726,11 @@ func directedVariantKinds(call string) (kinds []directedKind, ok bool) {
 	case "creat":
 		return []directedKind{{offsetBucketNA, RetSuccess}}, true
 	case "rename":
+		if profile.Name == "glusterfs" {
+			return []directedKind{
+				{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetFailure},
+			}, true
+		}
 		return []directedKind{
 			{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetFailure},
 		}, true
@@ -730,6 +783,29 @@ func variantKindAllowed(variant string, retB RetBucket, bn *directedBNode, root 
 		return retB == RetSuccess && !bn.isDir
 	case "rename":
 		return false
+	case "link":
+		return retB == RetSuccess && !bn.isDir
+	case "symlink", "readlink":
+		return retB == RetSuccess
+	case "getxattr":
+		switch retB {
+		case RetSuccess:
+			// Baseline has no xattrs: Success requires the root setxattr on
+			// the same path/key.
+			return root == "setxattr" && rel == PathSame
+		case RetFailure:
+			return !(root == "setxattr" && rel == PathSame)
+		}
+		return false
+	case "setxattr":
+		switch retB {
+		case RetSuccess:
+			return true
+		case RetEEXIST:
+			// XATTR_CREATE after the same-path key was created by the root.
+			return root == "setxattr" && rel == PathSame
+		}
+		return false
 	}
 	return true
 }
@@ -765,12 +841,16 @@ func destructiveSameRoot(root string, rel PathRelation, freshA2 bool) bool {
 // so this is a deliberate model/planner asymmetry, not an oversight.
 // truncate/rename carry the same lookup-failure form (FuncLookup, OffB=NA; the
 // model admits it via producibleOffBucketsForRet).
-func variantKindsFor(variant, root string, rel PathRelation, freshA2, isDir bool) ([]directedKind, bool) {
-	kinds, ok := directedVariantKinds(variant)
+func variantKindsFor(variant, root string, rel PathRelation, freshA2, isDir bool, profiles ...*DFSProfile) ([]directedKind, bool) {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
+	kinds, ok := directedVariantKinds(variant, profile)
 	if !ok {
 		return nil, false
 	}
-	if destructiveSameRoot(root, rel, freshA2) && !isDir {
+	if profile.Name != "glusterfs" && destructiveSameRoot(root, rel, freshA2) && !isDir {
 		switch variant {
 		case "stat", "open", "chmod", "truncate", "rename":
 			kinds = append(kinds, directedKind{offsetBucketNA, RetENOENT})
@@ -1021,16 +1101,30 @@ func planStateEffect(p *directedPlan) planEffect {
 	return planEffectObserver
 }
 
+// groupTouchedCalls are the calls whose path argument is resolved through a
+// planned hardlink alias, so they must be serialized against the alias's
+// canonical target group.
+var groupTouchedCalls = map[string]bool{
+	"write": true, "pwrite64": true, "truncate": true,
+	"creat": true, "read": true, "pread64": true,
+}
+
 // planTouchedPaths returns the paths whose state a plan depends on or
 // changes: BaseB always, plus the rename source BaseB2 for the dual-path form
 // (a successful rename moves the source away, so a sibling plan on that path
-// would observe a state it did not predict). The anchor is not added on its
-// own (a Same-form rename source may coincide with it).
+// would observe a state it did not predict). A link root's group-touched
+// variant also touches the hardlink group keyed by the root's canonical
+// target. The anchor is not added on its own (a Same-form rename source may
+// coincide with it).
 func planTouchedPaths(p *directedPlan) []string {
+	paths := []string{p.BaseB}
 	if p.Cell.Combo.Variant == "rename" && p.BaseB2 != "" && p.BaseB2 != p.BaseB {
-		return []string{p.BaseB, p.BaseB2}
+		paths = append(paths, p.BaseB2)
 	}
-	return []string{p.BaseB}
+	if p.Cell.Combo.Root == "link" && p.BaseA != "" && groupTouchedCalls[p.Cell.Combo.Variant] {
+		paths = append(paths, "\x00group:"+p.BaseA)
+	}
+	return paths
 }
 
 // filterBaseBAuthority enforces the batch's one-state-authority-per-path rule
@@ -1262,6 +1356,9 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 		}
 	}
 	batch := &directedBatch{Root: seed.Cell.Combo.Root, BaseA: seed.BaseA, BaseA2: seed.BaseA2}
+	if seed.Cell.Combo.Root == "setxattr" {
+		batch.RootXattrName = "user.eifuzz"
+	}
 	if seed.FreshA || seed.FreshSame {
 		batch.BaseA = directedFreshName(seed.Cell.Combo.Root, seed.BaseA2, r.Rand)
 	}
@@ -1303,6 +1400,22 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 					p.BaseB = dst
 					usedDst[dst] = true
 				}
+			}
+		}
+		switch p.Cell.Combo.Variant {
+		case "setxattr":
+			if p.Cell.Combo.Root == "setxattr" && p.Cell.Combo.Rel == PathSame &&
+				batch.RootXattrName != "" {
+				p.XattrName = batch.RootXattrName
+			} else {
+				p.XattrName = "user.eifuzz_set"
+			}
+		case "getxattr":
+			if p.Cell.Combo.Root == "setxattr" && p.Cell.Combo.Rel == PathSame &&
+				batch.RootXattrName != "" {
+				p.XattrName = batch.RootXattrName
+			} else {
+				p.XattrName = "user.eifuzz_missing"
 			}
 		}
 		batch.Plans = append(batch.Plans, p)
@@ -1466,6 +1579,8 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	planByCell := make(map[cellKey]*directedPlan)
 	var cells []cellKey
 	profile := hmcfg.ProfileOrDefault()
+	rootCalls := profile.DirectedRootCalls()
+	variantCalls := profile.DirectedVariantCalls()
 	view := buildDirectedView(lcs.FileTree, hmcfg.Persistence_dir)
 	if len(view.bNodes) == 0 {
 		return planByCell, cells
@@ -1576,8 +1691,11 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	// exact for the planner, not just an optimization.
 	rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
 	var combos []comboKey
-	for _, root := range directedRootCalls {
-		for _, variant := range directedVariantCalls {
+	for _, root := range rootCalls {
+		for _, variant := range variantCalls {
+			if !directedVariantAllowed(profile, root, variant) {
+				continue
+			}
 			for _, rel := range rels {
 				combos = append(combos, comboKey{Root: root, Variant: variant, Rel: rel})
 			}
@@ -1607,7 +1725,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	for i := range view.bNodes {
 		bn := &view.bNodes[i]
 		renameNode := bn.srcPath != ""
-		for _, variant := range directedVariantCalls {
+		for _, variant := range variantCalls {
 			if bn.freshB && variant != bn.freshBCall {
 				continue
 			}
@@ -1620,7 +1738,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 			if !ok {
 				continue
 			}
-			if !nodeFitsConstraint(bn.directedNode, variant) {
+			if !nodeFitsConstraintFor(profile, bn.directedNode, variant) {
 				continue
 			}
 			for _, rel := range rels {
@@ -1712,8 +1830,8 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 		if bn.srcPath != "" || bn.freshB {
 			continue
 		}
-		for _, variant := range directedVariantCalls {
-			kinds, ok := directedVariantKinds(variant)
+		for _, variant := range variantCalls {
+			kinds, ok := directedVariantKinds(variant, profile)
 			if !ok {
 				continue
 			}
@@ -1728,7 +1846,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 					if rel == PathSibling && !bn.parentEligible {
 						continue
 					}
-					if !nodeFitsConstraint(bn.directedNode, variant) {
+					if !nodeFitsConstraintFor(profile, bn.directedNode, variant) {
 						continue
 					}
 					parent := bn.path
@@ -1780,11 +1898,11 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 		if bn.srcPath != "" || bn.freshB {
 			continue
 		}
-		for _, variant := range directedVariantCalls {
+		for _, variant := range variantCalls {
 			if variant == "rename" {
 				continue
 			}
-			if !nodeFitsConstraint(bn.directedNode, variant) {
+			if !nodeFitsConstraintFor(profile, bn.directedNode, variant) {
 				continue
 			}
 			for _, rel := range []PathRelation{PathSame, PathSibling, PathParent} {
@@ -2013,6 +2131,46 @@ func directedVariantCallsSeq(r *randGen, sCalls *SpecialCalls, lcs *LayeredChoic
 	case "rename":
 		// Dual-path form: old = source (BaseB2), new = destination (BaseB).
 		c := r.generateRenameCallWithPaths(s, sCalls, plan.BaseB2, plan.BaseB)
+		if c == nil {
+			return nil
+		}
+		return []*Call{c}
+	case "link", "symlink":
+		if path == "" {
+			return nil
+		}
+		linkPath := r.freshLinkPath(path, variant)
+		if linkPath == "" {
+			return nil
+		}
+		return r.generateCallByName(s, sCalls, variant, linkPath, path, cid,
+			nil, false, size, directedNodeFlags(r, lcs, path))
+	case "readlink":
+		if path == "" {
+			return nil
+		}
+		return r.generateCallByName(s, sCalls, variant, path, "", cid,
+			nil, false, 0, 0)
+	case "getxattr":
+		name := plan.XattrName
+		if name == "" {
+			name = r.randomXattrName()
+		}
+		return r.generateCallByName(s, sCalls, variant, path, name, cid,
+			nil, false, 0, 0)
+	case "setxattr":
+		name := plan.XattrName
+		if name == "" {
+			name = r.randomXattrName()
+		}
+		var xflags uint64
+		if plan.Cell.RetB == RetEEXIST {
+			xflags = r.target.GetConst("XATTR_CREATE")
+			if xflags == 0 {
+				xflags = 1
+			}
+		}
+		c := r.generateSetxattrCallFull(s, sCalls, path, name, "bar", xflags)
 		if c == nil {
 			return nil
 		}
@@ -2521,6 +2679,15 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 			return false
 		}
 		if c := r.generateRenameCallWithPaths(stateFromProg(clone0), sCalls, batch.BaseA, batch.BaseA2); c != nil {
+			rootCalls = []*Call{c}
+		}
+	} else if batch.Root == "setxattr" {
+		name := batch.RootXattrName
+		if name == "" {
+			name = "user.eifuzz"
+		}
+		if c := r.generateSetxattrCallFull(stateFromProg(clone0), sCalls,
+			batch.BaseA, name, "bar", 0); c != nil {
 			rootCalls = []*Call{c}
 		}
 	} else {

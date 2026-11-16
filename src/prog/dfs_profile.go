@@ -57,6 +57,12 @@ type PlanProfile struct {
 	DCTRootCalls    []string
 	DCTVariantCalls []string
 	CausalRootCalls []string
+	// Directed-plan call lists and dual-path gate. HMDFS keeps the old global
+	// lists; GlusterFS v1 enables link/symlink only after trace stability, so
+	// DualPathCausalEnabled stays false for v1.
+	DirectedRootCalls     []string
+	DirectedVariantCalls  []string
+	DualPathCausalEnabled bool
 }
 
 type TreeProfile struct {
@@ -119,6 +125,16 @@ var GlusterfsCausalRootCalls = []string{
 // selectable roots stay at 19.
 var GlusterfsChoiceCalls = append(append([]string{}, GlusterfsRootCalls...), "close")
 
+// GlusterfsDirectedVariantCalls is the v1 C2 variant list. link/symlink and
+// readlink are gated by PlanProfile.DualPathCausalEnabled at planning time;
+// readlink additionally requires root=symlink.
+var GlusterfsDirectedVariantCalls = []string{
+	"open", "stat", "chmod", "fsync", "fdatasync", "getdents64",
+	"read", "write", "pread64", "pwrite64", "truncate", "rmdir", "rename",
+	"unlink", "mkdir", "creat", "link", "symlink", "readlink",
+	"getxattr", "setxattr",
+}
+
 var hmdfsProfile = &DFSProfile{
 	Name: "hmdfs",
 	Calls: CallProfile{
@@ -137,10 +153,16 @@ var hmdfsProfile = &DFSProfile{
 	},
 	Events: EventProfile{SupportsSameInode: true},
 	Paths:  PathPolicy{RootPrefix: MergeViewPrefix, SameParentRename: true},
-	Tree:   TreeProfile{Prefix: MergeViewPrefix},
-	Gen:    GenProfile{Stash: true, Dcache: true, Fsops: true, ClientOnly: false},
-	Check:  CheckerProfile{SymlinkPath: true, FullType: false, WeakNlink: true, DiagnosticMtime: true, UserXattrsOnly: true},
-	Trace:  TraceProfile{Name: "hmdfs"},
+	Plan: PlanProfile{
+		DCTRootCalls: FsopsSubCalls, DCTVariantCalls: FsopsSubCalls,
+		CausalRootCalls:   causalRootCalls,
+		DirectedRootCalls: directedRootCalls, DirectedVariantCalls: directedVariantCalls,
+		DualPathCausalEnabled: false,
+	},
+	Tree:  TreeProfile{Prefix: MergeViewPrefix},
+	Gen:   GenProfile{Stash: true, Dcache: true, Fsops: true, ClientOnly: false},
+	Check: CheckerProfile{SymlinkPath: true, FullType: false, WeakNlink: true, DiagnosticMtime: true, UserXattrsOnly: true},
+	Trace: TraceProfile{Name: "hmdfs"},
 	Feature: FeatureProfile{
 		Stash: true, Dcache: true, Persistence: true, C2san: false,
 		NetFailure: true, NodeCrash: true, ServerPrograms: false,
@@ -167,11 +189,17 @@ var glusterfsProfile = &DFSProfile{
 	},
 	Events: EventProfile{SupportsSameInode: false},
 	Paths:  PathPolicy{RootPrefix: "", SameParentRename: false, MaxClientNum: 3},
-	Plan:   PlanProfile{DCTRootCalls: GlusterfsRootCalls, DCTVariantCalls: GlusterfsVariantCalls, CausalRootCalls: GlusterfsCausalRootCalls},
-	Tree:   TreeProfile{Prefix: ""},
-	Gen:    GenProfile{Stash: false, Dcache: false, Fsops: true, ClientOnly: true},
-	Check:  CheckerProfile{SymlinkPath: true, FullType: true, WeakNlink: true, DiagnosticMtime: true, UserXattrsOnly: true},
-	Trace:  TraceProfile{Name: "glusterfs"},
+	Plan: PlanProfile{
+		DCTRootCalls: GlusterfsRootCalls, DCTVariantCalls: GlusterfsVariantCalls,
+		CausalRootCalls:       GlusterfsCausalRootCalls,
+		DirectedRootCalls:     GlusterfsCausalRootCalls,
+		DirectedVariantCalls:  GlusterfsDirectedVariantCalls,
+		DualPathCausalEnabled: false,
+	},
+	Tree:  TreeProfile{Prefix: ""},
+	Gen:   GenProfile{Stash: false, Dcache: false, Fsops: true, ClientOnly: true},
+	Check: CheckerProfile{SymlinkPath: true, FullType: true, WeakNlink: true, DiagnosticMtime: true, UserXattrsOnly: true},
+	Trace: TraceProfile{Name: "glusterfs"},
 	Feature: FeatureProfile{
 		Stash: false, Dcache: false, Persistence: false, C2san: false,
 		NetFailure: false, NodeCrash: false, ServerPrograms: true,
@@ -318,4 +346,26 @@ func profileCallListContains(list []string, name string) bool {
 		}
 	}
 	return false
+}
+
+// DirectedRootCalls returns the profile's directed/C1 root allowlist.
+func (p *DFSProfile) DirectedRootCalls() []string {
+	if p != nil && len(p.Plan.DirectedRootCalls) > 0 {
+		return p.Plan.DirectedRootCalls
+	}
+	return directedRootCalls
+}
+
+// DirectedVariantCalls returns the profile's directed/C2 variant allowlist.
+func (p *DFSProfile) DirectedVariantCalls() []string {
+	if p != nil && len(p.Plan.DirectedVariantCalls) > 0 {
+		return p.Plan.DirectedVariantCalls
+	}
+	return directedVariantCalls
+}
+
+// DualPathCausalEnabled gates causal link/symlink/readlink insertion. v1
+// leaves it false until the FUSE trace is stable.
+func (p *DFSProfile) DualPathCausalEnabled() bool {
+	return p != nil && p.Plan.DualPathCausalEnabled
 }

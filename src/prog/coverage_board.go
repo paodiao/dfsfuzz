@@ -197,9 +197,16 @@ func freshSameCombo(root, variant string) bool {
 // Sibling stays in the grid: it only needs a parent directory and is planned
 // today (existing-dir B and the synthesized fresh B under a parent).
 func comboStaticallyUnreachable(root, variant string, rel PathRelation) bool {
+	return comboStaticallyUnreachableFor(hmdfsProfile, root, variant, rel)
+}
+
+func comboStaticallyUnreachableFor(profile *DFSProfile, root, variant string, rel PathRelation) bool {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
 	switch rel {
 	case PathSame:
-		rRoot, rVar := callNameConstraint(root), callNameConstraint(variant)
+		rRoot, rVar := profile.TargetConstraint(root), profile.TargetConstraint(variant)
 		if rRoot == relTargetFile {
 			return rVar == relTargetDir && !freshSameCombo(root, variant)
 		}
@@ -208,9 +215,9 @@ func comboStaticallyUnreachable(root, variant string, rel PathRelation) bool {
 		}
 		return false
 	case PathParent:
-		return callNameConstraint(variant) == relTargetFile
+		return profile.TargetConstraint(variant) == relTargetFile
 	case PathChild:
-		return callNameConstraint(root) == relTargetFile
+		return profile.TargetConstraint(root) == relTargetFile
 	}
 	return false
 }
@@ -290,7 +297,7 @@ func InitCoverageBoard(hmcfg *Hmdfs_config) {
 				// they must not inflate cover=/target or stay live for the
 				// Directed pickers. This is a new scoring epoch (the target
 				// denominator shrinks; cover= is not comparable across it).
-				if comboStaticallyUnreachable(root, variant, rel) {
+				if comboStaticallyUnreachableFor(b.profile, root, variant, rel) {
 					continue
 				}
 				b.producible[ck] = b.computeProducibleLocked(ck)
@@ -427,7 +434,7 @@ func (b *coverageBoard) cellInDomain(ck cellKey) bool {
 // The caller must hold mu.
 func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
 	retACount := 1 // RetSuccess only; see the doc comment above
-	retB := producibleRets(ck.Variant)
+	retB := producibleRetsFor(b.profile, ck.Variant)
 	offCount := 0
 	for _, r := range retB {
 		offCount += len(producibleOffBucketsForRet(ck.Variant, r))
@@ -438,7 +445,7 @@ func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
 			depthList = append(depthList, uint64(d))
 		}
 	}
-	typeList := producibleTypes(ck.Variant)
+	typeList := producibleTypesFor(b.profile, ck.Variant)
 
 	// Non-persist cells exist at every domain bucket; persist cells only at
 	// buckets >= the persist dir's own bucket. The >= also covers shallow
@@ -596,7 +603,7 @@ func (b *coverageBoard) cellInModel(ck cellKey) bool {
 		return false
 	}
 	inRets := false
-	for _, r := range producibleRets(ck.Variant) {
+	for _, r := range producibleRetsFor(b.profile, ck.Variant) {
 		if r == ck.RetB {
 			inRets = true
 			break
@@ -615,7 +622,7 @@ func (b *coverageBoard) cellInModel(ck cellKey) bool {
 	if !inOffs {
 		return false
 	}
-	for _, t := range producibleTypes(ck.Variant) {
+	for _, t := range producibleTypesFor(b.profile, ck.Variant) {
 		if t == ck.TypeB {
 			return true
 		}
@@ -875,9 +882,9 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 	if nd == 0 {
 		return
 	}
-	for _, rb := range producibleRets(ck.Variant) {
+	for _, rb := range producibleRetsFor(b.profile, ck.Variant) {
 		for _, off := range producibleOffBucketsForRet(ck.Variant, rb) {
-			for _, isDir := range producibleTypes(ck.Variant) {
+			for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
 				for i := 0; i < nd; i++ {
 					depth := depthList[i]
 					persists := [2]bool{false}
@@ -1252,6 +1259,24 @@ func (b *coverageBoard) reset() {
 // `dag marg` (RetByFunc/ErrHist) data. Note that within RetFailure the pair
 // bit cannot distinguish ENOTEMPTY from EINVAL; errno detail stays offline.
 func producibleRets(call string) []RetBucket {
+	return producibleRetsFor(hmdfsProfile, call)
+}
+
+func producibleRetsFor(profile *DFSProfile, call string) []RetBucket {
+	if profile != nil && profile.Name == "glusterfs" {
+		switch call {
+		case "link", "symlink", "readlink":
+			return []RetBucket{RetSuccess}
+		case "getxattr":
+			return []RetBucket{RetSuccess, RetFailure}
+		case "setxattr":
+			return []RetBucket{RetSuccess, RetEEXIST}
+		case "rmdir", "rename":
+			return []RetBucket{RetSuccess, RetFailure}
+		case "unlink":
+			return []RetBucket{RetSuccess}
+		}
+	}
 	switch call {
 	case "mkdir":
 		return []RetBucket{RetSuccess, RetEEXIST}
@@ -1311,7 +1336,19 @@ func producibleOffBucketsForRet(call string, ret RetBucket) []uint64 {
 }
 
 func producibleTypes(call string) []bool {
-	switch callNameConstraint(call) {
+	return producibleTypesFor(hmdfsProfile, call)
+}
+
+func producibleTypesFor(profile *DFSProfile, call string) []bool {
+	if profile != nil && profile.Name == "glusterfs" {
+		switch call {
+		case "readlink":
+			return []bool{false}
+		case "symlink":
+			return []bool{false, true}
+		}
+	}
+	switch profile.TargetConstraint(call) {
 	case relTargetFile:
 		return []bool{false}
 	case relTargetDir:
