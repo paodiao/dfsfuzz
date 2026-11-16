@@ -150,7 +150,12 @@ func TestDctBaseCandidatesLinkRoles(t *testing.T) {
 		"merge_view/dirA/l1": true,
 		"merge_view/dirA/l2": true,
 	}
+	seen := make(map[string]bool)
 	for _, path := range got {
+		if seen[path] {
+			continue
+		}
+		seen[path] = true
 		if !want[path] {
 			t.Fatalf("unexpected base candidate %q in %v", path, got)
 		}
