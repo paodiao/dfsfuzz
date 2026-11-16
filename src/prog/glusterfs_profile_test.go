@@ -273,6 +273,26 @@ func TestGlusterfsCoverageProfileRules(t *testing.T) {
 	}
 }
 
+func TestGlusterfsReadlinkCoverageHBOnly(t *testing.T) {
+	ft := glusterfsPlanTree()
+	hmcfg := &Hmdfs_config{Profile: glusterfsProfile, DfsName: "glusterfs",
+		Node_num: 3, Cids: hmdfsSmokeCids(), FileTree: ft}
+	ResetCoverageBoard()
+	InitCoverageBoard(hmcfg)
+	t.Cleanup(ResetCoverageBoard)
+	covBoard.mu.RLock()
+	got := covBoard.computeProducibleLocked(comboKey{
+		Root: "symlink", Variant: "readlink", Rel: PathSame,
+	})
+	covBoard.mu.RUnlock()
+	if got[0] <= 0 {
+		t.Fatalf("readlink HB producible = %d, want > 0", got[0])
+	}
+	if got[1] != 0 {
+		t.Fatalf("readlink CC producible = %d, want 0", got[1])
+	}
+}
+
 func TestGlusterfsConflictWeights(t *testing.T) {
 	cases := []struct {
 		root, variant string

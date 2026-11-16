@@ -4389,6 +4389,76 @@ func dctCallPaths(call *Call) []string {
 	return []string{extractPathFromCall(call)}
 }
 
+// linkPathKind classifies a program-local linkpath binding.
+type linkPathKind int
+
+const (
+	linkPathHardlink linkPathKind = iota + 1
+	linkPathSymlink
+)
+
+type linkPathInfo struct {
+	Kind        linkPathKind
+	FollowIsDir bool
+	Target      string
+	CreatorIdx  int
+}
+
+// freshLinkPathsBefore scans link/symlink calls before end and records their
+// program-local linkpaths. A linkpath is not a FileTree node; a later
+// link/symlink target must not be one (v1 forbids nested links).
+func freshLinkPathsBefore(p *Prog, ft *FileTree, end int) map[string]linkPathInfo {
+	if p == nil {
+		return nil
+	}
+	if end > len(p.Calls) {
+		end = len(p.Calls)
+	}
+	m := make(map[string]linkPathInfo)
+	followKind := func(path string) (bool, bool) {
+		if info, ok := m[path]; ok {
+			return info.FollowIsDir, true
+		}
+		if ft != nil {
+			if n := ft.FindNode(path); n != nil {
+				return n.Type != NodeTypeFile, true
+			}
+		}
+		return false, false
+	}
+	for i := 0; i < end; i++ {
+		c := p.Calls[i]
+		if c == nil || c.Meta == nil {
+			continue
+		}
+		switch c.Meta.CallName {
+		case "link":
+			linkPath := extractPathFromCallByArgIdx(c, 1)
+			if linkPath != "" {
+				m[linkPath] = linkPathInfo{
+					Kind: linkPathHardlink, Target: extractPathFromCallByArgIdx(c, 0), CreatorIdx: i,
+				}
+			}
+		case "symlink":
+			linkPath := extractPathFromCallByArgIdx(c, 1)
+			target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(c, 0))
+			if linkPath != "" {
+				isDir, _ := followKind(target)
+				m[linkPath] = linkPathInfo{
+					Kind: linkPathSymlink, FollowIsDir: isDir, Target: target, CreatorIdx: i,
+				}
+			}
+		case "unlink", "rmdir", "rename":
+			// Removal invalidates a local binding; rename moves it.
+			paths := dctCallPaths(c)
+			for _, path := range paths {
+				delete(m, path)
+			}
+		}
+	}
+	return m
+}
+
 // basePathIsFileHinted is BasePathIsFile with the in-program creation hint
 // taking precedence over the unknown-path fallback.
 func basePathIsFileHinted(profile *DFSProfile, ft *FileTree, rootCallName, basePath string, freshKinds map[string]int) bool {
@@ -4448,6 +4518,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	// its intent as a local hint: a hinted mismatch is treated like a tree
 	// mismatch below, without writing the tree.
 	freshKinds := freshPathKindsBefore(p0, lcs.FileTree, insertPos)
+	freshLinks := freshLinkPathsBefore(p0, lcs.FileTree, insertPos)
 
 	// The candidate-derived basePath was chosen before the root was known, so
 	// a file-only/dir-only root may land on a mismatched type (EISDIR/ENOTDIR
@@ -4466,6 +4537,10 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 				basePath = ""
 				var compatible []string
 				for _, cand := range pathCandidates {
+					if (rootCallName == "link" || rootCallName == "symlink") &&
+						freshLinks[cand].Kind != 0 {
+						continue // link/symlink targets cannot be linkpaths
+					}
 					if n := lcs.FileTree.FindNode(cand); n != nil {
 						if nodeKindMatches(n, kind) {
 							compatible = append(compatible, cand)
@@ -4481,6 +4556,13 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 				}
 			}
 		}
+	}
+
+	if basePath != "" && (rootCallName == "link" || rootCallName == "symlink") &&
+		freshLinks[basePath].Kind != 0 {
+		// v1 forbids nested links: link/symlink targets must be real tree
+		// nodes, not another program-local linkpath.
+		basePath = ""
 	}
 
 	// The mount root is never a legal base for the destructive roots: rmdir

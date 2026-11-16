@@ -130,6 +130,30 @@ func TestPathSetOpenCreatRole(t *testing.T) {
 	}
 }
 
+func TestFreshLinkPathsBefore(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["symlink"]; !ok {
+		t.Skip("target has no symlink")
+	}
+	ft := glusterfsPlanTree()
+	link := mkLinkCall(t, target, "dirA/a", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	sym := mkSymlinkCall(t, target, "a", "dirA/l2")
+	sym.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{link, sym}}
+	links := freshLinkPathsBefore(p, ft, 2)
+	if info := links["dirA/l1"]; info.Kind != linkPathHardlink || info.Target != "dirA/a" {
+		t.Fatalf("hardlink info = %+v", info)
+	}
+	if info := links["dirA/l2"]; info.Kind != linkPathSymlink ||
+		info.Target != "dirA/a" || info.FollowIsDir {
+		t.Fatalf("symlink info = %+v", info)
+	}
+}
+
 func TestFreshBoundaryPrefix(t *testing.T) {
 	ft := glusterfsPlanTree()
 	if !freshParentNodeEligible(ft, "Eris_link_top") {
