@@ -264,6 +264,9 @@ func TestGlusterfsDirectedPlansArePlannable(t *testing.T) {
 		if ck.Variant == "mkdir" && ck.RetB == RetEEXIST {
 			t.Fatalf("mkdir EEXIST plan leaked into the normal planner: %+v", ck)
 		}
+		if ck.Root == "link" || ck.Root == "symlink" {
+			t.Fatalf("disabled dual-path gate emitted a dual root: %+v", ck)
+		}
 	}
 }
 
@@ -281,14 +284,23 @@ func TestGlusterfsNormalDualRootBatchInsert(t *testing.T) {
 	r := newRand(target, rand.NewSource(101))
 	plans, _ := planDirectedCells(glusterfsCoverageBaseProgs(target), lcs, hmcfg, r)
 
-	var dual *directedPlan
+	var dual, ccDual *directedPlan
 	for _, p := range plans {
-		if p.Cell.Combo.Root == "link" &&
-			(p.Cell.Combo.Variant == "open" || p.Cell.Combo.Variant == "stat") {
-			cp := *p
-			dual = &cp
+		if p.Cell.Combo.Root != "link" ||
+			(p.Cell.Combo.Variant != "open" && p.Cell.Combo.Variant != "stat") {
+			continue
+		}
+		cp := *p
+		if p.Cell.Temporal == TemporalConcurrent {
+			ccDual = &cp
 			break
 		}
+		if dual == nil {
+			dual = &cp
+		}
+	}
+	if ccDual != nil {
+		dual = ccDual
 	}
 	if dual == nil {
 		t.Fatal("no normal link-root plan with an open/stat variant")
