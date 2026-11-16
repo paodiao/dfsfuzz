@@ -1145,14 +1145,48 @@ func (env *Env) parseTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64,
 	return parseHmdfsTraceEvents(data)
 }
 
+// GlusterFS trace wire layout. Keep in sync with executor/glusterfs_trace.h
+// (which asserts the 1228-byte packed struct at compile time).
+const (
+	glusterfsTraceHeaderSize = 28
+	glusterfsTraceEventSize  = 1228
+	glusterfsTracePathMax    = 512
+	glusterfsTraceXattrMax   = 128
+
+	glusterfsTraceOffTimestamp = 0
+	glusterfsTraceOffEntryTs   = 8
+	glusterfsTraceOffFuncID    = 16
+	glusterfsTraceOffRet       = 20
+	glusterfsTraceOffNodeID    = 24
+	glusterfsTraceOffUnique    = 32
+	glusterfsTraceOffOffset    = 40
+	glusterfsTraceOffSize      = 48
+	glusterfsTraceOffMode      = 56
+	glusterfsTraceOffPathLen   = 60
+	glusterfsTraceOffPath2Len  = 64
+	glusterfsTraceOffXattrLen  = 68
+	glusterfsTraceOffTruncated = 72
+	glusterfsTraceOffPath      = 76
+	glusterfsTraceOffPath2     = 588
+	glusterfsTraceOffXattr     = 1100
+)
+
+func readGlusterfsU32(ev []byte, off int) uint32 {
+	return prog.HostEndian.Uint32(ev[off : off+4])
+}
+
+func readGlusterfsU64(ev []byte, off int) uint64 {
+	return prog.HostEndian.Uint64(ev[off : off+8])
+}
+
 // parseGlusterfsTraceEvents parses the executor's [ratio][offset][gap][count]
 // header followed by fixed 1228-byte GlusterFS events. The parser must read
 // the full 512/512/128 arrays for every event; path_len/path2_len/
 // xattr_name_len only slice what was read.
 func parseGlusterfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64) {
-	const eventSize = 1228
+	const eventSize = glusterfsTraceEventSize
 	out := *data
-	if len(out) < 28 {
+	if len(out) < glusterfsTraceHeaderSize {
 		return nil, 0, 0
 	}
 	ratioFixed, okRatio := readUint64(&out)
@@ -1192,10 +1226,10 @@ func parseGlusterfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, i
 			break
 		}
 		ev := out[:eventSize]
-		pathLen := prog.HostEndian.Uint32(ev[60:64])
-		path2Len := prog.HostEndian.Uint32(ev[64:68])
-		xattrLen := prog.HostEndian.Uint32(ev[68:72])
-		if pathLen > 512 || path2Len > 512 || xattrLen > 128 {
+		pathLen := readGlusterfsU32(ev, glusterfsTraceOffPathLen)
+		path2Len := readGlusterfsU32(ev, glusterfsTraceOffPath2Len)
+		xattrLen := readGlusterfsU32(ev, glusterfsTraceOffXattrLen)
+		if pathLen > glusterfsTracePathMax || path2Len > glusterfsTracePathMax || xattrLen > glusterfsTraceXattrMax {
 			appendParseDiag("parseGlusterfsTrace: event %d bad lengths %d/%d/%d",
 				i, pathLen, path2Len, xattrLen)
 			// The event record is fixed-size; keep the stream aligned for
@@ -1204,18 +1238,18 @@ func parseGlusterfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, i
 			break
 		}
 		events = append(events, prog.HmdfsTraceEvent{
-			Timestamp: prog.HostEndian.Uint64(ev[0:8]),
-			EntryTs:   prog.HostEndian.Uint64(ev[8:16]),
-			FuncID:    prog.HostEndian.Uint32(ev[16:20]),
-			Ret:       int32(prog.HostEndian.Uint32(ev[20:24])),
-			NodeID:    prog.HostEndian.Uint64(ev[24:32]),
-			Off:       prog.HostEndian.Uint64(ev[40:48]),
-			Size:      prog.HostEndian.Uint64(ev[48:56]),
-			Mode:      prog.HostEndian.Uint32(ev[56:60]),
-			Path:      string(ev[76 : 76+pathLen]),
-			Path2:     string(ev[588 : 588+path2Len]),
-			XattrName: string(ev[1100 : 1100+xattrLen]),
-			Truncated: prog.HostEndian.Uint32(ev[72:76]),
+			Timestamp: readGlusterfsU64(ev, glusterfsTraceOffTimestamp),
+			EntryTs:   readGlusterfsU64(ev, glusterfsTraceOffEntryTs),
+			FuncID:    readGlusterfsU32(ev, glusterfsTraceOffFuncID),
+			Ret:       int32(readGlusterfsU32(ev, glusterfsTraceOffRet)),
+			NodeID:    readGlusterfsU64(ev, glusterfsTraceOffNodeID),
+			Off:       readGlusterfsU64(ev, glusterfsTraceOffOffset),
+			Size:      readGlusterfsU64(ev, glusterfsTraceOffSize),
+			Mode:      readGlusterfsU32(ev, glusterfsTraceOffMode),
+			Path:      string(ev[glusterfsTraceOffPath : glusterfsTraceOffPath+pathLen]),
+			Path2:     string(ev[glusterfsTraceOffPath2 : glusterfsTraceOffPath2+path2Len]),
+			XattrName: string(ev[glusterfsTraceOffXattr : glusterfsTraceOffXattr+xattrLen]),
+			Truncated: readGlusterfsU32(ev, glusterfsTraceOffTruncated),
 			// GlusterFS v1: Ino and EntryIno stay zero; NodeID is separate.
 		})
 		out = out[eventSize:]

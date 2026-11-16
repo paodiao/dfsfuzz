@@ -6,7 +6,23 @@ import (
 	"monarch/prog"
 )
 
-const glusterfsTestEventSize = 1228
+func TestGlusterfsTraceLayoutConstants(t *testing.T) {
+	if glusterfsTraceHeaderSize != 28 {
+		t.Fatalf("header size = %d, want 28", glusterfsTraceHeaderSize)
+	}
+	if glusterfsTraceEventSize != 1228 {
+		t.Fatalf("event size = %d, want 1228", glusterfsTraceEventSize)
+	}
+	if glusterfsTraceOffPath+glusterfsTracePathMax != glusterfsTraceOffPath2 {
+		t.Fatalf("path array does not end at path2 offset")
+	}
+	if glusterfsTraceOffPath2+glusterfsTracePathMax != glusterfsTraceOffXattr {
+		t.Fatalf("path2 array does not end at xattr offset")
+	}
+	if glusterfsTraceOffXattr+glusterfsTraceXattrMax != glusterfsTraceEventSize {
+		t.Fatalf("xattr array does not end at event size")
+	}
+}
 
 func glusterfsU32(v uint32) []byte {
 	b := make([]byte, 4)
@@ -46,26 +62,26 @@ type glusterfsEventSpec struct {
 
 func glusterfsEvent(t *testing.T, s glusterfsEventSpec) []byte {
 	t.Helper()
-	if len(s.path) > 512 || len(s.path2) > 512 || len(s.xattr) > 128 {
+	if len(s.path) > glusterfsTracePathMax || len(s.path2) > glusterfsTracePathMax || len(s.xattr) > glusterfsTraceXattrMax {
 		t.Fatalf("test event string too long")
 	}
-	ev := make([]byte, glusterfsTestEventSize)
-	copy(ev[0:8], glusterfsU64(s.timestamp))
-	copy(ev[8:16], glusterfsU64(s.entryTS))
-	copy(ev[16:20], glusterfsU32(s.funcID))
-	copy(ev[20:24], glusterfsU32(uint32(s.ret)))
-	copy(ev[24:32], glusterfsU64(s.nodeID))
-	copy(ev[32:40], glusterfsU64(0)) // unique
-	copy(ev[40:48], glusterfsU64(s.off))
-	copy(ev[48:56], glusterfsU64(s.size))
-	copy(ev[56:60], glusterfsU32(s.mode))
-	copy(ev[60:64], glusterfsU32(uint32(len(s.path))))
-	copy(ev[64:68], glusterfsU32(uint32(len(s.path2))))
-	copy(ev[68:72], glusterfsU32(uint32(len(s.xattr))))
-	copy(ev[72:76], glusterfsU32(s.truncated))
-	copy(ev[76:76+len(s.path)], s.path)
-	copy(ev[588:588+len(s.path2)], s.path2)
-	copy(ev[1100:1100+len(s.xattr)], s.xattr)
+	ev := make([]byte, glusterfsTraceEventSize)
+	copy(ev[glusterfsTraceOffTimestamp:], glusterfsU64(s.timestamp))
+	copy(ev[glusterfsTraceOffEntryTs:], glusterfsU64(s.entryTS))
+	copy(ev[glusterfsTraceOffFuncID:], glusterfsU32(s.funcID))
+	copy(ev[glusterfsTraceOffRet:], glusterfsU32(uint32(s.ret)))
+	copy(ev[glusterfsTraceOffNodeID:], glusterfsU64(s.nodeID))
+	copy(ev[glusterfsTraceOffUnique:], glusterfsU64(0))
+	copy(ev[glusterfsTraceOffOffset:], glusterfsU64(s.off))
+	copy(ev[glusterfsTraceOffSize:], glusterfsU64(s.size))
+	copy(ev[glusterfsTraceOffMode:], glusterfsU32(s.mode))
+	copy(ev[glusterfsTraceOffPathLen:], glusterfsU32(uint32(len(s.path))))
+	copy(ev[glusterfsTraceOffPath2Len:], glusterfsU32(uint32(len(s.path2))))
+	copy(ev[glusterfsTraceOffXattrLen:], glusterfsU32(uint32(len(s.xattr))))
+	copy(ev[glusterfsTraceOffTruncated:], glusterfsU32(s.truncated))
+	copy(ev[glusterfsTraceOffPath:glusterfsTraceOffPath+len(s.path)], s.path)
+	copy(ev[glusterfsTraceOffPath2:glusterfsTraceOffPath2+len(s.path2)], s.path2)
+	copy(ev[glusterfsTraceOffXattr:glusterfsTraceOffXattr+len(s.xattr)], s.xattr)
 	return ev
 }
 
@@ -151,7 +167,7 @@ func TestParseGlusterfsTraceEventsCountCap(t *testing.T) {
 
 func TestParseGlusterfsTraceEventsBadLengthKeepsStreamAligned(t *testing.T) {
 	e := glusterfsEvent(t, glusterfsEventSpec{funcID: 9, path: "q0"})
-	copy(e[60:64], glusterfsU32(513)) // path_len > 512
+	copy(e[glusterfsTraceOffPathLen:], glusterfsU32(513)) // path_len > max
 	data := append(glusterfsTraceHeader(1), e...)
 	data = append(data, []byte("fsmd")...)
 	out := data

@@ -53,10 +53,12 @@ type FileMetadata struct {
 	ProcId      int
 }
 
-// HmdfsTraceEvent is a per-function-return event captured by the eBPF
-// kretprobe tracer on hmdfs merge-view VFS operations.
-// Fields match the C structure layout written by hmdfs_trace.cc.
-// Argument-derived state is captured at function entry (a kretprobe's
+// HmdfsTraceEvent is a per-operation trace event with two wire layouts:
+// HMDFS writes the 112-byte kretprobe event (fields through EntryTs), while
+// GlusterFS writes the 1228-byte FUSE uprobe event and fills the trailing
+// GlusterFS-only fields; HMDFS leaves those zero.
+//
+// HMDFS argument-derived state is captured at function entry (a kretprobe's
 // pt_regs hold the function body's leftovers, not the arguments):
 // Off/Size come from the paired entry kprobe for write/read/setattr
 // (ia_size for truncate), Ino from the entry kprobe, and EntryIno/Mode
@@ -66,9 +68,8 @@ type FileMetadata struct {
 // execution window is [EntryTs, Timestamp] (0 when the entry state was
 // lost; consumers fall back to the call window then).
 //
-// NodeID/Path/Path2/XattrName/Truncated are GlusterFS-only fields. The HMDFS
-// parser leaves them zero; the GlusterFS parser fills them from its wire
-// event. GlusterFS keeps Ino=0 and does not use EntryIno.
+// GlusterFS keeps Ino=0 and does not use EntryIno; NodeID is a separate
+// diagnostic (inode_t *), not a substitute inode number.
 type HmdfsTraceEvent struct {
 	Timestamp uint64
 	FuncID    uint32
