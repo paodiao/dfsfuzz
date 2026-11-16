@@ -35,7 +35,7 @@ using namespace std;
 #endif
 
 #include "defs.h"
-#include "hmdfs_trace.h"
+#include "dfs_runtime.h"
 
 // tao added
 #define SYZ_EXECUTOR_USES_SHMEM 1
@@ -460,6 +460,7 @@ uint64 is_dfs_client = 1, executor_index = 0, prog_data_offset = 0,
 uint32 stat_cnt = 0, kernel_server = 0, kernel_client = 0, lfs_based = 0,
        enable_csan = 0, enable_c2san = 0;
 char *dfs_name, *init_ip, *dfs_setup_params;
+static const DfsRuntimeOps *dfs_rt;
 volatile struct executeControl *execCtl;
 volatile struct outputControl *output_ctl_pos;
 unsigned char *execute_reply_pos;
@@ -709,7 +710,13 @@ int main(int argc, char **argv) {
 
   calibrate_tsc();
 
-  init_hmdfs_trace();
+  dfs_rt = dfs_runtime_ops(dfs_name);
+  const char *trace_root =
+      (is_dfs_client && !strcmp(dfs_name, "glusterfs")) ? "eifuzz_root"
+                                                        : nullptr;
+  if (dfs_rt && dfs_rt->trace_enabled_for(is_dfs_client != 0) &&
+      dfs_rt->init_trace)
+    dfs_rt->init_trace(is_dfs_client != 0, trace_root);
 
   snprintf(mnt_dir, 100, "/root/%s-client", dfs_name);
   if(!strcmp(dfs_name, "hmdfs")) {
@@ -2155,7 +2162,9 @@ void reply_execute(int status, int iter) {
   // windows, making every matchEventToCall fail. The output stream order
   // becomes [program output][trace][fsMd]; the fuzzer parses it in that
   // order (parseHmdfsTraceEvents before parseFsMd).
-  stop_collect_hmdfs_trace();
+  if (dfs_rt && dfs_rt->trace_enabled_for(is_dfs_client != 0) &&
+      dfs_rt->stop_trace)
+    dfs_rt->stop_trace();
   // write_output/write_output_64 inside stop_collect already keep
   // *output_pos_value in sync (pointing past the trace data), so
   // write_metadata()'s output_pos reset continues with the fsMd records.
@@ -2279,7 +2288,9 @@ void execute_one() {
 #endif
   uint64 start = current_time_ms();
 
-  start_hmdfs_trace();
+  if (dfs_rt && dfs_rt->trace_enabled_for(is_dfs_client != 0) &&
+      dfs_rt->start_trace)
+    dfs_rt->start_trace();
 
 retry:
   uint64 *input_pos = (uint64 *)(input_data + prog_data_offset);

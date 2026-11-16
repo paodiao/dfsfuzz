@@ -117,17 +117,41 @@ HMDFS_BPF_SRC   = executor/hmdfs_trace.bpf.c
 HMDFS_BPF_OBJ   = executor/hmdfs_trace.bpf.o
 HMDFS_BPF_SKEL  = executor/hmdfs_trace.skel.h
 HMDFS_TRACE_SRC = executor/hmdfs_trace.cc
-VMLINUX_H        = tools/vmlinux.h
+HMDFS_VMLINUX_H = tools/vmlinux.h
+HMDFS_BPF_INC   = -Itools
 
-$(VMLINUX_H):
+# === GlusterFS eBPF FUSE Uprobe Trace ===
+GLUSTERFS_BPF_SRC   = executor/glusterfs_trace.bpf.c
+GLUSTERFS_BPF_OBJ   = executor/glusterfs_trace.bpf.o
+GLUSTERFS_BPF_SKEL  = executor/glusterfs_trace.skel.h
+GLUSTERFS_TRACE_SRC = executor/glusterfs_trace.cc
+GLUSTERFS_VMLINUX_H = tools/glusterfs/vmlinux.h
+GLUSTERFS_BPF_INC   = -Itools/glusterfs
+
+# Shared trace dispatch table.
+DFS_RUNTIME_SRC = executor/dfs_runtime.cc
+VMLINUX_H       = $(HMDFS_VMLINUX_H)
+
+$(HMDFS_VMLINUX_H):
 	@echo "vmlinux.h not found. Export it from the VM:"
 	@echo "  bpftool btf dump file /sys/kernel/btf/vmlinux format c > tools/vmlinux.h"
 	@exit 1
 
-$(HMDFS_BPF_OBJ): $(HMDFS_BPF_SRC) $(VMLINUX_H)
-	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -Itools -c $< -o $@
+$(GLUSTERFS_VMLINUX_H):
+	@echo "GlusterFS vmlinux.h not found. Export it from the VM:"
+	@echo "  bpftool btf dump file /sys/kernel/btf/vmlinux format c > tools/glusterfs/vmlinux.h"
+	@exit 1
+
+$(HMDFS_BPF_OBJ): $(HMDFS_BPF_SRC) $(HMDFS_VMLINUX_H)
+	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 $(HMDFS_BPF_INC) -c $< -o $@
+
+$(GLUSTERFS_BPF_OBJ): $(GLUSTERFS_BPF_SRC) $(GLUSTERFS_VMLINUX_H) executor/glusterfs_trace.h
+	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 $(GLUSTERFS_BPF_INC) -c $< -o $@
 
 $(HMDFS_BPF_SKEL): $(HMDFS_BPF_OBJ)
+	bpftool gen skeleton $< > $@
+
+$(GLUSTERFS_BPF_SKEL): $(GLUSTERFS_BPF_OBJ)
 	bpftool gen skeleton $< > $@
 
 executor: descriptions
@@ -148,9 +172,9 @@ ifneq ("$(NO_CROSS_COMPILER)", "")
 	$(info ************************************************************************************)
 else
 	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
-	$(MAKE) $(HMDFS_BPF_SKEL)
+	$(MAKE) $(HMDFS_BPF_SKEL) $(GLUSTERFS_BPF_SKEL)
 	$(CXX) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) \
-		executor/executor.cc $(HMDFS_TRACE_SRC) \
+		executor/executor.cc $(HMDFS_TRACE_SRC) $(GLUSTERFS_TRACE_SRC) $(DFS_RUNTIME_SRC) \
 		$(ADDCFLAGS) $(CFLAGS) -L/usr/lib64 -lbpf -lz -lelf -g -O0 -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
 		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
 endif
@@ -390,7 +414,8 @@ test: descriptions
 
 clean:
 	rm -rf ./bin .descriptions executor/defs.h executor/syscalls.h \
-		executor/hmdfs_trace.skel.h executor/hmdfs_trace.bpf.o
+		executor/hmdfs_trace.skel.h executor/hmdfs_trace.bpf.o \
+		executor/glusterfs_trace.skel.h executor/glusterfs_trace.bpf.o
 	find sys/*/gen -type f -not -name empty.go -delete
 
 # For a tupical Ubuntu/Debian distribution.
