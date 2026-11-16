@@ -1051,6 +1051,39 @@ GlusterFS 规则：
 - `readv/writev/preadv/pwritev` 不在 22-call config 中，也没有 alias 映射；
   结构化生成器只认 `read/pread64/write/pwrite64`。
 
+### 8.2.1 覆盖板三层
+
+覆盖板拆成三层，禁止混用：
+
+- **observed**：`discovered` + `knownShapes`。每个首次观察到的 cell/shape
+  都记录，包括模型外返回值；这一层不受 model/plannable 的 gate 控制。
+- **model**：`producible` + `found`。静态自然可达性估计，只用于
+  `model=` / `outModel=` 等有界诊断，不是完整性声明，也不驱动选择。
+- **plannable**：`plannable` + `plannableFound`。FailurePolicy 和 directed
+  planner 主动构造的形态；Direction-3（2a variant 偏置、2b exact plan、
+  mutation offset/depth 偏置）只消费这一层。
+
+GlusterFS v1 的 plannable 形态由 `directedVariantKinds` 单一来源给出：
+
+```text
+Success-only: open/read/write/stat/pread64/pwrite64/fsync/fdatasync/truncate/
+              getdents64/mkdir/creat/unlink/chmod/link/symlink/readlink
+Success+Failure: rmdir/rename(ENOTEMPTY), getxattr(ENODATA)
+Success+EEXIST: setxattr
+```
+
+`mkdir EEXIST` 自然发生时可进 observed/model，但不进 plannable、不主动构造。
+`link/symlink/readlink` 在 `DualPathCausalEnabled=false` 时也不进 plannable；
+DCT 仍可自然生成并记录。HMDFS 的 plannable 恒等于 model，保持旧行为。
+
+构造层同样 profile 化：`freshSameFormsFor(profile)` 为 GlusterFS 只返回
+`RetSuccess` 形态，避免 HMDFS 的 G-c 表（含 `mkdir/mkdir EEXIST` 等）泄漏到
+GlusterFS。`planDirectedCells.add()` 的 plannable 检查是最后一道不变量：
+任何 normal plan 进入 batch 前都必须落在 plannable 内。
+
+DAG feedback（board learning + DAG corpus/triage）对 HMDFS/GlusterFS 都启用；
+DAG 只消费 client events，`directDagTriage` 的 owner 是第一个非 nil client。
+
 ### 8.3 接入顺序
 
 1. 先做 GlusterFS trace/parser，确认 link/symlink/readlink/xattr 事件。
