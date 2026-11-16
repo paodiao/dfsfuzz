@@ -594,6 +594,13 @@ error   = *(s32 *)(fuse_out_header + 4)
 S 用入口 uprobe 保存 `{finh, unique, opcode, pid, nodeid, error}`，uretprobe
 只取 `bpf_ktime_get_ns()` 写 S；不能在返回时读 `arg1/arg2`（尾调用/栈帧）。
 
+本 build 的 `bpf_uprobe_opts` 没有 `func_name`；attach 用
+`bpf_program__attach_uprobe(prog, ret, -1, fuse_so, file_offset)`。
+`fuse_dispatch`/`fuse_fop_resume` 的 `fuse.so` 是 LOCAL `.symtab`，用 libelf
+解析符号，并按所在 PT_LOAD 计算
+`file_offset = st_value - p_vaddr + p_offset`；不要直接把 `st_value` 当
+文件偏移。`send_fuse_iov` 用 `ret=true`。
+
 P0 已验证 `ia_type=+92`、`finh=arg0-24`、`pid=+32`；`link` 的源 inode 在
 `loc2.inode`（R 时 `loc.inode` 为空），`rename` 的源在 `loc.inode`。如果
 GlusterFS 版本变化，offset 必须随文档更新。
@@ -2131,6 +2138,10 @@ prefill 创建。
 - 先映射现有 0–14 + 16–20 + 28/44；P0 验证 link/symlink/readlink/xattr。
 - 更新旧 spec 中 RENAME2/COPY_FILE_RANGE/0–14 的错误。
 - v1 不写 `entry_ino`、不做 `PathSameInode`。
+- BPF 构建按 per-DFS vmlinux/include：HMDFS `tools/vmlinux.h` +
+  `-Itools`，GlusterFS `tools/glusterfs/vmlinux.h` + `-Itools/glusterfs`；
+  两个 skeleton 同时生成。uprobe attach 用 libelf `.symtab` + PT_LOAD
+  file offset（本 build 的 `bpf_uprobe_opts` 没有 `func_name`）。
 
 ### Phase 2：双路径角色模型
 

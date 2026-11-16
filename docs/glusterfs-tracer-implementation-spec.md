@@ -93,7 +93,8 @@
   的 S-only 内部 xattr 在 userspace 丢弃。
 - **符号/构建**：`fuse_dispatch` / `fuse_fop_resume` / `send_fuse_iov` 是
   LOCAL `.symtab`；`send_fuse_iov` 在 P0 build 有 4 个调用点、未被内联；
-  libbpf 没有 `func_name` 时用 `.symtab` + offset。
+  P0 host 的 `bpf_uprobe_opts` 没有 `func_name`，统一用 `.symtab` +
+  PT_LOAD file offset + `bpf_program__attach_uprobe`。
 - **时间对齐**：直接复用 `tsc_ns_to_global` / `tsc_offset` / `g_prog_end_raw` /
   ratio/gap；ctl/path 两个 ring 必须按 ts 合并。
 
@@ -534,9 +535,17 @@ P0 image fuse.so（LOCAL .symtab）：
 send_fuse_iov 在 P0 build 有 4 个 callq（394/986/2780/3015），未被内联。
 ```
 
-- 如果 libbpf 支持 `bpf_uprobe_opts.func_name`，用符号名 attach；
-- 否则用 libelf 解析 `.symtab`，取 `st_value` 后
-  `bpf_program__attach_uprobe(prog, retprobe, -1, fuse_so, offset)`；
+- P0 host 的 `bpf_uprobe_opts` **没有 `func_name`**
+  （`bpf_uprobe_opts__last_field=retprobe`），不能按函数名 attach。
+- 统一用
+  `bpf_program__attach_uprobe(prog, retprobe, -1, fuse_so, file_offset)`；
+  `send_fuse_iov` 的 `retprobe=true`，`fuse_dispatch` / `fuse_fop_resume`
+  为 false。
+- libelf 解析 `.symtab`（三个符号都是 LOCAL），按符号所在 PT_LOAD 计算：
+  ```text
+  file_offset = st_value - p_vaddr + p_offset
+  ```
+  不直接把 `st_value` 当文件偏移；多数 shared lib 两者相同，但实现不能赌。
 - P0 的 `fuse.so` 有 `.symtab`；如果镜像重建/strip，符号和 offset 都要
   重新确认。
 
@@ -1226,32 +1235,46 @@ tsc_best_gap / g_prog_end_raw
 
 ## 12. 构建
 
-`src/Makefile` 增加：
+`src/Makefile` 用 per-DFS vmlinux/include，禁止两个 profile 共用
+`-Itools`：
 
 ```make
+HMDFS_VMLINUX_H     = tools/vmlinux.h
+GLUSTERFS_VMLINUX_H = tools/glusterfs/vmlinux.h
+HMDFS_BPF_INC       = -Itools
+GLUSTERFS_BPF_INC   = -Itools/glusterfs
+
+HMDFS_BPF_SRC    = executor/hmdfs_trace.bpf.c
+HMDFS_BPF_OBJ    = executor/hmdfs_trace.bpf.o
+HMDFS_BPF_SKEL   = executor/hmdfs_trace.skel.h
+HMDFS_TRACE_SRC  = executor/hmdfs_trace.cc
+
 GLUSTERFS_BPF_SRC   = executor/glusterfs_trace.bpf.c
 GLUSTERFS_BPF_OBJ   = executor/glusterfs_trace.bpf.o
 GLUSTERFS_BPF_SKEL  = executor/glusterfs_trace.skel.h
 GLUSTERFS_TRACE_SRC = executor/glusterfs_trace.cc
-```
 
-规则与 HMDFS 相同：
+$(HMDFS_BPF_OBJ): $(HMDFS_BPF_SRC) $(HMDFS_VMLINUX_H)
+	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 $(HMDFS_BPF_INC) -c $< -o $@
 
-```make
-$(GLUSTERFS_BPF_OBJ): $(GLUSTERFS_BPF_SRC) $(VMLINUX_H)
-	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 -Itools -c $< -o $@
+$(GLUSTERFS_BPF_OBJ): $(GLUSTERFS_BPF_SRC) $(GLUSTERFS_VMLINUX_H)
+	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 $(GLUSTERFS_BPF_INC) -c $< -o $@
+
+$(HMDFS_BPF_SKEL): $(HMDFS_BPF_OBJ)
+	bpftool gen skeleton $< > $@
 
 $(GLUSTERFS_BPF_SKEL): $(GLUSTERFS_BPF_OBJ)
 	bpftool gen skeleton $< > $@
 ```
 
-executor 链接：
-
-```make
-executor/executor.cc $(HMDFS_TRACE_SRC) $(GLUSTERFS_TRACE_SRC)
-```
-
-`make executor` 自动生成 skeleton。
+- `tools/vmlinux.h`：HMDFS 内核完整 BTF，保持现有。
+- `tools/glusterfs/vmlinux.h`：GlusterFS 5.15 内核完整 BTF
+  （P0 文件 7,620,032B / 317,647 行），不是手写 minimal 头。
+- `executor` 目标同时生成两个 skeleton，并链接
+  `executor/executor.cc $(HMDFS_TRACE_SRC) $(GLUSTERFS_TRACE_SRC)`；
+  `make clean` 同时删除两个 `.bpf.o/.skel.h`。
+- `send_fuse_iov`/`fuse_dispatch`/`fuse_fop_resume` 的 attach 按 §5.2：
+  libelf `.symtab` + PT_LOAD file offset，不使用 `func_name`。
 
 ## 13. GlusterFS 文件树恢复
 
@@ -1391,12 +1414,14 @@ clang 支持 -target bpf
 bpftool 能 gen skeleton
 libbpf.h / libbpf.so 可链接
 libelf / zlib 可链接
-tools/vmlinux.h 来自 5.15 GlusterFS 内核
+tools/vmlinux.h 来自 HMDFS 内核
+tools/glusterfs/vmlinux.h 来自 GlusterFS 5.15 内核完整 BTF
 ```
 
 `fuse_dispatch` / `fuse_fop_resume` / `send_fuse_iov` 是 LOCAL `.symtab`；
-如果 libbpf 的 `bpf_uprobe_opts.func_name` 不可用，用 libelf 解析
-`.symtab` + `st_value` attach。P0 build 的 `send_fuse_iov` 有 4 个 callq，
+P0 host 的 `bpf_uprobe_opts` 没有 `func_name`，统一用 libelf 解析
+`.symtab` + PT_LOAD `file_offset = st_value - p_vaddr + p_offset`，再调用
+`bpf_program__attach_uprobe`。P0 build 的 `send_fuse_iov` 有 4 个 callq，
 没有内联；如果重建后 call 数变化，先检查 noinline。
 
 ### 14.3 单 VM 冒烟
@@ -1485,7 +1510,7 @@ dir close：ls 只看到 OPENDIR/READDIRPLUS，看不到 RELEASEDIR final event
 | `GETXATTR/FLUSH` 误过滤 | `FLUSH` 继续过滤；`GETXATTR/SETXATTR` 只保留 `user.*`，虚拟/内部 key 过滤；内部 xattr 的 S-only 事件丢弃 |
 | `RELEASE/RELEASEDIR` 无 R | 18 保留 D/S，path 走 fd provenance，不计 missing_r；29 过滤，不产生 final event |
 | ctl/path 双 ring 顺序 | 两个 ring 全 drain 后按 ts 合并；不能按单 ring 顺序 finalize |
-| 构建机 libbpf/bpftool | 先找 HMDFS 既有构建环境/kernel tree；`func_name` 不可用则用 `.symtab` + offset |
+| 构建机 libbpf/bpftool | 先找 HMDFS 既有构建环境/kernel tree；本 build 的 `bpf_uprobe_opts` 无 `func_name`，统一 `.symtab` + PT_LOAD file offset |
 
 回退：
 
@@ -1620,3 +1645,20 @@ bpftrace 注意：
   *(uint32 *)(*(uint64 *)(arg0 - 24) + 4)
 正式 executor 的 BPF 用 PT_REGS_PARM1，不受影响。
 ```
+
+host libbpf：
+
+```text
+bpf_uprobe_opts 没有 func_name 字段；
+bpf_uprobe_opts__last_field = retprobe。
+```
+
+因此 attach 固定走：
+
+```text
+libelf .symtab -> st_value
+PT_LOAD: file_offset = st_value - p_vaddr + p_offset
+bpf_program__attach_uprobe(prog, ret, -1, fuse_so, file_offset)
+```
+
+`send_fuse_iov` 用 ret=true；另两个 ret=false。

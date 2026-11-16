@@ -203,50 +203,99 @@ limits affect observation statistics only.
 
 ## Step 1: Export vmlinux.h
 
-**When**: Once per kernel image (re-export only when the kernel is updated).
+**When**: Once per DFS kernel image (re-export only when the kernel is updated).
 
-**Who**: Developer, either manually or via the Makefile `vmlinux.h` target.
+**Who**: Developer. `bpftool` runs on the build host; the VM only needs to
+provide `/sys/kernel/btf/vmlinux`.
 
-### Method A — Manual (Recommended)
+The two DFS profiles use **separate** headers:
 
-Run inside the VM:
+```text
+HMDFS:     tools/vmlinux.h              (from the HMDFS test kernel)
+GlusterFS: tools/glusterfs/vmlinux.h    (from the GlusterFS 5.15 kernel)
+```
+
+Never overwrite one with the other.
+
+### GlusterFS
+
+Copy the raw BTF out of the GlusterFS VM (VM does not need `bpftool`):
+
 ```bash
-bpftool btf dump file /sys/kernel/btf/vmlinux format c > /tmp/vmlinux.h
+VM=root@192.168.x.y
+ssh "$VM" 'uname -r; ls -l /sys/kernel/btf/vmlinux'
+scp "$VM":/sys/kernel/btf/vmlinux /tmp/glusterfs-5.15.btf
 ```
 
-Copy out to the build host:
+Dump it on the build host:
+
 ```bash
-scp <vm>:/tmp/vmlinux.h tools/vmlinux.h
+mkdir -p src/tools/glusterfs
+bpftool btf dump file /tmp/glusterfs-5.15.btf format c \
+    > src/tools/glusterfs/vmlinux.h
 ```
 
-### Method B — Automated via SSH
+The result is a full BTF dump (approximately 7.6 MB / 317k lines), not a
+hand-written minimal header.
 
-Add to `src/Makefile` (the existing `VMLINUX_H`/`HMDFS_BPF_OBJ`/`HMDFS_BPF_SKEL`
-targets in `src/Makefile` already automate this):
-```makefile
-$(HMDFS_BPF_SKEL): $(HMDFS_BPF_OBJ)
-	bpftool gen skeleton $< > $@
-```
+### HMDFS
+
+Keep the existing `src/tools/vmlinux.h`; it is generated from the HMDFS test
+kernel. Do **not** replace it with the GlusterFS BTF.
 
 ---
 
-## Step 2: Build the BPF Object
+## Step 2: Build the BPF Objects
+
+Use per-DFS include directories:
 
 ```bash
-# Compile BPF program to ELF object
+# HMDFS: full HMDFS kernel BTF
 clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
-      -I tools \
+      -I src/tools \
       -c src/executor/hmdfs_trace.bpf.c \
       -o src/executor/hmdfs_trace.bpf.o
 
-# Generate libbpf skeleton header (C code for executor)
+# GlusterFS: full GlusterFS 5.15 BTF
+clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
+      -I src/tools/glusterfs \
+      -c src/executor/glusterfs_trace.bpf.c \
+      -o src/executor/glusterfs_trace.bpf.o
+
+# Skeleton headers
 bpftool gen skeleton src/executor/hmdfs_trace.bpf.o \
       > src/executor/hmdfs_trace.skel.h
+bpftool gen skeleton src/executor/glusterfs_trace.bpf.o \
+      > src/executor/glusterfs_trace.skel.h
 ```
 
-The skeleton header provides type-safe C functions to load, attach, and
-manage the BPF program from the executor. The main `src/Makefile` `executor`
-target builds `hmdfs_trace.skel.h` automatically (requires `tools/vmlinux.h`).
+`src/Makefile` uses `HMDFS_BPF_INC=-Itools` and
+`GLUSTERFS_BPF_INC=-Itools/glusterfs`; do not compile one DFS with the other
+DFS's include path.
+
+The skeleton header provides type-safe C functions to load and manage the BPF
+program from the executor. The main `src/Makefile` `executor` target builds
+both skeletons and links both trace `.cc` files.
+
+### GlusterFS uprobe attach
+
+The libbpf version used by the P0 build has `bpf_uprobe_opts` **without**
+`func_name` (`bpf_uprobe_opts__last_field=retprobe`). Attach by offset:
+
+```c
+bpf_program__attach_uprobe(prog, /*retprobe=*/false, -1, fuse_so, file_offset);
+```
+
+Resolve the three LOCAL symbols from `fuse.so` `.symtab` with libelf, then
+convert the symbol virtual address to the file offset through the containing
+PT_LOAD:
+
+```text
+file_offset = st_value - p_vaddr + p_offset
+```
+
+`send_fuse_iov` uses `retprobe=true`; `fuse_dispatch` and `fuse_fop_resume`
+use `false`.
 
 ---
 
