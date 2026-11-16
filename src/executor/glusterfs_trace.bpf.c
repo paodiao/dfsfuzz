@@ -7,8 +7,8 @@
  *
  *   fuse_dispatch    entry       -> D (fuse_in_header only)
  *   fuse_fop_resume  entry       -> R (path/path2/xattr/off/size/mode)
- *   send_fuse_iov    entry       -> save finh/iov_out/error
- *   send_fuse_iov    uretprobe   -> S (timestamp only from the return)
+ *   send_fuse_iov    entry       -> save finh/iov_out[0..1]/error
+ *   send_fuse_iov    uretprobe   -> S (timestamp + LOOKUP reply mode)
  *
  * ctl ring carries D/S; path ring carries R.  The two rings are independent,
  * so userspace merges both by timestamp before building final events.
@@ -24,10 +24,10 @@
 #define GF_S_IFDIR 0x4000
 #define GF_S_IFLNK 0xA000
 #define GF_S_IFMT  0xF000
-#define GF_FUSE_OUT_HEADER_SIZE 16
+/* send_fuse_iov's iovec[1] points at the FUSE payload (entry_out). The
+ * payload starts after the 16-byte fuse_out_header; attr.mode is at
+ * offset 100 inside entry_out. */
 #define GF_FUSE_ENTRY_OUT_MODE_OFF 100
-#define GF_FUSE_LOOKUP_MODE_OFF \
-	(GF_FUSE_OUT_HEADER_SIZE + GF_FUSE_ENTRY_OUT_MODE_OFF)
 
 #define GF_PHASE_D 0
 #define GF_PHASE_S 1
@@ -45,8 +45,10 @@ struct gf_send_key {
 struct gf_send_val {
 	u64 unique;
 	u64 nodeid;
-	u64 iov_base;
+	u64 iov_base;     /* iovec[0]: fuse_out_header */
 	u64 iov_len;
+	u64 payload_base; /* iovec[1]: entry_out/attr_out/... */
+	u64 payload_len;
 	u32 opcode;
 	u32 pid;
 	s32 error;
@@ -306,14 +308,17 @@ int gf_resume(struct pt_regs *ctx)
 }
 
 /* S entry: send_fuse_iov(xlator_t *this, fuse_in_header_t *finh,
- *                        struct iovec *iov_out, ...). */
+ *                        struct iovec *iov_out, int count). */
 SEC("uprobe")
 int gf_send_entry(struct pt_regs *ctx)
 {
 	u64 finh = (u64)PT_REGS_PARM2(ctx);
 	u64 iov_out = (u64)PT_REGS_PARM3(ctx);
+	u32 iov_cnt = (u32)PT_REGS_PARM4(ctx);
 	u64 iov_base = 0;
 	u64 iov_len = 0;
+	u64 payload_base = 0;
+	u64 payload_len = 0;
 	u32 opcode = 0, pid = 0;
 	u64 unique = 0, nodeid = 0;
 	s32 error = 0;
@@ -332,6 +337,16 @@ int gf_send_entry(struct pt_regs *ctx)
 		iov_len = 0;
 	if (iov_base)
 		bpf_probe_read_user(&error, sizeof(error), (void *)(iov_base + 4));
+	/* send_fuse_data/send_fuse_obj use iovec[0] for the
+	 * fuse_out_header and iovec[1] for the payload. send_fuse_err uses
+	 * count=1 and has no payload. */
+	if (iov_cnt >= 2) {
+		bpf_probe_read_user(&payload_base, sizeof(payload_base),
+				    (void *)(iov_out + 16));
+		if (bpf_probe_read_user(&payload_len, sizeof(payload_len),
+					(void *)(iov_out + 24)))
+			payload_len = 0;
+	}
 
 	key.pid_tgid = bpf_get_current_pid_tgid();
 	val.unique = unique;
@@ -341,6 +356,8 @@ int gf_send_entry(struct pt_regs *ctx)
 	val.error = error;
 	val.iov_base = iov_base;
 	val.iov_len = iov_len;
+	val.payload_base = payload_base;
+	val.payload_len = payload_len;
 	val.mode = 0;
 	bpf_map_update_elem(&gf_send_state, &key, &val, BPF_ANY);
 	return 0;
@@ -361,13 +378,14 @@ int gf_send_ret(struct pt_regs *ctx)
 	if (!val)
 		return 0;
 	if (val->opcode == GF_OP_LOOKUP && val->iov_base &&
-	    val->iov_len >= GF_FUSE_LOOKUP_MODE_OFF + 4) {
+	    val->payload_base &&
+	    val->payload_len >= GF_FUSE_ENTRY_OUT_MODE_OFF + 4) {
 		if (!bpf_probe_read_user(&reply_err, sizeof(reply_err),
 					 (void *)(val->iov_base + 4)) &&
 		    reply_err == 0) {
 			bpf_probe_read_user(&lookup_mode, sizeof(lookup_mode),
-					    (void *)(val->iov_base +
-						     GF_FUSE_LOOKUP_MODE_OFF));
+					    (void *)(val->payload_base +
+						     GF_FUSE_ENTRY_OUT_MODE_OFF));
 			lookup_mode &= GF_S_IFMT;
 		}
 	}

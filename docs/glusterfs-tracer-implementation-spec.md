@@ -346,8 +346,9 @@ IA_IFLNK 3 -> S_IFLNK
 - `link`：源 inode 用 `loc2.inode + 92`（R 发生在 `fuse_link_resume` 之前，
   `loc.inode` 还是空的）；
 - `lookup`：R 时 `loc.inode` 是父目录，不能用于 entry 类型；由 S 的
-  `send_fuse_iov` reply 解析 `fuse_entry_out.attr.mode`（iov_base + 116），
-  negative lookup/解析失败为 0；
+  `send_fuse_iov` reply 解析 `fuse_entry_out.attr.mode`：
+  `iov_out[0]` 是 16B `fuse_out_header`，`iov_out[1].iov_base + 100` 才是
+  entry_out.attr.mode；`send_fuse_err` 没有 payload，negative lookup 为 0；
 - `symlink/mkdir/create`：新 inode 在 R 时 `ia_type=0`，用函数默认；
 - `symlink` 的 `path2` 是 payload，不能 strip；`rename/link` 的 `path2` 是
   挂载内路径，必须 strip。
@@ -1550,10 +1551,16 @@ make glusterfs-trace-test
 拷贝到目标 VM 后以 root 运行：
 
 ```bash
+TRACE_ROOT=/root/glusterfs-client/eifuzz_root
+
 ./glusterfs-trace-test \
   --fuse-so /usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so \
-  --trace-root /eifuzz_root --raw
+  --trace-root eifuzz_root --raw
 ```
+
+注意 `--trace-root` 是 **相对 mount root** 的路径（executor 也传
+`eifuzz_root`）；`normalize_trace_path` 会先去掉 raw `/eifuzz_root/...` 的
+leading `/`，所以不要传 `/root/glusterfs-client/eifuzz_root` 或 `/eifuzz_root`。
 
 交互：Enter/c 收集，q 退出。`--raw` 会同时打印：
 
@@ -1567,18 +1574,21 @@ make glusterfs-trace-test
 LOOKUP 必须单独验证。remount 后对新路径执行：
 
 ```bash
-stat /eifuzz_root/lk/f       # 正文件：S mode=0x8000
-stat /eifuzz_root/lk         # 正目录：S mode=0x4000
-lstat /eifuzz_root/lk/l      # symlink：S mode=0xA000
-stat /eifuzz_root/lk/missing # 负 lookup：error=-ENOENT, mode=0
+stat "$TRACE_ROOT/lk/f"       # 正文件：S mode=0x8000
+stat "$TRACE_ROOT/lk"         # 正目录：S mode=0x4000
+stat "$TRACE_ROOT/lk/l"       # symlink：S mode=0xA000
+stat "$TRACE_ROOT/lk/missing" # 负 lookup：error=-ENOENT, mode=0
 ```
+
+final event 的 `path` 应是 `lk/f`、`lk`、`lk/l`、`lk/missing`，不是
+`eifuzz_root/...`。
 
 判定：
 
 - 正 LOOKUP 的 raw S `mode` 和 final `mode` 都不能为 0；
 - 负 LOOKUP `mode=0` 正常；
-- raw S 正确但 final 错 -> merge 问题；raw S 错 -> `iov_base + 116`
-  偏移/长度/error gate 问题；
+- raw S 正确但 final 错 -> merge 问题；raw S 错 -> iovec[1] payload
+  指针/长度或 `entry_out.attr.mode`（payload+100）偏移问题；
 - `missing_d/missing_s` 不应异常增长。
 
 ### 14.4 3-3 + replica 3

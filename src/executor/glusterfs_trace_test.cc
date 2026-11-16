@@ -10,7 +10,7 @@
  *   make glusterfs-trace-test
  *
  * Run (in the target VM, as root):
- *   ./glusterfs-trace-test --fuse-so <fuse.so> --trace-root /eifuzz_root --raw
+ *   ./glusterfs-trace-test --fuse-so <fuse.so> --trace-root eifuzz_root --raw
  *
  * Commands:
  *   Enter / c : drain rings, print raw events (with --raw) and final events
@@ -246,7 +246,7 @@ static void usage(const char *argv0)
 		"usage: %s [--fuse-so PATH] [--trace-root PATH] [--raw]\n"
 		"  default fuse.so: "
 		"/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so\n"
-		"  default trace-root: /eifuzz_root\n",
+		"  default trace-root: eifuzz_root (relative to mount root)\n",
 		argv0);
 }
 
@@ -254,7 +254,9 @@ int main(int argc, char **argv)
 {
 	std::string fuse_so =
 		"/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so";
-	std::string trace_root = "/eifuzz_root";
+	// trace_root is relative to the FUSE mount root; normalize_trace_path
+	// strips the leading '/' from the raw event path before comparing.
+	std::string trace_root = "eifuzz_root";
 	bool raw = false;
 
 	for (int i = 1; i < argc; i++) {

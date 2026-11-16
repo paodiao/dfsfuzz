@@ -507,7 +507,8 @@ offset  size  field
 - `mode` 来自 `inode_t.ia_type`（+92）映射 `S_IFMT`，不是 `i_mode`；
   `link` 用 `loc2.inode`，`rename` 用 `loc.inode`。`LOOKUP` 的 R 时机
   `loc.inode` 是父目录，entry 类型由 S reply 的
-  `fuse_entry_out.attr.mode` 解析（iov_base + 116），negative lookup 为 0。
+  `fuse_entry_out.attr.mode` 解析（`iov_out[1].iov_base + 100`；
+  `iov_out[0]` 只是 16 字节 `fuse_out_header`），negative lookup 为 0。
   `symlink/mkdir/create` 在 R 时 `ia_type=0`，用函数默认；symlink target
   类型由 DAG 侧的调用链近似解析。`truncate` 的 `off` 是
   新大小、`size=0`；read/write、readdir、xattr 的 off/size 语义见 tracer
