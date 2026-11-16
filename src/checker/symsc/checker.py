@@ -53,10 +53,11 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
     # mode 权限位硬编码 0660/0751），跨节点不保证一致——跳过这两个字段
     # 的对比（与 CSAN compareFileMeta 的筛选依据一致）。其他 FS 保持原校验。
     is_hmdfs = (c.FSTYPE == "hmdfs")
+    is_glusterfs = (c.FSTYPE == "glusterfs")
 
     # print inode.id, inode.name, inode.u_name, inode.mode, inode.size
     # lcnt
-    if not is_hmdfs and inode.type != c.DIR:
+    if not is_hmdfs and not is_glusterfs and inode.type != c.DIR:
         if inode.linkcnt != int(entry[c.IDX_NLINK]):
             errstr = "*** [META] Link count mismatch in {0} {1} linkcnt: em {2} vs ex {3}".format(
                     c.TYPESTR[inode.type], str(inode.name), inode.linkcnt, int(entry[c.IDX_NLINK]))
@@ -66,6 +67,13 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
             return 1
+    if is_glusterfs and inode.type != c.DIR:
+        if inode.linkcnt != int(entry[c.IDX_NLINK]):
+            # GlusterFS nlink is a B-class diagnostic field: DHT/AFR
+            # bookkeeping and quiescence timing can legitimately differ.
+            if print_err:
+                print("*** [META][diag] GlusterFS link count differs in {0} {1}: em {2} vs ex {3}".format(
+                        c.TYPESTR[inode.type], str(inode.name), inode.linkcnt, int(entry[c.IDX_NLINK])))
 
     # mode
     if not is_hmdfs and inode.mode & 0o777 != int(entry[c.IDX_MODE], 8) & 0o777:
@@ -696,7 +704,7 @@ def test_self_consistency(METADATA, print_err=1):
         # hmdfs remote stat reports nlink=0 (cached getattr leaves it unset),
         # so only the nlink comparison is waived there (same rationale as
         # the is_hmdfs skips in check_meta).
-        if c.FSTYPE != "hmdfs" and int(entry[c.IDX_NLINK]) != id_list.count(entry[c.IDX_INUM]):
+        if c.FSTYPE != "hmdfs" and c.FSTYPE != "glusterfs" and int(entry[c.IDX_NLINK]) != id_list.count(entry[c.IDX_INUM]):
             errstr = "Failed self-consistency test:\n"
             errstr += "*** [META] Incorrect metadata: {0} id:{1} lcnt:{2}".format(
                     entry[c.IDX_PATH], entry[c.IDX_INUM], entry[c.IDX_NLINK])
@@ -707,6 +715,10 @@ def test_self_consistency(METADATA, print_err=1):
 
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
+        elif c.FSTYPE == "glusterfs" and int(entry[c.IDX_NLINK]) != id_list.count(entry[c.IDX_INUM]) and print_err:
+            # B-class diagnostic only: never fails the checker.
+            print("*** [META][diag] GlusterFS self-consistency link count differs: {0} id:{1} lcnt:{2}".format(
+                    entry[c.IDX_PATH], entry[c.IDX_INUM], entry[c.IDX_NLINK]))
     if err_cnt > 0:
         # print("WARNING: test self consistency fails")
         return False

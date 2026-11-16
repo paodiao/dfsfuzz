@@ -1986,17 +1986,21 @@ PathSet 不改变上述 fresh 语义；它迁移 fresh path 后仍按同一
 
 - `xattrCmp` 单向 → 双向：先比较 key 集合/数量，再比较 value；比较前过滤
   `trusted.gfid`、`trusted.glusterfs.*`、`trusted.afr.*`、`glusterfs.*` 等内部 key，
-  只对 user xattr 做双向比较。
-- `compareFileMeta` 增加 `SymlinkPath`。
+  只对 user xattr 做双向比较（GlusterFS 已实现 `xattrCmpUser`）。
+- `compareFileMeta` 增加 `SymlinkPath`（GlusterFS 已实现）。
 - `SymlinkPath` 是 fsMd 里的原始 target payload；A 类比较同一 program 的 client
   间 payload，不把它当 FileTree 路径。需要 canonical target 时用 linkpath +
   payload 解析；不能在 checker 里对 payload 做普通路径 normalize。
-- GlusterFS 用完整类型；HMDFS 保留目录位。
-- `initTreeSubset` 按 profile namespace root。
+- GlusterFS 用完整类型；HMDFS 保留目录位（已实现）。
+- `initTreeSubset` 按 profile namespace root：只取 syscall 的 path 参数，
+  `ft.FindNode` 命中才加入；fresh path 跳过；symlink target 先按 linkpath
+  canonical 解析（已实现）。
 - server fsMd 永不进入 client checker。
 - symsc 保留完整绝对 program 数组，只过滤 fsMd；最终状态用 root client。
 - `filter_failure_sync_calls` 改为 profile supported/ignored，不因
   `fcntl/flock/sendfile/...` 整体跳过 CSAN。
+- GlusterFS `Nlink`/`Mtime` 为 B 类：`compareFileMeta` 和
+  `symsc/checker.py::check_meta` 只诊断，不进入失败列表（已实现）。
 
 ### 9.4 symsc 支持边界
 
@@ -2534,6 +2538,7 @@ normal dual root                     已实现，v1 DualPathCausalEnabled=false
 GlusterFS DAG feedback               已启用
 GlusterFS executor cwd/restore/metadata 已实现
 MetadataDelayMs profile default      已实现（HMDFS 30000 / GlusterFS 10000）
+GlusterFS CSAN/symsc A/B             已实现
 D1 BPF standalone smoke              已通过
 D2 executor integration              待执行
 D3 short/medium run                  待执行
@@ -2637,6 +2642,8 @@ executor cwd = /root/glusterfs-client/eifuzz_root
 trace path 无 dfs- 前缀
 trace events > 0
 fsMds 非空（enable_csan=true 时）
+[symsc] init_tree loaded: N DENTRY entries（N > 1）
+无 GlusterFS Nlink/Mtime 误报
 DAG vertices > 0
 hbPairs 或 ccPairs > 0
 coverage obs/model/plan 都有增长

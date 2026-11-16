@@ -1167,7 +1167,7 @@ src/executor/executor.cc
 - `proc.go` 的 `InitialDir` 使用 `hc.RootPrefix`。
 - `executor.cc` 的 cwd 和 `write_metadata` 对非 HMDFS 使用固定测试根。
 - `path_set.go` 的 `normalizePathSetPath`、`pathSetTopRoot`、`pathSetTopPath`、`mapPathSetPath` 去掉硬编码 `MergeViewPrefix`。
-- `checker/conc-fs.go` 的 `TrimPrefix` 和硬编码 `merge_view` 改为当前 prefix。
+- `checker/conc-fs.go` 的 `TrimPrefix` 和硬编码 `merge_view` 改为当前 prefix（`initTreeSubset` 已按 profile prefix 与 syscall path 参数实现）。
 - `dag.go` 的 `mergeRoot`、`firstComponentUnderRoot` 使用 `ft.Prefix` / `RootPrefix`。
 
 ### 10.4 验收

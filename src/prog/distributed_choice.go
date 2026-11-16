@@ -317,6 +317,14 @@ func symlinkCanonicalTarget(linkPath, payload string) string {
 	return p
 }
 
+// SymlinkCanonicalTarget exposes the symlink payload resolver to the checker's
+// initTreeSubset. The linkpath itself remains a program-local binding; only a
+// canonical target that resolves inside the test root is useful as a FileTree
+// coordinate.
+func SymlinkCanonicalTarget(linkPath, payload string) string {
+	return symlinkCanonicalTarget(linkPath, payload)
+}
+
 // symlinkPayload materializes the program-visible symlink target for a
 // canonical test-root path. The payload is relative to the linkpath parent, so
 // the kernel resolves it back to canonicalTarget without escaping the root.

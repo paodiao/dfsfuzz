@@ -254,6 +254,38 @@ func xattrCmp(xattr1 map[string]string, xattr2 map[string]string) bool {
 	return true
 }
 
+// xattrCmpUser is the GlusterFS policy: compare user.* keys bidirectionally
+// and ignore GlusterFS-internal keys that may leak into the snapshot on some
+// clients. HMDFS keeps the historical one-way xattrCmp above.
+func xattrCmpUser(xattr1 map[string]string, xattr2 map[string]string) bool {
+	isUser := func(name string) bool {
+		if !strings.HasPrefix(name, "user.") {
+			return false
+		}
+		// getmetadata.h's should_filter drops these two test/internal keys
+		// before serialization; keep the checker consistent even if a future
+		// collector change lets them through.
+		return name != "user.ftest" && name != "user.glusterfs"
+	}
+	for name, value1 := range xattr1 {
+		if !isUser(name) {
+			continue
+		}
+		if value2, ok := xattr2[name]; !ok || value1 != value2 {
+			return false
+		}
+	}
+	for name := range xattr2 {
+		if !isUser(name) {
+			continue
+		}
+		if _, ok := xattr1[name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func MdCmp(fsMd1 map[string]prog.FileMetadata,
 	fsMd2 map[string]prog.FileMetadata, fsType string) []string {
 	var ics []string
@@ -298,27 +330,16 @@ func MdCmp(fsMd1 map[string]prog.FileMetadata,
 }
 
 func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata, fsType string) []string {
-	// Type mismatch is the strongest cross-node inconsistency signal: the
-	// same path being a directory on one node and a non-directory on another
-	// makes every other field (checksum/size/mtime/...) incomparable.
-	// Report it directly and short-circuit instead of comparing the derived
-	// fields (e.g. checksum 0 for a directory vs a real CRC for a file).
-	//
-	// Only the directory bit (S_IFDIR) is compared:
-	// 1. Under CONFIG_HMDFS_FS_PERMISSION, uid/gid/mode permission bits
-	//    on the remote view are simplified values (uid/gid inherited from
-	//    the parent dir, mode hardcoded 0660), so they are intentionally
-	//    inconsistent across nodes.
-	// 2. A full S_IFMT type compare is avoided because hmdfs hardcodes
-	//    the symlink inode type as S_IFREG (fill_inode_remote LNK branch),
-	//    which would falsely report S_IFLNK (owning node) vs S_IFREG
-	//    (remote view) on symlinks.
-	//
-	// Directory vs non-directory must match across nodes - that is the
-	// meaningful cross-node type consistency signal (path-set equality is
-	// already checked by MdCmp; a same-path file/dir type conflict would
-	// otherwise go undetected).
-	if (m1.StatMd.Mode & syscall.S_IFDIR) != (m2.StatMd.Mode & syscall.S_IFDIR) {
+	isGlusterfs := fsType == "glusterfs"
+	// Type mismatch is the strongest cross-node inconsistency signal. HMDFS
+	// compares only the directory bit (its remote view intentionally maps
+	// symlinks to regular inodes); GlusterFS compares the complete S_IFMT.
+	if isGlusterfs {
+		if m1.StatMd.Mode&syscall.S_IFMT != m2.StatMd.Mode&syscall.S_IFMT {
+			return []string{fmt.Sprintf("%s: type %o vs %o", path,
+				m1.StatMd.Mode&syscall.S_IFMT, m2.StatMd.Mode&syscall.S_IFMT)}
+		}
+	} else if (m1.StatMd.Mode & syscall.S_IFDIR) != (m2.StatMd.Mode & syscall.S_IFDIR) {
 		return []string{fmt.Sprintf("%s: dirtype %o vs %o", path,
 			m1.StatMd.Mode&syscall.S_IFDIR, m2.StatMd.Mode&syscall.S_IFDIR)}
 	}
@@ -328,64 +349,120 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata, fs
 	if m1.Checksum != m2.Checksum {
 		ics = append(ics, fmt.Sprintf("%s: checksum %d vs %d", path, m1.Checksum, m2.Checksum))
 	}
-	/*
-	 * Nlink and full-mode comparisons are skipped for hmdfs: the
-	 * remote-view cached attr leaves nlink unset (0) and hardcodes mode
-	 * permission bits (0660), so they are intentionally inconsistent across
-	 * nodes (same rationale as mtime/size below). The directory bit is
-	 * still compared for all filesystems.
-	 */
-	if fsType != "hmdfs" && m1.StatMd.Nlink != m2.StatMd.Nlink {
-		ics = append(ics, fmt.Sprintf("%s: nlink %d vs %d", path,
-			m1.StatMd.Nlink, m2.StatMd.Nlink))
+	if isGlusterfs {
+		// A-class fields for GlusterFS v1.
+		if m1.StatMd.Mode&0777 != m2.StatMd.Mode&0777 {
+			ics = append(ics, fmt.Sprintf("%s: mode %o vs %o", path,
+				m1.StatMd.Mode&0777, m2.StatMd.Mode&0777))
+		}
+		isRegular := m1.StatMd.Mode&syscall.S_IFMT == syscall.S_IFREG
+		if isRegular && m1.StatMd.Size != m2.StatMd.Size {
+			ics = append(ics, fmt.Sprintf("%s: size %d vs %d", path,
+				m1.StatMd.Size, m2.StatMd.Size))
+		}
+		// SymlinkPath is the raw on-wire target payload. It is A-class for
+		// GlusterFS; the canonical path relation is resolved by DAG, but the
+		// checker compares the payload that userspace actually observed.
+		if m1.SymlinkPath != m2.SymlinkPath {
+			ics = append(ics, fmt.Sprintf("%s: symlink target %q vs %q", path,
+				m1.SymlinkPath, m2.SymlinkPath))
+		}
+		// B-class fields: keep diagnostics visible but do not fail CSAN.
+		// GlusterFS nlink/mtime can legitimately differ between clients due
+		// to DHT/AFR bookkeeping and quiescence timing.
+		if m1.StatMd.Nlink != m2.StatMd.Nlink {
+			log.Logf(1, "glusterfs CSAN diagnostic: %s nlink %d vs %d", path,
+				m1.StatMd.Nlink, m2.StatMd.Nlink)
+		}
+		if m1.StatMd.Mtim.Sec != m2.StatMd.Mtim.Sec {
+			log.Logf(1, "glusterfs CSAN diagnostic: %s mtime %d vs %d", path,
+				m1.StatMd.Mtim.Sec, m2.StatMd.Mtim.Sec)
+		}
+	} else {
+		/*
+		 * Nlink and full-mode comparisons are skipped for hmdfs: the
+		 * remote-view cached attr leaves nlink unset (0) and hardcodes mode
+		 * permission bits (0660), so they are intentionally inconsistent across
+		 * nodes (same rationale as mtime/size below). The directory bit is
+		 * still compared for all filesystems.
+		 */
+		if fsType != "hmdfs" && m1.StatMd.Nlink != m2.StatMd.Nlink {
+			ics = append(ics, fmt.Sprintf("%s: nlink %d vs %d", path,
+				m1.StatMd.Nlink, m2.StatMd.Nlink))
+		}
+		if fsType != "hmdfs" && m1.StatMd.Mode != m2.StatMd.Mode {
+			ics = append(ics, fmt.Sprintf("%s: mode %o vs %o", path,
+				m1.StatMd.Mode, m2.StatMd.Mode))
+		}
+		/*
+		 * Uid/Gid comparison disabled: with CONFIG_HMDFS_FS_PERMISSION the
+		 * remote view returns uid/gid inherited from the parent dir (e.g.
+		 * 1008) while the owning node returns the real ext4 values (e.g.
+		 * 1000) - intentionally inconsistent by design. Kept commented out
+		 * for reuse if another filesystem needs strict uid/gid comparison.
+		 */
+		// if m1.StatMd.Uid != m2.StatMd.Uid {
+		// 	ics = append(ics, fmt.Sprintf("%s: uid %d vs %d", path, m1.StatMd.Uid, m2.StatMd.Uid))
+		// }
+		// if m1.StatMd.Gid != m2.StatMd.Gid {
+		// 	ics = append(ics, fmt.Sprintf("%s: gid %d vs %d", path, m1.StatMd.Gid, m2.StatMd.Gid))
+		// }
+		/*
+		 * mtime/size comparison is skipped for hmdfs: the remote-view stat
+		 * (get_cached_attr_remote) returns the device_view inode's cached
+		 * getattr_isize/i_mtime, which only refresh on open/own-write/inode
+		 * rebuild - not on stat or cross-node write. The values are therefore
+		 * intentionally inconsistent across nodes (weak consistency), same
+		 * rationale as nlink/mode/uid-gid above. Content integrity is still
+		 * covered by the Checksum comparison.
+		 */
+		if fsType != "hmdfs" && m1.StatMd.Mtim.Sec != m2.StatMd.Mtim.Sec {
+			ics = append(ics, fmt.Sprintf("%s: mtime %d vs %d", path,
+				m1.StatMd.Mtim.Sec, m2.StatMd.Mtim.Sec))
+		}
+		isDir := (m1.StatMd.Mode & syscall.S_IFDIR) != 0
+		if fsType != "hmdfs" && !isDir && m1.StatMd.Size != m2.StatMd.Size {
+			ics = append(ics, fmt.Sprintf("%s: size %d vs %d", path,
+				m1.StatMd.Size, m2.StatMd.Size))
+		}
 	}
-	if fsType != "hmdfs" && m1.StatMd.Mode != m2.StatMd.Mode {
-		ics = append(ics, fmt.Sprintf("%s: mode %o vs %o", path,
-			m1.StatMd.Mode, m2.StatMd.Mode))
-	}
-	/*
-	 * Uid/Gid comparison disabled: with CONFIG_HMDFS_FS_PERMISSION the
-	 * remote view returns uid/gid inherited from the parent dir (e.g.
-	 * 1008) while the owning node returns the real ext4 values (e.g.
-	 * 1000) - intentionally inconsistent by design. Kept commented out
-	 * for reuse if another filesystem needs strict uid/gid comparison.
-	 */
-	// if m1.StatMd.Uid != m2.StatMd.Uid {
-	// 	ics = append(ics, fmt.Sprintf("%s: uid %d vs %d", path, m1.StatMd.Uid, m2.StatMd.Uid))
-	// }
-	// if m1.StatMd.Gid != m2.StatMd.Gid {
-	// 	ics = append(ics, fmt.Sprintf("%s: gid %d vs %d", path, m1.StatMd.Gid, m2.StatMd.Gid))
-	// }
-	/*
-	 * mtime/size comparison is skipped for hmdfs: the remote-view stat
-	 * (get_cached_attr_remote) returns the device_view inode's cached
-	 * getattr_isize/i_mtime, which only refresh on open/own-write/inode
-	 * rebuild - not on stat or cross-node write. The values are therefore
-	 * intentionally inconsistent across nodes (weak consistency), same
-	 * rationale as nlink/mode/uid-gid above. Content integrity is still
-	 * covered by the Checksum comparison.
-	 */
-	if fsType != "hmdfs" && m1.StatMd.Mtim.Sec != m2.StatMd.Mtim.Sec {
-		ics = append(ics, fmt.Sprintf("%s: mtime %d vs %d", path, m1.StatMd.Mtim.Sec, m2.StatMd.Mtim.Sec))
-	}
-	isDir := (m1.StatMd.Mode & syscall.S_IFDIR) != 0
-	if fsType != "hmdfs" && !isDir && m1.StatMd.Size != m2.StatMd.Size {
-		ics = append(ics, fmt.Sprintf("%s: size %d vs %d", path, m1.StatMd.Size, m2.StatMd.Size))
-	}
-	if !xattrCmp(m1.Xattr, m2.Xattr) {
+	if isGlusterfs {
+		if !xattrCmpUser(m1.Xattr, m2.Xattr) {
+			ics = append(ics, fmt.Sprintf("%s: xattr differ", path))
+		}
+	} else if !xattrCmp(m1.Xattr, m2.Xattr) {
 		ics = append(ics, fmt.Sprintf("%s: xattr differ", path))
 	}
 
 	return ics
 }
 
+// callPathArg returns the path string carried by one syscall argument. It is
+// deliberately limited to path-argument positions selected by the caller, so
+// payload/data buffers are never mistaken for FileTree paths.
+func callPathArg(call *prog.Call, idx int) string {
+	if call == nil || idx < 0 || idx >= len(call.Args) {
+		return ""
+	}
+	ptr, ok := call.Args[idx].(*prog.PointerArg)
+	if !ok || ptr.Res == nil {
+		return ""
+	}
+	data, ok := ptr.Res.(*prog.DataArg)
+	if !ok || data.Dir() == prog.DirOut {
+		return ""
+	}
+	return strings.TrimSuffix(string(data.Data()), "\x00")
+}
+
 // initTreeSubset serializes the subset of the initial file tree touched by
 // the test programs (plus all ancestor directories) for symsc, in the
-// emulation's canonical domain: paths relative to the merge_view root (no
-// "merge_view/" prefix). The merge_view root itself is skipped (symsc
-// pre-creates its root inode). The initial tree can contain thousands of
-// files while a program only touches a few dozen, so passing the whole tree
-// would blow up the emulation's per-call state copies.
+// emulation's canonical domain: paths relative to the profile namespace root
+// (no "merge_view/" prefix for HMDFS, bare root-relative paths for GlusterFS).
+// The namespace root itself is skipped (symsc pre-creates its root inode).
+// The initial tree can contain thousands of files while a program only touches
+// a few dozen, so passing the whole tree would blow up the emulation's per-call
+// state copies.
 func initTreeSubset(ps []*prog.Prog, ft *prog.FileTree) string {
 	if ft == nil {
 		return ""
@@ -394,38 +471,53 @@ func initTreeSubset(ps []*prog.Prog, ft *prog.FileTree) string {
 	var lines []string
 	addPath := func(path string) {
 		path = strings.TrimPrefix(path, "./")
-		if node := ft.FindNode(path); node != nil {
-			for n := node; n != nil; n = n.Parent {
-				if n.Parent == nil {
-					continue // merge_view root: not part of the emulated world
-				}
-				fp := strings.TrimPrefix(n.FullPath, prog.MergeViewPrefix)
-				if seen[fp] {
-					continue
-				}
-				seen[fp] = true
-				t := "dir"
-				if n.Type == prog.NodeTypeFile {
-					t = "file"
-				}
-				lines = append(lines, fmt.Sprintf("%s\t%s\t%d\t%d", fp, t, n.Size, len(n.Children)))
+		if path == "" {
+			return
+		}
+		node := ft.FindNode(path)
+		if node == nil {
+			return
+		}
+		for n := node; n != nil; n = n.Parent {
+			if n.Parent == nil {
+				continue // namespace root: not part of the emulated world
 			}
+			fp := strings.TrimPrefix(n.FullPath, ft.Prefix)
+			fp = strings.TrimPrefix(fp, "/")
+			if fp == "" || seen[fp] {
+				continue
+			}
+			seen[fp] = true
+			t := "dir"
+			if n.Type == prog.NodeTypeFile {
+				t = "file"
+			}
+			lines = append(lines, fmt.Sprintf("%s\t%s\t%d\t%d", fp, t, n.Size, len(n.Children)))
 		}
 	}
 	for _, p := range ps {
+		if p == nil {
+			continue
+		}
 		for _, call := range p.Calls {
-			for _, arg := range call.Args {
-				switch a := arg.(type) {
-				case *prog.PointerArg:
-					if d, ok := a.Res.(*prog.DataArg); ok && d.Dir() != prog.DirOut &&
-						strings.Contains(string(d.Data()), "merge_view") {
-						addPath(string(d.Data()))
-					}
-				case *prog.DataArg:
-					if a.Dir() != prog.DirOut && strings.Contains(string(a.Data()), "merge_view") {
-						addPath(string(a.Data()))
-					}
-				}
+			if call == nil || call.Meta == nil {
+				continue
+			}
+			name := call.Meta.Name
+			switch {
+			case strings.Contains(name, "symlink"):
+				linkPath := callPathArg(call, 1)
+				addPath(prog.SymlinkCanonicalTarget(linkPath, callPathArg(call, 0)))
+				addPath(linkPath)
+			case strings.Contains(name, "rename") || name == "link":
+				addPath(callPathArg(call, 0))
+				addPath(callPathArg(call, 1))
+			default:
+				// Every other path-resolving call carries its path in arg0.
+				// fd-based calls (read/write/getdents/fsync/close) have a
+				// ResultArg there, so callPathArg returns "" and the baseline
+				// file is picked up from the earlier open call.
+				addPath(callPathArg(call, 0))
 			}
 		}
 	}
