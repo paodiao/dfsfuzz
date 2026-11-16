@@ -10,9 +10,9 @@ import (
 // (Temporal, PathRel, featuresOf(A), featuresOf(B)) — see hashPair — so this
 // board re-materializes that structure from each novel pair and keeps a
 // structured record of which cells have been discovered. The selection side
-// (chooseVariant) can then bias toward combos whose producible cells
-// are still uncovered ("directed" picks), instead of learning weights from a
-// signal that is too sparse to be learnable at the observed volume.
+// (chooseVariant) can then bias toward combos whose plannable cells are still
+// uncovered ("directed" picks), instead of learning weights from a signal that
+// is too sparse to be learnable at the observed volume.
 //
 // The board is process-global (not per-Proc LCS): the throwaway LCS used by
 // from-scratch generation shares the same discovery state. It starts empty on
@@ -59,15 +59,28 @@ type shapeDrainEntry struct {
 	Drained bool
 }
 
-// coverageBoard tracks discovered cells and per-combo producible-cell counts.
-// producible/found are indexed by temporal form (HB=0, CC=1, matching the
-// TemporalRel enum values). All fields are guarded by mu.
+// coverageBoard has three layers:
+//
+//	observed  - discovered + knownShapes. Every first sighting is recorded,
+//	            including cells outside the static model. This ledger is never
+//	            gated by the model or by planner reachability.
+//	model     - producible + found. A finite static estimate of naturally
+//	            reachable cells, used only for bounded diagnostics (model=,
+//	            outModel=). It is not a completeness claim.
+//	plannable - plannable + plannableFound. The forms FailurePolicy and the
+//	            directed planner actively construct. Direction-3 (2a variant
+//	            bias, 2b exact plans, mutation biases) consumes only this layer.
+//
+// The per-temporal arrays are indexed by TemporalRel (HB=0, CC=1). All fields
+// are guarded by mu.
 type coverageBoard struct {
-	mu          sync.RWMutex
-	discovered  map[cellKey]int
-	producible  map[comboKey][2]int // cells producible per temporal form
-	found       map[comboKey][2]int // discovered cells per temporal form
-	knownShapes map[uint64]bool     // observed event shapes (call-name agnostic)
+	mu             sync.RWMutex
+	discovered     map[cellKey]int
+	producible     map[comboKey][2]int // model: producible cells per temporal form
+	found          map[comboKey][2]int // model: discovered cells per temporal form
+	plannable      map[comboKey][2]int // planner: constructible cells per temporal form
+	plannableFound map[comboKey][2]int // planner: discovered cells per temporal form
+	knownShapes    map[uint64]bool     // observed event shapes (call-name agnostic)
 	// shapeEpoch increments on every newly observed shape; shapeDrainCache
 	// entries are valid only at the epoch they were written, since shapes
 	// never disappear within a board generation. The cache is replaced
@@ -79,6 +92,7 @@ type coverageBoard struct {
 	persistDir      string
 	persistBucket   uint64  // depth bucket of the persist dir (persist = path prefix)
 	depths          [4]bool // depth buckets present in the initial tree
+	dualPath        bool    // snapshot of profile.DualPathCausalEnabled at init
 	ready           bool
 
 	directedPicks    uint64
@@ -120,6 +134,8 @@ var covBoard = &coverageBoard{
 	discovered:       make(map[cellKey]int),
 	producible:       make(map[comboKey][2]int),
 	found:            make(map[comboKey][2]int),
+	plannable:        make(map[comboKey][2]int),
+	plannableFound:   make(map[comboKey][2]int),
 	knownShapes:      make(map[uint64]bool),
 	shapeDrainCache:  make(map[shapeDrainKey]shapeDrainEntry),
 	directedAttempts: make(map[comboKey]int),
@@ -247,7 +263,7 @@ func coverageBoardCallLists(profile *DFSProfile) (roots, variants []string) {
 
 // InitCoverageBoard initializes the global coverage board from the run config
 // (persistence dir + depth buckets present in the initial tree) and eagerly
-// precomputes every combo's producible-cell counts. Idempotent: the
+// precomputes every combo's model- and plannable-cell counts. Idempotent: the
 // first call wins so extra Procs cannot reset a shared board mid-run.
 func InitCoverageBoard(hmcfg *Hmdfs_config) {
 	if hmcfg == nil {
@@ -261,6 +277,7 @@ func InitCoverageBoard(hmcfg *Hmdfs_config) {
 	}
 	b.persistDir = hmcfg.Persistence_dir
 	b.profile = hmcfg.ProfileOrDefault()
+	b.dualPath = b.profile != nil && b.profile.DualPathCausalEnabled()
 	if b.persistDir != "" {
 		b.persistBucket = DepthBucketOf(b.persistDir)
 	}
@@ -301,6 +318,7 @@ func InitCoverageBoard(hmcfg *Hmdfs_config) {
 					continue
 				}
 				b.producible[ck] = b.computeProducibleLocked(ck)
+				b.plannable[ck] = b.computePlannableLocked(ck)
 			}
 		}
 	}
@@ -320,9 +338,37 @@ func RecordCoveragePairs(observedPairs []DAGPair) {
 	covBoard.recordPairs(observedPairs)
 }
 
-// CoverageStats returns (found cells, producible cells).
+// CoverageStats returns the model layer's (found cells, target cells). It is
+// kept for compatibility; the observed ledger is
+// CoverageLayerStats().ObservedCells and the actionable planner view is
+// PlannableFound/PlannableTarget.
 func CoverageStats() (found, target int) {
 	return covBoard.coverStats()
+}
+
+// CoverageSnapshot is the three-layer coverage ledger:
+//
+//	Observed    - all distinct first-sighting cells (including out-of-model)
+//	OutOfModel  - observed cells outside the model layer
+//	Model*      - the finite natural-reachability estimate
+//	Plannable*  - the FailurePolicy/planner constructible set
+//
+// ModelOnly = ModelFound - PlannableFound is the number of observed cells that
+// are naturally reachable but not actively planned (e.g. GlusterFS mkdir
+// EEXIST); it is derived by the caller to keep the snapshot redundancy-free.
+type CoverageSnapshot struct {
+	ObservedCells   int
+	ObservedShapes  int
+	OutOfModel      int
+	ModelFound      int
+	ModelTarget     int
+	PlannableFound  int
+	PlannableTarget int
+}
+
+// CoverageLayerStats returns one consistent snapshot of the three layers.
+func CoverageLayerStats() CoverageSnapshot {
+	return covBoard.layerStats()
 }
 
 // DirectedPickStats returns (directed pick count, summed potential score).
@@ -340,9 +386,9 @@ func CoverageBoardReady() bool {
 	return covBoard.isReady()
 }
 
-// CoveragePotential returns the directed-scope uncovered producible-cell count
+// CoveragePotential returns the directed-scope uncovered plannable-cell count
 // of a combo (both temporal forms); 0 when the board is not ready, the combo is
-// not in the producible grid, or it is suppressed as unreachable (directed-
+// not in the plannable grid, or it is suppressed as unreachable (directed-
 // failure accounting).
 func CoveragePotential(root, variant string, rel PathRelation) int {
 	return covBoard.uncoveredPotential(root, variant, rel)
@@ -400,56 +446,118 @@ func ResetCoverageBoard() {
 }
 
 // cellInDomain reports whether the cell's depth bucket was present in the
-// initial tree's domain. This is a model-consistency constraint, not a target
-// margin: found must stay within the producible model's domain
-// (computeProducibleLocked builds its depthList from the same b.depths), so
-// prod-found can never go negative and the 2b enumerator cannot aim at cells
-// the model cannot count. There is no static target subset anymore: every
-// producible cell counts towards found/target/potential (full scoring,
-// 2026-09-28; the former OR margins excluded only 4-17% of the cell space).
+// initial tree's domain. This is a layer-consistency constraint, not a target
+// margin: model/plannable found counts must stay within the depth domain their
+// grids were built from (computeCellCountLocked uses the same b.depths), so
+// target-found can never go negative and the 2b enumerator cannot aim at cells
+// the layer cannot count.
 func (b *coverageBoard) cellInDomain(ck cellKey) bool {
 	return b.depths[ck.DepthB]
 }
 
-// computeProducibleLocked computes the per-temporal producible-cell counts of
-// a combo arithmetically (no cell enumeration). The root's return bucket is
-// pinned to Success (retA=1): directed cells target B-side margins with a
-// working root, and this removes the root's producible-ret multiplicity from
-// the potential (a root with 3 reachable rets would otherwise get 3x the
-// potential of a single-ret root). There is no target subset: every producible
-// cell counts (full scoring).
+// cellForm is one (offset, return) form of a variant call. The model layer
+// expands a call into rets x offset buckets; the plannable layer uses the
+// directed planner's own form table so the two cannot drift.
+type cellForm struct {
+	off uint64
+	ret RetBucket
+}
+
+// modelFormsFor expands the model's static ret/offset tables for a call.
+func modelFormsFor(profile *DFSProfile, call string) []cellForm {
+	var forms []cellForm
+	for _, ret := range producibleRetsFor(profile, call) {
+		for _, off := range producibleOffBucketsForRet(call, ret) {
+			forms = append(forms, cellForm{off: off, ret: ret})
+		}
+	}
+	return forms
+}
+
+// plannableFormsFor returns the forms FailurePolicy/the directed planner
+// actively construct:
+//
+//   - GlusterFS: the directedVariantKinds table itself (Success-only unless a
+//     failure form is an explicit policy target: rmdir/rename ENOTEMPTY,
+//     getxattr ENODATA, setxattr EEXIST);
+//   - HMDFS: the model table, preserving the pre-plannable D3 behavior.
+func plannableFormsFor(profile *DFSProfile, call string) []cellForm {
+	if profile != nil && profile.Name == "glusterfs" {
+		kinds, ok := directedVariantKinds(call, profile)
+		if !ok {
+			return nil
+		}
+		forms := make([]cellForm, len(kinds))
+		for i, kind := range kinds {
+			forms[i] = cellForm{off: kind.bucket, ret: kind.retB}
+		}
+		return forms
+	}
+	return modelFormsFor(profile, call)
+}
+
+// plannableComboEnabled applies the combo-level construction gate. HMDFS is
+// always enabled (plannable == model); GlusterFS keeps link/symlink/readlink
+// out of the active target set until the dual-path gate is enabled.
+func (b *coverageBoard) plannableComboEnabled(ck comboKey) bool {
+	if b.profile == nil || b.profile.Name != "glusterfs" {
+		return true
+	}
+	if !b.dualPath &&
+		(ck.Root == "link" || ck.Root == "symlink" ||
+			ck.Variant == "link" || ck.Variant == "symlink" ||
+			ck.Variant == "readlink") {
+		return false
+	}
+	return true
+}
+
+// computeProducibleLocked computes the model layer's per-temporal cell counts.
+// See computeCellCountLocked for the shared dimension rules.
+func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
+	return b.computeCellCountLocked(ck,
+		modelFormsFor(b.profile, ck.Variant),
+		producibleTypesFor(b.profile, ck.Variant))
+}
+
+// computePlannableLocked computes the planner layer's per-temporal cell counts.
+func (b *coverageBoard) computePlannableLocked(ck comboKey) [2]int {
+	if !b.plannableComboEnabled(ck) {
+		return [2]int{}
+	}
+	return b.computeCellCountLocked(ck,
+		plannableFormsFor(b.profile, ck.Variant),
+		producibleTypesFor(b.profile, ck.Variant))
+}
+
+// computeCellCountLocked computes per-temporal cell counts arithmetically (no
+// cell enumeration). The root's return bucket is pinned to Success (retA=1):
+// directed cells target B-side margins with a working root, and this removes
+// the root's ret multiplicity from the potential.
 //
 // The modifier gates mirror ExtractPairs reachability:
 //   - an HB pair requires the temporally earlier vertex (the pair's root) to
 //     be a succeeded modifier, so a non-modifier root can never produce HB
-//     cells (previously counted, inflating those combos' potential ~2x);
+//     cells;
 //   - a CC pair requires at least one side to be a modifier (by type), so a
 //     combo whose root and variant are both non-modifiers produces nothing.
 //
 // Persist is depth-conditional: a persist path is the persist dir itself or a
 // descendant (path-prefix match, see cellKeyOf), so its depth bucket is at
-// least the dir's bucket (buckets are monotone in slash count). One extra
-// depth multiplicity is counted per domain bucket that can hold persist paths.
+// least the dir's bucket. One extra depth multiplicity is counted per domain
+// bucket that can hold persist paths.
 //
 // The caller must hold mu.
-func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
-	retACount := 1 // RetSuccess only; see the doc comment above
-	retB := producibleRetsFor(b.profile, ck.Variant)
-	offCount := 0
-	for _, r := range retB {
-		offCount += len(producibleOffBucketsForRet(ck.Variant, r))
-	}
+func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, typeList []bool) [2]int {
+	retACount := 1 // RetSuccess only
 	var depthList []uint64
 	for d := 0; d < 4; d++ {
 		if b.depths[d] {
 			depthList = append(depthList, uint64(d))
 		}
 	}
-	typeList := producibleTypesFor(b.profile, ck.Variant)
-
 	// Non-persist cells exist at every domain bucket; persist cells only at
-	// buckets >= the persist dir's own bucket. The >= also covers shallow
-	// persist dirs, whose descendants may cross bucket thresholds.
+	// buckets >= the persist dir's own bucket.
 	depthMult := len(depthList)
 	if b.persistDir != "" {
 		for _, d := range depthList {
@@ -458,7 +566,7 @@ func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
 			}
 		}
 	}
-	total := retACount * offCount * depthMult * len(typeList)
+	total := retACount * len(forms) * depthMult * len(typeList)
 	rootMod := isModifierCall(ck.Root)
 	variantMod := isModifierCall(ck.Variant)
 	var hb, cc int
@@ -574,22 +682,30 @@ func (b *coverageBoard) markDiscoveredLocked(ck cellKey) {
 			}
 		}
 		// Count a cell towards the combo only on first sight, only when the
-		// root succeeded (the scored set pins retA=Success; see
-		// computeProducibleLocked) and only inside the producible model's
-		// dimension tables.
-		if ck.RetA == RetSuccess && b.cellInDomain(ck) && b.cellInModel(ck) {
+		// root succeeded (the scored set pins retA=Success) and only inside
+		// the layer's dimension tables. The observed ledger above is already
+		// updated unconditionally; these two counters are bounded views.
+		if ck.RetA == RetSuccess && b.cellInDomain(ck) {
 			fk := comboKey{Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel}
-			f := b.found[fk]
-			f[int(ck.Temporal)]++
-			b.found[fk] = f
-			// F1: a productive combo lifts its directed-failure suppression
-			// and re-baselines its window, so it can re-enter directed
-			// selection once new evidence arrives (tree growth, the 2b
-			// planner, refreshed model tables).
-			delete(b.unreachable, fk)
-			b.directedAttempts[fk] = 0
-			b.resolveMark[fk] = 0
-			b.foundSnapshot[fk] = f[0] + f[1]
+			if b.cellInModel(ck) {
+				f := b.found[fk]
+				f[int(ck.Temporal)]++
+				b.found[fk] = f
+			}
+			if b.cellInPlannable(ck) {
+				f := b.plannableFound[fk]
+				f[int(ck.Temporal)]++
+				b.plannableFound[fk] = f
+				// F1: a productive combo lifts its directed-failure
+				// suppression and re-baselines its window, so it can re-enter
+				// directed selection once new evidence arrives (tree growth,
+				// the 2b planner, refreshed plannable tables). Model-only
+				// observations must not lift a planner-dead combo.
+				delete(b.unreachable, fk)
+				b.directedAttempts[fk] = 0
+				b.resolveMark[fk] = 0
+				b.foundSnapshot[fk] = f[0] + f[1]
+			}
 		}
 	}
 	b.discovered[ck]++
@@ -630,6 +746,42 @@ func (b *coverageBoard) cellInModel(ck cellKey) bool {
 		}
 	}
 	if !inOffs {
+		return false
+	}
+	for _, t := range producibleTypesFor(b.profile, ck.Variant) {
+		if t == ck.TypeB {
+			return true
+		}
+	}
+	return false
+}
+
+// cellInPlannable reports whether the cell lies inside the plannable layer:
+// the combo is in the plannable grid, its temporal form is producible, and
+// RetB/OffB/TypeB are among the planner's constructible forms. HMDFS falls
+// back to cellInModel so its legacy plannable == model behavior is exact;
+// GlusterFS uses directedVariantKinds (the same table the planner uses).
+// The caller must hold b.mu.
+func (b *coverageBoard) cellInPlannable(ck cellKey) bool {
+	if b.profile == nil || b.profile.Name != "glusterfs" {
+		return b.cellInModel(ck)
+	}
+	ckm := comboKey{Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel}
+	if !b.plannableComboEnabled(ckm) {
+		return false
+	}
+	prod, ok := b.plannable[ckm]
+	if !ok || prod[int(ck.Temporal)] == 0 {
+		return false
+	}
+	inForm := false
+	for _, f := range plannableFormsFor(b.profile, ck.Variant) {
+		if f.ret == ck.RetB && f.off == ck.OffB {
+			inForm = true
+			break
+		}
+	}
+	if !inForm {
 		return false
 	}
 	for _, t := range producibleTypesFor(b.profile, ck.Variant) {
@@ -716,7 +868,7 @@ func (b *coverageBoard) shapeDrainedLocked(ck comboKey, aFunc uint32, aDepth uin
 	if !b.ready {
 		return false
 	}
-	prod, ok := b.producible[ck]
+	prod, ok := b.plannable[ck]
 	if !ok || (prod[0] == 0 && prod[1] == 0) {
 		return false
 	}
@@ -771,7 +923,7 @@ func (b *coverageBoard) direction3ShapeDrain(rootCall, variant string, rel PathR
 		aFunc, DepthBucketOf(basePath), isDir, persist, dagRel)
 }
 
-// uncoveredPotentials returns the uncovered producible-cell counts of the
+// uncoveredPotentials returns the uncovered plannable-cell counts of the
 // given candidates under one read lock (per-combo lookup of the precomputed
 // tables).
 func (b *coverageBoard) uncoveredPotentials(root string, cands []CallVariant) []int {
@@ -786,11 +938,11 @@ func (b *coverageBoard) uncoveredPotentials(root string, cands []CallVariant) []
 		if b.unreachable[ck] {
 			continue
 		}
-		prod, ok := b.producible[ck]
+		prod, ok := b.plannable[ck]
 		if !ok {
 			continue
 		}
-		found := b.found[ck]
+		found := b.plannableFound[ck]
 		for t := 0; t < 2; t++ {
 			if d := prod[t] - found[t]; d > 0 {
 				res[i] += d
@@ -801,7 +953,7 @@ func (b *coverageBoard) uncoveredPotentials(root string, cands []CallVariant) []
 }
 
 // pickByCoveragePotential samples a candidate with probability proportional
-// to its uncovered producible-cell count (potential roulette). Roulette, not
+// to its uncovered plannable-cell count (potential roulette). Roulette, not
 // argmax, is deliberate: argmax would direct the whole budget onto a single
 // combo until its potential drains below the runner-up, whereas roulette
 // spreads across combos in proportion to what they still have to offer.
@@ -853,11 +1005,11 @@ func (b *coverageBoard) uncoveredPotential(root, variant string, rel PathRelatio
 	if b.unreachable[ck] {
 		return 0
 	}
-	prod, ok := b.producible[ck]
+	prod, ok := b.plannable[ck]
 	if !ok {
 		return 0
 	}
-	found := b.found[ck]
+	found := b.plannableFound[ck]
 	pot := 0
 	for t := 0; t < 2; t++ {
 		if d := prod[t] - found[t]; d > 0 {
@@ -868,16 +1020,16 @@ func (b *coverageBoard) uncoveredPotential(root, variant string, rel PathRelatio
 }
 
 // forEachUncoveredCellKey enumerates the uncovered cells of one combo in the
-// producible space: RetA pinned to Success, every producible RetB/OffB/TypeB,
+// plannable space: RetA pinned to Success, every plannable RetB/OffB/TypeB,
 // every depth bucket in the run's domain, both persistence margins and both
-// temporal forms (a form is skipped when its precomputed producible count is
+// temporal forms (a form is skipped when its precomputed plannable count is
 // zero, i.e. the ExtractPairs modifier gate). fn receives the full cell.
 // The caller must hold b.mu for reading.
 func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKey)) {
-	if !b.ready || b.unreachable[ck] {
+	if !b.ready || b.unreachable[ck] || !b.plannableComboEnabled(ck) {
 		return
 	}
-	prod, ok := b.producible[ck]
+	prod, ok := b.plannable[ck]
 	if !ok {
 		return
 	}
@@ -892,32 +1044,30 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 	if nd == 0 {
 		return
 	}
-	for _, rb := range producibleRetsFor(b.profile, ck.Variant) {
-		for _, off := range producibleOffBucketsForRet(ck.Variant, rb) {
-			for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
-				for i := 0; i < nd; i++ {
-					depth := depthList[i]
-					persists := [2]bool{false}
-					np := 1
-					if b.persistDir != "" && depth >= b.persistBucket {
-						persists[1] = true
-						np = 2
-					}
-					for pi := 0; pi < np; pi++ {
-						for t := 0; t < 2; t++ {
-							if prod[t] == 0 {
-								continue
-							}
-							cell := cellKey{
-								Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel,
-								Temporal: TemporalRel(t), RetA: RetSuccess, RetB: rb,
-								OffB: off, PersistB: persists[pi], DepthB: depth, TypeB: isDir,
-							}
-							if b.discovered[cell] != 0 || b.cellUnreachable[cell] {
-								continue
-							}
-							fn(cell)
+	for _, form := range plannableFormsFor(b.profile, ck.Variant) {
+		for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
+			for i := 0; i < nd; i++ {
+				depth := depthList[i]
+				persists := [2]bool{false}
+				np := 1
+				if b.persistDir != "" && depth >= b.persistBucket {
+					persists[1] = true
+					np = 2
+				}
+				for pi := 0; pi < np; pi++ {
+					for t := 0; t < 2; t++ {
+						if prod[t] == 0 {
+							continue
 						}
+						cell := cellKey{
+							Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel,
+							Temporal: TemporalRel(t), RetA: RetSuccess, RetB: form.ret,
+							OffB: form.off, PersistB: persists[pi], DepthB: depth, TypeB: isDir,
+						}
+						if b.discovered[cell] != 0 || b.cellUnreachable[cell] {
+							continue
+						}
+						fn(cell)
 					}
 				}
 			}
@@ -953,7 +1103,7 @@ func (b *coverageBoard) uncoveredOffPots(variants []string) [5]int {
 	for _, v := range variants {
 		set[v] = true
 	}
-	for ck := range b.producible {
+	for ck := range b.plannable {
 		if !set[ck.Variant] {
 			continue
 		}
@@ -1005,7 +1155,7 @@ func (b *coverageBoard) noteDirectedPick(ck comboKey, pot int) {
 	b.directedAttempts[ck] = a
 	if a-b.resolveMark[ck] >= unreachableThreshold {
 		f := 0
-		if fc, ok := b.found[ck]; ok {
+		if fc, ok := b.plannableFound[ck]; ok {
 			f = fc[0] + fc[1]
 		}
 		if f == b.foundSnapshot[ck] {
@@ -1095,12 +1245,12 @@ func (b *coverageBoard) noteDirectedCfgErr() {
 }
 
 // cellUncovered reports whether ck is still a valid directed-plan target:
-// undiscovered, inside the producible model, success root, and not
+// undiscovered, inside the plannable layer, success root, and not
 // cell-suppressed. Mirrors uncoveredCellFlags (the batch form) exactly.
 func (b *coverageBoard) cellUncovered(ck cellKey) bool {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	if !b.ready || ck.RetA != RetSuccess || !b.cellInDomain(ck) || !b.cellInModel(ck) {
+	if !b.ready || ck.RetA != RetSuccess || !b.cellInDomain(ck) || !b.cellInPlannable(ck) {
 		return false
 	}
 	return b.discovered[ck] == 0 && !b.cellUnreachable[ck]
@@ -1117,7 +1267,7 @@ func (b *coverageBoard) uncoveredCellFlags(cells []cellKey) []bool {
 	}
 	for i := range cells {
 		ck := cells[i]
-		res[i] = ck.RetA == RetSuccess && b.cellInDomain(ck) && b.cellInModel(ck) &&
+		res[i] = ck.RetA == RetSuccess && b.cellInDomain(ck) && b.cellInPlannable(ck) &&
 			b.discovered[ck] == 0 && !b.cellUnreachable[ck]
 	}
 	return res
@@ -1147,9 +1297,12 @@ func (b *coverageBoard) cellUnreachableCount() int {
 	return len(b.cellUnreachable)
 }
 
-// comboSelectableFlags reports which of the given combos are in the producible
+// comboSelectableFlags reports which of the given combos are in the plannable
 // grid and not suppressed at the combo (directed) scope. Batch form used by the
-// Phase 2b plan enumerator.
+// Phase 2b plan enumerator. Zero-potential combos stay selectable here; the
+// potential filters (comboPotentials / uncoveredPotentials) decide whether
+// they are worth targeting. Keeping zero combos membership-true also preserves
+// HMDFS's legacy causal-C2 prefilter behavior.
 func (b *coverageBoard) comboSelectableFlags(cks []comboKey) map[comboKey]bool {
 	res := make(map[comboKey]bool, len(cks))
 	b.mu.RLock()
@@ -1158,10 +1311,10 @@ func (b *coverageBoard) comboSelectableFlags(cks []comboKey) map[comboKey]bool {
 		return res
 	}
 	for _, ck := range cks {
-		if b.unreachable[ck] {
+		if b.unreachable[ck] || !b.plannableComboEnabled(ck) {
 			continue
 		}
-		if _, ok := b.producible[ck]; ok {
+		if _, ok := b.plannable[ck]; ok {
 			res[ck] = true
 		}
 	}
@@ -1170,13 +1323,14 @@ func (b *coverageBoard) comboSelectableFlags(cks []comboKey) map[comboKey]bool {
 
 // comboPotentials returns the 2b-available uncovered potential of each combo
 // in one batch (0 when the board is not ready, the combo is outside the
-// producible grid, or it is suppressed at the combo scope). found[t] counts
-// distinct discovered cells and cellSuppressed subtracts the cells the 2b miss
-// ledger currently suppresses, so a combo whose remaining uncovered cells are
-// all cell-suppressed reads 0 and the planner skips it immediately instead of
-// waiting for the combo-level blind-pick retirement. The 2a APIs
-// (uncoveredPotentials / CoveragePotential) intentionally keep the raw model
-// potential: generation can still observe cells the 2b templates gave up on.
+// plannable grid, has no plannable cells, or is suppressed at the combo
+// scope). plannableFound[t] counts distinct discovered plannable cells and
+// cellSuppressed subtracts the cells the 2b miss ledger currently suppresses,
+// so a combo whose remaining uncovered cells are all cell-suppressed reads 0
+// and the planner skips it immediately instead of waiting for the combo-level
+// blind-pick retirement. The 2a APIs (uncoveredPotentials / CoveragePotential)
+// use the same plannable layer; generation-side natural observations remain in
+// the observed/model ledgers but are not active targets.
 func (b *coverageBoard) comboPotentials(cks []comboKey) []int {
 	res := make([]int, len(cks))
 	b.mu.RLock()
@@ -1188,11 +1342,11 @@ func (b *coverageBoard) comboPotentials(cks []comboKey) []int {
 		if b.unreachable[ck] {
 			continue
 		}
-		prod, ok := b.producible[ck]
-		if !ok {
+		prod, ok := b.plannable[ck]
+		if !ok || !b.plannableComboEnabled(ck) {
 			continue
 		}
-		found := b.found[ck]
+		found := b.plannableFound[ck]
 		pot := 0
 		for t := 0; t < 2; t++ {
 			if d := prod[t] - found[t]; d > 0 {
@@ -1219,6 +1373,29 @@ func (b *coverageBoard) coverStats() (found, target int) {
 	return found, target
 }
 
+func (b *coverageBoard) layerStats() CoverageSnapshot {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	s := CoverageSnapshot{
+		ObservedCells:  len(b.discovered),
+		ObservedShapes: len(b.knownShapes),
+	}
+	for _, f := range b.found {
+		s.ModelFound += f[0] + f[1]
+	}
+	for _, p := range b.producible {
+		s.ModelTarget += p[0] + p[1]
+	}
+	for _, f := range b.plannableFound {
+		s.PlannableFound += f[0] + f[1]
+	}
+	for _, p := range b.plannable {
+		s.PlannableTarget += p[0] + p[1]
+	}
+	s.OutOfModel = s.ObservedCells - s.ModelFound
+	return s
+}
+
 func (b *coverageBoard) directedPickStats() (uint64, uint64) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1238,6 +1415,8 @@ func (b *coverageBoard) reset() {
 	b.discovered = make(map[cellKey]int)
 	b.producible = make(map[comboKey][2]int)
 	b.found = make(map[comboKey][2]int)
+	b.plannable = make(map[comboKey][2]int)
+	b.plannableFound = make(map[comboKey][2]int)
 	b.knownShapes = make(map[uint64]bool)
 	b.shapeEpoch = 0
 	b.shapeDrainCache = make(map[shapeDrainKey]shapeDrainEntry)
@@ -1245,6 +1424,7 @@ func (b *coverageBoard) reset() {
 	b.persistDir = ""
 	b.persistBucket = 0
 	b.depths = [4]bool{}
+	b.dualPath = false
 	b.ready = false
 	b.directedPicks = 0
 	b.directedScoreSum = 0

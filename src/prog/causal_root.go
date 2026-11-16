@@ -244,10 +244,7 @@ func causalC2ComboLive(profile *DFSProfile, root string) (map[comboKey]bool, boo
 		}
 		variants[variant] = true
 	}
-	for _, fp := range freshSameForms {
-		if profile.Name == "glusterfs" && fp.ret != RetSuccess {
-			continue
-		}
+	for _, fp := range freshSameFormsFor(profile) {
 		variants[fp.variant] = true
 	}
 	rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
@@ -428,11 +425,8 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		cells = append(cells, ck)
 	}
 	if rootKind == causalRootFresh {
-		for _, fp := range freshSameForms {
+		for _, fp := range freshSameFormsFor(profile) {
 			if fp.root != rootCall {
-				continue
-			}
-			if profile.Name == "glusterfs" && fp.ret != RetSuccess {
 				continue
 			}
 			cell := directedCell{
@@ -1530,7 +1524,7 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 			plan.BaseA2 == "" || GetParentDir(plan.BaseA) != plan.BaseA2 {
 			return false
 		}
-		if !freshSameFormAllowed(plan.Cell.Combo.Root, plan.Cell.Combo.Variant,
+		if !freshSameFormAllowedFor(profile, plan.Cell.Combo.Root, plan.Cell.Combo.Variant,
 			plan.Cell.RetB, plan.Cell.OffB, plan.Cell.TypeB) {
 			return false
 		}

@@ -98,8 +98,9 @@ type directedPlan struct {
 	RootParentKind     AnchorPathKind
 	RootParentIsDir    bool
 	RootParentIsAnchor bool
-	// RootLinkPath is the C1 symlink root's program-local linkpath. It is the
-	// B side of a readlink C2 variant and is never a FileTree node.
+	// RootLinkPath is a link/symlink root's program-local linkpath (causal C1
+	// or the normal dual-root pass). It is the B side of a readlink C2 variant
+	// and is never a FileTree node. BaseA stays the existing target.
 	RootLinkPath string
 	// XattrName is the shared key for getxattr/setxattr variant construction.
 	XattrName string
@@ -116,7 +117,9 @@ type directedPlan struct {
 // related to the same A), so one root execution can form every planned pair.
 // BaseA2 is the rename root's fresh destination (empty otherwise). NodeX is
 // assigned 1..M at assembly; M is capped by len(ps)-1 and by the number of
-// pickable cells sharing the root.
+// pickable cells sharing the root. RootSource/RootDest carry the dual-path
+// link/symlink root (target + linkpath); they are set for both causal C1 and
+// the normal dual-root pass.
 type directedBatch struct {
 	Root              string
 	BaseA             string
@@ -1272,7 +1275,10 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 	// Group: every still-pickable cell whose representative shares the seed's
 	// root call name and root base paths, so one root execution serves all of
 	// them. BaseA2 participates for fresh-path roots (it anchors the parent
-	// directory or the rename destination).
+	// directory or the rename destination). RootLinkPath participates for
+	// link/symlink roots: a target may in principle have several planned
+	// linkpaths, but one batch executes exactly one root linkpath, so plans
+	// from another linkpath must never be mixed in.
 	var group []int
 	for i, ok := range flags {
 		if !ok {
@@ -1280,7 +1286,7 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 		}
 		p := planByCell[cells[i]]
 		if p.Cell.Combo.Root == seed.Cell.Combo.Root && p.BaseA == seed.BaseA &&
-			p.BaseA2 == seed.BaseA2 {
+			p.BaseA2 == seed.BaseA2 && p.RootLinkPath == seed.RootLinkPath {
 			group = append(group, i)
 		}
 	}
@@ -1366,6 +1372,15 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 		}
 	}
 	batch := &directedBatch{Root: seed.Cell.Combo.Root, BaseA: seed.BaseA, BaseA2: seed.BaseA2}
+	if seed.Cell.Combo.Root == "link" || seed.Cell.Combo.Root == "symlink" {
+		// Normal dual root: BaseA is the existing target; RootLinkPath is the
+		// fresh linkpath materialized by insertDirectedBatch.
+		if seed.RootLinkPath == "" {
+			return nil, directedPlanCfgErr
+		}
+		batch.RootSource = seed.BaseA
+		batch.RootDest = seed.RootLinkPath
+	}
 	if seed.Cell.Combo.Root == "setxattr" {
 		batch.RootXattrName = "user.eifuzz"
 	}
@@ -1591,6 +1606,16 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	profile := hmcfg.ProfileOrDefault()
 	rootCalls := profile.DirectedRootCalls()
 	variantCalls := profile.DirectedVariantCalls()
+	// link/symlink roots need a target and a program-local linkpath. They are
+	// enumerated by the dedicated dual pass below (which reuses causal C2);
+	// the ordinary passes keep their single-path root assumption.
+	primaryRoots := make([]string, 0, len(rootCalls))
+	for _, root := range rootCalls {
+		if root == "link" || root == "symlink" {
+			continue
+		}
+		primaryRoots = append(primaryRoots, root)
+	}
 	view := buildDirectedView(lcs.FileTree, hmcfg.Persistence_dir)
 	if len(view.bNodes) == 0 {
 		return planByCell, cells
@@ -1682,8 +1707,18 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 		}
 		return covBoard.shapesAllKnown(shapes)
 	}
+	// GlusterFS normal plans must stay inside the plannable layer. The
+	// per-combo prefilter above is not sufficient on its own: the FreshSame
+	// table and future passes can emit forms from a live combo that the
+	// planner is not allowed to construct (e.g. mkdir/mkdir EEXIST). Keep the
+	// check at the single plan-admission point so every pass is covered.
+	// HMDFS keeps its legacy per-combo-only behavior.
+	filterPlannable := profile.Name == "glusterfs" && covBoard.isReady()
 	add := func(plan directedPlan) {
 		ck := plan.Cell.toKey()
+		if filterPlannable && !covBoard.cellUncovered(ck) {
+			return
+		}
 		if _, ok := planByCell[ck]; ok {
 			return
 		}
@@ -1694,14 +1729,15 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 		planByCell[ck] = &p
 		cells = append(cells, ck)
 	}
-	// Live combos only: producible, not combo-suppressed, and with potential
-	// left. found[t] counts distinct discovered cells and comboPotentials
-	// subtracts the currently cell-suppressed cells, so potential 0 means no
-	// 2b-available cell is left (discovered or suppressed): the prefilter is
-	// exact for the planner, not just an optimization.
+	// Live combos only: plannable, not combo-suppressed, and with potential
+	// left. plannableFound[t] counts distinct discovered plannable cells and
+	// comboPotentials subtracts the currently cell-suppressed cells, so
+	// potential 0 means no 2b-available cell is left (discovered or
+	// suppressed): the prefilter is exact for the planner, not just an
+	// optimization.
 	rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
 	var combos []comboKey
-	for _, root := range rootCalls {
+	for _, root := range primaryRoots {
 		for _, variant := range variantCalls {
 			if !directedVariantAllowed(profile, root, variant) {
 				continue
@@ -1998,7 +2034,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 		if bn.srcPath != "" || bn.freshB || !bn.isDir || bn.isTmpDir {
 			continue
 		}
-		for _, fp := range freshSameForms {
+		for _, fp := range freshSameFormsFor(profile) {
 			if !comboLive[comboKey{Root: fp.root, Variant: fp.variant, Rel: PathSame}] {
 				continue
 			}
@@ -2027,6 +2063,41 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 			if isModifierCall(fp.root) {
 				plan.Cell.Temporal = TemporalHB
 				add(plan)
+			}
+		}
+	}
+	// Normal dual-path roots. link/symlink cannot be planned by the ordinary
+	// single-path passes: the root call needs both the existing target and a
+	// fresh program-local linkpath, while the cell/relation identity remains
+	// target-based. Reuse causal C2's fixed-root enumerator with
+	// causalRootNormal so relation, readlink and type semantics stay
+	// single-sourced. One linkpath is generated per (root, target) and is
+	// shared by every plan in the resulting batch group.
+	if profile.DualPathCausalEnabled() {
+		var dualRoots []string
+		for _, root := range rootCalls {
+			if root == "link" || root == "symlink" {
+				dualRoots = append(dualRoots, root)
+			}
+		}
+		for i := range view.bNodes {
+			bn := &view.bNodes[i]
+			if bn.freshB || bn.srcPath != "" || bn.isTmpDir {
+				continue
+			}
+			for _, root := range dualRoots {
+				linkPath := r.freshLinkPathFor(lcs.FileTree, bn.path, root)
+				if linkPath == "" {
+					continue
+				}
+				dualPlans, dualCells := planCausalC2CellsWithParent(nil, lcs, hmcfg,
+					root, bn.path, "", AnchorPathUnknown, false, false,
+					bn.path, linkPath, false, causalRootNormal, r)
+				for _, ck := range dualCells {
+					if p := dualPlans[ck]; p != nil {
+						add(*p)
+					}
+				}
 			}
 		}
 	}
@@ -2434,10 +2505,48 @@ var freshSameForms = []freshSameForm{
 	{"mkdir", "getdents64", RetSuccess, offsetBucketNA, true},
 }
 
+// glusterfsFreshSameForms is the GlusterFS subset of the HMDFS G-c scope-S
+// table. The table above encodes HMDFS construction choices (including
+// mkdir/creat races that observe EEXIST/Failure/ENOENT). GlusterFS v1's
+// FailurePolicy does not actively build those forms, so the planner must not
+// inherit the HMDFS table wholesale: only the Success forms are constructible.
+// The plannable layer is the final invariant; this table keeps the unwanted
+// forms out of the construction pass in the first place.
+var glusterfsFreshSameForms = filterFreshSameForms(freshSameForms, func(fp freshSameForm) bool {
+	return fp.ret == RetSuccess
+})
+
+func filterFreshSameForms(forms []freshSameForm, keep func(freshSameForm) bool) []freshSameForm {
+	res := make([]freshSameForm, 0, len(forms))
+	for _, fp := range forms {
+		if keep(fp) {
+			res = append(res, fp)
+		}
+	}
+	return res
+}
+
+// freshSameFormsFor returns the pinned fresh-fresh construction table for a
+// profile. HMDFS keeps its full G-c table; GlusterFS uses the Success-only
+// subset (the same rule causal_root's fresh root pass already applied).
+func freshSameFormsFor(profile *DFSProfile) []freshSameForm {
+	if profile != nil && profile.Name == "glusterfs" {
+		return glusterfsFreshSameForms
+	}
+	return freshSameForms
+}
+
 // freshSameFormAllowed reports whether (root, variant) with the given cell
-// margins is a pinned fresh-fresh form.
+// margins is a pinned fresh-fresh form for the HMDFS/default table.
 func freshSameFormAllowed(root, variant string, retB RetBucket, offB uint64, isDir bool) bool {
-	for _, fp := range freshSameForms {
+	return freshSameFormAllowedFor(hmdfsProfile, root, variant, retB, offB, isDir)
+}
+
+// freshSameFormAllowedFor is the profile-aware form of freshSameFormAllowed.
+// Validation uses the same table the planner generated from, so a GlusterFS
+// plan cannot validate against an HMDFS-only failure form.
+func freshSameFormAllowedFor(profile *DFSProfile, root, variant string, retB RetBucket, offB uint64, isDir bool) bool {
+	for _, fp := range freshSameFormsFor(profile) {
 		if fp.root == root && fp.variant == variant && fp.ret == retB &&
 			fp.off == offB && fp.isDir == isDir {
 			return true
@@ -2519,8 +2628,8 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 		if GetParentDir(plan.BaseA) != plan.BaseA2 || plan.Cell.Combo.Rel != PathSame {
 			return false
 		}
-		if !freshSameFormAllowed(plan.Cell.Combo.Root, plan.Cell.Combo.Variant,
-			plan.Cell.RetB, plan.Cell.OffB, plan.Cell.TypeB) {
+		if !freshSameFormAllowedFor(hmcfg.ProfileOrDefault(), plan.Cell.Combo.Root,
+			plan.Cell.Combo.Variant, plan.Cell.RetB, plan.Cell.OffB, plan.Cell.TypeB) {
 			return false
 		}
 		if DepthBucketOf(plan.BaseA) != plan.Cell.DepthB || persistOf(plan.BaseA) != plan.Cell.PersistB {
@@ -2673,11 +2782,6 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 		refTime = int64(p0.Calls[insertPos-1].CheckInfo.Etime) - lcs.tscoffFor(0)
 	}
 	// Root on a clone of node 0.
-	// Non-causal dual-path roots need RootPaths materialization, which is not
-	// wired into this path yet. Causal C1 batches (Anchor != nil) handle them.
-	if batch.Anchor == nil && (batch.Root == "link" || batch.Root == "symlink") {
-		return false
-	}
 	clone0 := p0.Clone()
 	if clone0 == nil {
 		return false
@@ -2688,6 +2792,12 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 	}
 	var rootCalls []*Call
 	if batch.Anchor != nil {
+		rootCalls = causalRootCallsSeq(r, sCalls, lcs, hmcfg, clone0, batch)
+	} else if batch.Root == "link" || batch.Root == "symlink" {
+		if batch.RootSource == "" || batch.RootDest == "" ||
+			batch.RootSource == batch.RootDest {
+			return false
+		}
 		rootCalls = causalRootCallsSeq(r, sCalls, lcs, hmcfg, clone0, batch)
 	} else if batch.Root == "rename" {
 		if batch.BaseA2 == "" {
