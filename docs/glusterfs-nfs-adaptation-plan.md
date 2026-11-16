@@ -81,6 +81,12 @@
     - `vm.count = 6`
   - 资源开销：6 × 2C / 10G；资源不足时只调 `vm.mem`，不改拓扑。
   - `data.img` 不启用：server VM 仍会被 QEMU 挂上 data.img，但 `glusterfs-config.sh` 中 mkfs/mount 保持注释，brick 继续使用 rootfs 的 `/root/glusterfs-server`。
+  - 镜像预建 `/root/glusterfs-client`（空挂载点）、`/root/glusterfs-server`、
+    `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 不在镜像预置，由 prefill
+    在挂载 volume 后创建。
+  - 镜像需有 `rsync`、`sshpass`、`gluster`/`glusterd`；缺 `rsync` 时 prefill/
+    restore 无法执行。
+  - QEMU 复用原 Monarch 镜像/启动路径；fuzzer 用 SSH key，不用密码登录。
 - NFS 使用 **1-2**（1 server + 2 client，3 VMs）。
 - 最终配置片段：
 
@@ -116,6 +122,8 @@
   - `timeout 60s rsync -a --numeric-ids --delete /home/baseline/glusterfs/ /root/glusterfs-client/eifuzz_root/`；
   - `sync`。
 - prefill 和每轮 restore 共用同一份 baseline，避免树漂移。
+- `prefill.sh` 放 `src/dfs-config/glusterfs/`；manager 会复制该目录下所有
+  `.sh` 到 VM `/root`。必须直接放、`.sh` 后缀、幂等，只由 reset client 执行。
 - 不在 server brick 中预放文件：GlusterFS 需要正确的 GFID/xattr/replica 元数据，直接写 brick 不可靠。
 - baseline 保留空目录，不含 xattr / symlink / hardlink。
 
@@ -448,6 +456,7 @@ FUSE_RELEASE      -> release
 **P3：路径调用点改造**
 
 - `rand.go` 约 13 处、`generation.go` 1 处、`mutation.go` 5 处写死的 `merge_view` / `merge_view/test_dir` 改为 `RootPath()` / `JoinRoot()`；
+- `rand.go:389 filenameImpl` 改用 `JoinRoot`；GlusterFS 空前缀生成 `file0`，不能生成 `./file0` 或 `/file0`；
 - `proc.go` InitialDir 的 `"merge_view/" + ...` 改为 `hc.RootPrefix`；`Persistence_dir` 保持 HMDFS-only；
 - `executor.cc` 的 `write_metadata`：非 HMDFS 从 `dfs-<pid>-<iter>` 改为固定测试根；HMDFS 才用 `merge_view`；
 - `checker/conc-fs.go` 的 `TrimPrefix(..., prog.MergeViewPrefix)` 和硬编码 `"merge_view"` 检查改用 `ft.Prefix`；

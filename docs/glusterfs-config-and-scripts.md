@@ -24,6 +24,25 @@
   `glusterfs-node-down.sh` 只在 failure/crash 场景使用。
 - normal restore 只做 client 侧 `rm -rf + rsync`，不重启 server/volume。
 
+### 0.1 上线前检查清单
+
+```text
+[ ] /root/glusterfs-client          空目录，Volume 挂载点
+[ ] /root/glusterfs-server          空目录，server brick
+[ ] /root/dfs-fuzzing/libucov.so    LD_PRELOAD
+[ ] /home/baseline/glusterfs/       client baseline
+[ ] rsync                           可执行
+[ ] sshpass                         可执行
+[ ] gluster / glusterd              可执行
+[ ] /root/.ssh/authorized_keys      focal.id_rsa.pub
+[ ] ssh -i focal.id_rsa root@VM     可登录
+[ ] eifuzz_root                     不预置，由 prefill 创建
+```
+
+`prefill.sh` 放 `src/dfs-config/glusterfs/prefill.sh`：manager 会把该目录下所有
+`.sh` 复制到 VM `/root`。它必须直接放、`.sh` 后缀、幂等，并只由 reset client
+执行；scp 不保证执行位，必要时用 `sh /root/prefill.sh` 调用。
+
 ## 1. 3-3 config
 
 新增 GlusterFS 3-3 normal 配置，例如：
@@ -179,6 +198,32 @@ cp -a HorcruxSourceCode/shared /path/to/client-image/home/baseline/glusterfs/
 baseline 保留空目录，但不含 xattr/symlink/hardlink；运行期创建的链接由每轮
 restore 清掉，不写回 FileTree。
 
+镜像目录前置条件：
+
+```text
+/root/glusterfs-client        空目录，GlusterFS 挂载点
+/root/glusterfs-server        server brick 根
+/root/dfs-fuzzing/libucov.so  LD_PRELOAD
+```
+
+- `/root/glusterfs-client` 必须预建；`glusterfs-config.sh` 的 mount 依赖它。
+- `/root/glusterfs-client/eifuzz_root` 不在镜像预置；volume 挂载后由 prefill
+  创建。
+- 不要把这些目录和 baseline 内容混在一起。
+
+镜像命令/软件包检查：
+
+```text
+rsync        prefill + GlusterFS restore 必需
+sshpass      glusterfs-config.sh 的 sshpass 依赖
+gluster      gluster CLI
+glusterd     GlusterFS server 服务
+mount        mount.glusterfs
+timeout/sync coreutils
+```
+
+缺 `rsync` 时必须 chroot 进镜像安装；否则 prefill/restore 会直接失败。
+
 ## 3. InitialDir 加载
 
 ### 3.1 HMDFS
@@ -255,8 +300,9 @@ set -e
 TARGET=/root/glusterfs-client/eifuzz_root
 BASELINE=/home/baseline/glusterfs/
 
+mkdir -p /root/glusterfs-client
+rm -rf "$TARGET"
 mkdir -p "$TARGET"
-rm -rf "$TARGET"/*
 timeout 60s rsync -a --numeric-ids --delete \
   "$BASELINE" "$TARGET"/
 sync
@@ -268,6 +314,39 @@ sync
 - 其他 client 等 prefill finish barrier；
 - prefill 和每轮 restore 使用同一份 baseline；
 - 不直接写 server brick。
+
+#### prefill.sh 放置与自动复制
+
+推荐路径：
+
+```text
+src/dfs-config/glusterfs/prefill.sh
+```
+
+`src/syz-manager/manager.go` 的 `DFSConfigBins` 复制逻辑会遍历
+`src/dfs-config/<dfs_name>/` 下所有 `.sh` 文件，并复制到每台 VM 的 `/root/`。
+因此：
+
+- `prefill.sh` 必须直接放在 `src/dfs-config/glusterfs/`，不能放子目录；
+- 必须使用小写 `.sh` 后缀；
+- 会被复制到所有 VM，server/client 都会有；只由 reset client 执行；
+- scp 不保证保留执行位；仓库里 `chmod +x`，或调用时用
+  `sh /root/prefill.sh`；
+- 脚本必须幂等，不能依赖只执行一次；
+- 不应在 server 上执行。
+
+```bash
+#!/bin/sh
+set -e
+TARGET=/root/glusterfs-client/eifuzz_root
+BASELINE=/home/baseline/glusterfs/
+
+rm -rf "$TARGET"
+mkdir -p "$TARGET"
+timeout 60s rsync -a --numeric-ids --delete \
+  "$BASELINE" "$TARGET"/
+sync
+```
 
 ### 4.2 normal restore
 
@@ -334,8 +413,18 @@ mount -t glusterfs \
   $start_ip:/test-volume /root/glusterfs-client
 ```
 
-当前脚本的 `mount ... glusterfs-client` 相对路径要统一为绝对路径。
+当前脚本的 `mount ... glusterfs-client` 使用相对挂载点，v1 直接复用它，
+不改脚本。前提是 executor config 阶段 cwd=`/root`，且镜像已预建
+`/root/glusterfs-client`。如果以后启动方式改变，再把脚本改成绝对路径。
 挂载完成后增加 client mount barrier；不能只依赖 `popen` 返回。
+
+脚本复用还需：
+
+- 镜像安装 `sshpass`；
+- root key 或 123456 密码至少一个可用；
+  `sshpass -p "123456"` 是脚本内部依赖，不是 fuzzer 登录；
+- `/root/glusterfs-server`、`/root/dfs-fuzzing/libucov.so` 存在；
+- 3-3 参数为 `start_ip 3 3 'replica 3'`。
 
 ### 5.2 glusterfs-node-up.sh
 
@@ -415,6 +504,17 @@ timing 由 profile 解析，HMDFS 现有值不变：
 - GlusterFS rsync 命令为 `timeout 60s rsync -a --numeric-ids --delete ...`；
 - 完整字段表见 `glusterfs-adaptation-plan.md` §10.4。
 
+### 5.6 QEMU / SSH
+
+- GlusterFS 使用原 Monarch 镜像和原 QEMU 启动路径；
+- 不复用 HMDFS 的 `hmdfs<index>.img` 命名和 `ip=...eth0` 特殊参数；
+- QEMU 会给 server 挂 `data.img`，但 v1 不 mkfs/mount；
+- fuzzer 用 SSH key，`ssh_user` 默认 root；不把 123456 密码登录写进
+  QEMU/fuzzer 启动；
+- `glusterfs-config.sh` 内部仍使用 `sshpass -p "123456"`，这是脚本依赖，
+  不是 fuzzer 登录方式；
+- 启动前用 `ssh -i <focal.id_rsa> root@<ip>` 验证 key 可用。
+
 ## 6. 验收
 
 - 3-3 config 启动后：
@@ -427,6 +527,13 @@ timing 由 profile 解析，HMDFS 现有值不变：
     program-local bindings；所有调用路径是相对测试根 canonical 路径，
     symlink target 在调用物化时转 payload 且不逃出测试根；
   - `large_dir.info` 未被读取；
+  - 镜像预建 `/root/glusterfs-client`（空挂载点）、`/root/glusterfs-server`、
+    `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 由 prefill 创建；
+  - 镜像包含 `rsync`、`sshpass`、`gluster`/`glusterd`；缺 `rsync` 时 prefill/
+    restore 直接失败；
+  - `glusterfs-config.sh` 复用，cwd `/root`，sshpass/key 可用；
+  - `prefill.sh` 直接放在 `src/dfs-config/glusterfs/`，会被 manager 复制到
+    `/root`；脚本幂等、可执行，只由 reset client 执行；
   - prefill 后 baseline 内容在 volume 根；
   - 每次 execute 前 restore 后树回到 baseline（含 triage/light）；server 只
     参与 barrier；FileTree 保持 baseline，`SyncFileTreeFromFsMd` 停用；

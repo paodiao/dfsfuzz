@@ -314,6 +314,25 @@ DCT/derived/PathSet 代码不会被调用。所有入口改为 profile 选择：
 - `lcsFsops`、`InitCoverageBoard`、DAG feedback/build 由 profile 初始化；
   GlusterFS 不能因为 `DFSName != "hmdfs"` 而跳过。
 
+### 2.8 路径根与 filename 生成
+
+GlusterFS executor 在 `chdir` 到固定测试根后，逻辑根是空字符串：
+
+```text
+HMDFS:     RootPath = "merge_view"; JoinRoot("file0") = "merge_view/file0"
+GlusterFS: RootPath = "";           JoinRoot("file0") = "file0"
+```
+
+- `FileTree.Prefix`/`Hmdfs_config.RootPrefix`：HMDFS `merge_view/`，GlusterFS `""`。
+- `RootPath()`/`JoinRoot(rel)` 是 profile 路径原语；不能生成 `./file0` 或 `/file0`。
+- `rand.go:389 filenameImpl` 不能再用 `dir="."` 或 HMDFS 的 `merge_view`；
+  改用 `JoinRoot(...)`。`rand.go`/`generation.go`/`mutation.go` 里所有
+  `merge_view`/`merge_view/test_dir` 硬编码一起按 NFS 文档 §3.6.8 改。
+- `filenameImpl` 会服务 `Target.Generate()`、标准 `Mutate()`、`filename()` 的
+  BufferType 路径参数和 DCT/derived fallback，不能漏。
+- 空前缀下 `DepthBucketOf`/DAG/coverage/PathSet 必须用
+  `DepthBucketOfWithPrefix` 或 `FileTree.Prefix`，不能整体错位。
+
 ## 3. GlusterFS 源码结论
 
 源码基线：`glusterfs-79154ae538f4539ccf69272b2b4736d891262781`，
@@ -1773,6 +1792,13 @@ struct DfsRuntimeOps {
   - server `/root`
   - 不使用 legacy `/root/<dfs>-client/dfs-<pid>-<iter>` 目录；不执行每轮
     `remove_dir`/`make_test_dir`，cwd 固定测试根，树由 restore 管理。
+- `in_userspace`：GlusterFS 使用 `executor.cc:719` 的默认 userspace 分支
+  （`in_userspace=1`）；HMDFS/NFS/cephfs client 的 `0` 不走 GlusterFS。该值
+  固定为 profile 属性，不能由 `dfs_name` 散写。
+- `common_linux.h:263-270` crash recovery `test_dir`：GlusterFS 当前分支是
+  `/root/glusterfs-client/`；v1 failure/crash 关闭，普通 restore 不走这里。
+  后续启用 crash 时改成固定测试根 `/root/glusterfs-client/eifuzz_root` 或走
+  `DfsRuntimeOps` hook。
 - metadata：
   - client 固定测试根；
   - server 跳过，server fsMd 不进 checker；
@@ -1888,6 +1914,37 @@ DAG direct 用 `Call="dag"`。GlusterFS 只补 profile/gate，不另写算法：
 - triage 的 `WorkTriage` target list 仍然按同一侧聚合；client/server 不混在
   一个 list 里。
 
+### 10.6 QEMU / SSH 与 config 脚本复用
+
+GlusterFS v1 复用原 Monarch 镜像和原 QEMU 启动路径，不复用 HMDFS 的镜像/agent
+专有逻辑：
+
+- `src/vm/qemu/qemu.go:602` 的按 VM index 拼 `hmdfs<index>.img` 只对
+  `DFSName=="hmdfs"` 生效；GlusterFS 走原镜像路径。
+- `qemu.go:708` 的 `ip=...:::::eth0:off` 只对 HMDFS 生效；GlusterFS 走默认
+  `ip=`。
+- GlusterFS server 的 `data.img` 分支已存在（`qemu.go:634/671`）；
+  v1 不 mkfs/mount，brick 在 rootfs 的 `/root/glusterfs-server`。
+- fuzzer 启动使用 SSH key：`syz-manager` 的 `SSHUser` 默认 root，
+  `SSHKey` 指向镜像的 `focal.id_rsa`；不实现密码登录。
+- root 密码 123456 只作为配置脚本内部 `sshpass` 的兼容依赖，不进入
+  QEMU/fuzzer 启动参数。
+
+`glusterfs-config.sh` v1 直接复用，不改脚本。复用前提：
+
+```text
+executor config 阶段 cwd = /root
+镜像预建 /root/glusterfs-client（空挂载点）
+镜像预建 /root/glusterfs-server
+镜像存在 /root/dfs-fuzzing/libucov.so
+sshpass 可用
+root key 或 123456 至少一个可用
+```
+
+配置脚本的 mount 使用相对 `glusterfs-client`；v1 不修改脚本，但必须保证
+cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume 挂载后由
+prefill 创建。
+
 ## 11. 初始树、config 与脚本
 
 详细命令和清单见 `docs/glusterfs-config-and-scripts.md`。
@@ -1908,6 +1965,14 @@ DAG direct 用 `Call="dag"`。GlusterFS 只补 profile/gate，不另写算法：
 - 可选 `--shared` 校验，防止多个 cid。
 - baseline 只复制 `shared/` 的内容，不要把 `shared/` 这层目录带进 baseline。
 - 清单文件放 `InitialDir` 指向的目录。
+- 镜像目录前置条件：
+  - `/root/glusterfs-client`：空挂载点，必须预建；
+  - `/root/glusterfs-server`：server brick 根；
+  - `/root/dfs-fuzzing/libucov.so`：LD_PRELOAD；
+  - `/root/glusterfs-client/eifuzz_root` 不在镜像预置，挂载 volume 后由
+    prefill 创建。
+- `prefill.sh` 放 `src/dfs-config/glusterfs/`：manager 会复制该目录下所有
+  `.sh` 到 VM `/root`；必须直接放、`.sh` 后缀、幂等、只由 reset client 执行。
 
 ### 11.2 3-3 config
 
@@ -2126,6 +2191,17 @@ DAG direct 用 `Call="dag"`。GlusterFS 只补 profile/gate，不另写算法：
   - legacy fallback：rename 走 `RenamePolicy`，HMDFS same-parent 行为不变；
     link/symlink/readlink 不进入 legacy fallback。
   - PathSet 的 `MergeViewPrefix` 硬编码清除；空前缀下可构建、迁移、target arm。
+  - `filenameImpl`/通用 fallback 生成 `file0` 而不是 `./file0`；`RootPath()`/
+    `JoinRoot()` 在 HMDFS/GlusterFS 下分别为 `merge_view`/`""`；
+    `in_userspace=1`、crash recovery test_dir 记录为 profile 行为。
+  - 镜像预建 `/root/glusterfs-client`、`/root/glusterfs-server`、
+    `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 由 prefill 创建。
+  - 镜像包含 `rsync`/`sshpass`/`glusterd`；`prefill.sh` 放在
+    `src/dfs-config/glusterfs/`，被 manager 复制到 `/root`，只由 reset
+    client 执行，脚本幂等。
+  - QEMU/SSH：原 Monarch 镜像、默认 `ip=`、key 登录；不把 123456 密码登录
+    接入 fuzzer。`glusterfs-config.sh` 复用，cwd `/root`、sshpass/密码或 key
+    可用、挂载点存在。
   - fuzzer 入口：GlusterFS 实际走到 `GenerateProgsForDfsFsops` /
     `MutateFsopsWithDCT` / `insertDerivedCallFromDCT`；`ps[0]` 不再被当成
     client；DAG feedback/DAG build 对 GlusterFS 启用。
@@ -2157,7 +2233,13 @@ DAG direct 用 `Call="dag"`。GlusterFS 只补 profile/gate，不另写算法：
 - `src/pkg/ipc/ipc.go`：GlusterFS parser、server/client parse split。
 - `src/checker/conc-fs.go`、`src/checker/symsc`：A 类检查、profile 过滤。
 - `src/syz-fuzzer/proc.go`、`fuzzer.go`：角色 view、seed/corpus 校验。
-- `src/executor/executor.cc`、`glusterfs_trace.*`、`dfs_trace.*`：runtime/tracer。
-- `src/dfs-config/glusterfs/*`：config/node-up/node-down/prefill。
+- `src/prog/rand.go`、`generation.go`、`mutation.go`：`RootPath()`/`JoinRoot()`、
+  `filenameImpl` 空前缀、client-only generators/mutators。
+- `src/executor/executor.cc`、`common_linux.h`、`glusterfs_trace.*`、
+  `dfs_trace.*`：runtime/tracer、`in_userspace`、crash recovery test_dir。
+- `src/vm/qemu/qemu.go`：原镜像启动、GlusterFS server data.img、HMDFS gate；
+  key 登录与 SSH 配置。
+- `src/dfs-config/glusterfs/*`：config/node-up/node-down/prefill；config 脚本
+  复用，sshpass/key/cwd/挂载点前提。
 - `HorcruxSourceCode/generate_test_files.py`：shared 清单。
 - `docs/glusterfs-tracer-implementation-spec.md`：BPF raw 细节；冲突以本文为准。

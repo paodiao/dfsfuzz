@@ -887,6 +887,7 @@ src/executor/executor.cc
 关键点：
 
 - `rand.go` / `generation.go` / `mutation.go` 中写死的 `merge_view`、`merge_view/test_dir` 改为 `RootPath()` / `JoinRoot()`。
+- `rand.go:389 filenameImpl` 不能再用 `dir="."` 或 HMDFS `merge_view`；GlusterFS 空前缀应生成 `file0`，不能生成 `./file0` 或 `/file0`。该函数服务 `Target.Generate`、标准 `Mutate`、`filename()` BufferType 和 DCT/derived fallback。
 - `proc.go` 的 `InitialDir` 使用 `hc.RootPrefix`。
 - `executor.cc` 的 cwd 和 `write_metadata` 对非 HMDFS 使用固定测试根。
 - `path_set.go` 的 `normalizePathSetPath`、`pathSetTopRoot`、`pathSetTopPath`、`mapPathSetPath` 去掉硬编码 `MergeViewPrefix`。

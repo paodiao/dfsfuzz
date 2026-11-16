@@ -281,6 +281,8 @@ executor_index == server_num
   barrier 90s，start barrier 30s。详见 `glusterfs-adaptation-plan.md` §10.4。
 - GlusterFS baseline 约 100 文件，restore 不应比 HMDFS 的 1000 文件大目录
   给更长超时。
+- 镜像预建 `/root/glusterfs-client` 空挂载点；`/root/glusterfs-client/eifuzz_root`
+  不预置，由 prefill 在挂载 volume 后创建。
 - GlusterFS baseline 不含 symlink/hardlink/xattr；运行期创建的链接由
   `rm -rf + rsync` 清掉，FileTree 始终是 baseline，不把 linkpath 写回树。
 - normal restore 不重启 server/volume，不调用 `glusterfs-node-down.sh`；
