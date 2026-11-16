@@ -1368,11 +1368,14 @@ func (proc *Proc) execute(execOpts *ipc.ExecOpts, ps []*prog.Prog, flags ProgTyp
 		}
 	}
 
-	//DAG feedback (hmdfs): every execution discovering a novel operation
-	//pair/schedule earns a corpus entry (the "energy" model), tracked in
-	//dedicated stats separate from the coverage channel. Novel pairs also
-	//feed back into the DCT tables (exploration tracking + yield reset).
-	if proc.fuzzer.config.EnableDagFb && proc.fuzzer.config.DFSName == "hmdfs" {
+	//DAG feedback (hmdfs/glusterfs): every execution discovering a novel
+	//operation pair/schedule earns a corpus entry (the "energy" model),
+	//tracked in dedicated stats separate from the coverage channel. Novel
+	//pairs also feed back into the DCT tables (exploration tracking + yield
+	//reset). The pipeline is DFS-agnostic; GlusterFS only contributes client
+	//events, with the first non-nil client as the owner.
+	if proc.fuzzer.config.EnableDagFb &&
+		(proc.fuzzer.config.DFSName == "hmdfs" || proc.fuzzer.config.DFSName == "glusterfs") {
 		for idx, info := range infos {
 			if idx < servNum || info == nil {
 				continue
@@ -1608,11 +1611,16 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 	appendDiagLog("hmdfs trace events=%d csanPassed=%v stat=%d tscRatio=%f dataMiss=%d anchorMiss=%d alignMiss=%d failShape=%d/%d directed=%d/%d directCell=%d/%d/%d/%d/%d dcBatch=%d cfgErr=%d lastMut=%s",
 		len(hmdfsTraceEvents), csanPassed, stat, tscRatio, prog.DataMutateMissCount(), prog.AnchorMissCount(), prog.TimingAlignMissCount(), failHit, failSkip,
 		directedPicks, directedScore, dcPlans, dcHits, dcMisses, dcNoPlans, dcInsertFails, dcBatches, prog.DirectedCfgErrCount(), prog.LastMutation())
-	if proc.fuzzer.config.DFSName == "hmdfs" && proc.lcsFsops != nil {
+	if (proc.fuzzer.config.DFSName == "hmdfs" || proc.fuzzer.config.DFSName == "glusterfs") &&
+		proc.lcsFsops != nil {
 		if now := time.Now(); now.Sub(proc.lastDCTBoardLog) >= dctBoardLogInterval {
 			proc.lastDCTBoardLog = now
-			covFound, covTarget := prog.CoverageStats()
-			appendDiagLog("dct pool: cover=%d/%d unreach=%d cellUnreach=%d", covFound, covTarget, prog.UnreachableComboCount(), prog.CellUnreachableCount())
+			cov := prog.CoverageLayerStats()
+			modelOnly := cov.ModelFound - cov.PlannableFound
+			appendDiagLog("dct pool: obs=%d outModel=%d modelOnly=%d model=%d/%d plan=%d/%d shapes=%d unreach=%d cellUnreach=%d",
+				cov.ObservedCells, cov.OutOfModel, modelOnly,
+				cov.ModelFound, cov.ModelTarget, cov.PlannableFound, cov.PlannableTarget,
+				cov.ObservedShapes, prog.UnreachableComboCount(), prog.CellUnreachableCount())
 		}
 	}
 	if stat != StatTriage && stat != StatMinimize && csanPassed &&
