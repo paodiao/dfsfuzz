@@ -52,7 +52,9 @@
 - `Cids` 中重复 `ClientNum` 份 `"shared"`，满足 client view 的 `len(Cids) == len(client ps)` 检查；server 不进入 Cids（2026-11-15 修订）。
 - `Init_file / Init_dir / Init_tmpdir / Init_empty_dir / FileSize` 只挂这个 cid。
 - `InitFromHmdfsConfig`（`distributed_choice.go:212`）对所有 DFS 生效。
-- `NewLayeredChoiceStrategy`、`InitCoverageBoard`、`len(Executor) == Node_num` 校验对所有 DFS 放开。
+- `NewLayeredChoiceStrategy`、`InitCoverageBoard` 对所有 DFS 放开；
+  executor 批量校验按 profile：HMDFS `len(Executor) == Node_num`，
+  GlusterFS `len(Executor) == TotalNum`。
 - `large_dir.info` persistence 保持 HMDFS-only。
 - GlusterFS 的 cid 固定为 `"shared"`；`generate_test_files.py` 的 `node_id`、`InitialDir` 清单名、`Cids` 都使用该值。
 

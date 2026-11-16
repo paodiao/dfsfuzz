@@ -170,10 +170,12 @@ type DFSProfile struct {
 type DFSConfig struct {
     Profile *DFSProfile
 
-    ServNum     int
-    ClientNum   int
-    TotalNum    int
-    RootProgIdx int
+    Node_num    int // seed-generation slots; GlusterFS sets this to ClientNum
+    ServNum     int // leading empty server programs
+    ClientNum   int // client programs in the executor batch
+    TotalNum    int // full batch: ServNum + ClientNum
+    RootProgIdx int // absolute index of the first client (= ServNum)
+    RootPrefix  string
 
     DfsName string
     InitIp  string
@@ -197,12 +199,14 @@ type Hmdfs_config = DFSConfig
 
 - 所有现有函数先继续接收 `*Hmdfs_config`，避免大面积改签名。
 - 新逻辑只从 `Profile` 取策略，不从 HMDFS 专用字段推断。
-- `Node_num` 在 prog 层统一改为 `ClientNum`；总节点数用 `TotalNum`。
+- `Node_num` 保留为 seed/DCT/legacy 生成器的 slot 数；GlusterFS 下
+  `Node_num == ClientNum`。`TotalNum` 是完整 executor batch（含空 server）。
 
 ### 2.3 角色空间
 
 ```text
-ClientNum   = FuzzingVMs - ServNum
+ClientNum   = FuzzingVMs - ServNum   // GlusterFS v1 固定为 3
+Node_num    = ClientNum              // GlusterFS；HMDFS 为总节点数
 TotalNum    = FuzzingVMs
 RootProgIdx = ServNum
 ```
@@ -234,7 +238,7 @@ func (c *DFSConfig) PersistenceProgIdx() int
 - full batch `len(ps) == TotalNum`
 - `ps[0..ServNum-1]` 为空
 - client programs 非空
-- `MAXCLT=3`；client 数 >3 拒绝
+- `ClientNum == 3`（v1 固定；`MAXCLT=3`，1/2/4 均拒绝）
 
 ### 2.4 CID 模型
 

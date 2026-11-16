@@ -296,6 +296,11 @@ PT_LOAD:
 file_offset = st_value - p_vaddr + p_offset
 ```
 
+The VM image must keep `.symtab`; a stripped `fuse.so` makes startup symbol
+resolution fail. The P0 image (`BuildID e752dad97c4d6048387bd91117df351afb83c0c1`)
+has the three symbols in LOAD1 (`p_offset=p_vaddr=0x15000`), so
+`file_offset == st_value` for that build.
+
 `send_fuse_iov` uses `retprobe=true`; `fuse_dispatch` and `fuse_fop_resume`
 use `false`.
 

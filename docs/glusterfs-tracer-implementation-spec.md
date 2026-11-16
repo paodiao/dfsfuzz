@@ -1662,3 +1662,15 @@ bpf_program__attach_uprobe(prog, ret, -1, fuse_so, file_offset)
 ```
 
 `send_fuse_iov` 用 ret=true；另两个 ret=false。
+
+2026-11-16 在 client 镜像上复核（`fuse.so` BuildID
+`e752dad97c4d6048387bd91117df351afb83c0c1`，`not stripped`）：
+
+```text
+.symtab 存在；三个符号均 LOCAL，Ndx=14
+LOAD1: p_offset=0x15000 p_vaddr=0x15000
+=> file_offset == st_value
+   send_fuse_iov   0x216a0
+   fuse_dispatch   0x5e940
+   fuse_fop_resume 0x68be0
+```
