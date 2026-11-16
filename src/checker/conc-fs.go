@@ -23,6 +23,12 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	fsType string, cfg_mode string, initIP string, testdirIno uint64,
 	ft *prog.FileTree) (bool, []string) {
 
+	var glusterfsDiag *glusterfsCSANDiag
+	if fsType == "glusterfs" {
+		glusterfsDiag = newGlusterfsCSANDiag()
+		defer glusterfsDiag.flush()
+	}
+
 	if fsType == "hmdfs" {
 		fsMds = append([]map[string]prog.FileMetadata(nil), fsMds...)
 		for i := range fsMds {
@@ -37,7 +43,7 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	// Cross-check states from multiple client nodes
 	allIcs := make([]string, 0)
 	for i := srvNum; i < len(fsMds)-1; i++ {
-		ics := MdCmp(fsMds[i], fsMds[i+1], fsType)
+		ics := mdCmp(fsMds[i], fsMds[i+1], fsType, glusterfsDiag)
 		allIcs = append(allIcs, ics...)
 	}
 
@@ -206,6 +212,8 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Env = append(os.Environ(),
+		"GLUSTERFS_CSAN_LOG="+glusterfsCSANLogPath())
 
 	err = cmd.Run()
 	if err != nil {
@@ -288,6 +296,12 @@ func xattrCmpUser(xattr1 map[string]string, xattr2 map[string]string) bool {
 
 func MdCmp(fsMd1 map[string]prog.FileMetadata,
 	fsMd2 map[string]prog.FileMetadata, fsType string) []string {
+	return mdCmp(fsMd1, fsMd2, fsType, nil)
+}
+
+func mdCmp(fsMd1 map[string]prog.FileMetadata,
+	fsMd2 map[string]prog.FileMetadata, fsType string,
+	diag *glusterfsCSANDiag) []string {
 	var ics []string
 
 	log.Logf(0, "----- comparison: clientMdCmp: %v\n%v\n", fsMd1, fsMd2)
@@ -309,7 +323,7 @@ func MdCmp(fsMd1 map[string]prog.FileMetadata,
 		}
 		outputBuf := fmt.Sprintf("ConsistencySan stat:\n%+v\n%+v\n", md1, md2)
 		log.Logf(0, outputBuf)
-		ics = append(ics, compareFileMeta(filepath, md1, md2, fsType)...)
+		ics = append(ics, compareFileMetaWithDiag(filepath, md1, md2, fsType, diag)...)
 	}
 
 	for filepath := range fsMd2 {
@@ -330,6 +344,11 @@ func MdCmp(fsMd1 map[string]prog.FileMetadata,
 }
 
 func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata, fsType string) []string {
+	return compareFileMetaWithDiag(path, m1, m2, fsType, nil)
+}
+
+func compareFileMetaWithDiag(path string, m1 prog.FileMetadata, m2 prog.FileMetadata,
+	fsType string, diag *glusterfsCSANDiag) []string {
 	isGlusterfs := fsType == "glusterfs"
 	// Type mismatch is the strongest cross-node inconsistency signal. HMDFS
 	// compares only the directory bit (its remote view intentionally maps
@@ -371,12 +390,14 @@ func compareFileMeta(path string, m1 prog.FileMetadata, m2 prog.FileMetadata, fs
 		// GlusterFS nlink/mtime can legitimately differ between clients due
 		// to DHT/AFR bookkeeping and quiescence timing.
 		if m1.StatMd.Nlink != m2.StatMd.Nlink {
-			log.Logf(1, "glusterfs CSAN diagnostic: %s nlink %d vs %d", path,
-				m1.StatMd.Nlink, m2.StatMd.Nlink)
+			if diag != nil {
+				diag.recordNlink(path, m1.StatMd.Nlink, m2.StatMd.Nlink)
+			}
 		}
 		if m1.StatMd.Mtim.Sec != m2.StatMd.Mtim.Sec {
-			log.Logf(1, "glusterfs CSAN diagnostic: %s mtime %d vs %d", path,
-				m1.StatMd.Mtim.Sec, m2.StatMd.Mtim.Sec)
+			if diag != nil {
+				diag.recordMtime(path, m1.StatMd.Mtim.Sec, m2.StatMd.Mtim.Sec)
+			}
 		}
 	} else {
 		/*
@@ -475,6 +496,17 @@ func initTreeSubset(ps []*prog.Prog, ft *prog.FileTree) string {
 			return
 		}
 		node := ft.FindNode(path)
+		if node == nil {
+			// The path itself is fresh. Seed the nearest baseline ancestor
+			// (for creat/mkdir/rename-dst/linkpath under an existing dir), but
+			// never insert the fresh path itself.
+			for parent := filepath.Dir(path); parent != "." && parent != "/" && parent != ""; parent = filepath.Dir(parent) {
+				node = ft.FindNode(parent)
+				if node != nil {
+					break
+				}
+			}
+		}
 		if node == nil {
 			return
 		}

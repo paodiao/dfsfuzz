@@ -5,9 +5,30 @@ import re
 import binascii
 import copy
 import pdb
+import os
+import time
 import utils
 
 BTRFS_ERRSTR = ""
+
+_DIAG_PATH = os.environ.get("GLUSTERFS_CSAN_LOG")
+_DIAG_COUNTS = {"nlink": 0, "mtime": 0}
+
+
+def _glusterfs_csan_diag(kind, msg):
+    """Write GlusterFS B-class diagnostics only to the dedicated CSAN file."""
+    if not _DIAG_PATH:
+        return
+    _DIAG_COUNTS[kind] = _DIAG_COUNTS.get(kind, 0) + 1
+    if _DIAG_COUNTS[kind] > 32:
+        return
+    line = "%s pid=%d kind=%s %s\n" % (
+        time.strftime("%Y/%m/%d %H:%M:%S"), os.getpid(), kind, msg)
+    try:
+        with open(_DIAG_PATH, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
 
 def _print_hex(s):
     s = "\\x" + "\\x".join("{:02x}".format(ord(c)) for c in s)
@@ -71,9 +92,10 @@ def check_meta(inode, entry, ret_on_err=0, print_err=1):
         if inode.linkcnt != int(entry[c.IDX_NLINK]):
             # GlusterFS nlink is a B-class diagnostic field: DHT/AFR
             # bookkeeping and quiescence timing can legitimately differ.
-            if print_err:
-                print("*** [META][diag] GlusterFS link count differs in {0} {1}: em {2} vs ex {3}".format(
-                        c.TYPESTR[inode.type], str(inode.name), inode.linkcnt, int(entry[c.IDX_NLINK])))
+            _glusterfs_csan_diag("nlink",
+                "path=%s em=%d ex=%d" % (
+                    entry[c.IDX_PATH], inode.linkcnt,
+                    int(entry[c.IDX_NLINK])))
 
     # mode
     if not is_hmdfs and inode.mode & 0o777 != int(entry[c.IDX_MODE], 8) & 0o777:
@@ -715,10 +737,13 @@ def test_self_consistency(METADATA, print_err=1):
 
             # if not c.REGTEST:
             #    c.FP_LOG.write(errstr + "\n")
-        elif c.FSTYPE == "glusterfs" and int(entry[c.IDX_NLINK]) != id_list.count(entry[c.IDX_INUM]) and print_err:
-            # B-class diagnostic only: never fails the checker.
-            print("*** [META][diag] GlusterFS self-consistency link count differs: {0} id:{1} lcnt:{2}".format(
-                    entry[c.IDX_PATH], entry[c.IDX_INUM], entry[c.IDX_NLINK]))
+        elif c.FSTYPE == "glusterfs" and int(entry[c.IDX_NLINK]) != id_list.count(entry[c.IDX_INUM]):
+            # B-class diagnostic only: never fails the checker and never goes
+            # to the generic fuzzer log.
+            _glusterfs_csan_diag("nlink",
+                "path=%s em=%d ex=%d" % (
+                    entry[c.IDX_PATH], id_list.count(entry[c.IDX_INUM]),
+                    int(entry[c.IDX_NLINK])))
     if err_cnt > 0:
         # print("WARNING: test self consistency fails")
         return False

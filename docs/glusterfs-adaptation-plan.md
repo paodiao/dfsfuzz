@@ -1993,8 +1993,11 @@ PathSet 不改变上述 fresh 语义；它迁移 fresh path 后仍按同一
   payload 解析；不能在 checker 里对 payload 做普通路径 normalize。
 - GlusterFS 用完整类型；HMDFS 保留目录位（已实现）。
 - `initTreeSubset` 按 profile namespace root：只取 syscall 的 path 参数，
-  `ft.FindNode` 命中才加入；fresh path 跳过；symlink target 先按 linkpath
-  canonical 解析（已实现）。
+  `ft.FindNode` 命中才加入；fresh path 跳过，但 fresh path 的最近 baseline
+  祖先目录要加入；symlink target 先按 linkpath canonical 解析（已实现）。
+- GlusterFS CSAN B 类（Nlink/Mtime）只写专用
+  `/home/user/dfsfuzz/glusterfs-csan.log`（可由 `GLUSTERFS_CSAN_LOG`
+  覆盖），不进 fuzzer 通用日志；Go 和 Python symsc 的 B 类诊断走同一文件。
 - server fsMd 永不进入 client checker。
 - symsc 保留完整绝对 program 数组，只过滤 fsMd；最终状态用 root client。
 - `filter_failure_sync_calls` 改为 profile supported/ignored，不因
@@ -2643,6 +2646,7 @@ trace path 无 dfs- 前缀
 trace events > 0
 fsMds 非空（enable_csan=true 时）
 [symsc] init_tree loaded: N DENTRY entries（N > 1）
+GlusterFS B 类诊断只出现在 glusterfs-csan.log
 无 GlusterFS Nlink/Mtime 误报
 DAG vertices > 0
 hbPairs 或 ccPairs > 0

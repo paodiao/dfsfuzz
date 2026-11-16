@@ -142,6 +142,23 @@ func TestInitTreeSubsetHMDFS(t *testing.T) {
 	}
 }
 
+func TestInitTreeSubsetFreshParentFallback(t *testing.T) {
+	target := checkerTestTarget(t)
+	ft := checkerTree("", nil, []string{"dir"})
+
+	ps := []*prog.Prog{{Calls: []*prog.Call{
+		checkerPathCall(t, target, "creat", "dir/fresh"),
+		checkerSymlinkCall(t, target, "dir", "dir/newlink"),
+	}}}
+	got := checkerSubset(t, ps, ft)
+	if !got["dir"] {
+		t.Fatalf("fresh path did not seed its baseline parent: %v", got)
+	}
+	if got["dir/fresh"] || got["dir/newlink"] {
+		t.Fatalf("fresh path leaked into initTreeSubset: %v", got)
+	}
+}
+
 func TestCompareFileMetaGlusterfs(t *testing.T) {
 	file := func() prog.FileMetadata {
 		return prog.FileMetadata{
