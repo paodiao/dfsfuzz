@@ -75,6 +75,11 @@ unsupported/ignored，不能静默保留（尤其避免 `readv/writev` 这类“
 | cid | 路径所有者为 `shared` |
 | HMDFS | `ServNum=0`、现有 0–15 事件、`merge_view`、same-parent rename 不变 |
 
+> v1 固定 3 个 client（`MAXCLT=3`，`loadGlusterfsConfig` 拒绝其它值）。共享的
+> HMDFS seed/legacy 生成器只在 2–3 个 slot 上做过预算验证；1 client 会触发
+> over-budget/截断，2 client 虽有 fold 逻辑但 v1 不启用。1/2 client 支持需要
+> 先做 generator slot folding。
+
 ### 1.3 兼容性约束
 
 - HMDFS 的 wire event、BPF 探针、DAG 语义、coverage cell、same-parent rename 不变。

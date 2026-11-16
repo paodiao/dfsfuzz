@@ -9,6 +9,12 @@ import (
 	"monarch/prog"
 )
 
+// GlusterFS v1 fixes the client count at 3. The shared HMDFS seed/legacy
+// generators are budget-tested only for 2-3 slots; with ClientNum=1 several
+// concurrency generators still emit 2+ programs, and the batch normalizer
+// would have to silently drop their planned operations.
+const glusterfsV1ClientCount = 3
+
 // loadGlusterfsConfig initializes the client-only GlusterFS view. All clients
 // share one manifest/namespace; Cids is repeated only for length-compatible
 // APIs and never identifies a client.
@@ -28,8 +34,9 @@ func loadGlusterfsConfig(hc *prog.Hmdfs_config, setupParams string, fuzzingVMs, 
 	if serverCnt != servNum {
 		return fmt.Errorf("glusterfs server count %d does not match config %d", serverCnt, servNum)
 	}
-	if clientCnt <= 0 || clientCnt > 3 {
-		return fmt.Errorf("glusterfs client count %d outside [1,3]", clientCnt)
+	if clientCnt != glusterfsV1ClientCount {
+		return fmt.Errorf("glusterfs v1 requires exactly %d clients (got %d)",
+			glusterfsV1ClientCount, clientCnt)
 	}
 	if serverCnt+clientCnt != fuzzingVMs {
 		return fmt.Errorf("glusterfs server+client %d != fuzzing_vms %d", serverCnt+clientCnt, fuzzingVMs)

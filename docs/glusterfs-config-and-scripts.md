@@ -87,9 +87,10 @@
 
 约束：
 
-- `server_num + client_num == fuzzing_vms == vm.count == len(Executor)`；
-- `DfsSetupParams` 的第一个数是 server 数，第二个数是 client 数；
-- GlusterFS 必须有至少 1 个 client，且 client 数不超过 `MAXCLT=3`；
+- `server_num + 3 == fuzzing_vms == vm.count == len(Executor)`；
+- `DfsSetupParams` 的第一个数是 server 数，第二个数是 client 数，v1 必须为 `3`；
+- GlusterFS v1 固定 3 个 client（`MAXCLT=3`）；1/2 client 暂不支持，
+  seed/legacy 生成器只按 2–3 个 slot 验证过，1 client 会触发 over-budget/截断；
 - `enable_syscalls` 必须与上面的 22 个逐字一致；profile 启动校验遇到
   `readv/writev/preadv/pwritev`、at 变体或其它列表外调用时报告
   unsupported/ignored，不能静默保留；

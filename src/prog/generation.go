@@ -311,6 +311,11 @@ func (target *Target) GenerateProgsForHmdfsFsops(rs rand.Source, sCalls *Special
 // non-empty client programs. DCT, pattern and legacy fallbacks can each return
 // a short/empty batch, so the boundary normalizes instead of trusting any one
 // generator.
+//
+// GlusterFS v1 config requires ClientNum == 3 (loadGlusterfsConfig): the legacy
+// producers stay within that budget, so normalization only fills short/empty
+// DCT/pattern output. Supporting 1/2 clients requires slot folding in the
+// concurrency generators first.
 func (target *Target) GenerateProgsForGlusterfsFsops(rs rand.Source, sCalls *SpecialCalls, hmcfg *Hmdfs_config) []*Prog {
 	ps := target.GenerateProgsForHmdfsFsops(rs, sCalls, hmcfg)
 	want := 0
