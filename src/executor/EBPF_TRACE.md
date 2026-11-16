@@ -277,7 +277,8 @@ DFS's include path.
 
 The skeleton header provides type-safe C functions to load and manage the BPF
 program from the executor. The main `src/Makefile` `executor` target builds
-both skeletons and links both trace `.cc` files.
+both skeletons and links both trace `.cc` files plus `dfs_runtime.cc`, which
+dispatches trace hooks through `DfsRuntimeOps`.
 
 ### GlusterFS uprobe attach
 

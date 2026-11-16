@@ -1841,7 +1841,8 @@ PathSet 不改变上述 fresh 语义；它迁移 fresh path 后仍按同一
 struct DfsRuntimeOps {
     const char *name;
 
-    void (*init_trace)();
+    bool (*trace_enabled_for)(bool is_client);
+    void (*init_trace)(bool is_client, const char *trace_root);
     void (*start_trace)();
     void (*stop_trace)();
 
@@ -1855,7 +1856,6 @@ struct DfsRuntimeOps {
 
     bool (*client_metadata_enabled)();
     bool (*server_metadata_enabled)();
-    bool (*trace_enabled_for)(bool is_client);
 
     std::string (*config_command)(const char *init_ip,
                                   const char *setup_params,
@@ -1867,17 +1867,24 @@ struct DfsRuntimeOps {
 };
 ```
 
+`trace_enabled_for` 表示该角色是否产生 trace 输出：HMDFS client=true；
+GlusterFS client/server=true（server 只写 `count=0` 头）。`trace_root` 只对
+GlusterFS client 非空（`eifuzz_root`），HMDFS/server 传 `nullptr`。
+
 实现点：
 
-- `init_hmdfs_trace` → `rt->init_trace()`
-- `start_hmdfs_trace` → `rt->start_trace()`
-- `stop_collect_hmdfs_trace` → `rt->stop_trace()`
+- trace 统一走 `rt->trace_enabled_for(is_client)` 门控：
+  - `init_hmdfs_trace` → `rt->init_trace(is_client, trace_root)`
+  - `start_hmdfs_trace` → `rt->start_trace()`
+  - `stop_collect_hmdfs_trace` → `rt->stop_trace()`
+- B2 只填 trace 字段；restore/cwd/metadata/config/node-up/down 在 D 阶段补。
 - `restore_initial_file_tree` → `rt->restore_initial(is_restarting)`
 - cwd/metadata/config/node-up/down 全部走 runtime。
 
 ### 10.2 GlusterFS hooks
 
-- trace：client-only，`init/start/stop_glusterfs_trace`。
+- trace：attach 是 client-only；`trace_enabled_for` 对 client/server 都为 true，
+  server 只写 `count=0` 头。`init_trace(server)` 不 attach，`stop_trace` 仍写头。
 - cwd：
   - client `/root/glusterfs-client/eifuzz_root`
   - server `/root`
@@ -2142,7 +2149,8 @@ prefill 创建。
 
 ### Phase 1：GlusterFS Trace/Event
 
-- 新 `glusterfs_trace.bpf.c/.cc/.h` + `dfs_trace` dispatch。
+- 新 `glusterfs_trace.bpf.c/.cc/.h`；trace 分发走 `DfsRuntimeOps` 的
+  `init_trace/start_trace/stop_trace`。
 - 事件布局、parser、FUSE opcode/path/filter；packed 1228B/1204B。
 - 先映射现有 0–14 + 16–20 + 28/44；P0 验证 link/symlink/readlink/xattr。
 - 更新旧 spec 中 RENAME2/COPY_FILE_RANGE/0–14 的错误。
@@ -2346,7 +2354,7 @@ prefill 创建。
 - `src/prog/rand.go`、`generation.go`、`mutation.go`：`RootPath()`/`JoinRoot()`、
   `filenameImpl` 空前缀、client-only generators/mutators。
 - `src/executor/executor.cc`、`common_linux.h`、`glusterfs_trace.*`、
-  `dfs_trace.*`：runtime/tracer、`in_userspace`、crash recovery test_dir。
+  `dfs_runtime.*`：runtime/tracer、`in_userspace`、crash recovery test_dir。
 - `src/vm/qemu/qemu.go`：原镜像启动、GlusterFS server data.img、HMDFS gate；
   key 登录与 SSH 配置。
 - `src/dfs-config/glusterfs/*`：config/node-up/node-down/prefill；config 脚本

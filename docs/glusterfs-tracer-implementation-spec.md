@@ -1165,30 +1165,41 @@ FileTree。详见 `glusterfs-config-and-scripts.md` §3。
 > 本节只说明 trace 分发接入；executor runtime/config/checker 策略见
 > `glusterfs-adaptation-plan.md` §10。
 
-新增：
+不新增 `dfs_trace.h/.cc`。在 `src/executor/dfs_runtime.h/.cc` 定义
+`DfsRuntimeOps`；B2 只实现 trace 子集，restore/cwd/metadata/config/node-up/down
+在 D 阶段补：
 
-```text
-src/executor/dfs_trace.h
-src/executor/dfs_trace.cc
-```
+```cpp
+struct DfsRuntimeOps {
+    const char *name;
 
-接口：
-
-```c
-void init_dfs_trace(const char *dfs_name, const char *trace_root);
-void start_dfs_trace(void);
-void stop_collect_dfs_trace(void);
+    bool (*trace_enabled_for)(bool is_client);
+    void (*init_trace)(bool is_client, const char *trace_root);
+    void (*start_trace)();
+    void (*stop_trace)();
+};
 ```
 
 `trace_root` 是挂载根到测试根的相对路径；GlusterFS 固定 `eifuzz_root`，
-HMDFS 不使用（传空）。它只用于 tracer 路径 strip，不写进 FileTree.Prefix。
+HMDFS 不使用（传 `nullptr`）。它只用于 tracer 路径 strip，不写进
+FileTree.Prefix。
 
 分发：
 
 ```text
+dfs_runtime_ops(dfs_name) -> DfsRuntimeOps
 hmdfs     -> hmdfs_trace 的 init/start/stop
 glusterfs -> glusterfs_trace 的 init/start/stop
-其他      -> no-op
+其他      -> nullptr/no-op
+```
+
+`trace_enabled_for` 表示该角色是否产生 trace 输出：
+
+```text
+HMDFS client      -> true
+GlusterFS client  -> true
+GlusterFS server  -> true（只写 count=0 头）
+其他              -> false
 ```
 
 v1 实现不只在 trace 上分发；cwd/restore/metadata/config/node-up/down 统一走
@@ -1196,10 +1207,25 @@ v1 实现不只在 trace 上分发；cwd/restore/metadata/config/node-up/down �
 
 `executor.cc` 调用点：
 
-```text
-init_hmdfs_trace()         -> init_dfs_trace(dfs_name, trace_root)
-start_hmdfs_trace()        -> start_dfs_trace()
-stop_collect_hmdfs_trace() -> stop_collect_dfs_trace()
+```cpp
+const DfsRuntimeOps *rt = dfs_runtime_ops(dfs_name);
+if (rt && rt->trace_enabled_for(is_dfs_client != 0))
+    rt->init_trace(is_dfs_client != 0, trace_root);
+
+// fork 子进程、执行前
+if (rt && rt->trace_enabled_for(is_dfs_client != 0))
+    rt->start_trace();
+
+// 父进程，write_metadata 前
+if (rt && rt->trace_enabled_for(is_dfs_client != 0))
+    rt->stop_trace();
+```
+
+`trace_root` 只对 GlusterFS client 设置：
+
+```cpp
+const char *trace_root =
+    (is_dfs_client && !strcmp(dfs_name, "glusterfs")) ? "eifuzz_root" : nullptr;
 ```
 
 调用时机：
@@ -1207,7 +1233,7 @@ stop_collect_hmdfs_trace() -> stop_collect_dfs_trace()
 - `init`：启动时；当前 `executor.cc` 是先 `calibrate_tsc()` 再
   `init_hmdfs_trace()`，GlusterFS 沿用实际顺序，不依赖校准。
 - `start`：fork 子进程、执行前；只做 ring drain（丢弃 stale 事件）。
-- `stop_collect`：父进程，`clt_finish()`/`g_prog_end_raw` 之后、
+- `stop_trace`：父进程，`clt_finish()`/`g_prog_end_raw` 之后、
   `write_metadata()` 前。
 
 GlusterFS 时间对齐直接复用现有 HMDFS 代码路径：
@@ -1217,7 +1243,7 @@ calibrate_tsc() / tsc_ns_to_global() / tsc_offset / tsc_ns_ratio /
 tsc_best_gap / g_prog_end_raw
 ```
 
-`stop_collect_dfs_trace()` 必须：
+`stop_trace()` 必须：
 
 1. 在父进程 drain ctl/path 两个 ring；
 2. 按 `ts` 合并，再做 D/R/S 聚合；
@@ -1227,11 +1253,11 @@ tsc_best_gap / g_prog_end_raw
 
 角色：
 
-- GlusterFS server executor 不 attach fuse uprobe；但 `stop_collect` 仍写
+- GlusterFS server executor 不 attach fuse uprobe；但 `stop_trace` 仍写
   `count=0` 的 trace 头，保证 `[program output][trace][fsMd]` 流顺序。
-- client executor 才 init/attach；一个 client VM 只允许一个 mount，否则
+- client executor 才 attach；一个 client VM 只允许一个 mount，否则
   `unique` 会跨 mount 冲突。
-- `trace_root` 只对 client 设置；server 传空。
+- `trace_root` 只对 client 设置；server 传 `nullptr`。
 
 ## 12. 构建
 
@@ -1253,6 +1279,7 @@ GLUSTERFS_BPF_SRC   = executor/glusterfs_trace.bpf.c
 GLUSTERFS_BPF_OBJ   = executor/glusterfs_trace.bpf.o
 GLUSTERFS_BPF_SKEL  = executor/glusterfs_trace.skel.h
 GLUSTERFS_TRACE_SRC = executor/glusterfs_trace.cc
+DFS_RUNTIME_SRC     = executor/dfs_runtime.cc
 
 $(HMDFS_BPF_OBJ): $(HMDFS_BPF_SRC) $(HMDFS_VMLINUX_H)
 	clang -g -O2 -target bpf -D__TARGET_ARCH_x86 $(HMDFS_BPF_INC) -c $< -o $@
@@ -1271,7 +1298,7 @@ $(GLUSTERFS_BPF_SKEL): $(GLUSTERFS_BPF_OBJ)
 - `tools/glusterfs/vmlinux.h`：GlusterFS 5.15 内核完整 BTF
   （P0 文件 7,620,032B / 358,698 行），不是手写 minimal 头。
 - `executor` 目标同时生成两个 skeleton，并链接
-  `executor/executor.cc $(HMDFS_TRACE_SRC) $(GLUSTERFS_TRACE_SRC)`；
+  `executor/executor.cc $(HMDFS_TRACE_SRC) $(GLUSTERFS_TRACE_SRC) $(DFS_RUNTIME_SRC)`；
   `make clean` 同时删除两个 `.bpf.o/.skel.h`。
 - `send_fuse_iov`/`fuse_dispatch`/`fuse_fop_resume` 的 attach 按 §5.2：
   libelf `.symtab` + PT_LOAD file offset，不使用 `func_name`。
