@@ -4,11 +4,11 @@ type DFSConfig struct {
 	Profile                 *DFSProfile
 	DfsName                 string
 	Cids                    []string
-	Node_num                int
-	Serv_num                int
-	ClientNum               int
-	TotalNum                int
-	RootProgIdx             int
+	Node_num                int // seed-generation slots; GlusterFS sets this to ClientNum
+	Serv_num                int // leading empty server programs in an executor batch
+	ClientNum               int // client programs in the executor batch
+	TotalNum                int // full batch size: ServNum + ClientNum
+	RootProgIdx             int // absolute index of the first client (= ServNum)
 	RootPrefix              string
 	InitIp                  string
 	Init_file               map[string][]string
