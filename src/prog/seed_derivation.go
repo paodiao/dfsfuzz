@@ -11,12 +11,23 @@ var seedRootRelations = []PathRelation{
 }
 
 func newCausalDerivationTable() *CausalDerivationTable {
+	return newCausalDerivationTableFor(hmdfsProfile)
+}
+
+func newCausalDerivationTableFor(profile *DFSProfile) *CausalDerivationTable {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
+	rootCalls := profile.Calls.CausalRootCalls
+	if len(rootCalls) == 0 {
+		rootCalls = causalRootCalls
+	}
 	t := &CausalDerivationTable{Weights: make(map[string]map[CallVariant]int)}
-	for _, anchorCall := range causalRootCalls {
+	for _, anchorCall := range rootCalls {
 		weights := make(map[CallVariant]int)
-		for _, rootCall := range causalRootCalls {
+		for _, rootCall := range rootCalls {
 			for _, rel := range seedRootRelations {
-				w := relBaseOf(rel) * conflictCoeffOf(anchorCall, rootCall) / 100
+				w := relBaseOf(rel) * profile.ConflictCoeffOf(anchorCall, rootCall) / 100
 				if w < 5 {
 					w = 5
 				}
@@ -46,6 +57,12 @@ type seedAnchor struct {
 	IsDir    bool
 	PathKind AnchorPathKind
 	Role     seedAnchorRole
+	// Dual anchors (link/symlink) keep both canonical paths. Path remains the
+	// compatibility projection: target for link, linkpath for symlink.
+	Dual        DualPathKind
+	Target      string
+	LinkPath    string
+	FollowIsDir bool
 }
 
 type seedRootDerivation struct {
@@ -55,6 +72,44 @@ type seedRootDerivation struct {
 	RootSource string
 	RootDest   string
 	RootIsDir  bool
+	Dual       DualPathKind
+	TargetPath string
+	LinkPath   string
+}
+
+// RootPaths returns the unified dual-path view of the derived root.
+func (d seedRootDerivation) RootPaths() RootPaths {
+	switch d.Dual {
+	case DualRename:
+		return RootPaths{Kind: DualRename, PrePath: d.RootSource, PostPath: d.RootDest}
+	case DualLink, DualSymlink:
+		return RootPaths{Kind: d.Dual, PrePath: d.TargetPath, PostPath: d.LinkPath,
+			TargetPath: d.TargetPath, LinkPath: d.LinkPath}
+	case DualReadlink:
+		return RootPaths{Kind: DualReadlink, PrePath: d.LinkPath, PostPath: d.LinkPath,
+			LinkPath: d.LinkPath}
+	}
+	return RootPaths{Kind: DualNone, PrePath: d.RootSource, PostPath: d.RootDest}
+}
+
+// seedAnchorPaths returns the program-visible path roles of an anchor call.
+// link: target + linkpath; symlink: canonical target + linkpath; readlink:
+// linkpath. Other calls use their effective path.
+func seedAnchorPaths(p *Prog, pos GroupPosition, call *Call) []string {
+	if call == nil || call.Meta == nil {
+		return nil
+	}
+	switch call.Meta.CallName {
+	case "link":
+		return []string{extractPathFromCallByArgIdx(call, 0), extractPathFromCallByArgIdx(call, 1)}
+	case "symlink":
+		linkPath := extractPathFromCallByArgIdx(call, 1)
+		target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(call, 0))
+		return []string{target, linkPath}
+	case "readlink":
+		return []string{extractPathFromCallByArgIdx(call, 0)}
+	}
+	return []string{pathOfCall([]*Prog{p}, pos)}
 }
 
 func collectSeedAnchors(p *Prog, ft *FileTree, requireSuccess bool) []seedAnchor {
@@ -87,14 +142,30 @@ func collectSeedAnchors(p *Prog, ft *FileTree, requireSuccess bool) []seedAnchor
 			return
 		}
 		seen[key] = true
-		anchors = append(anchors, seedAnchor{
+		anchor := seedAnchor{
 			Pos:      pos,
 			CallName: call.Meta.CallName,
 			Path:     path,
 			IsDir:    info.IsDir,
 			PathKind: info.Kind,
 			Role:     role,
-		})
+		}
+		switch call.Meta.CallName {
+		case "link":
+			anchor.Dual = DualLink
+			anchor.Target = extractPathFromCallByArgIdx(call, 0)
+			anchor.LinkPath = extractPathFromCallByArgIdx(call, 1)
+		case "symlink":
+			anchor.Dual = DualSymlink
+			anchor.LinkPath = extractPathFromCallByArgIdx(call, 1)
+			anchor.Target = symlinkCanonicalTarget(anchor.LinkPath,
+				extractPathFromCallByArgIdx(call, 0))
+			anchor.FollowIsDir = info.IsDir
+		case "readlink":
+			anchor.Dual = DualReadlink
+			anchor.LinkPath = path
+		}
+		anchors = append(anchors, anchor)
 	}
 	for i, call := range p.Calls {
 		if call == nil || call.Meta == nil {
@@ -107,7 +178,9 @@ func collectSeedAnchors(p *Prog, ft *FileTree, requireSuccess bool) []seedAnchor
 			add(pos, dst, seedAnchorRenameDst)
 			continue
 		}
-		add(pos, pathOfCall([]*Prog{p}, pos), seedAnchorNormal)
+		for _, path := range seedAnchorPaths(p, pos, call) {
+			add(pos, path, seedAnchorNormal)
+		}
 	}
 	sort.SliceStable(anchors, func(i, j int) bool {
 		if anchors[i].Pos.CallIdx != anchors[j].Pos.CallIdx {
@@ -191,6 +264,9 @@ func deriveSeedRootPath(ft *FileTree, anchor seedAnchor, rootCall string, rel Pa
 		out.RootSource = source
 		out.RootDest = dest
 		out.RootIsDir = isDir
+		out.Dual = DualRename
+		out.TargetPath = source
+		out.LinkPath = dest
 		if !seedRootPathAllowed(anchor, out.RootSource) ||
 			!seedRootPathAllowed(anchor, out.RootDest) {
 			return seedRootDerivation{}, false
@@ -235,7 +311,34 @@ func deriveSeedRootPath(ft *FileTree, anchor seedAnchor, rootCall string, rel Pa
 		out.RootIsDir = rootCall == "mkdir"
 		return out, true
 	}
-	constraint := callNameConstraint(rootCall)
+	if rootCall == "link" || rootCall == "symlink" {
+		constraint := r.profile().TargetConstraint(rootCall)
+		target := ft.GetPathByRelation(anchor.Path, "", rel, r.Rand, false, constraint)
+		if target == "" {
+			return seedRootDerivation{}, false
+		}
+		node := ft.FindNode(target)
+		if node == nil || !nodeMatchesConstraint(node, constraint) ||
+			!aEligible(node, ft.Root) {
+			return seedRootDerivation{}, false
+		}
+		linkPath := r.freshLinkPath(target, rootCall)
+		if linkPath == "" || ft.FindNode(linkPath) != nil {
+			return seedRootDerivation{}, false
+		}
+		if !seedRootPathAllowed(anchor, target) ||
+			!seedRootPathAllowed(anchor, linkPath) {
+			return seedRootDerivation{}, false
+		}
+		out.RootSource = target
+		out.RootDest = linkPath
+		out.RootIsDir = node.Type != NodeTypeFile
+		out.Dual = dualKindForCall(rootCall)
+		out.TargetPath = target
+		out.LinkPath = linkPath
+		return out, true
+	}
+	constraint := r.profile().TargetConstraint(rootCall)
 	path := ft.GetPathByRelation(anchor.Path, "", rel, r.Rand, false, constraint)
 	if path == "" {
 		return seedRootDerivation{}, false
@@ -284,7 +387,7 @@ func sampleSeedDerivation(p *Prog, ft *FileTree, table *CausalDerivationTable, r
 		return seedRootDerivation{}, false
 	}
 	if table == nil {
-		table = newCausalDerivationTable()
+		table = newCausalDerivationTableFor(r.profile())
 	}
 	anchors := collectSeedAnchors(p, ft, requireSuccess)
 	if len(anchors) == 0 {

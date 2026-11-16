@@ -4278,14 +4278,106 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int) map[string]int {
 			if created, known := openCallCreatesFile(p.Target, c); known && created {
 				set(extractPathFromCall(c), relTargetFile)
 			}
+		case "link":
+			set(extractPathFromCallByArgIdx(c, 1), relTargetFile)
+		case "symlink":
+			linkPath := extractPathFromCallByArgIdx(c, 1)
+			target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(c, 0))
+			if k, ok := kindOf(target); ok {
+				set(linkPath, k)
+			}
+		case "unlink", "rmdir":
+			delete(m, extractPathFromCall(c))
 		case "rename":
 			src, dst := extractRenamePaths(c)
 			if k, ok := kindOf(src); ok {
 				set(dst, k)
 			}
+			delete(m, src)
 		}
 	}
 	return m
+}
+
+// dctBaseCandidates returns the p0 paths a new DCT root may use. link/symlink
+// targets are always usable; their fresh linkpaths become usable only when the
+// creating call ran before insertPos and succeeded. readlink only contributes
+// its linkpath. This keeps a not-yet-executed linkpath out of the root base.
+func dctBaseCandidates(p *Prog, insertPos int) []string {
+	if p == nil {
+		return nil
+	}
+	var out []string
+	for i, call := range p.Calls {
+		if call == nil || call.Meta == nil {
+			continue
+		}
+		before := i < insertPos
+		switch call.Meta.CallName {
+		case "rename":
+			src, dst := extractRenamePaths(call)
+			if src != "" {
+				out = append(out, src)
+			}
+			if dst != "" {
+				out = append(out, dst)
+			}
+		case "link":
+			target := extractPathFromCallByArgIdx(call, 0)
+			linkPath := extractPathFromCallByArgIdx(call, 1)
+			if target != "" {
+				out = append(out, target)
+			}
+			if before && callSucceeded(call) && linkPath != "" {
+				out = append(out, linkPath)
+			}
+		case "symlink":
+			linkPath := extractPathFromCallByArgIdx(call, 1)
+			target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(call, 0))
+			if target != "" {
+				out = append(out, target)
+			}
+			if before && callSucceeded(call) && linkPath != "" {
+				out = append(out, linkPath)
+			}
+		case "readlink":
+			linkPath := extractPathFromCallByArgIdx(call, 0)
+			if before && callSucceeded(call) && linkPath != "" {
+				out = append(out, linkPath)
+			}
+		default:
+			if path := extractPathFromCall(call); path != "" {
+				out = append(out, path)
+			}
+		}
+	}
+	return out
+}
+
+// dctCallPaths returns the canonical path roles of a call for DCT base
+// candidate collection. Symlink payloads are relative to the linkpath parent
+// and must be resolved before they can be used as a FileTree coordinate.
+func dctCallPaths(call *Call) []string {
+	if call == nil || call.Meta == nil {
+		return nil
+	}
+	switch call.Meta.CallName {
+	case "rename":
+		src, dst := extractRenamePaths(call)
+		return []string{src, dst}
+	case "link":
+		return []string{
+			extractPathFromCallByArgIdx(call, 0),
+			extractPathFromCallByArgIdx(call, 1),
+		}
+	case "symlink":
+		linkPath := extractPathFromCallByArgIdx(call, 1)
+		target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(call, 0))
+		return []string{target, linkPath}
+	case "readlink":
+		return []string{extractPathFromCallByArgIdx(call, 0)}
+	}
+	return []string{extractPathFromCall(call)}
 }
 
 // basePathIsFileHinted is BasePathIsFile with the in-program creation hint
@@ -4318,31 +4410,14 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	// basePath 路线：多数沿用 p0 已有路径上下文（fd 可复用、跨组路径关联），
 	// 部分直接 FileTree 新选（fd 必然新开、操作面更广）。生成与变异统一生效。
 	useFreshPath := r.Rand.Float64() < 0.30
+	insertPos := r.biasedRand(len(p0.Calls)+1, 5)
 	var pathCandidates []string
 	if !useFreshPath {
-		// Collect all file paths from p0's calls, pick one randomly
-		for _, call := range p0.Calls {
-			if call.Meta.Name == "rename" {
-				p1, p2 := extractRenamePaths(call)
-				if p1 != "" {
-					pathCandidates = append(pathCandidates, p1)
-				}
-				if p2 != "" {
-					pathCandidates = append(pathCandidates, p2)
-				}
-			} else {
-				p := extractPathFromCall(call)
-				if p != "" {
-					pathCandidates = append(pathCandidates, p)
-				}
-			}
-		}
+		pathCandidates = dctBaseCandidates(p0, insertPos)
 		if len(pathCandidates) > 0 {
 			basePath = pathCandidates[r.Intn(len(pathCandidates))]
 		}
 	}
-
-	insertPos := r.biasedRand(len(p0.Calls)+1, 5)
 
 	biasCall := -1
 	if insertPos > 0 && insertPos <= len(p0.Calls) {
@@ -4696,8 +4771,9 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 		return false
 	}
 	rootCallName := derivation.RootCall
-	basePath := derivation.RootSource
-	basePath2 := derivation.RootDest
+	rp := derivation.RootPaths()
+	basePath := rp.Source()
+	basePath2 := rp.Dest()
 	if basePath == "" {
 		return false
 	}
@@ -4733,12 +4809,15 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 	}
 	rootPath, rootPath2 := basePath, basePath2
 	rootLinkPath := ""
-	if rootCallName == "link" || rootCallName == "symlink" {
-		rootPath2 = basePath
-		rootPath = r.freshLinkPath(basePath, rootCallName)
-		if rootCallName == "symlink" {
-			rootLinkPath = rootPath
+	switch rp.Kind {
+	case DualLink, DualSymlink:
+		rootPath2 = rp.TargetPath
+		rootPath = rp.LinkPath
+		if rp.Kind == DualSymlink {
+			rootLinkPath = rp.LinkPath
 		}
+	case DualRename:
+		rootPath, rootPath2 = rp.PrePath, rp.PostPath
 	}
 	rootCalls := r.generateCallByName(stateFromProg(p0), sCalls, rootCallName,
 		rootPath, rootPath2, hmcfg.Cids[0], rootFd, rootUseFd, rootFileSize, rootFlags)
@@ -4765,8 +4844,8 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 	}
 
 	rootObservedPath := derivation.RootDest
-	if rootCallName == "link" || rootCallName == "symlink" {
-		rootObservedPath = derivation.RootSource
+	if lcs.profileOrDefault().Name == "glusterfs" {
+		rootObservedPath = rp.ObservedPath()
 	}
 	baseIsFile := basePathIsFileHinted(lcs.profileOrDefault(), ft, rootCallName, rootObservedPath, freshKinds)
 

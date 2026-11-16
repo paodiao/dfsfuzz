@@ -198,6 +198,22 @@ func mkSymlinkCall(t *testing.T, target *Target, payload, linkPath string) *Call
 	return c
 }
 
+func mkReadlinkCall(t *testing.T, target *Target, linkPath string) *Call {
+	t.Helper()
+	meta := target.SyscallMap["readlink"]
+	pathType := meta.Args[0].Type.(*PtrType)
+	bufType := meta.Args[1].Type.(*PtrType)
+	sizeType := meta.Args[2].Type.(*LenType)
+	pathArg := MakePointerArg(pathType, DirIn, 0,
+		MakeDataArg(pathType.Elem, DirIn, []byte(linkPath+"\x00")))
+	buf := MakeOutDataArg(bufType.Elem, DirOut, 256)
+	bufArg := MakePointerArg(bufType, DirIn, 0, buf)
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{pathArg, bufArg, MakeConstArg(sizeType, DirIn, 256)}
+	target.assignSizesCall(c)
+	return c
+}
+
 // TestGlusterfsDagLinkSymlinkPaths pins the GlusterFS v1 vertex path roles:
 // link uses Path=new/OldPath=source, symlink uses Path=linkpath and
 // OldPath=canonical target.

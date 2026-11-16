@@ -2056,7 +2056,7 @@ func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoic
 	lcs := &LayeredChoiceStrategy{
 		PredefinedPatterns:    NewPredefinedPatterns(),
 		DCTFsops:              BuildDefaultDCT(profile),
-		CausalDerivationTable: newCausalDerivationTable(),
+		CausalDerivationTable: newCausalDerivationTableFor(profile),
 		FileTree:              nil,
 		Profile:               profile,
 		patternProbability:    0.15,

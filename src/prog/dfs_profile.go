@@ -133,6 +133,7 @@ var hmdfsProfile = &DFSProfile{
 		NamespaceCalls:    []string{"mkdir", "rmdir", "creat", "unlink", "rename"},
 		DataModCalls:      []string{"write", "pwrite64", "truncate", "fsync", "fdatasync"},
 		DataObserverCalls: []string{"read", "pread64", "stat", "getdents64", "chmod"},
+		CausalRootCalls:   causalRootCalls,
 	},
 	Events: EventProfile{SupportsSameInode: true},
 	Paths:  PathPolicy{RootPrefix: MergeViewPrefix, SameParentRename: true},

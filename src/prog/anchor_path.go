@@ -8,16 +8,19 @@ const (
 	AnchorPathFreshDir
 	AnchorPathFreshFile
 	AnchorPathFreshRenameDst
+	AnchorPathFreshSymlink
 )
 
 func (k AnchorPathKind) IsFresh() bool {
-	return k == AnchorPathFreshDir || k == AnchorPathFreshFile || k == AnchorPathFreshRenameDst
+	return k == AnchorPathFreshDir || k == AnchorPathFreshFile ||
+		k == AnchorPathFreshRenameDst || k == AnchorPathFreshSymlink
 }
 
 type anchorPathInfo struct {
-	Kind       AnchorPathKind
-	IsDir      bool
-	CreatorIdx int
+	Kind        AnchorPathKind
+	IsDir       bool
+	FollowIsDir bool
+	CreatorIdx  int
 }
 
 func classifyAnchorPath(p *Prog, ft *FileTree, pos GroupPosition, path string, requireSuccess bool) (anchorPathInfo, bool) {
@@ -27,16 +30,17 @@ func classifyAnchorPath(p *Prog, ft *FileTree, pos GroupPosition, path string, r
 	}
 	if node := ft.FindNode(path); node != nil {
 		return anchorPathInfo{
-			Kind:       AnchorPathExisting,
-			IsDir:      node.Type != NodeTypeFile,
-			CreatorIdx: -1,
+			Kind:        AnchorPathExisting,
+			IsDir:       node.Type != NodeTypeFile,
+			FollowIsDir: node.Type != NodeTypeFile,
+			CreatorIdx:  -1,
 		}, true
 	}
 	kind, isDir, idx, ok := findAnchorCreator(p, ft, path, pos.CallIdx, requireSuccess)
 	if !ok {
 		return anchorPathInfo{}, false
 	}
-	return anchorPathInfo{Kind: kind, IsDir: isDir, CreatorIdx: idx}, true
+	return anchorPathInfo{Kind: kind, IsDir: isDir, FollowIsDir: isDir, CreatorIdx: idx}, true
 }
 
 func findAnchorCreator(p *Prog, ft *FileTree, path string, end int, requireSuccess bool) (AnchorPathKind, bool, int, bool) {
@@ -80,6 +84,22 @@ func findAnchorCreator(p *Prog, ft *FileTree, path string, end int, requireSucce
 				return AnchorPathUnknown, false, -1, false
 			}
 			return AnchorPathFreshRenameDst, isDir, i, true
+		case "link":
+			if extractPathFromCallByArgIdx(call, 1) == path {
+				// v1 link targets are regular files; the new dentry is a file
+				// alias and follows the target type.
+				return AnchorPathFreshFile, false, i, true
+			}
+		case "symlink":
+			if extractPathFromCallByArgIdx(call, 1) != path {
+				continue
+			}
+			target := symlinkCanonicalTarget(path, extractPathFromCallByArgIdx(call, 0))
+			isDir, ok := anchorSourceIsDir(p, ft, target, i, requireSuccess)
+			if !ok {
+				return AnchorPathUnknown, false, -1, false
+			}
+			return AnchorPathFreshSymlink, isDir, i, true
 		}
 	}
 	return AnchorPathUnknown, false, -1, false
@@ -140,9 +160,12 @@ func freshParentNodeEligible(ft *FileTree, path string) bool {
 	if ft == nil || path == "" {
 		return false
 	}
-	parent := GetParentDir(path)
+	parent := parentDirOrRoot(path)
 	if parent == "" {
-		return false
+		// The test root is a valid parent only when it is the namespace root
+		// itself (GlusterFS has an empty prefix); HMDFS paths must stay under
+		// merge_view/.
+		return ft.Prefix == "" && ft.Root != nil
 	}
 	node := ft.FindNode(parent)
 	return node != nil && node.Type != NodeTypeFile && node.Type != NodeTypeTmpDir
