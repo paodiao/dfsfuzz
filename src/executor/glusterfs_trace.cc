@@ -494,6 +494,13 @@ static bool find_symbol_offsets(const char *path, struct symbol_offset *syms,
 {
 	int fd = -1;
 	Elf *elf = nullptr;
+	Elf_Scn *symtab = nullptr;
+	GElf_Shdr symshdr = {};
+	Elf_Scn *scn = nullptr;
+	Elf_Data *symdata = nullptr;
+	size_t entsize = 0;
+	size_t count = 0;
+	size_t phnum = 0;
 	bool ok = false;
 
 	if (elf_version(EV_CURRENT) == EV_NONE)
@@ -510,9 +517,6 @@ static bool find_symbol_offsets(const char *path, struct symbol_offset *syms,
 		goto out;
 	}
 
-	Elf_Scn *symtab = nullptr;
-	GElf_Shdr symshdr;
-	Elf_Scn *scn = nullptr;
 	while ((scn = elf_nextscn(elf, scn)) != nullptr) {
 		GElf_Shdr shdr;
 		if (!gelf_getshdr(scn, &shdr))
@@ -528,17 +532,17 @@ static bool find_symbol_offsets(const char *path, struct symbol_offset *syms,
 		goto out;
 	}
 
-	Elf_Data *symdata = elf_getdata(symtab, nullptr);
+	symdata = elf_getdata(symtab, nullptr);
 	if (!symdata) {
 		fprintf(stderr, "glusterfs_trace: no symtab data\n");
 		goto out;
 	}
-	size_t entsize = symshdr.sh_entsize;
+	entsize = symshdr.sh_entsize;
 	if (!entsize)
 		entsize = gelf_fsize(elf, ELF_T_SYM, 1, EV_CURRENT);
 	if (!entsize)
 		goto out;
-	size_t count = symshdr.sh_size / entsize;
+	count = symshdr.sh_size / entsize;
 
 	for (size_t i = 1; i < count; i++) {
 		GElf_Sym sym;
@@ -558,7 +562,7 @@ static bool find_symbol_offsets(const char *path, struct symbol_offset *syms,
 		}
 	}
 
-	size_t phnum = 0;
+	phnum = 0;
 	if (elf_getphdrnum(elf, &phnum) != 0)
 		goto out;
 
