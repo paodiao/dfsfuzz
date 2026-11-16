@@ -274,7 +274,11 @@ func pathSetNodeConstraint(ft *FileTree, path string) int {
 	return relTargetFile
 }
 
-func buildPathMembers(ps []*Prog, ft *FileTree) []pathMember {
+func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathMember {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
 	var members []pathMember
 	for pi, p := range ps {
 		for ci, call := range p.Calls {
@@ -374,7 +378,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree) []pathMember {
 					kind = pathFresh
 				}
 			case strings.Contains(name, "open"):
-				if openPathCreatesFile(p.Target, call) {
+				if profile.Name == "glusterfs" && openPathCreatesFile(p.Target, call) {
 					role = pathRoleCreat
 					if ft == nil || ft.FindNode(path) == nil {
 						kind = pathFresh
@@ -405,8 +409,8 @@ func pathMembersRelated(a, b pathMember) bool {
 	return false
 }
 
-func buildPathSet(ps []*Prog, anchor GroupPosition, ft *FileTree) (*pathSet, bool) {
-	members := buildPathMembers(ps, ft)
+func buildPathSet(ps []*Prog, anchor GroupPosition, ft *FileTree, profiles ...*DFSProfile) (*pathSet, bool) {
+	members := buildPathMembers(ps, ft, profiles...)
 	if len(members) == 0 {
 		return nil, false
 	}
@@ -1117,7 +1121,7 @@ func mutatePathSetDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) b
 		return false
 	}
 	anchorPos := resolveFdTarget(ps, anchor)
-	set, ok := buildPathSet(ps, anchorPos, lcs.FileTree)
+	set, ok := buildPathSet(ps, anchorPos, lcs.FileTree, lcs.profileOrDefault())
 	if !ok {
 		return false
 	}

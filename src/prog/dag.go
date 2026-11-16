@@ -234,6 +234,9 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		if ev.ProgIdx < 0 || ev.ProgIdx >= len(ps) {
 			continue
 		}
+		if glusterfs && hmcfg.Serv_num > 0 && ev.ProgIdx < hmcfg.Serv_num {
+			continue
+		}
 		p := ps[ev.ProgIdx]
 		callIdx := matchEventToCall(ev, p, tscoffs)
 		if callIdx < 0 {
@@ -276,6 +279,11 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		ev := &events[i]
 		if ev.ProgIdx < 0 || ev.ProgIdx >= len(ps) {
 			diag.ProgIdxBad++
+			continue
+		}
+		if glusterfs && hmcfg.Serv_num > 0 && ev.ProgIdx < hmcfg.Serv_num {
+			// GlusterFS server programs do not attach uprobes; any server
+			// ProgIdx in a malformed event is not a client observation.
 			continue
 		}
 		p := ps[ev.ProgIdx]
@@ -602,6 +610,15 @@ func recordCallTypeIno(diag *DagDiag, ev *HmdfsTraceEvent, v *DAGVertex) {
 // ExtractPairs computes happens-before edges (from succeeded modifiers) and
 // concurrent pairs (at least one modifier, overlapping windows).
 func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPair) {
+	return ExtractPairsFor(hmdfsProfile, vertices, diag)
+}
+
+// ExtractPairsFor is the profile-aware pair extractor. GlusterFS v1 has no
+// PathSameInode classification: pairs are classified by canonical path only.
+func ExtractPairsFor(profile *DFSProfile, vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPair) {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
 	if diag == nil {
 		diag = &DagDiag{}
 	}
@@ -619,7 +636,7 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 				// modifier operation (by type, not by success): failed
 				// writes/mkdirs still carry state impact worth exploring,
 				// while pure read||read pairs have no consistency value.
-				if rel := determinePathRel(A, B, false); rel != PathNone &&
+				if rel := determinePathRelFor(profile, A, B, false); rel != PathNone &&
 					(isModifierFunc(A.FuncID) || isModifierFunc(B.FuncID)) {
 					diag.RelHist[rel]++
 					ccPairs = append(ccPairs, DAGPair{A: A, B: B, Temporal: TemporalConcurrent, PathRel: rel})
@@ -630,7 +647,7 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 				}
 			case A.Etime < B.Stime:
 				diag.HBForwardPairs++
-				if rel := determinePathRel(A, B, true); rel != PathNone && aMod {
+				if rel := determinePathRelFor(profile, A, B, true); rel != PathNone && aMod {
 					diag.RelHist[rel]++
 					hbPairs = append(hbPairs, DAGPair{A: A, B: B, Temporal: TemporalHB, PathRel: rel})
 				} else if rel == PathNone {
@@ -640,7 +657,7 @@ func ExtractPairs(vertices []DAGVertex, diag *DagDiag) (hbPairs, ccPairs []DAGPa
 				}
 			default:
 				diag.HBReversePairs++
-				if rel := determinePathRel(B, A, true); rel != PathNone && bMod {
+				if rel := determinePathRelFor(profile, B, A, true); rel != PathNone && bMod {
 					diag.RelHist[rel]++
 					hbPairs = append(hbPairs, DAGPair{A: B, B: A, Temporal: TemporalHB, PathRel: rel})
 				} else if rel == PathNone {
@@ -747,6 +764,16 @@ func callNameOfFunc(fid uint32) string {
 		return "unlink"
 	case FuncRename:
 		return "rename"
+	case FuncLink:
+		return "link"
+	case FuncSymlink:
+		return "symlink"
+	case FuncReadlink:
+		return "readlink"
+	case FuncGetxattr:
+		return "getxattr"
+	case FuncSetxattr:
+		return "setxattr"
 	case FuncWrite:
 		return "write"
 	case FuncRead:
@@ -1273,6 +1300,10 @@ func prePath(v *DAGVertex) string {
 // nodes do not identify the same file (cross-node same-path pairs are
 // classified as SamePath first).
 func determinePathRel(A, B *DAGVertex, ordered bool) PathRel {
+	return determinePathRelFor(hmdfsProfile, A, B, ordered)
+}
+
+func determinePathRelFor(profile *DFSProfile, A, B *DAGVertex, ordered bool) PathRel {
 	ap, bp := pairPathCandidates(A), pairPathCandidates(B)
 	aPaths, bPaths := ap[:], bp[:]
 	for _, a := range aPaths {
@@ -1282,7 +1313,11 @@ func determinePathRel(A, B *DAGVertex, ordered bool) PathRel {
 			}
 		}
 	}
-	if A.ProgIdx == B.ProgIdx && A.Ino != 0 && A.Ino == B.Ino {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
+	if profile.Events.SupportsSameInode &&
+		A.ProgIdx == B.ProgIdx && A.Ino != 0 && A.Ino == B.Ino {
 		return PathSameInode
 	}
 	for _, a := range aPaths {

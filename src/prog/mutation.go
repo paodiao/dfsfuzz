@@ -2790,7 +2790,7 @@ func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 		return false
 	}
 	anchorPos := resolveFdTarget(ps, anchor)
-	if set, ok := buildPathSet(ps, anchorPos, lcs.FileTree); ok {
+	if set, ok := buildPathSet(ps, anchorPos, lcs.FileTree, lcs.profileOrDefault()); ok {
 		notePathSetBuilt(set, pathSetRoots(set), false)
 		if relocatePathSet(ps, lcs, set, r) {
 			recordLastMutation("MutatePathSet")

@@ -60,7 +60,7 @@ func TestBuildPathMembersLinkSymlinkRoles(t *testing.T) {
 	read := mkReadlinkCall(t, target, "dirA/l2")
 	p := &Prog{Target: target, Calls: []*Call{link, sym, read}}
 
-	members := buildPathMembers([]*Prog{p}, ft)
+	members := buildPathMembers([]*Prog{p}, ft, glusterfsProfile)
 	roles := map[pathRole]pathSpec{}
 	for _, m := range members {
 		if len(m.Paths) != 1 {
@@ -120,7 +120,7 @@ func TestPathSetOpenCreatRole(t *testing.T) {
 	ft := glusterfsPlanTree()
 	call := mkOpenWithFlags(target, "dirA/new", ocreate|2)
 	p := &Prog{Target: target, Calls: []*Call{call}}
-	members := buildPathMembers([]*Prog{p}, ft)
+	members := buildPathMembers([]*Prog{p}, ft, glusterfsProfile)
 	if len(members) != 1 || len(members[0].Paths) != 1 {
 		t.Fatalf("open(O_CREAT) members = %+v", members)
 	}

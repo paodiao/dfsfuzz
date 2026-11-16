@@ -1611,14 +1611,15 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			appendDiagLog("dct pool: cover=%d/%d unreach=%d cellUnreach=%d", covFound, covTarget, prog.UnreachableComboCount(), prog.CellUnreachableCount())
 		}
 	}
-	if stat != StatTriage && stat != StatMinimize && csanPassed && proc.fuzzer.config.DFSName == "hmdfs" &&
+	if stat != StatTriage && stat != StatMinimize && csanPassed &&
+		(proc.fuzzer.config.DFSName == "hmdfs" || proc.fuzzer.config.DFSName == "glusterfs") &&
 		len(hmdfsTraceEvents) > 0 && len(infos) > proc.fuzzer.config.ServNum {
 		// DAG vertices intentionally use RAW fsMds (no CanonicalizeFsMd):
 		// conflict/remote-directory suffixes are kernel-visible truth here,
 		// and DAG paths never flow back into generation. The checker
 		// canonicalizes fsMd, while FileTree stays at the restored baseline.
 		vertices, dagDiag := prog.BuildVertices(hmdfsTraceEvents, ps, fsMds, &proc.hmcfg, proc.tscoffs)
-		hbPairs, ccPairs := prog.ExtractPairs(vertices, dagDiag)
+		hbPairs, ccPairs := prog.ExtractPairsFor(proc.hmcfg.ProfileOrDefault(), vertices, dagDiag)
 		allPairs := append(hbPairs, ccPairs...)
 		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg, dagDiag)
 		log.Logf(0, "hmdfs dag: vertices=%d ps0Len=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d mfDistIn=%v mfDistOut=%v tol=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
