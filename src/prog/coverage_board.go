@@ -455,12 +455,16 @@ func (b *coverageBoard) cellInDomain(ck cellKey) bool {
 	return b.depths[ck.DepthB]
 }
 
-// cellForm is one (offset, return) form of a variant call. The model layer
-// expands a call into rets x offset buckets; the plannable layer uses the
-// directed planner's own form table so the two cannot drift.
+// cellForm is one (offset, return, optional type) form of a variant call.
+// The model layer expands a call into rets x offset buckets; the plannable
+// layer uses the directed planner's own form table so the two cannot drift.
+// hasType pins the B-side type for fresh-fresh race forms (which carry an
+// explicit isDir); standalone forms leave the type dimension open.
 type cellForm struct {
-	off uint64
-	ret RetBucket
+	off     uint64
+	ret     RetBucket
+	hasType bool
+	isDir   bool
 }
 
 // modelFormsFor expands the model's static ret/offset tables for a call.
@@ -474,12 +478,14 @@ func modelFormsFor(profile *DFSProfile, call string) []cellForm {
 	return forms
 }
 
-// plannableFormsFor returns the forms FailurePolicy/the directed planner
-// actively construct:
+// plannableFormsFor returns the standalone/existing-object forms
+// FailurePolicy/the directed planner actively construct:
 //
 //   - GlusterFS: the directedVariantKinds table itself (Success-only unless a
 //     failure form is an explicit policy target: rmdir/rename ENOTEMPTY,
-//     getxattr ENODATA, setxattr EEXIST);
+//     getxattr ENODATA, setxattr EEXIST). Fresh-fresh race forms are added by
+//     plannableFreshSameFormsFor for the combos whose sole channel is
+//     FreshSame;
 //   - HMDFS: the model table, preserving the pre-plannable D3 behavior.
 func plannableFormsFor(profile *DFSProfile, call string) []cellForm {
 	if profile != nil && profile.Name == "glusterfs" {
@@ -494,6 +500,95 @@ func plannableFormsFor(profile *DFSProfile, call string) []cellForm {
 		return forms
 	}
 	return modelFormsFor(profile, call)
+}
+
+// freshSameCellFormsFor converts the fresh-fresh race forms of a combo into
+// fixed-type cell forms.
+func freshSameCellFormsFor(profile *DFSProfile, ck comboKey) []cellForm {
+	var forms []cellForm
+	for _, fp := range freshSameFormsFor(profile) {
+		if fp.root == ck.Root && fp.variant == ck.Variant {
+			forms = append(forms, cellForm{
+				off: fp.off, ret: fp.ret, hasType: true, isDir: fp.isDir,
+			})
+		}
+	}
+	return forms
+}
+
+// plannableFreshSameFormsFor returns the fresh-fresh race forms when the combo
+// is constructed only by the FreshSame pass. For GlusterFS creation roots
+// (mkdir/creat) with PathSame, the ordinary existing-node and fresh-root
+// passes cannot produce a Same cell: the root creates the path, and the
+// variant observes a race outcome. The FreshSame matrix is therefore the
+// combo's sole constructible-form source.
+//
+// HMDFS keeps its legacy per-variant form model (ok=false): its plannable is
+// intentionally broad and must not change here.
+func plannableFreshSameFormsFor(profile *DFSProfile, ck comboKey) ([]cellForm, bool) {
+	if profile == nil || profile.Name != "glusterfs" {
+		return nil, false
+	}
+	if ck.Rel != PathSame || (ck.Root != "mkdir" && ck.Root != "creat") {
+		return nil, false
+	}
+	return freshSameCellFormsFor(profile, ck), true
+}
+
+// modelFormsForCombo expands the model layer's forms for a combo. GlusterFS
+// creation-root Same combos add the fresh-fresh race forms that the per-variant
+// model rets omit (rmdir/unlink ENOENT are naturally reachable only through the
+// create/delete race, not as standalone existing-object failures). Forms
+// already covered by the per-variant model are not duplicated.
+func modelFormsForCombo(profile *DFSProfile, ck comboKey) ([]cellForm, []bool) {
+	base := modelFormsFor(profile, ck.Variant)
+	types := producibleTypesFor(profile, ck.Variant)
+	if profile == nil || profile.Name != "glusterfs" ||
+		ck.Rel != PathSame || (ck.Root != "mkdir" && ck.Root != "creat") {
+		return base, types
+	}
+	type formKey struct {
+		ret   RetBucket
+		off   uint64
+		isDir bool
+	}
+	seen := make(map[formKey]bool)
+	for _, f := range base {
+		for _, t := range types {
+			seen[formKey{ret: f.ret, off: f.off, isDir: t}] = true
+		}
+	}
+	for _, f := range freshSameCellFormsFor(profile, ck) {
+		key := formKey{ret: f.ret, off: f.off, isDir: f.isDir}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		base = append(base, f)
+	}
+	return base, types
+}
+
+// cellInForms reports whether a cell matches one of the forms. Open forms
+// (hasType=false) match any type in typeList; fresh-fresh forms pin isDir.
+func cellInForms(forms []cellForm, ck cellKey, typeList []bool) bool {
+	for _, f := range forms {
+		if f.ret != ck.RetB || f.off != ck.OffB {
+			continue
+		}
+		if f.hasType {
+			if f.isDir == ck.TypeB {
+				return true
+			}
+			continue
+		}
+		for _, t := range typeList {
+			if t == ck.TypeB {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // plannableComboEnabled applies the combo-level construction gate. HMDFS is
@@ -515,9 +610,8 @@ func (b *coverageBoard) plannableComboEnabled(ck comboKey) bool {
 // computeProducibleLocked computes the model layer's per-temporal cell counts.
 // See computeCellCountLocked for the shared dimension rules.
 func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
-	return b.computeCellCountLocked(ck,
-		modelFormsFor(b.profile, ck.Variant),
-		producibleTypesFor(b.profile, ck.Variant))
+	forms, types := modelFormsForCombo(b.profile, ck)
+	return b.computeCellCountLocked(ck, forms, types)
 }
 
 // computePlannableLocked computes the planner layer's per-temporal cell counts.
@@ -525,31 +619,17 @@ func (b *coverageBoard) computePlannableLocked(ck comboKey) [2]int {
 	if !b.plannableComboEnabled(ck) {
 		return [2]int{}
 	}
+	if forms, ok := plannableFreshSameFormsFor(b.profile, ck); ok {
+		return b.computeCellCountLocked(ck, forms, nil)
+	}
 	return b.computeCellCountLocked(ck,
 		plannableFormsFor(b.profile, ck.Variant),
 		producibleTypesFor(b.profile, ck.Variant))
 }
 
-// computeCellCountLocked computes per-temporal cell counts arithmetically (no
-// cell enumeration). The root's return bucket is pinned to Success (retA=1):
-// directed cells target B-side margins with a working root, and this removes
-// the root's ret multiplicity from the potential.
-//
-// The modifier gates mirror ExtractPairs reachability:
-//   - an HB pair requires the temporally earlier vertex (the pair's root) to
-//     be a succeeded modifier, so a non-modifier root can never produce HB
-//     cells;
-//   - a CC pair requires at least one side to be a modifier (by type), so a
-//     combo whose root and variant are both non-modifiers produces nothing.
-//
-// Persist is depth-conditional: a persist path is the persist dir itself or a
-// descendant (path-prefix match, see cellKeyOf), so its depth bucket is at
-// least the dir's bucket. One extra depth multiplicity is counted per domain
-// bucket that can hold persist paths.
-//
-// The caller must hold mu.
-func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, typeList []bool) [2]int {
-	retACount := 1 // RetSuccess only
+// depthMultiplierLocked returns the number of depth/persist combinations in
+// the run's domain. The caller must hold mu.
+func (b *coverageBoard) depthMultiplierLocked() int {
 	var depthList []uint64
 	for d := 0; d < 4; d++ {
 		if b.depths[d] {
@@ -566,7 +646,14 @@ func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, ty
 			}
 		}
 	}
-	total := retACount * len(forms) * depthMult * len(typeList)
+	return depthMult
+}
+
+// temporalCellCounts applies the ExtractPairs modifier gates to a total number
+// of B-side cells. The root's return bucket is pinned to Success (retA=1):
+// directed cells target B-side margins with a working root, and this removes
+// the root's ret multiplicity from the potential.
+func temporalCellCounts(ck comboKey, total int) [2]int {
 	rootMod := isModifierCall(ck.Root)
 	variantMod := isModifierCall(ck.Variant)
 	var hb, cc int
@@ -589,6 +676,22 @@ func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, ty
 		cc = 0
 	}
 	return [2]int{hb, cc}
+}
+
+// computeCellCountLocked computes per-temporal cell counts arithmetically (no
+// cell enumeration). Open forms (hasType=false) expand over typeList; pinned
+// fresh-fresh forms contribute exactly one type each. The caller must hold mu.
+func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, typeList []bool) [2]int {
+	typeCount := 0
+	for _, f := range forms {
+		if f.hasType {
+			typeCount++
+		} else {
+			typeCount += len(typeList)
+		}
+	}
+	total := typeCount * b.depthMultiplierLocked()
+	return temporalCellCounts(ck, total)
 }
 
 // cellKeyOf maps a pair onto its coverage cell. persistDir is the run's
@@ -728,40 +831,17 @@ func (b *coverageBoard) cellInModel(ck cellKey) bool {
 	if prod[int(ck.Temporal)] == 0 {
 		return false
 	}
-	inRets := false
-	for _, r := range producibleRetsFor(b.profile, ck.Variant) {
-		if r == ck.RetB {
-			inRets = true
-			break
-		}
-	}
-	if !inRets {
-		return false
-	}
-	inOffs := false
-	for _, o := range producibleOffBucketsForRet(ck.Variant, ck.RetB) {
-		if o == ck.OffB {
-			inOffs = true
-			break
-		}
-	}
-	if !inOffs {
-		return false
-	}
-	for _, t := range producibleTypesFor(b.profile, ck.Variant) {
-		if t == ck.TypeB {
-			return true
-		}
-	}
-	return false
+	forms, types := modelFormsForCombo(b.profile, ckm)
+	return cellInForms(forms, ck, types)
 }
 
 // cellInPlannable reports whether the cell lies inside the plannable layer:
 // the combo is in the plannable grid, its temporal form is producible, and
 // RetB/OffB/TypeB are among the planner's constructible forms. HMDFS falls
 // back to cellInModel so its legacy plannable == model behavior is exact;
-// GlusterFS uses directedVariantKinds (the same table the planner uses).
-// The caller must hold b.mu.
+// GlusterFS uses directedVariantKinds for standalone forms and the complete
+// fresh-fresh race matrix for creation-root Same combos. The caller must hold
+// b.mu.
 func (b *coverageBoard) cellInPlannable(ck cellKey) bool {
 	if b.profile == nil || b.profile.Name != "glusterfs" {
 		return b.cellInModel(ck)
@@ -774,22 +854,11 @@ func (b *coverageBoard) cellInPlannable(ck cellKey) bool {
 	if !ok || prod[int(ck.Temporal)] == 0 {
 		return false
 	}
-	inForm := false
-	for _, f := range plannableFormsFor(b.profile, ck.Variant) {
-		if f.ret == ck.RetB && f.off == ck.OffB {
-			inForm = true
-			break
-		}
+	if freshForms, ok := plannableFreshSameFormsFor(b.profile, ckm); ok {
+		return cellInForms(freshForms, ck, nil)
 	}
-	if !inForm {
-		return false
-	}
-	for _, t := range producibleTypesFor(b.profile, ck.Variant) {
-		if t == ck.TypeB {
-			return true
-		}
-	}
-	return false
+	return cellInForms(plannableFormsFor(b.profile, ck.Variant), ck,
+		producibleTypesFor(b.profile, ck.Variant))
 }
 
 // shapesAllKnown reports whether every candidate shape of a planned cell is
@@ -1023,8 +1092,10 @@ func (b *coverageBoard) uncoveredPotential(root, variant string, rel PathRelatio
 // plannable space: RetA pinned to Success, every plannable RetB/OffB/TypeB,
 // every depth bucket in the run's domain, both persistence margins and both
 // temporal forms (a form is skipped when its precomputed plannable count is
-// zero, i.e. the ExtractPairs modifier gate). fn receives the full cell.
-// The caller must hold b.mu for reading.
+// zero, i.e. the ExtractPairs modifier gate). Creation-root Same combos use
+// the fresh-fresh race matrix with its pinned types; other combos use the
+// standalone variant forms. fn receives the full cell. The caller must hold
+// b.mu for reading.
 func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKey)) {
 	if !b.ready || b.unreachable[ck] || !b.plannableComboEnabled(ck) {
 		return
@@ -1044,33 +1115,42 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 	if nd == 0 {
 		return
 	}
-	for _, form := range plannableFormsFor(b.profile, ck.Variant) {
-		for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
-			for i := 0; i < nd; i++ {
-				depth := depthList[i]
-				persists := [2]bool{false}
-				np := 1
-				if b.persistDir != "" && depth >= b.persistBucket {
-					persists[1] = true
-					np = 2
-				}
-				for pi := 0; pi < np; pi++ {
-					for t := 0; t < 2; t++ {
-						if prod[t] == 0 {
-							continue
-						}
-						cell := cellKey{
-							Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel,
-							Temporal: TemporalRel(t), RetA: RetSuccess, RetB: form.ret,
-							OffB: form.off, PersistB: persists[pi], DepthB: depth, TypeB: isDir,
-						}
-						if b.discovered[cell] != 0 || b.cellUnreachable[cell] {
-							continue
-						}
-						fn(cell)
+	emit := func(ret RetBucket, off uint64, isDir bool) {
+		for i := 0; i < nd; i++ {
+			depth := depthList[i]
+			persists := [2]bool{false}
+			np := 1
+			if b.persistDir != "" && depth >= b.persistBucket {
+				persists[1] = true
+				np = 2
+			}
+			for pi := 0; pi < np; pi++ {
+				for t := 0; t < 2; t++ {
+					if prod[t] == 0 {
+						continue
 					}
+					cell := cellKey{
+						Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel,
+						Temporal: TemporalRel(t), RetA: RetSuccess, RetB: ret,
+						OffB: off, PersistB: persists[pi], DepthB: depth, TypeB: isDir,
+					}
+					if b.discovered[cell] != 0 || b.cellUnreachable[cell] {
+						continue
+					}
+					fn(cell)
 				}
 			}
+		}
+	}
+	if freshForms, ok := plannableFreshSameFormsFor(b.profile, ck); ok {
+		for _, fp := range freshForms {
+			emit(fp.ret, fp.off, fp.isDir)
+		}
+		return
+	}
+	for _, form := range plannableFormsFor(b.profile, ck.Variant) {
+		for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
+			emit(form.ret, form.off, isDir)
 		}
 	}
 }

@@ -2505,34 +2505,13 @@ var freshSameForms = []freshSameForm{
 	{"mkdir", "getdents64", RetSuccess, offsetBucketNA, true},
 }
 
-// glusterfsFreshSameForms is the GlusterFS subset of the HMDFS G-c scope-S
-// table. The table above encodes HMDFS construction choices (including
-// mkdir/creat races that observe EEXIST/Failure/ENOENT). GlusterFS v1's
-// FailurePolicy does not actively build those forms, so the planner must not
-// inherit the HMDFS table wholesale: only the Success forms are constructible.
-// The plannable layer is the final invariant; this table keeps the unwanted
-// forms out of the construction pass in the first place.
-var glusterfsFreshSameForms = filterFreshSameForms(freshSameForms, func(fp freshSameForm) bool {
-	return fp.ret == RetSuccess
-})
-
-func filterFreshSameForms(forms []freshSameForm, keep func(freshSameForm) bool) []freshSameForm {
-	res := make([]freshSameForm, 0, len(forms))
-	for _, fp := range forms {
-		if keep(fp) {
-			res = append(res, fp)
-		}
-	}
-	return res
-}
-
-// freshSameFormsFor returns the pinned fresh-fresh construction table for a
-// profile. HMDFS keeps its full G-c table; GlusterFS uses the Success-only
-// subset (the same rule causal_root's fresh root pass already applied).
+// freshSameFormsFor returns the pinned fresh-fresh race matrix. The matrix is
+// DFS-agnostic: the forms encode concurrent create/delete/lookup outcomes, not
+// single-operation failure injection. Profile-specific narrowing belongs to
+// the plannable layer (plannableFreshSameFormsFor), which scopes the matrix to
+// the combos whose only construction channel is FreshSame; the table itself
+// must stay complete so those race plans can be generated and validated.
 func freshSameFormsFor(profile *DFSProfile) []freshSameForm {
-	if profile != nil && profile.Name == "glusterfs" {
-		return glusterfsFreshSameForms
-	}
 	return freshSameForms
 }
 

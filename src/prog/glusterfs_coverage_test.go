@@ -43,24 +43,30 @@ func glusterfsCoverageCell(root, variant string, rel PathRelation, temporal Temp
 	}
 }
 
-// TestGlusterfsFreshSameFormsSuccessOnly pins the profile split: GlusterFS must
-// not inherit HMDFS's EEXIST/Failure/ENOENT fresh-fresh construction forms.
-func TestGlusterfsFreshSameFormsSuccessOnly(t *testing.T) {
+// TestGlusterfsFreshSameFormsKeepRaceMatrix pins that the fresh-fresh race
+// matrix is DFS-agnostic and stays complete for GlusterFS. The narrowing is
+// applied by the plannable layer, not by deleting forms from the table.
+func TestGlusterfsFreshSameFormsKeepRaceMatrix(t *testing.T) {
 	forms := freshSameFormsFor(glusterfsProfile)
-	if len(forms) == 0 || len(forms) >= len(freshSameForms) {
-		t.Fatalf("GlusterFS freshSame table size = %d, want a strict subset of %d",
+	if len(forms) != len(freshSameForms) {
+		t.Fatalf("GlusterFS freshSame table size = %d, want the full race matrix %d",
 			len(forms), len(freshSameForms))
 	}
-	for _, fp := range forms {
-		if fp.ret != RetSuccess {
-			t.Fatalf("GlusterFS freshSame form %+v is not Success-only", fp)
+	for _, tc := range []struct {
+		root, variant string
+		ret           RetBucket
+		isDir         bool
+	}{
+		{"mkdir", "mkdir", RetEEXIST, true},
+		{"creat", "mkdir", RetEEXIST, true},
+		{"mkdir", "creat", RetFailure, false},
+		{"mkdir", "rmdir", RetENOENT, true},
+		{"creat", "stat", RetENOENT, false},
+	} {
+		if !freshSameFormAllowedFor(glusterfsProfile, tc.root, tc.variant, tc.ret,
+			offsetBucketNA, tc.isDir) {
+			t.Fatalf("GlusterFS freshSame missing race form %+v", tc)
 		}
-	}
-	if !freshSameFormAllowedFor(hmdfsProfile, "mkdir", "mkdir", RetEEXIST, offsetBucketNA, true) {
-		t.Fatal("HMDFS mkdir/mkdir EEXIST must remain a pinned form")
-	}
-	if freshSameFormAllowedFor(glusterfsProfile, "mkdir", "mkdir", RetEEXIST, offsetBucketNA, true) {
-		t.Fatal("GlusterFS mkdir/mkdir EEXIST must not be a pinned form")
 	}
 }
 
@@ -109,6 +115,65 @@ func TestGlusterfsPlannableFailurePolicy(t *testing.T) {
 		RetEEXIST, offsetBucketNA, true)
 	if !covBoard.cellInModel(mkdirEEXIST) {
 		t.Fatal("mkdir EEXIST must remain model-visible")
+	}
+}
+
+// TestGlusterfsPlannableFreshSameRaces pins B's combo-aware split: the
+// fresh-fresh race matrix is plannable only for creation-root PathSame combos,
+// while the same ret buckets on ordinary existing-object combos stay out.
+func TestGlusterfsPlannableFreshSameRaces(t *testing.T) {
+	glusterfsCoverageConfig(t, false)
+
+	covBoard.mu.RLock()
+	defer covBoard.mu.RUnlock()
+
+	cases := []struct {
+		name    string
+		root    string
+		variant string
+		ret     RetBucket
+		off     uint64
+		isDir   bool
+		want    bool
+	}{
+		{"creat/mkdir EEXIST", "creat", "mkdir", RetEEXIST, offsetBucketNA, true, true},
+		{"mkdir/creat Failure", "mkdir", "creat", RetFailure, offsetBucketNA, false, true},
+		{"mkdir/mkdir EEXIST", "mkdir", "mkdir", RetEEXIST, offsetBucketNA, true, true},
+		{"mkdir/mkdir Success", "mkdir", "mkdir", RetSuccess, offsetBucketNA, true, false},
+		{"mkdir/rmdir ENOENT", "mkdir", "rmdir", RetENOENT, offsetBucketNA, true, true},
+		{"open/rmdir ENOENT", "open", "rmdir", RetENOENT, offsetBucketNA, true, false},
+		{"creat/unlink ENOENT", "creat", "unlink", RetENOENT, offsetBucketNA, false, true},
+		{"open/unlink ENOENT", "open", "unlink", RetENOENT, offsetBucketNA, false, false},
+		{"creat/stat ENOENT", "creat", "stat", RetENOENT, offsetBucketNA, false, true},
+		{"open/stat ENOENT", "open", "stat", RetENOENT, offsetBucketNA, false, false},
+		{"mkdir/getdents64 Success", "mkdir", "getdents64", RetSuccess, offsetBucketNA, true, true},
+		{"creat/read Success zero", "creat", "read", RetSuccess, offsetBucketZero, false, true},
+	}
+	for _, tc := range cases {
+		ck := glusterfsCoverageCell(tc.root, tc.variant, PathSame, TemporalHB,
+			tc.ret, tc.off, tc.isDir)
+		if got := covBoard.cellInPlannable(ck); got != tc.want {
+			t.Fatalf("%s: cellInPlannable = %v, want %v (%+v)", tc.name, got, tc.want, ck)
+		}
+		if tc.want && !covBoard.cellInModel(ck) {
+			t.Fatalf("%s: plannable cell is outside the model: %+v", tc.name, ck)
+		}
+	}
+
+	// Enumeration must agree with the combo-aware plannable forms: the
+	// creat/mkdir Same combo yields only the EEXIST/dir race cells.
+	combo := comboKey{Root: "creat", Variant: "mkdir", Rel: PathSame}
+	var cells []cellKey
+	covBoard.forEachUncoveredCellKey(combo, func(c cellKey) {
+		cells = append(cells, c)
+	})
+	if len(cells) == 0 {
+		t.Fatal("creat/mkdir Same race combo has no enumerable cells")
+	}
+	for _, c := range cells {
+		if c.RetB != RetEEXIST || !c.TypeB {
+			t.Fatalf("creat/mkdir Same enumeration produced a non-race cell: %+v", c)
+		}
 	}
 }
 
@@ -217,9 +282,10 @@ func TestGlusterfsObservedVsModelOnly(t *testing.T) {
 	}
 }
 
-// TestMkdirEEXISTDoesNotDeductPlannablePotential pins the core separation:
-// natural mkdir EEXIST is observed in the model, but it neither removes a
-// plannable cell nor becomes a planner target.
+// TestMkdirEEXISTDoesNotDeductPlannablePotential pins the standalone case:
+// natural existing-object mkdir EEXIST is observed in the model, but it neither
+// removes a plannable cell nor becomes a planner target. The fresh-fresh
+// mkdir EEXIST race forms are covered separately.
 func TestMkdirEEXISTDoesNotDeductPlannablePotential(t *testing.T) {
 	glusterfsCoverageConfig(t, false)
 
@@ -246,8 +312,8 @@ func TestMkdirEEXISTDoesNotDeductPlannablePotential(t *testing.T) {
 }
 
 // TestGlusterfsDirectedPlansArePlannable pins the normal planner invariant:
-// every emitted plan is inside the plannable layer, and the HMDFS-only
-// mkdir/mkdir EEXIST fresh-fresh form never reaches the batch.
+// every emitted plan is inside the plannable layer, standalone mkdir EEXIST
+// stays out, and the fresh-fresh race forms under creation roots are emitted.
 func TestGlusterfsDirectedPlansArePlannable(t *testing.T) {
 	target := hmdfsSmokeTarget(t)
 	hmcfg := glusterfsCoverageConfig(t, false)
@@ -257,16 +323,33 @@ func TestGlusterfsDirectedPlansArePlannable(t *testing.T) {
 	if len(plans) == 0 {
 		t.Fatal("no normal plans generated")
 	}
+	sawMkdirCreatFailure := false
+	sawCreatMkdirEEXIST := false
 	for ck, p := range plans {
 		if !covBoard.cellUncovered(ck) {
 			t.Fatalf("plan outside plannable: %+v (%+v)", ck, p)
 		}
-		if ck.Variant == "mkdir" && ck.RetB == RetEEXIST {
-			t.Fatalf("mkdir EEXIST plan leaked into the normal planner: %+v", ck)
+		// mkdir EEXIST is legal only as a fresh-fresh race under a creation
+		// root; the standalone existing-object form stays unplanned.
+		if ck.Variant == "mkdir" && ck.RetB == RetEEXIST &&
+			!(ck.Rel == PathSame && (ck.Root == "mkdir" || ck.Root == "creat")) {
+			t.Fatalf("standalone mkdir EEXIST plan leaked into the normal planner: %+v", ck)
+		}
+		if ck.Root == "mkdir" && ck.Variant == "creat" &&
+			ck.Rel == PathSame && ck.RetB == RetFailure {
+			sawMkdirCreatFailure = true
+		}
+		if ck.Root == "creat" && ck.Variant == "mkdir" &&
+			ck.Rel == PathSame && ck.RetB == RetEEXIST {
+			sawCreatMkdirEEXIST = true
 		}
 		if ck.Root == "link" || ck.Root == "symlink" {
 			t.Fatalf("disabled dual-path gate emitted a dual root: %+v", ck)
 		}
+	}
+	if !sawMkdirCreatFailure || !sawCreatMkdirEEXIST {
+		t.Fatalf("missing fresh-fresh race plans: mkdir/creat Failure=%v creat/mkdir EEXIST=%v",
+			sawMkdirCreatFailure, sawCreatMkdirEEXIST)
 	}
 }
 

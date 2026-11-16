@@ -1063,7 +1063,7 @@ GlusterFS 规则：
   planner 主动构造的形态；Direction-3（2a variant 偏置、2b exact plan、
   mutation offset/depth 偏置）只消费这一层。
 
-GlusterFS v1 的 plannable 形态由 `directedVariantKinds` 单一来源给出：
+GlusterFS v1 的单操作 plannable 形态由 `directedVariantKinds` 给出：
 
 ```text
 Success-only: open/read/write/stat/pread64/pwrite64/fsync/fdatasync/truncate/
@@ -1072,14 +1072,33 @@ Success+Failure: rmdir/rename(ENOTEMPTY), getxattr(ENODATA)
 Success+EEXIST: setxattr
 ```
 
-`mkdir EEXIST` 自然发生时可进 observed/model，但不进 plannable、不主动构造。
-`link/symlink/readlink` 在 `DualPathCausalEnabled=false` 时也不进 plannable；
-DCT 仍可自然生成并记录。HMDFS 的 plannable 恒等于 model，保持旧行为。
+FailurePolicy 与 fresh-fresh 竞赛是两条独立通道：
 
-构造层同样 profile 化：`freshSameFormsFor(profile)` 为 GlusterFS 只返回
-`RetSuccess` 形态，避免 HMDFS 的 G-c 表（含 `mkdir/mkdir EEXIST` 等）泄漏到
-GlusterFS。`planDirectedCells.add()` 的 plannable 检查是最后一道不变量：
-任何 normal plan 进入 batch 前都必须落在 plannable 内。
+- 单操作、已有对象上的失败按上表收窄：普通 `mkdir EEXIST`、`creat EISDIR`、
+  `open/stat ENOENT` 等不主动构造；
+- fresh-fresh 竞赛使用完整 `freshSameForms` 矩阵，表示 root/variant 在同一
+  fresh 路径上的并发结果（`mkdir/creat Same EISDIR`、`creat/mkdir Same
+  EEXIST`、`mkdir/mkdir Same EEXIST`、`mkdir/rmdir Same ENOENT` 等）。
+
+GlusterFS 的 plannable 因此是 combo-aware 的：
+
+```text
+Rel=Same 且 root ∈ {mkdir, creat}:
+    使用 freshSameForms 中该 (root, variant) 的形态；
+    这是 creation-root Same 的唯一构造通道。
+其它 combo:
+    使用 directedVariantKinds 的单操作形态。
+```
+
+`mkdir EEXIST` 只在 `creat/mkdir Same`、`mkdir/mkdir Same` 这类竞赛 combo 中
+plannable；普通已有目录上的 `mkdir EEXIST` 仍不主动构造。race 中自然可达但
+单操作 model 未列出的形态（如 `mkdir/rmdir ENOENT`、`creat/unlink ENOENT`）
+只在对应 creation-root Same combo 的 model/plannable 中扩展，不污染其它 combo。
+
+`planDirectedCells.add()` 的 plannable 检查是最后一道不变量：任何 normal plan
+进入 batch 前都必须落在 combo-aware plannable 内。HMDFS 的 plannable 恒等于
+model，保持旧行为；`link/symlink/readlink` 在 `DualPathCausalEnabled=false`
+时对 GlusterFS 不进 plannable，DCT 仍可自然生成并记录。
 
 DAG feedback（board learning + DAG corpus/triage）对 HMDFS/GlusterFS 都启用；
 DAG 只消费 client events，`directDagTriage` 的 owner 是第一个非 nil client。
@@ -1495,8 +1514,26 @@ getxattr ERANGE
 setxattr EPERM/EINVAL
 ```
 
-这些路径缺失只作为 LOOKUP 自然观测，不进入 GlusterFS directed/producible
-失败 cell。HMDFS 的失败表保持不变。
+这些限制只针对单操作/已有对象上的失败构造：路径缺失只作为 LOOKUP 自然观测，
+不进入普通 GlusterFS directed/producible 失败 cell。
+
+fresh-fresh 竞赛是独立通道，使用完整 `freshSameForms` 矩阵：
+
+```text
+mkdir/creat Same EISDIR
+creat/mkdir Same EEXIST
+mkdir/mkdir Same EEXIST
+mkdir/rmdir Same ENOENT
+creat/unlink Same ENOENT
+creat/stat Same ENOENT
+mkdir/open Same ENOENT
+...
+```
+
+这些形态只在 `Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo 中进入
+plannable；对应的 model 也只为这些 combo 补充单操作表未列出的 race 形态
+（如 `mkdir/rmdir ENOENT`、`creat/unlink ENOENT`）。普通已有对象上的
+`mkdir EEXIST` 仍然不主动构造。HMDFS 的失败表保持不变。
 
 `causalC2ComboLive` 加入新 variant；`readlink` 仅在 `root=symlink` 时加入。
 `directedVariantCallsSeq` 的 link/symlink 生成 target + fresh linkpath；
@@ -1614,11 +1651,18 @@ producibleOffBuckets:
   全部 NA
 ```
 
-GlusterFS 不把其他失败形态放进 `producible`：`mkdir EEXIST`、
-`unlink/open/stat/... ENOENT`、`link/symlink/readlink` 失败、
-`readlink EINVAL`、`link EMLINK`、`getxattr ERANGE`、
-`setxattr EPERM/EINVAL` 都不进入 directed/producible。自然 DAG 观测可以
-记录为 out-of-model，不压低未覆盖势能。HMDFS 的 producible 表不变。
+GlusterFS 不把其他**单操作/已有对象**失败形态放进 `producible`：
+`mkdir EEXIST`（已有目录）、`unlink/open/stat/... ENOENT`、
+`link/symlink/readlink` 失败、`readlink EINVAL`、`link EMLINK`、
+`getxattr ERANGE`、`setxattr EPERM/EINVAL` 都不进入 directed/producible。
+自然 DAG 观测可以记录为 out-of-model，不压低未覆盖势能。
+
+例外是 fresh-fresh 竞赛：对 `Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo，
+model/plannable 额外采用完整 `freshSameForms` 的 (root, variant, ret, type)
+形态。因此 `mkdir/creat Same Failure`、`creat/mkdir Same EEXIST`、
+`mkdir/mkdir Same EEXIST`、`mkdir/rmdir Same ENOENT`、`creat/unlink Same
+ENOENT` 等 race cell 在这些 combo 内是 model/plannable；普通已有对象上的
+同名返回仍被排除。HMDFS 的 producible 表不变。
 
 实现约束：
 
@@ -1649,9 +1693,12 @@ C2：
 - rmdir/rename RetB=Success/RetFailure（ENOTEMPTY）；
 - getxattr RetB=Success/RetFailure（ENODATA）；
 - setxattr RetB=Success/RetEEXIST（XATTR_CREATE）；
-- 其他失败（mkdir EEXIST、unlink/open/stat/... ENOENT、link/symlink/readlink
-  失败、readlink EINVAL、link EMLINK、getxattr ERANGE、setxattr EPERM/EINVAL）
-  不进入 directed/producible；
+- 其他单操作失败（已有对象的 mkdir EEXIST、unlink/open/stat/... ENOENT、
+  link/symlink/readlink 失败、readlink EINVAL、link EMLINK、getxattr ERANGE、
+  setxattr EPERM/EINVAL）不进入 directed/producible；
+- fresh-fresh 竞赛在 `Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo 内使用
+  `freshSameForms` 的 Failure/EEXIST/ENOENT 形态；这是独立通道，不受上面的
+  单操作失败限制；
 - HardlinkGroupKey 只影响 size/offset 预测；
 - `DualPathCausalEnabled=false` 时 link/symlink causal 插入不生成。
 
