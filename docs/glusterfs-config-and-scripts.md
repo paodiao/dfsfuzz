@@ -36,12 +36,11 @@
 [ ] gluster / glusterd              可执行
 [ ] /root/.ssh/authorized_keys      focal.id_rsa.pub
 [ ] ssh -i focal.id_rsa root@VM     可登录
-[ ] eifuzz_root                     不预置，由 prefill 创建
+[ ] eifuzz_root                     不预置，由首轮 restore 创建
 ```
 
-`prefill.sh` 放 `src/dfs-config/glusterfs/prefill.sh`：manager 会把该目录下所有
-`.sh` 复制到 VM `/root`。它必须直接放、`.sh` 后缀、幂等，并只由 reset client
-执行；scp 不保证执行位，必要时用 `sh /root/prefill.sh` 调用。
+当前没有独立 `prefill.sh`；首轮 `receive_execute` 的 `restore_initial_file_tree()`
+由 reset client 执行，等价于 prefill。不再依赖 manager 复制 prefill 脚本。
 
 ## 1. 3-3 config
 
@@ -208,14 +207,14 @@ restore 清掉，不写回 FileTree。
 ```
 
 - `/root/glusterfs-client` 必须预建；`glusterfs-config.sh` 的 mount 依赖它。
-- `/root/glusterfs-client/eifuzz_root` 不在镜像预置；volume 挂载后由 prefill
+- `/root/glusterfs-client/eifuzz_root` 不在镜像预置；volume 挂载后由首轮 restore
   创建。
 - 不要把这些目录和 baseline 内容混在一起。
 
 镜像命令/软件包检查：
 
 ```text
-rsync        prefill + GlusterFS restore 必需
+rsync        首轮 restore（等价 prefill）+ 每轮 restore 必需
 sshpass      glusterfs-config.sh 的 sshpass 依赖
 gluster      gluster CLI
 glusterd     GlusterFS server 服务
@@ -223,7 +222,7 @@ mount        mount.glusterfs
 timeout/sync coreutils
 ```
 
-缺 `rsync` 时必须 chroot 进镜像安装；否则 prefill/restore 会直接失败。
+缺 `rsync` 时必须 chroot 进镜像安装；否则首轮 restore/每轮 restore 会直接失败。
 
 ## 3. InitialDir 加载
 
@@ -291,63 +290,28 @@ empty_dirs.info
 
 ## 4. prefill 与 restore
 
-### 4.1 prefill
+### 4.1 prefill（由首轮 restore 承担）
 
-只在 volume 首次挂载后执行一次：
+当前没有独立 `prefill.sh`。第一轮 `receive_execute` 的
+`restore_initial_file_tree()` 由 designated reset client 执行，等价于 prefill：
 
 ```bash
-#!/bin/sh
-set -e
-TARGET=/root/glusterfs-client/eifuzz_root
-BASELINE=/home/baseline/glusterfs/
-
-mkdir -p /root/glusterfs-client
-rm -rf "$TARGET"
-mkdir -p "$TARGET"
+chdir("/root")
+rm -rf /root/glusterfs-client/eifuzz_root
 timeout 60s rsync -a --numeric-ids --delete \
-  "$BASELINE" "$TARGET"/
+  /home/baseline/glusterfs/ \
+  /root/glusterfs-client/eifuzz_root/
 sync
 ```
 
 要求：
 
 - 由 client1（3-3 下 `executor_index == 3`）执行；
-- 其他 client 等 prefill finish barrier；
-- prefill 和每轮 restore 使用同一份 baseline；
-- 不直接写 server brick。
-
-#### prefill.sh 放置与自动复制
-
-推荐路径：
-
-```text
-src/dfs-config/glusterfs/prefill.sh
-```
-
-`src/syz-manager/manager.go` 的 `DFSConfigBins` 复制逻辑会遍历
-`src/dfs-config/<dfs_name>/` 下所有 `.sh` 文件，并复制到每台 VM 的 `/root/`。
-因此：
-
-- `prefill.sh` 必须直接放在 `src/dfs-config/glusterfs/`，不能放子目录；
-- 必须使用小写 `.sh` 后缀；
-- 会被复制到所有 VM，server/client 都会有；只由 reset client 执行；
-- scp 不保证保留执行位；仓库里 `chmod +x`，或调用时用
-  `sh /root/prefill.sh`；
-- 脚本必须幂等，不能依赖只执行一次；
-- 不应在 server 上执行。
-
-```bash
-#!/bin/sh
-set -e
-TARGET=/root/glusterfs-client/eifuzz_root
-BASELINE=/home/baseline/glusterfs/
-
-rm -rf "$TARGET"
-mkdir -p "$TARGET"
-timeout 60s rsync -a --numeric-ids --delete \
-  "$BASELINE" "$TARGET"/
-sync
-```
+- 其他 client 等 restore finish barrier；
+- 首轮 restore 和每轮 restore 使用同一份 baseline；
+- 不直接写 server brick；
+- 不新增 `src/dfs-config/glusterfs/prefill.sh`；如果后续需要独立 prologue，
+  再拆脚本并复用同一命令。
 
 ### 4.2 normal restore
 
@@ -505,6 +469,9 @@ timing 由 profile 解析，HMDFS 现有值不变：
 | node-down/node-up | 15s / 30s | normal restore 不调用 |
 
 - `MetadataDelayMs` config 未显式设置时取 profile 默认值，显式值优先；
+- GlusterFS CSAN B 类（Nlink/Mtime）只写
+  `/home/user/dfsfuzz/glusterfs-csan.log`，可用 `GLUSTERFS_CSAN_LOG`
+  覆盖；Go 与 Python symsc 共用该文件，不写 fuzzer 通用日志；
 - GlusterFS rsync 命令为 `timeout 60s rsync -a --numeric-ids --delete ...`；
 - 完整字段表见 `glusterfs-adaptation-plan.md` §10.4。
 
@@ -534,13 +501,12 @@ timing 由 profile 解析，HMDFS 现有值不变：
     symlink target 在调用物化时转 payload 且不逃出测试根；
   - `large_dir.info` 未被读取；
   - 镜像预建 `/root/glusterfs-client`（空挂载点）、`/root/glusterfs-server`、
-    `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 由 prefill 创建；
-  - 镜像包含 `rsync`、`sshpass`、`gluster`/`glusterd`；缺 `rsync` 时 prefill/
-    restore 直接失败；
+    `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 由首轮 restore 创建；
+  - 镜像包含 `rsync`、`sshpass`、`gluster`/`glusterd`；缺 `rsync` 时首轮/
+    每轮 restore 直接失败；
   - `glusterfs-config.sh` 复用，cwd `/root`，sshpass/key 可用；
-  - `prefill.sh` 直接放在 `src/dfs-config/glusterfs/`，会被 manager 复制到
-    `/root`；脚本幂等、可执行，只由 reset client 执行；
-  - prefill 后 baseline 内容在 volume 根；
+  - 当前无独立 `prefill.sh`；首轮 restore 由 reset client 执行，等价 prefill；
+  - 首轮 restore 后 baseline 内容在 volume 根；
   - 每次 execute 前 restore 后树回到 baseline（含 triage/light）；server 只
     参与 barrier；FileTree 保持 baseline，`SyncFileTreeFromFsMd` 停用；
   - metadata delay 未显式配置时取 GlusterFS profile 的 10s，rsync 总超时 60s，

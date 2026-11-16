@@ -2028,7 +2028,8 @@ struct DfsRuntimeOps {
     void (*start_trace)();
     void (*stop_trace)();
 
-    bool (*restore_initial)(bool is_restarting);
+    bool (*restore_initial)(bool is_restarting, bool is_client,
+                            bool is_reset_client);
     bool (*needs_startup_barrier)();
     bool (*needs_restore_barrier)();
 
@@ -2059,9 +2060,11 @@ GlusterFS client 非空（`eifuzz_root`），HMDFS/server 传 `nullptr`。
   - `init_hmdfs_trace` → `rt->init_trace(is_client, trace_root)`
   - `start_hmdfs_trace` → `rt->start_trace()`
   - `stop_collect_hmdfs_trace` → `rt->stop_trace()`
-- B2 只填 trace 字段；restore/cwd/metadata/config/node-up/down 在 D 阶段补。
-- `restore_initial_file_tree` → `rt->restore_initial(is_restarting)`
-- cwd/metadata/config/node-up/down 全部走 runtime。
+- B2 只填 trace 字段；D 阶段已补 restore/cwd/metadata；config/node-up/down
+  仍未实现。
+- `restore_initial_file_tree` →
+  `rt->restore_initial(is_restarting, is_client, is_reset_client)`
+- cwd/metadata 已走 runtime；config/node-up/down 仍为 `nullptr`，继续走现有命令路径。
 
 ### 10.2 GlusterFS hooks
 
@@ -2076,9 +2079,7 @@ GlusterFS client 非空（`eifuzz_root`），HMDFS/server 传 `nullptr`。
   （`in_userspace=1`）；HMDFS/NFS/cephfs client 的 `0` 不走 GlusterFS。该值
   固定为 profile 属性，不能由 `dfs_name` 散写。
 - `common_linux.h:263-270` crash recovery `test_dir`：GlusterFS 当前分支是
-  `/root/glusterfs-client/`；v1 failure/crash 关闭，普通 restore 不走这里。
-  后续启用 crash 时改成固定测试根 `/root/glusterfs-client/eifuzz_root` 或走
-  `DfsRuntimeOps` hook。
+  `/root/glusterfs-client/eifuzz_root`；v1 failure/crash 关闭，普通 restore 不走这里。
 - metadata：
   - client 固定测试根；
   - server 跳过，server fsMd 不进 checker；
@@ -2230,7 +2231,7 @@ root key 或 123456 至少一个可用
 
 配置脚本的 mount 使用相对 `glusterfs-client`；v1 不修改脚本，但必须保证
 cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume 挂载后由
-prefill 创建。
+首轮 `restore_initial` 创建。
 
 ## 11. 初始树、config 与脚本
 
@@ -2257,9 +2258,10 @@ prefill 创建。
   - `/root/glusterfs-server`：server brick 根；
   - `/root/dfs-fuzzing/libucov.so`：LD_PRELOAD；
   - `/root/glusterfs-client/eifuzz_root` 不在镜像预置，挂载 volume 后由
-    prefill 创建。
-- `prefill.sh` 放 `src/dfs-config/glusterfs/`：manager 会复制该目录下所有
-  `.sh` 到 VM `/root`；必须直接放、`.sh` 后缀、幂等、只由 reset client 执行。
+    首轮 `restore_initial` 创建。
+- 当前没有独立 `prefill.sh`：首轮 restore 由 reset client 执行
+  `rm -rf eifuzz_root` + rsync baseline + sync，等价于 prefill；如果后续需要
+  独立 prologue，再拆出脚本。
 
 ### 11.2 3-3 config
 
@@ -2287,7 +2289,8 @@ prefill 创建。
 ### 11.3 脚本
 
 - `glusterfs-config.sh`：4 参数 `start_ip srv_cnt client_cnt mode`；
-  volume create/start；client mount 带 timeout 选项；prefill 独立执行一次。
+  volume create/start；client mount 带 timeout 选项；首轮 restore 负责初始化
+  `eifuzz_root`，不单独调用 prefill 脚本。
 - `glusterfs-node-up.sh`：5 参数
   `start_ip srv_cnt client_cnt mode cur_idx`；
   server 重启 glusterd；client umount/remount 带 timeout 选项。
@@ -2509,10 +2512,9 @@ prefill 创建。
     `JoinRoot()` 在 HMDFS/GlusterFS 下分别为 `merge_view`/`""`；
     `in_userspace=1`、crash recovery test_dir 记录为 profile 行为。
   - 镜像预建 `/root/glusterfs-client`、`/root/glusterfs-server`、
-    `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 由 prefill 创建。
-  - 镜像包含 `rsync`/`sshpass`/`glusterd`；`prefill.sh` 放在
-    `src/dfs-config/glusterfs/`，被 manager 复制到 `/root`，只由 reset
-    client 执行，脚本幂等。
+    `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 由首轮 restore 创建。
+  - 镜像包含 `rsync`/`sshpass`/`glusterd`；当前不单独调用 `prefill.sh`，
+    首轮 restore 由 reset client 执行，后续如需独立 prologue 再拆脚本。
   - QEMU/SSH：原 Monarch 镜像、默认 `ip=`、key 登录；不把 123456 密码登录
     接入 fuzzer。`glusterfs-config.sh` 复用，cwd `/root`、sshpass/密码或 key
     可用、挂载点存在。
@@ -2746,7 +2748,7 @@ batch 预算决定。
   smoke harness（复用生产 trace 合并逻辑，执行器源文件不变）。
 - `src/vm/qemu/qemu.go`：原镜像启动、GlusterFS server data.img、HMDFS gate；
   key 登录与 SSH 配置。
-- `src/dfs-config/glusterfs/*`：config/node-up/node-down/prefill；config 脚本
-  复用，sshpass/key/cwd/挂载点前提。
+- `src/dfs-config/glusterfs/*`：config/node-up/node-down；config 脚本
+  复用，sshpass/key/cwd/挂载点前提；prefill 由首轮 restore 承担。
 - `HorcruxSourceCode/generate_test_files.py`：shared 清单。
 - `docs/glusterfs-tracer-implementation-spec.md`：BPF raw 细节；冲突以本文为准。

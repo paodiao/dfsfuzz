@@ -171,7 +171,8 @@ docs/kernel-build-glusterfs-bpf.md
 - `data.img` 不启用；QEMU 仍会挂给 server，但 mkfs/mount 保持注释，brick 在 rootfs 的 `/root/glusterfs-server`。
 - host 用 `generate_test_files.py shared ...` 生成一棵树；树本体复制到 client 镜像 `/home/baseline/glusterfs/`，清单为 `shared.file/.dir/.tmpdir` 和 `empty_dirs.info`。
 - GlusterFS 不使用 `large_dir.info`；生成时 `--num-large-files 0`。
-- client1 挂载后运行 `prefill.sh`：`rm -rf` 固定测试根 + rsync baseline + `sync`；其他 client 只等待 barrier。
+- client1 挂载后由首轮 restore 执行 `rm -rf` 固定测试根 + rsync baseline +
+  `sync`；其他 client 只等待 barrier。当前没有独立 `prefill.sh`。
 - 每轮 restore 复用同一份 baseline；reset client 固定 `executor_index == server_num`。
 - CSAN：
   - `enable_csan=true`，`enable_c2san=false`。
@@ -1192,8 +1193,9 @@ FileTree。详见 `glusterfs-config-and-scripts.md` §3。
 > `glusterfs-adaptation-plan.md` §10。
 
 不新增 `dfs_trace.h/.cc`。在 `src/executor/dfs_runtime.h/.cc` 定义
-`DfsRuntimeOps`；B2 只实现 trace 子集，restore/cwd/metadata/config/node-up/down
-在 D 阶段补：
+`DfsRuntimeOps`；trace 子集在 B2 已实现，D 阶段已补
+restore/cwd/metadata；config/node-up/down 仍为 `nullptr`。完整字段表见
+`docs/glusterfs-adaptation-plan.md` §10.1：
 
 ```cpp
 struct DfsRuntimeOps {
@@ -1348,26 +1350,24 @@ restore_initial_file_tree()
 /root/glusterfs-client/eifuzz_root
 ```
 
-prefill（volume 挂载后只执行一次，client1）：
+prefill（volume 挂载后由首轮 restore 执行，client1）：
 
 ```bash
 rm -rf /root/glusterfs-client/eifuzz_root
-mkdir -p /root/glusterfs-client/eifuzz_root
 timeout 60s rsync -a --numeric-ids --delete \
   /home/baseline/glusterfs/ \
   /root/glusterfs-client/eifuzz_root/
 sync
 ```
 
-prefill 和 restore 共用同一份 baseline；prefill 后其他 client 通过 replica 看到同一棵树。
+prefill 和 restore 共用同一份 baseline；首轮 restore 完成后其他 client 通过 replica 看到同一棵树。
 
 每次 `receive_execute` 前的 restore 流程（含 triage/light）：
 
 ```text
 restore start barrier（所有节点）
-chdir("/")
+chdir("/root")
 reset client: rm -rf /root/glusterfs-client/eifuzz_root
-              mkdir -p /root/glusterfs-client/eifuzz_root
               timeout 60s rsync -a --numeric-ids --delete \
                 /home/baseline/glusterfs/ \
                 /root/glusterfs-client/eifuzz_root/
@@ -1390,8 +1390,8 @@ restore finish barrier
 - normal restore 不重启 server/volume，不调用 `glusterfs-node-down.sh`。
 - `glusterfs-node-down.sh` 只在 failure/crash 场景使用；当前 v1 不启用 failure。
 - 恢复后其他 client 若看到旧 dentry/attr，再评估 `drop_caches` / remount 回退。
-- cwd/metadata/trace/config/node-up/down 统一由 `DfsRuntimeOps` 分发，见总计划 §10；
-  不要只在这里保留一个 `restore_initial_file_tree` 分支。
+- cwd/metadata/trace/restore 已由 `DfsRuntimeOps` 分发；config/node-up/down
+  仍待实现，见总计划 §10；不要只在这里保留一个 `restore_initial_file_tree` 分支。
 
 ## 14. 测试与验收
 
