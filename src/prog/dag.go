@@ -450,7 +450,8 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 			// symlink's B-side type is the canonical target, not the
 			// linkpath. The tracer has no target inode, so resolve it from the
 			// producing program's call prefix plus a deterministic
-			// cross-client fallback.
+			// cross-client fallback. ps here is the full server+client batch;
+			// pathTypeBefore requires that shape with the absolute Serv_num.
 			matchIdx := matchEventToCall(ev, p, tscoffs)
 			if isDir, known := pathTypeBefore(ps, ev.ProgIdx, matchIdx, hmcfg.Serv_num,
 				hmcfg.FileTree, v.OldPath); known {

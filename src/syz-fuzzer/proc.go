@@ -850,6 +850,10 @@ func (proc *Proc) rootProg(ps []*prog.Prog) *prog.Prog {
 
 func (proc *Proc) mutateDfs(ps []*prog.Prog, corpus [][]*prog.Prog) {
 	if proc.fuzzer.config.DFSName == "glusterfs" {
+		// The planner here is intentionally client-only. DAG helpers such as
+		// pathTypeBefore require the full server+client batch and an absolute
+		// Serv_num; do not call them with cps unless servNum is 0 or the
+		// caller rebases ProgIdx explicitly.
 		cps := proc.clientView(ps)
 		if len(cps) == 0 {
 			return

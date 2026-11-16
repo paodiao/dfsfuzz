@@ -20,6 +20,12 @@ const (
 //  3. scan other client programs from the beginning in program order and use
 //     the first call that establishes target's type.
 //
+// ps MUST be the full server+client batch that BuildVertices receives and
+// servNum MUST be the absolute server-slot count: idx < servNum skips servers.
+// Do not pass a client-only view (e.g. hmcfg.ClientView(ps)) together with a
+// non-zero servNum: the leading client programs would be mistaken for servers.
+// For a client-only slice pass servNum=0.
+//
 // Cross-program order is not a visibility proof; it is only a deterministic
 // fallback for fresh paths and is used solely for the DAG B-side type.
 func pathTypeBefore(ps []*Prog, progIdx, callIdx, servNum int,
