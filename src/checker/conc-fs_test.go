@@ -159,6 +159,20 @@ func TestInitTreeSubsetFreshParentFallback(t *testing.T) {
 	}
 }
 
+func TestSetEnvReplaces(t *testing.T) {
+	got := setEnv([]string{"PATH=/bin", "GLUSTERFS_CSAN_LOG=/old", "X=1"},
+		"GLUSTERFS_CSAN_LOG", "/new")
+	want := []string{"PATH=/bin", "X=1", "GLUSTERFS_CSAN_LOG=/new"}
+	if len(got) != len(want) {
+		t.Fatalf("setEnv = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("setEnv = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestCompareFileMetaGlusterfs(t *testing.T) {
 	file := func() prog.FileMetadata {
 		return prog.FileMetadata{

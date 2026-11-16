@@ -12,6 +12,7 @@ import utils
 BTRFS_ERRSTR = ""
 
 _DIAG_PATH = os.environ.get("GLUSTERFS_CSAN_LOG")
+_DIAG_CHECK = os.environ.get("GLUSTERFS_CSAN_CHECK", "-")
 _DIAG_COUNTS = {"nlink": 0, "mtime": 0}
 
 
@@ -22,8 +23,9 @@ def _glusterfs_csan_diag(kind, msg):
     _DIAG_COUNTS[kind] = _DIAG_COUNTS.get(kind, 0) + 1
     if _DIAG_COUNTS[kind] > 32:
         return
-    line = "%s pid=%d kind=%s %s\n" % (
-        time.strftime("%Y/%m/%d %H:%M:%S"), os.getpid(), kind, msg)
+    line = "%s pid=%d check=%s kind=%s %s\n" % (
+        time.strftime("%Y/%m/%d %H:%M:%S"), os.getpid(),
+        _DIAG_CHECK, kind, msg)
     try:
         with open(_DIAG_PATH, "a") as f:
             f.write(line)

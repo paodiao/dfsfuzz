@@ -18,11 +18,24 @@ import (
 
 type Calls []*prog.Call
 
+// setEnv replaces key in a child environment slice. os.Environ() may already
+// contain key; appending would create duplicate names whose getenv winner is
+// implementation-dependent.
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, prefix) {
+			out = append(out, entry)
+		}
+	}
+	return append(out, prefix+value)
+}
+
 func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 	fsMds []map[string]prog.FileMetadata, srvNum int,
 	fsType string, cfg_mode string, initIP string, testdirIno uint64,
 	ft *prog.FileTree) (bool, []string) {
-
 	var glusterfsDiag *glusterfsCSANDiag
 	if fsType == "glusterfs" {
 		glusterfsDiag = newGlusterfsCSANDiag()
@@ -212,8 +225,13 @@ func ConcFSCheck(progs []*prog.Prog, infos []*ipc.ProgInfo,
 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
-		"GLUSTERFS_CSAN_LOG="+glusterfsCSANLogPath())
+	if glusterfsDiag != nil {
+		env := os.Environ()
+		env = setEnv(env, "GLUSTERFS_CSAN_LOG", glusterfsCSANLogPath())
+		env = setEnv(env, "GLUSTERFS_CSAN_CHECK",
+			fmt.Sprintf("%d", glusterfsDiag.check))
+		cmd.Env = env
+	}
 
 	err = cmd.Run()
 	if err != nil {
