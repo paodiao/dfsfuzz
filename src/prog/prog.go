@@ -162,6 +162,11 @@ type SpecialCalls struct {
 	StatId      int
 	FdatasyncId int
 	NanosleepId int
+	LinkId      int
+	SymlinkId   int
+	ReadlinkId  int
+	GetxattrId  int
+	SetxattrId  int
 	CrashClient int
 	CrashServer int
 }

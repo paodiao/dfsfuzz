@@ -197,6 +197,7 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 	tscoffs []int64) ([]DAGVertex, *DagDiag) {
 
 	diag := &DagDiag{Events: len(events)}
+	glusterfs := hmcfg != nil && hmcfg.ProfileOrDefault().Name == "glusterfs"
 
 	// 1. per-node ino -> path (inos are node-local; cross-node the same file
 	// has a different ino, so lookups must use the event's own node first).
@@ -407,7 +408,19 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 			case FuncRename:
 				v.OldPath, v.Path = extractRenamePaths(call)
 			case FuncLookup:
-				v.Path, v.OldPath = lookupPath(ev, call, inoToPathByNode, inoToPath)
+				if glusterfs {
+					v.Path = ev.Path
+				} else {
+					v.Path, v.OldPath = lookupPath(ev, call, inoToPathByNode, inoToPath)
+				}
+			case FuncLink:
+				if glusterfs {
+					v.OldPath, v.Path = glusterfsLinkVertexPaths(call)
+				}
+			case FuncSymlink:
+				if glusterfs {
+					v.Path, v.OldPath = glusterfsSymlinkVertexPaths(call)
+				}
 			default:
 				v.Path = extractPathFromCall(call)
 				if v.Path == "" {
@@ -993,6 +1006,22 @@ func nearestWindowOfFunc(ev *HmdfsTraceEvent, p *Prog, tscoffs []int64) (delta i
 // the merge-view root's i_ino. The root is never part of the fsMd snapshot,
 // so root-parent lookups need this sentinel.
 const hmdfsRootMergeIno = 6
+
+// glusterfsLinkVertexPaths reads link(old, new): Path is the new linkpath and
+// OldPath is the existing source. The hardlink alias itself is program-local
+// and never authoritative.
+func glusterfsLinkVertexPaths(call *Call) (oldPath, newPath string) {
+	return extractPathFromCallByArgIdx(call, 0), extractPathFromCallByArgIdx(call, 1)
+}
+
+// glusterfsSymlinkVertexPaths reads symlink(target, linkpath): Path is the
+// linkpath and OldPath is the canonical test-root target. The on-wire payload
+// is relative to the linkpath parent.
+func glusterfsSymlinkVertexPaths(call *Call) (linkPath, canonicalTarget string) {
+	linkPath = extractPathFromCallByArgIdx(call, 1)
+	return linkPath, symlinkCanonicalTarget(linkPath,
+		extractPathFromCallByArgIdx(call, 0))
+}
 
 // lookupPath resolves the looked-up path component of a LOOKUP event. The
 // event carries the parent inode (ev.Ino) and, for positive lookups, the

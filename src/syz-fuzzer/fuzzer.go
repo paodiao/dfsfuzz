@@ -494,6 +494,16 @@ func main() {
 			fuzzer.sCalls.RenameId = id
 		case "chmod":
 			fuzzer.sCalls.ChmodId = id
+		case "link":
+			fuzzer.sCalls.LinkId = id
+		case "symlink":
+			fuzzer.sCalls.SymlinkId = id
+		case "readlink":
+			fuzzer.sCalls.ReadlinkId = id
+		case "getxattr":
+			fuzzer.sCalls.GetxattrId = id
+		case "setxattr":
+			fuzzer.sCalls.SetxattrId = id
 		//case "chown":
 		//fuzzer.sCalls.ChownId = id
 		case "truncate":

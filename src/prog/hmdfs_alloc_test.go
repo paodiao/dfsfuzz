@@ -115,6 +115,16 @@ func hmdfsSmokeSpecialCalls(t *testing.T, target *Target) *SpecialCalls {
 			sc.RenameId = id
 		case "chmod":
 			sc.ChmodId = id
+		case "link":
+			sc.LinkId = id
+		case "symlink":
+			sc.SymlinkId = id
+		case "readlink":
+			sc.ReadlinkId = id
+		case "getxattr":
+			sc.GetxattrId = id
+		case "setxattr":
+			sc.SetxattrId = id
 		case "truncate":
 			sc.TruncateId = id
 		case "stat":

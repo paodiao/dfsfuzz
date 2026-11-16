@@ -2384,6 +2384,14 @@ func (r *randGen) freshChildPath(dirPath, kind string) string {
 	return joinTestPath(dirPath, "mut_dir_"+randomSuffix(r.Rand))
 }
 
+// freshLinkPath creates a fresh linkpath next to target. The target path owns
+// the cell/relation; linkpath is only a program-local binding and is never
+// inserted into FileTree.
+func (r *randGen) freshLinkPath(target, kind string) string {
+	parent := parentDirOrRoot(target)
+	return joinTestPath(parent, "Eris_"+kind+"_"+randomSuffix(r.Rand))
+}
+
 func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op ConcurrentOp, basePath string, cid string, lcs *LayeredChoiceStrategy, ExistingFd *ResultArg, UseExistFd bool, offsetRel OffsetRelationType, sharedOffset uint64) ([]*Call, []*WriteInfo, string) {
 	var calls []*Call
 	var writeinfos []*WriteInfo
@@ -2796,7 +2804,12 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 			}
 		}
 	}
-	rootCalls := r.generateCallByName(s, sCalls, rootCallName, basePath, basePath2, cid0, nil, false, rootFileSize, rootFlags)
+	rootPath, rootPath2 := basePath, basePath2
+	if rootCallName == "link" || rootCallName == "symlink" {
+		rootPath2 = basePath
+		rootPath = r.freshLinkPath(basePath, rootCallName)
+	}
+	rootCalls := r.generateCallByName(s, sCalls, rootCallName, rootPath, rootPath2, cid0, nil, false, rootFileSize, rootFlags)
 	if len(rootCalls) == 0 || hasNilCall(rootCalls) {
 		// A nil call would panic at Serialize; return an empty set so the
 		// caller falls back to the legacy generators.
@@ -2884,7 +2897,12 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 				concurrentFlags = r.target.GetConst("O_DIRECTORY")
 			}
 		}
-		concurrentCalls := r.generateCallByName(s, sCalls, variant.CallName, concurrentPath, concurrentPath2, cid, nil, false, concurrentFileSize, concurrentFlags)
+		variantPath, variantPath2 := concurrentPath, concurrentPath2
+		if variant.CallName == "link" || variant.CallName == "symlink" {
+			variantPath2 = concurrentPath
+			variantPath = r.freshLinkPath(concurrentPath, variant.CallName)
+		}
+		concurrentCalls := r.generateCallByName(s, sCalls, variant.CallName, variantPath, variantPath2, cid, nil, false, concurrentFileSize, concurrentFlags)
 		if len(concurrentCalls) == 0 || hasNilCall(concurrentCalls) {
 			// A nil call would panic at Serialize; keep the node slot with the
 			// stat fallback instead.
@@ -2969,6 +2987,187 @@ func (r *randGen) chooseRootCallName(ct *ChoiceTable, bias int) string {
 		}
 	}
 	return ""
+}
+
+// specialCallMeta resolves a SpecialCalls id by index, or falls back to the
+// syscall name. Tests often build a bare SpecialCalls; production initializes
+// every id in syz-fuzzer.
+func (r *randGen) specialCallMeta(sCalls *SpecialCalls, id int, name string) *Syscall {
+	if sCalls != nil && id > 0 && id < len(r.target.Syscalls) {
+		return r.target.Syscalls[id]
+	}
+	for _, meta := range r.target.Syscalls {
+		if meta != nil && meta.Name == name {
+			return meta
+		}
+	}
+	return nil
+}
+
+func (r *randGen) pathPtrArg(s *state, typ Type, path string) Arg {
+	ptrType, ok := typ.(*PtrType)
+	if !ok {
+		return nil
+	}
+	data := MakeDataArg(ptrType.Elem, DirIn, []byte(path+"\x00"))
+	return r.allocAddr(s, ptrType, DirIn, data.Size(), data)
+}
+
+func (r *randGen) randomXattrName() string {
+	return "user." + r.randomString(6)
+}
+
+func (r *randGen) generateLinkCallWithPaths(s *state, sCalls *SpecialCalls, oldPath, newPath string) *Call {
+	meta := r.specialCallMeta(sCalls, func() int {
+		if sCalls == nil {
+			return 0
+		}
+		return sCalls.LinkId
+	}(), "link")
+	if meta == nil || len(meta.Args) < 2 {
+		return nil
+	}
+	oldArg := r.pathPtrArg(s, meta.Args[0].Type, oldPath)
+	newArg := r.pathPtrArg(s, meta.Args[1].Type, newPath)
+	if oldArg == nil || newArg == nil {
+		return nil
+	}
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{oldArg, newArg}
+	r.target.assignSizesCall(c)
+	s.analyze(c)
+	return c
+}
+
+func (r *randGen) generateSymlinkCallWithPath(s *state, sCalls *SpecialCalls, target, linkPath string) *Call {
+	meta := r.specialCallMeta(sCalls, func() int {
+		if sCalls == nil {
+			return 0
+		}
+		return sCalls.SymlinkId
+	}(), "symlink")
+	if meta == nil || len(meta.Args) < 2 {
+		return nil
+	}
+	payload := symlinkPayload(linkPath, target)
+	if payload == "" {
+		return nil
+	}
+	targetArg := r.pathPtrArg(s, meta.Args[0].Type, payload)
+	linkArg := r.pathPtrArg(s, meta.Args[1].Type, linkPath)
+	if targetArg == nil || linkArg == nil {
+		return nil
+	}
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{targetArg, linkArg}
+	r.target.assignSizesCall(c)
+	s.analyze(c)
+	return c
+}
+
+func (r *randGen) generateReadlinkCallWithPath(s *state, sCalls *SpecialCalls, path string) *Call {
+	meta := r.specialCallMeta(sCalls, func() int {
+		if sCalls == nil {
+			return 0
+		}
+		return sCalls.ReadlinkId
+	}(), "readlink")
+	if meta == nil || len(meta.Args) < 3 {
+		return nil
+	}
+	pathArg := r.pathPtrArg(s, meta.Args[0].Type, path)
+	bufPtrType, ok := meta.Args[1].Type.(*PtrType)
+	if !ok {
+		return nil
+	}
+	const bufSize = 4096
+	buf := MakeOutDataArg(bufPtrType.Elem, DirOut, bufSize)
+	bufArg := r.allocAddr(s, bufPtrType, DirIn, buf.Size(), buf)
+	sizeType, ok := meta.Args[2].Type.(*LenType)
+	if !ok {
+		return nil
+	}
+	sizeArg := MakeConstArg(sizeType, DirIn, bufSize)
+	if pathArg == nil {
+		return nil
+	}
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{pathArg, bufArg, sizeArg}
+	r.target.assignSizesCall(c)
+	s.analyze(c)
+	return c
+}
+
+func (r *randGen) generateGetxattrCallWithPath(s *state, sCalls *SpecialCalls, path, name string) *Call {
+	meta := r.specialCallMeta(sCalls, func() int {
+		if sCalls == nil {
+			return 0
+		}
+		return sCalls.GetxattrId
+	}(), "getxattr")
+	if meta == nil || len(meta.Args) < 4 {
+		return nil
+	}
+	pathArg := r.pathPtrArg(s, meta.Args[0].Type, path)
+	nameArg := r.pathPtrArg(s, meta.Args[1].Type, name)
+	bufPtrType, ok := meta.Args[2].Type.(*PtrType)
+	if !ok {
+		return nil
+	}
+	const bufSize = 256
+	buf := MakeOutDataArg(bufPtrType.Elem, DirOut, bufSize)
+	bufArg := r.allocAddr(s, bufPtrType, DirIn, buf.Size(), buf)
+	sizeType, ok := meta.Args[3].Type.(*LenType)
+	if !ok {
+		return nil
+	}
+	sizeArg := MakeConstArg(sizeType, DirIn, bufSize)
+	if pathArg == nil || nameArg == nil {
+		return nil
+	}
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{pathArg, nameArg, bufArg, sizeArg}
+	r.target.assignSizesCall(c)
+	s.analyze(c)
+	return c
+}
+
+func (r *randGen) generateSetxattrCallWithPath(s *state, sCalls *SpecialCalls, path, name, value string) *Call {
+	meta := r.specialCallMeta(sCalls, func() int {
+		if sCalls == nil {
+			return 0
+		}
+		return sCalls.SetxattrId
+	}(), "setxattr")
+	if meta == nil || len(meta.Args) < 5 {
+		return nil
+	}
+	pathArg := r.pathPtrArg(s, meta.Args[0].Type, path)
+	nameArg := r.pathPtrArg(s, meta.Args[1].Type, name)
+	valPtrType, ok := meta.Args[2].Type.(*PtrType)
+	if !ok {
+		return nil
+	}
+	valData := MakeDataArg(valPtrType.Elem, DirIn, []byte(value))
+	valArg := r.allocAddr(s, valPtrType, DirIn, valData.Size(), valData)
+	sizeType, ok := meta.Args[3].Type.(*LenType)
+	if !ok {
+		return nil
+	}
+	sizeArg := MakeConstArg(sizeType, DirIn, uint64(len(value)))
+	flagsType, ok := meta.Args[4].Type.(*FlagsType)
+	if !ok {
+		return nil
+	}
+	flagsArg := MakeConstArg(flagsType, DirIn, 0)
+	if pathArg == nil || nameArg == nil {
+		return nil
+	}
+	c := MakeCall(meta, nil)
+	c.Args = []Arg{pathArg, nameArg, valArg, sizeArg, flagsArg}
+	r.target.assignSizesCall(c)
+	s.analyze(c)
+	return c
 }
 
 func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName string, path string, path2 string, cid string, ExistingFd *ResultArg, UseExistFd bool, fileSize uint64, flags uint64) []*Call {
@@ -3074,6 +3273,32 @@ func (r *randGen) generateCallByName(s *state, sCalls *SpecialCalls, callName st
 		calls = append(calls, r.generateTruncateCallWithPath(s, sCalls, path, fileSize))
 	case "chmod":
 		calls = append(calls, r.generateChmodCallWithPath(s, sCalls, path))
+	case "link":
+		oldPath := path2
+		newPath := path
+		if oldPath == "" {
+			oldPath = path
+			if path != "" {
+				newPath = path + "._link_" + randomSuffix(r.Rand)
+			}
+		}
+		calls = append(calls, r.generateLinkCallWithPaths(s, sCalls, oldPath, newPath))
+	case "symlink":
+		target := path2
+		linkPath := path
+		if target == "" {
+			target = "q0"
+		}
+		if linkPath == "" {
+			linkPath = "Eris_link_" + randomSuffix(r.Rand)
+		}
+		calls = append(calls, r.generateSymlinkCallWithPath(s, sCalls, target, linkPath))
+	case "readlink":
+		calls = append(calls, r.generateReadlinkCallWithPath(s, sCalls, path))
+	case "getxattr":
+		calls = append(calls, r.generateGetxattrCallWithPath(s, sCalls, path, r.randomXattrName()))
+	case "setxattr":
+		calls = append(calls, r.generateSetxattrCallWithPath(s, sCalls, path, r.randomXattrName(), "bar"))
 	case "mkdir":
 		calls = append(calls, r.generateMkdirCallWithPath(s, sCalls, path))
 	case "rmdir":

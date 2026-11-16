@@ -3,6 +3,7 @@ package prog
 import (
 	"fmt"
 	"math/rand"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -274,6 +275,62 @@ func joinTestPath(dir, name string) string {
 		return name
 	}
 	return dir + "/" + name
+}
+
+// parentDirOrRoot returns the test-root-relative parent of path. Top-level
+// names such as "q0" have no parent; filepath.Dir would report ".".
+func parentDirOrRoot(path string) string {
+	parent := filepath.Dir(path)
+	if parent == "." || parent == "/" || parent == "\\" {
+		return ""
+	}
+	return filepath.ToSlash(parent)
+}
+
+// symlinkCanonicalTarget resolves a symlink payload relative to the linkpath
+// parent into a test-root-relative path. Only the test root may be addressed
+// absolutely; escaping paths return "". Symlink payload itself is never used
+// as a FileTree node.
+func symlinkCanonicalTarget(linkPath, payload string) string {
+	p := strings.TrimSpace(payload)
+	if p == "" {
+		return ""
+	}
+	if strings.HasPrefix(p, "/") {
+		// Absolute payloads outside the test root are host paths and must not
+		// become FileTree coordinates.
+		if p != "/eifuzz_root" && !strings.HasPrefix(p, "/eifuzz_root/") {
+			return ""
+		}
+		p = strings.TrimPrefix(p, "/")
+		if p == "eifuzz_root" {
+			return ""
+		}
+		p = strings.TrimPrefix(p, "eifuzz_root/")
+		p = path.Clean(p)
+	} else {
+		p = path.Clean(path.Join(parentDirOrRoot(linkPath), p))
+	}
+	if p == "." || p == ".." || strings.HasPrefix(p, "../") {
+		return ""
+	}
+	return p
+}
+
+// symlinkPayload materializes the program-visible symlink target for a
+// canonical test-root path. The payload is relative to the linkpath parent, so
+// the kernel resolves it back to canonicalTarget without escaping the root.
+func symlinkPayload(linkPath, canonicalTarget string) string {
+	target := strings.TrimPrefix(strings.TrimSpace(canonicalTarget), "/")
+	if target == "" {
+		return ""
+	}
+	parent := parentDirOrRoot(linkPath)
+	rel, err := filepath.Rel(filepath.FromSlash("/"+parent), filepath.FromSlash("/"+target))
+	if err != nil || rel == "" {
+		return ""
+	}
+	return filepath.ToSlash(rel)
 }
 
 func normalizeRelativePath(path string) string {
