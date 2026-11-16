@@ -155,7 +155,8 @@ var offsetVariants = map[string]bool{"pread64": true, "pwrite64": true, "truncat
 func isModifierCall(name string) bool {
 	switch name {
 	case "mkdir", "creat", "rmdir", "unlink", "rename",
-		"write", "pwrite64", "truncate", "chmod", "fsync", "fdatasync":
+		"write", "pwrite64", "truncate", "chmod", "fsync", "fdatasync",
+		"link", "symlink", "setxattr":
 		return true
 	}
 	return false
@@ -1325,7 +1326,7 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 // the func cannot be predicted from the name, so the shape guard leaves the
 // plan alone. open is classified by the planned flags: the directed generator
 // never sets O_CREAT, so only FileOpen/DirOpen are possible.
-func callFuncClass(call string, isDir bool) (uint32, bool) {
+func callFuncClass(profile *DFSProfile, call string, isDir bool) (uint32, bool) {
 	switch call {
 	case "write", "pwrite64":
 		return FuncWrite, true
@@ -1354,19 +1355,46 @@ func callFuncClass(call string, isDir bool) (uint32, bool) {
 			return FuncDirOpen, true
 		}
 		return FuncFileOpen, true
+	case "link":
+		if profileIncludesGlusterfsFuncs(profile) {
+			return FuncLink, true
+		}
+	case "symlink":
+		if profileIncludesGlusterfsFuncs(profile) {
+			return FuncSymlink, true
+		}
+	case "readlink":
+		if profileIncludesGlusterfsFuncs(profile) {
+			return FuncReadlink, true
+		}
+	case "getxattr":
+		if profileIncludesGlusterfsFuncs(profile) {
+			return FuncGetxattr, true
+		}
+	case "setxattr":
+		if profileIncludesGlusterfsFuncs(profile) {
+			return FuncSetxattr, true
+		}
 	}
 	return 0, false
+}
+
+// profileIncludesGlusterfsFuncs reports whether the profile can emit the
+// GlusterFS-only FuncIDs 16..20. HMDFS has no tracepoints for link/symlink/
+// readlink/xattr, so it must keep returning ok=false for them.
+func profileIncludesGlusterfsFuncs(profile *DFSProfile) bool {
+	return profile != nil && profile.Name == "glusterfs"
 }
 
 // callFuncClasses mirrors funcMatchesCall for the shape guards: creat() runs
 // both the create and file-open paths, so it maps to two traced funcs. The
 // guards enumerate every func a realized call may fire, so a known subset
 // never suppresses the unknown half.
-func callFuncClasses(call string, isDir bool) ([]uint32, bool) {
+func callFuncClasses(profile *DFSProfile, call string, isDir bool) ([]uint32, bool) {
 	if call == "creat" {
 		return []uint32{FuncCreate, FuncFileOpen}, true
 	}
-	f, ok := callFuncClass(call, isDir)
+	f, ok := callFuncClass(profile, call, isDir)
 	if !ok {
 		return nil, false
 	}
@@ -1380,10 +1408,10 @@ func callFuncClasses(call string, isDir bool) ([]uint32, bool) {
 // lookup fails, or it succeeds and the op func itself returns ENOENT. Both
 // shapes must be enumerated, otherwise a recorded lookup shape (hashShape is
 // call-name agnostic) could mark the unknown op-func shape as covered.
-func predictedEventFuncs(call string, isDir bool, ret RetBucket, temporal TemporalRel) ([]uint32, bool) {
+func predictedEventFuncs(profile *DFSProfile, call string, isDir bool, ret RetBucket, temporal TemporalRel) ([]uint32, bool) {
 	if ret == RetENOENT {
 		if temporal == TemporalConcurrent {
-			funcs, ok := callFuncClasses(call, isDir)
+			funcs, ok := callFuncClasses(profile, call, isDir)
 			if !ok {
 				return nil, false
 			}
@@ -1391,7 +1419,7 @@ func predictedEventFuncs(call string, isDir bool, ret RetBucket, temporal Tempor
 		}
 		return []uint32{FuncLookup}, true
 	}
-	return callFuncClasses(call, isDir)
+	return callFuncClasses(profile, call, isDir)
 }
 
 // dagRelOfPathRelation maps a DCT/planner relation onto the classifier's
@@ -1437,6 +1465,7 @@ func rootOffsetBuckets(root string, freshFD bool) []uint64 {
 func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, r *randGen) (map[cellKey]*directedPlan, []cellKey) {
 	planByCell := make(map[cellKey]*directedPlan)
 	var cells []cellKey
+	profile := hmcfg.ProfileOrDefault()
 	view := buildDirectedView(lcs.FileTree, hmcfg.Persistence_dir)
 	if len(view.bNodes) == 0 {
 		return planByCell, cells
@@ -1504,11 +1533,11 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 		if !ok {
 			return false
 		}
-		aFuncs, ok := callFuncClasses(plan.Cell.Combo.Root, a.isDir)
+		aFuncs, ok := callFuncClasses(profile, plan.Cell.Combo.Root, a.isDir)
 		if !ok {
 			return false
 		}
-		bFuncs, ok := predictedEventFuncs(plan.Cell.Combo.Variant, plan.Cell.TypeB, plan.Cell.RetB, plan.Cell.Temporal)
+		bFuncs, ok := predictedEventFuncs(profile, plan.Cell.Combo.Variant, plan.Cell.TypeB, plan.Cell.RetB, plan.Cell.Temporal)
 		if !ok {
 			return false
 		}

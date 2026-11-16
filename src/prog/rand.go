@@ -2727,13 +2727,13 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 		return ps
 	}
 
-	if IsDirOnlyCall(rootCallName) {
+	if r.isDirOnlyCall(rootCallName) {
 		dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
 		if dirNode == nil {
 			return ps
 		}
 		basePath = dirNode.FullPath
-	} else if IsFileOnlyCall(rootCallName) {
+	} else if r.isFileOnlyCall(rootCallName) {
 		fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
 		if fileNode == nil {
 			return ps
@@ -2926,6 +2926,23 @@ func (r *randGen) fallbackStatNode(s *state, sCalls *SpecialCalls, basePath stri
 	p.Calls = append(p.Calls, c)
 	p.IsFsops = true
 	return p
+}
+
+// isDirOnlyCall / isFileOnlyCall use the active DFS profile's lists; falling
+// back to the historical HMDFS lists keeps randGen instances built without a
+// config (tests, stash) working.
+func (r *randGen) isDirOnlyCall(name string) bool {
+	if r.hmcfg != nil {
+		return r.hmcfg.IsDirOnlyCall(name)
+	}
+	return isDirOnlyCall(name)
+}
+
+func (r *randGen) isFileOnlyCall(name string) bool {
+	if r.hmcfg != nil {
+		return r.hmcfg.IsFileOnlyCall(name)
+	}
+	return isFileOnlyCallByName(name)
 }
 
 func (r *randGen) chooseRootCallName(ct *ChoiceTable, bias int) string {

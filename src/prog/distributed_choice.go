@@ -31,6 +31,9 @@ var (
 		"fsync",
 		"fdatasync",
 		"unlink",
+		"link",
+		"symlink",
+		"readlink",
 	}
 
 	FileOrDirCalls = []string{
@@ -38,6 +41,8 @@ var (
 		"stat",
 		"chmod",
 		"rename",
+		"getxattr",
+		"setxattr",
 	}
 
 	FdRequiredCalls = []string{

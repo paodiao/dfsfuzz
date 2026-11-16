@@ -1698,7 +1698,7 @@ func dagErrHistString(h [64]int) string {
 
 // dagRetFuncString renders nonzero (funcID x retBucket):count entries in
 // ascending func/ret order ("" when none).
-func dagRetFuncString(m [16][6]int) string {
+func dagRetFuncString(m [prog.FuncCount][6]int) string {
 	s := ""
 	for f := range m {
 		for r := range m[f] {
@@ -1764,9 +1764,10 @@ func dagOffCallString(m [6][5]int) string {
 // type-sensitive functions, nonzero rows only ("" when none). Verifies the
 // i_mode fix: namespace-op types come from the event, not from the
 // post-execution tree state.
-func dagTypeFuncString(m [16][2]int) string {
+func dagTypeFuncString(m [prog.FuncCount][2]int) string {
 	fids := []uint32{prog.FuncMkdir, prog.FuncCreate, prog.FuncRmdir, prog.FuncUnlink,
-		prog.FuncRename, prog.FuncDirOpen, prog.FuncIterate, prog.FuncLookup}
+		prog.FuncRename, prog.FuncDirOpen, prog.FuncIterate, prog.FuncLookup,
+		prog.FuncLink, prog.FuncSymlink, prog.FuncReadlink, prog.FuncGetxattr, prog.FuncSetxattr}
 	s := ""
 	for _, fid := range fids {
 		d, f := m[fid][1], m[fid][0]
@@ -1788,7 +1789,7 @@ func dagTypeFuncString(m [16][2]int) string {
 // zeroOK is the capture-failure alarm — a successful create/mkdir must have
 // produced an entry inode, so zeroOK>0 for them means the capture is broken
 // (LOOKUP zeroOK is legitimate: negative lookups return no dentry).
-func dagInoFuncString(m [16][4]int) string {
+func dagInoFuncString(m [prog.FuncCount][4]int) string {
 	fids := []uint32{prog.FuncMkdir, prog.FuncCreate, prog.FuncRename, prog.FuncLookup}
 	s := ""
 	for _, fid := range fids {

@@ -75,6 +75,7 @@ type coverageBoard struct {
 	// live entries.
 	shapeEpoch      uint64
 	shapeDrainCache map[shapeDrainKey]shapeDrainEntry
+	profile         *DFSProfile // per-run call-name/func classifier
 	persistDir      string
 	persistBucket   uint64  // depth bucket of the persist dir (persist = path prefix)
 	depths          [4]bool // depth buckets present in the initial tree
@@ -214,6 +215,29 @@ func comboStaticallyUnreachable(root, variant string, rel PathRelation) bool {
 	return false
 }
 
+// coverageBoardCallLists returns the root/variant call lists the coverage grid
+// is built from. HMDFS has no explicit RootCalls/VariantCalls split, so it
+// keeps using its full SubCalls set; GlusterFS uses the 19/21 v1 lists.
+func coverageBoardCallLists(profile *DFSProfile) (roots, variants []string) {
+	if profile != nil {
+		roots = profile.Calls.RootCalls
+		if len(roots) == 0 {
+			roots = profile.Calls.SubCalls
+		}
+		variants = profile.Calls.VariantCalls
+		if len(variants) == 0 {
+			variants = profile.Calls.SubCalls
+		}
+	}
+	if len(roots) == 0 {
+		roots = FsopsSubCalls
+	}
+	if len(variants) == 0 {
+		variants = FsopsSubCalls
+	}
+	return roots, variants
+}
+
 // InitCoverageBoard initializes the global coverage board from the run config
 // (persistence dir + depth buckets present in the initial tree) and eagerly
 // precomputes every combo's producible-cell counts. Idempotent: the
@@ -229,6 +253,7 @@ func InitCoverageBoard(hmcfg *Hmdfs_config) {
 		return
 	}
 	b.persistDir = hmcfg.Persistence_dir
+	b.profile = hmcfg.ProfileOrDefault()
 	if b.persistDir != "" {
 		b.persistBucket = DepthBucketOf(b.persistDir)
 	}
@@ -255,8 +280,9 @@ func InitCoverageBoard(hmcfg *Hmdfs_config) {
 	// aim at unobservable combos. NoRel generation itself stays on the DCT
 	// weighted path (lowest initial weight tier via relBaseOf).
 	rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
-	for _, root := range FsopsSubCalls {
-		for _, variant := range FsopsSubCalls {
+	roots, variants := coverageBoardCallLists(hmcfg.ProfileOrDefault())
+	for _, root := range roots {
+		for _, variant := range variants {
 			for _, rel := range rels {
 				ck := comboKey{Root: root, Variant: variant, Rel: rel}
 				// Class-impossible combos (no construction channel can produce
@@ -628,7 +654,7 @@ func (b *coverageBoard) shapesAllKnown(shapes []uint64) bool {
 // cell "unknown" (false). The caller must hold b.mu (shapeDrained holds the
 // write lock).
 func (b *coverageBoard) cellShapeKnown(cell cellKey, aFunc uint32, aDepth uint64, aIsDir, aPersist bool, rel PathRel) bool {
-	bFuncs, ok := predictedEventFuncs(cell.Variant, cell.TypeB, cell.RetB, cell.Temporal)
+	bFuncs, ok := predictedEventFuncs(b.profile, cell.Variant, cell.TypeB, cell.RetB, cell.Temporal)
 	if !ok {
 		return false
 	}
@@ -708,7 +734,7 @@ func (b *coverageBoard) direction3ShapeDrain(rootCall, variant string, rel PathR
 	if basePath == "" {
 		return false
 	}
-	aFuncs, ok := callFuncClasses(rootCall, isDir)
+	aFuncs, ok := callFuncClasses(b.profile, rootCall, isDir)
 	if !ok || len(aFuncs) != 1 {
 		// An ambiguous A class (creat fires both create and open) has no
 		// single-function A context for the memo key; keep the directed pick.
@@ -1198,6 +1224,7 @@ func (b *coverageBoard) reset() {
 	b.knownShapes = make(map[uint64]bool)
 	b.shapeEpoch = 0
 	b.shapeDrainCache = make(map[shapeDrainKey]shapeDrainEntry)
+	b.profile = nil
 	b.persistDir = ""
 	b.persistBucket = 0
 	b.depths = [4]bool{}
@@ -1234,6 +1261,10 @@ func producibleRets(call string) []RetBucket {
 		return []RetBucket{RetSuccess, RetENOENT}
 	case "rmdir", "rename":
 		return []RetBucket{RetSuccess, RetENOENT, RetFailure}
+	case "link", "symlink":
+		return []RetBucket{RetSuccess, RetEEXIST, RetENOENT, RetFailure}
+	case "readlink", "getxattr", "setxattr":
+		return []RetBucket{RetSuccess, RetENOENT, RetFailure}
 	case "write", "pwrite64":
 		return []RetBucket{RetSuccess, RetFailure}
 	case "getdents64":
@@ -1250,6 +1281,9 @@ func producibleRets(call string) []RetBucket {
 // chmod/utime share FuncSetattr with truncate but carry no ia_size and must
 // classify as NA.
 func isOffsetCall(call string) bool {
+	if strings.Contains(call, "readlink") {
+		return false
+	}
 	return strings.Contains(call, "write") ||
 		strings.Contains(call, "read") ||
 		strings.Contains(call, "truncate")

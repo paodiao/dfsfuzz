@@ -24,10 +24,10 @@ func newTestCoverageBoard(t *testing.T) {
 func mkCoveragePair(rootCall, variantCall string, rel PathRel, temporal TemporalRel,
 	retA, retB RetBucket, bPath string) DAGPair {
 	aFunc, bFunc := uint32(0), uint32(0)
-	if fs, ok := callFuncClasses(rootCall, false); ok && len(fs) > 0 {
+	if fs, ok := callFuncClasses(hmdfsProfile, rootCall, false); ok && len(fs) > 0 {
 		aFunc = fs[0]
 	}
-	if fs, ok := callFuncClasses(variantCall, false); ok && len(fs) > 0 {
+	if fs, ok := callFuncClasses(hmdfsProfile, variantCall, false); ok && len(fs) > 0 {
 		bFunc = fs[0]
 	}
 	return DAGPair{
@@ -744,7 +744,7 @@ func TestCoverageFoundTemporalGate(t *testing.T) {
 // addKnownCellShapes white-box-registers every candidate shape of one cell
 // under an A context (the test mirror of cellShapeKnown's enumeration).
 func addKnownCellShapes(cell cellKey, aFunc uint32, aDepth uint64, aIsDir, aPersist bool, rel PathRel) {
-	bFuncs, ok := predictedEventFuncs(cell.Variant, cell.TypeB, cell.RetB, cell.Temporal)
+	bFuncs, ok := predictedEventFuncs(hmdfsProfile, cell.Variant, cell.TypeB, cell.RetB, cell.Temporal)
 	if !ok {
 		return
 	}

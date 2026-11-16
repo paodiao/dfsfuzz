@@ -50,7 +50,9 @@ const (
 	PathNone
 )
 
-// FuncID constants, must match the enum in hmdfs_trace.bpf.c.
+// FuncID constants, must match the enum in hmdfs_trace.bpf.c and
+// glusterfs_trace.bpf.c. 0..15 are the shared/HMDFS functions; 16..20 are
+// GlusterFS-only (v1) and are never emitted by HMDFS.
 const (
 	FuncMkdir     uint32 = 0
 	FuncCreate    uint32 = 1
@@ -67,7 +69,15 @@ const (
 	FuncRelease   uint32 = 12
 	FuncLookup    uint32 = 13
 	FuncIterate   uint32 = 14
-	FuncWritepage uint32 = 15
+	FuncWritepage uint32 = 15 // HMDFS only
+
+	FuncLink     uint32 = 16
+	FuncSymlink  uint32 = 17
+	FuncReadlink uint32 = 18
+	FuncGetxattr uint32 = 19
+	FuncSetxattr uint32 = 20
+
+	FuncCount = 21
 )
 
 // DAGVertex is a single traced operation bound to a concrete path.
@@ -105,10 +115,10 @@ type DagDiag struct {
 	ProgIdxBad      int   // events dropped because ProgIdx is out of range
 	PathEmpty       int   // events dropped because the path could not be resolved
 	PerNodeVertices []int // vertices per ProgIdx (node)
-	// Function-level breakdown (indexed by FuncID 0..15).
-	PerFuncVertices [16]int // matched vertices per FuncID
-	MatchFailFunc   [16]int // unmatched events per FuncID
-	MatchFailRetOK  [16]int // unmatched events with a succeeded ret per FuncID
+	// Function-level breakdown (indexed by FuncID 0..20).
+	PerFuncVertices [FuncCount]int // matched vertices per FuncID
+	MatchFailFunc   [FuncCount]int // unmatched events per FuncID
+	MatchFailRetOK  [FuncCount]int // unmatched events with a succeeded ret per FuncID
 	// Match failure reasons (only counted once per event, in the vertex pass).
 	MatchFailNoFunc int // no call of the event's function type in the program
 	MatchFailNoCI   int // matching calls exist but CheckInfo is nil
@@ -139,18 +149,18 @@ type DagDiag struct {
 	PairBitsUnique int // deduplicated pair hash count
 	// Feature marginals of matched vertices / produced pairs (per execution),
 	// emitted to dag.log for offline feature-coverage analysis.
-	RetHist       [6]int     // matched vertices per RetBucket (0..5)
-	ErrHist       [64]int    // negative rets: index = -ret-1 (-1..-64)
-	DepthHist     [4]int     // matched vertices per depth bucket 0..3
-	OffHist       [5]int     // matched vertices per offset bucket 0..4
-	PersistHist   [2]int     // 0 = non-persistence path, 1 = under hmcfg.Persistence_dir
-	TypeHist      [2]int     // 0 = file, 1 = dir
-	RetByFunc     [16][6]int // matched vertices per (FuncID, RetBucket)
-	OffByCall     [6][5]int  // matched vertices per (off-call row, offset bucket)
-	TypeByFunc    [16][2]int // matched vertices per (FuncID, 0=file 1=dir)
-	InoByFunc     [16][4]int // namespace funcs: 0=EntryIno==0, 1=EntryIno==0 and RetSuccess (capture-failure alarm; RENAME fresh-dst successes legitimately land here — the upper new_dentry has no inode until VFS's post-rename d_move, which runs after the kretprobe; the BPF entry fallback supplies the event-time type), 2=EntryIno!=Ino, 3=EntryIno==Ino
-	RelHist       [5]int     // produced hb+cc pairs per PathRel (SamePath..None)
-	PairRetCombos [6][6]int  // produced hb+cc pairs per (A.RetBucket, B.RetBucket)
+	RetHist       [6]int            // matched vertices per RetBucket (0..5)
+	ErrHist       [64]int           // negative rets: index = -ret-1 (-1..-64)
+	DepthHist     [4]int            // matched vertices per depth bucket 0..3
+	OffHist       [5]int            // matched vertices per offset bucket 0..4
+	PersistHist   [2]int            // 0 = non-persistence path, 1 = under hmcfg.Persistence_dir
+	TypeHist      [2]int            // 0 = file, 1 = dir
+	RetByFunc     [FuncCount][6]int // matched vertices per (FuncID, RetBucket)
+	OffByCall     [6][5]int         // matched vertices per (off-call row, offset bucket)
+	TypeByFunc    [FuncCount][2]int // matched vertices per (FuncID, 0=file 1=dir)
+	InoByFunc     [FuncCount][4]int // namespace funcs: 0=EntryIno==0, 1=EntryIno==0 and RetSuccess (capture-failure alarm; RENAME fresh-dst successes legitimately land here — the upper new_dentry has no inode until VFS's post-rename d_move, which runs after the kretprobe; the BPF entry fallback supplies the event-time type), 2=EntryIno!=Ino, 3=EntryIno==Ino
+	RelHist       [5]int            // produced hb+cc pairs per PathRel (SamePath..None)
+	PairRetCombos [6][6]int         // produced hb+cc pairs per (A.RetBucket, B.RetBucket)
 }
 
 type renameEvent struct {
@@ -505,7 +515,7 @@ func funcDefaultIsDir(fid uint32) (isDir bool, known bool) {
 	case FuncMkdir, FuncRmdir, FuncDirOpen, FuncIterate:
 		return true, true
 	case FuncCreate, FuncUnlink, FuncWrite, FuncRead, FuncFileOpen,
-		FuncFsync, FuncWritepage:
+		FuncFsync, FuncWritepage, FuncLink, FuncSymlink, FuncReadlink:
 		return false, true
 	}
 	return false, false
@@ -1200,7 +1210,8 @@ func bucketizeRet(fid uint32, ret int32) RetBucket {
 func isModifierFunc(fid uint32) bool {
 	switch fid {
 	case FuncMkdir, FuncCreate, FuncRmdir, FuncUnlink, FuncRename,
-		FuncWrite, FuncSetattr, FuncFsync, FuncWritepage:
+		FuncWrite, FuncSetattr, FuncFsync, FuncWritepage,
+		FuncLink, FuncSymlink, FuncSetxattr:
 		return true
 	}
 	return false
@@ -1282,7 +1293,8 @@ func funcMatchesCall(fid uint32, name string) bool {
 	case FuncWrite:
 		return strings.Contains(name, "write")
 	case FuncRead:
-		return strings.Contains(name, "read") && !strings.Contains(name, "getdents")
+		return strings.Contains(name, "read") && !strings.Contains(name, "getdents") &&
+			!strings.Contains(name, "readlink")
 	case FuncFileOpen:
 		// creat() reaches the file .open (hmdfs_file_open_merge), so its
 		// FILE_OPEN event must be attributable to the creat call too.
@@ -1302,6 +1314,16 @@ func funcMatchesCall(fid uint32, name string) bool {
 		return isPathResolvingCall(name)
 	case FuncIterate:
 		return strings.Contains(name, "getdents")
+	case FuncLink:
+		return name == "link"
+	case FuncSymlink:
+		return name == "symlink"
+	case FuncReadlink:
+		return name == "readlink"
+	case FuncGetxattr:
+		return strings.Contains(name, "getxattr")
+	case FuncSetxattr:
+		return strings.Contains(name, "setxattr")
 	}
 	return false
 }
@@ -1311,7 +1333,9 @@ func isPathResolvingCall(name string) bool {
 		name == "rmdir" || name == "unlink" || name == "rename" ||
 		strings.Contains(name, "open") || name == "stat" ||
 		strings.Contains(name, "fstatat") || strings.Contains(name, "chmod") ||
-		strings.Contains(name, "truncate") || strings.Contains(name, "utime")
+		strings.Contains(name, "truncate") || strings.Contains(name, "utime") ||
+		name == "link" || name == "symlink" || name == "readlink" ||
+		strings.Contains(name, "getxattr") || strings.Contains(name, "setxattr")
 }
 
 // packFeatures packs the vertex feature vector into one uint64:

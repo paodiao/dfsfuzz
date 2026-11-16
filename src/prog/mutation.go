@@ -4403,13 +4403,13 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	}
 
 	if basePath == "" {
-		if IsDirOnlyCall(rootCallName) {
+		if r.isDirOnlyCall(rootCallName) {
 			dirNode := lcs.FileTree.GetRandomDir(r.Rand, cid0, true)
 			if dirNode == nil {
 				return false
 			}
 			basePath = dirNode.FullPath
-		} else if IsFileOnlyCall(rootCallName) {
+		} else if r.isFileOnlyCall(rootCallName) {
 			fileNode := lcs.FileTree.GetRandomFile(r.Rand, cid0)
 			if fileNode == nil {
 				return false

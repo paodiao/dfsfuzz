@@ -108,6 +108,11 @@ var HmdfsFuncName = map[uint32]string{
 	13: "LOOKUP",
 	14: "ITERATE",
 	15: "WRITEPAGE_CB",
+	16: "LINK",
+	17: "SYMLINK",
+	18: "READLINK",
+	19: "GETXATTR",
+	20: "SETXATTR",
 }
 
 // These properties are parsed and serialized according to the tag and the type
