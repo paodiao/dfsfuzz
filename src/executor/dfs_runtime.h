@@ -2,8 +2,9 @@
 /*
  * dfs_runtime.h — per-DFS executor runtime hook table.
  *
- * B2 fills the trace hooks only.  The remaining restore/cwd/metadata/config
- * hooks are declared here for the D phase and stay nullptr until then.
+ * Trace hooks were filled in B2; the D phase adds the GlusterFS
+ * restore/cwd/metadata hooks.  HMDFS keeps its existing executor paths
+ * (the table entries stay nullptr for those hooks).
  */
 
 #ifndef DFS_RUNTIME_H
@@ -23,7 +24,8 @@ struct DfsRuntimeOps {
 	void (*start_trace)();
 	void (*stop_trace)();
 
-	bool (*restore_initial)(bool is_restarting);
+	bool (*restore_initial)(bool is_restarting, bool is_client,
+				bool is_reset_client);
 	bool (*needs_startup_barrier)();
 	bool (*needs_restore_barrier)();
 

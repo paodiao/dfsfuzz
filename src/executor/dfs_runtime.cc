@@ -5,13 +5,21 @@
 
 #include "dfs_runtime.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 
 #include "glusterfs_trace.h"
 #include "hmdfs_trace.h"
 
 #define GLUSTERFS_FUSE_SO \
 	"/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so"
+#define GLUSTERFS_CLIENT_ROOT "/root/glusterfs-client/eifuzz_root"
+#define GLUSTERFS_SERVER_ROOT "/root"
+#define GLUSTERFS_RESTORE_BASELINE "/home/baseline/glusterfs/"
+#define GLUSTERFS_RESTORE_TARGET GLUSTERFS_CLIENT_ROOT "/"
 
 /* ── HMDFS ─────────────────────────────────────────────────────── */
 
@@ -62,8 +70,67 @@ static void glusterfs_stop_trace(void)
 	stop_collect_glusterfs_trace();
 }
 
-/* Field order mirrors struct DfsRuntimeOps.  B2 leaves the non-trace hooks
- * null; the D phase fills them. */
+static const char *glusterfs_client_cwd(void)
+{
+	return GLUSTERFS_CLIENT_ROOT;
+}
+
+static const char *glusterfs_server_cwd(void)
+{
+	return GLUSTERFS_SERVER_ROOT;
+}
+
+static const char *glusterfs_metadata_root(bool is_client)
+{
+	return is_client ? GLUSTERFS_CLIENT_ROOT : GLUSTERFS_SERVER_ROOT;
+}
+
+static bool glusterfs_needs_restore_barrier(void)
+{
+	return true;
+}
+
+/* The reset client rebuilds the fixed test root from the baseline; every
+ * other client only participates in the barrier.  Clients leave the test
+ * root first so the reset client can unlink it even if another client still
+ * had it as its cwd. */
+static bool glusterfs_restore_initial(bool is_restarting, bool is_client,
+				      bool is_reset_client)
+{
+	if (is_restarting || !is_client)
+		return true;
+	if (chdir(GLUSTERFS_SERVER_ROOT) != 0) {
+		fprintf(stderr,
+			"glusterfs restore: chdir %s failed: %s\n",
+			GLUSTERFS_SERVER_ROOT, strerror(errno));
+		return false;
+	}
+	if (!is_reset_client)
+		return true;
+
+	fprintf(stderr, "glusterfs restore: rebuild %s\n",
+		GLUSTERFS_CLIENT_ROOT);
+	sync();
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd), "rm -rf %s", GLUSTERFS_CLIENT_ROOT);
+	if (system(cmd) != 0) {
+		fprintf(stderr, "glusterfs restore: rm failed: %s\n", cmd);
+		return false;
+	}
+	snprintf(cmd, sizeof(cmd),
+		 "timeout 60s rsync -a --numeric-ids --delete "
+		 "--one-file-system --checksum %s %s",
+		 GLUSTERFS_RESTORE_BASELINE, GLUSTERFS_RESTORE_TARGET);
+	if (system(cmd) != 0) {
+		fprintf(stderr, "glusterfs restore: rsync failed: %s\n", cmd);
+		return false;
+	}
+	sync();
+	return true;
+}
+
+/* Field order mirrors struct DfsRuntimeOps.  HMDFS keeps the legacy
+ * executor paths; GlusterFS fills the D-phase runtime hooks. */
 static const DfsRuntimeOps hmdfs_runtime = {
 	"hmdfs",                    /* name */
 	hmdfs_trace_enabled,        /* trace_enabled_for */
@@ -89,12 +156,12 @@ static const DfsRuntimeOps glusterfs_runtime = {
 	glusterfs_init_trace,       /* init_trace */
 	glusterfs_start_trace,      /* start_trace */
 	glusterfs_stop_trace,       /* stop_trace */
-	nullptr,                    /* restore_initial */
+	glusterfs_restore_initial,  /* restore_initial */
 	nullptr,                    /* needs_startup_barrier */
-	nullptr,                    /* needs_restore_barrier */
-	nullptr,                    /* client_cwd */
-	nullptr,                    /* server_cwd */
-	nullptr,                    /* metadata_root */
+	glusterfs_needs_restore_barrier, /* needs_restore_barrier */
+	glusterfs_client_cwd,       /* client_cwd */
+	glusterfs_server_cwd,       /* server_cwd */
+	glusterfs_metadata_root,    /* metadata_root */
 	nullptr,                    /* client_metadata_enabled */
 	nullptr,                    /* server_metadata_enabled */
 	nullptr,                    /* config_command */

@@ -20,6 +20,23 @@ type InputTest struct {
 	sig  hash.Sig
 }
 
+func TestDefaultMetadataDelayMs(t *testing.T) {
+	cases := []struct {
+		dfs  string
+		want int
+	}{
+		{"hmdfs", 30000},
+		{"glusterfs", 10000},
+		{"nfs", 30000},
+		{"", 30000},
+	}
+	for _, tc := range cases {
+		if got := defaultMetadataDelayMs(tc.dfs); got != tc.want {
+			t.Fatalf("defaultMetadataDelayMs(%q) = %d, want %d", tc.dfs, got, tc.want)
+		}
+	}
+}
+
 func TestChooseProgram(t *testing.T) {
 	rs := rand.NewSource(0)
 	r := rand.New(rs)

@@ -192,6 +192,13 @@ func debug_output(info []byte) {
 
 //tao end
 
+func defaultMetadataDelayMs(dfsName string) int {
+	if dfsName == "glusterfs" {
+		return 10000
+	}
+	return 30000
+}
+
 // nolint: funlen
 func main() {
 
@@ -230,7 +237,7 @@ func main() {
 		MaxDagCorpus         = flag.Int("MaxDagCorpus", 0, "Max DAG-driven corpus entries (0 = unlimited)")
 		Syzkaller            = flag.String("Syzkaller", "", "syzkaller location")
 		TSCOFF               = flag.String("TSCOFF", "0", "tsc offset")
-		MetadataDelayMs      = flag.Int("MetadataDelayMs", 30000, "metadata collection delay in ms for DFS conflict resolution")
+		MetadataDelayMs      = flag.Int("MetadataDelayMs", -1, "metadata collection delay in ms; -1 = DFS profile default")
 	)
 	defer tool.Init()()
 	outputType := parseOutputType(*flagOutput)
@@ -265,6 +272,9 @@ func main() {
 	config.Syzkaller = *Syzkaller
 	config.TSCOFF = *TSCOFF
 	config.MetadataDelayMs = *MetadataDelayMs
+	if config.MetadataDelayMs < 0 {
+		config.MetadataDelayMs = defaultMetadataDelayMs(config.DFSName)
+	}
 
 	if err != nil {
 		log.Fatalf("failed to create default ipc config: %v", err)

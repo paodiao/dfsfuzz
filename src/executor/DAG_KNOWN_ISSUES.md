@@ -169,12 +169,15 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 
 | flag | 默认值 | 用途 |
 |---|---|---|
-| `-MetadataDelayMs` | 10000 | 元数据收集延迟（executor argv[16]） |
+| `-MetadataDelayMs` | -1（按 profile：HMDFS 30000 / GlusterFS 10000） | 元数据收集延迟（executor argv[16]） |
 | `-EnableDagFb` | true | DAG 反馈总开关 |
 | `-EnableDagScheduleFb` | true | schedule 统计开关（见附录） |
 | `-MaxDagCorpus` | 0（无限） | DAG 驱动 corpus 上限——设计讨论中的示意值 2000-5000 未经实验校准；启用前需先测量 `dag corpus` 增长率与 smash 执行预算再定（见 #14） |
 
-**影响**：当前默认值均适用（10s 延迟与 hmdfs writeback 周期匹配、DAG 反馈默认开），功能不受影响；但做**对比实验**（如关闭 DAG 反馈的消融组）或**调参**时无法从配置控制，只能改代码或手动传 flag。
+**影响**：当前默认值均适用（DAG 反馈默认开；`MetadataDelayMs` 未显式设置时按
+profile 取 HMDFS 30s / GlusterFS 10s，显式 `-MetadataDelayMs` 仍可覆盖）；
+但做**对比实验**（如关闭 DAG 反馈的消融组）或**调参**时，manager 配置仍无法
+控制，只能改代码或手动传 flag。
 
 GlusterFS v1 也启用完整 DAG feedback（board learning + DAG corpus/triage），
 沿用同一组 flag。`MaxDagCorpus=0` 是 unlimited，长跑前按规模设置。
@@ -185,10 +188,12 @@ D1（BPF standalone）已通过：LOOKUP mode、path strip、D/S/R 合并正常�
 `hmdfs trace events`、DAG vertices/pairs 与 smash 预算是否一致。注意
 `missing_r` 会包含 root/无路径 GETATTR，属统计口径，不是 DAG 回归。
 
-**不修理由**：当前实验默认值已满足需求；补通道需改 mgrconfig + qemu.go 两处（+ 配置文件），收益待实验需要时再实现。
+**不修理由**：当前实验默认值已满足需求；`MetadataDelayMs` 已增加 profile 默认，
+但 manager 配置通道仍需改 mgrconfig + qemu.go 两处（+ 配置文件），收益待实验
+需要时再实现。
 
 **将来修复**（3 处）：
-1. `src/pkg/mgrconfig/config.go` — 加 `MetadataDelayMs int json:"metadata_delay_ms"`、`EnableDagFb bool json:"enable_dag_fb"`、`EnableDagScheduleFb bool json:"enable_dag_schedule_fb"`、`MaxDagCorpus int json:"max_dag_corpus"`
+1. `src/pkg/mgrconfig/config.go` — 加 `MetadataDelayMs *int json:"metadata_delay_ms,omitempty"`、`EnableDagFb bool json:"enable_dag_fb"`、`EnableDagScheduleFb bool json:"enable_dag_schedule_fb"`、`MaxDagCorpus int json:"max_dag_corpus"`
 2. `src/vm/qemu/qemu.go`（930-948）— 加 4 行 flag 传递（`MetadataDelayMs` 链路已通：fuzzer flag → fuzzer config → ipc.Config → executor argv[16]）
 3. hmdfs 配置文件加对应字段
 

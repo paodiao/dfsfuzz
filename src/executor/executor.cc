@@ -1435,6 +1435,22 @@ static bool restore_hmdfs_file_tree() {
 static bool restore_initial_file_tree() {
   if (is_restarting)
     return true;
+
+  if (dfs_rt && dfs_rt->restore_initial) {
+    bool barrier = !dfs_rt->needs_restore_barrier ||
+                   dfs_rt->needs_restore_barrier();
+    if (barrier)
+      restore_start_barrier();
+    bool restore_ok =
+        dfs_rt->restore_initial(is_restarting, is_dfs_client != 0,
+                                executor_index == server_num);
+    if (barrier)
+      restore_finish_barrier(restore_ok);
+    else if (!restore_ok)
+      fail("initial file tree restore failed");
+    return true;
+  }
+
   if (strcmp(dfs_name, "hmdfs"))
     return true;
 
@@ -1906,15 +1922,32 @@ uint64 receive_execute() {
   // disk_fault_injection(10, 10, 1);
 
   char cwdbuf[200], lastcwdbuf[200];
+  const char *runtime_client_cwd =
+      (is_dfs_client && dfs_rt && dfs_rt->client_cwd)
+          ? dfs_rt->client_cwd()
+          : nullptr;
   // snprintf(cwdbuf, 199, "/root/%s-client/", dfs_name);
-  if(!strcmp(dfs_name, "hmdfs")) {
+  if (runtime_client_cwd) {
+    snprintf(cwdbuf, 199, "%s", runtime_client_cwd);
+  } else if(!strcmp(dfs_name, "hmdfs")) {
     snprintf(cwdbuf, 199, "/mnt/hmdfs/100/non_account");
   } else {
     snprintf(cwdbuf, 199, "/root/%s-client/dfs-%lld-%lld", dfs_name, req.pid,
            execution_index);
   }
   
-  if (executor_index == server_num && strcmp(dfs_name, "hmdfs")) {
+  if (runtime_client_cwd) {
+    // The profile fixed cwd is restored by restore_initial_file_tree()
+    // above; there is no per-execution dfs-<pid>-<iter> directory to create
+    // or remove. Client 3 owns the restore and publishes the ready flag.
+    if (executor_index == server_num)
+      execCtl->tmpDirEstablished = 1;
+    else {
+      while (execCtl->tmpDirEstablished != 1) {
+      }
+      __sync_synchronize();
+    }
+  } else if (executor_index == server_num && strcmp(dfs_name, "hmdfs")) {
     if (execution_index > 0) {
       snprintf(lastcwdbuf, 199, "/root/%s-client/dfs-%lld-%lld", dfs_name,
                req.pid, execution_index - 1);
@@ -3664,7 +3697,13 @@ void write_metadata(int iter) {
     char cwdbuf[240], orgcwdbuf[240];
     // save original dir
     getcwd(orgcwdbuf, 239);
-    if (is_dfs_client)
+    const char *runtime_meta_root =
+        dfs_rt && dfs_rt->metadata_root
+            ? dfs_rt->metadata_root(is_dfs_client != 0)
+            : nullptr;
+    if (runtime_meta_root)
+      snprintf(cwdbuf, 239, "%s", runtime_meta_root);
+    else if (is_dfs_client)
       snprintf(cwdbuf, 239, "/root/%s-client/dfs-%lld-%d", dfs_name,
                last_execute_req.pid, iter);
     else
@@ -3674,14 +3713,15 @@ void write_metadata(int iter) {
     if(!strcmp(dfs_name, "hmdfs"))
         snprintf(cwdbuf, 239, "/mnt/hmdfs/100/non_account/merge_view");
 
-    // Workaround for GlusterFS crash consistency bug
+    // The GlusterFS fixed test root must exist after restore; a missing root
+    // is a restore/config error, not an empty metadata snapshot.
     struct stat tmp;
     errno = 0;
     if (!strcmp(dfs_name, "glusterfs") && stat(cwdbuf, &tmp) < 0) {
       fprintf(stderr,
-              "executor %lld write_metadata returns as stat %s errors %s\n",
+              "executor %lld write_metadata stat %s failed: %s\n",
               executor_index, cwdbuf, strerror(errno));
-      return;
+      fail("glusterfs metadata root missing");
     }
 
     stat_cnt = 0;

@@ -2157,7 +2157,7 @@ struct RuntimeTiming {
 - `MetadataDelayMs` flag 默认改为“未设置”哨兵；由 profile 解析：
   - HMDFS 30000ms；
   - GlusterFS 10000ms；
-  - 显式 config 覆盖优先。
+  - 显式 fuzzer flag 覆盖优先（已实现；manager config 通道待补）。
 - `write_metadata` 等所有 client 的 `executionsFinish` 超时用
   `program_timeout_ms + metadata_wait_grace_ms`。
 - HMDFS 的 agent/peer/settle/startup barrier 行为不变；GlusterFS 的
@@ -2532,6 +2532,8 @@ coverage 三层                        已实现
 FreshSame combo-aware plannable      已实现
 normal dual root                     已实现，v1 DualPathCausalEnabled=false
 GlusterFS DAG feedback               已启用
+GlusterFS executor cwd/restore/metadata 已实现
+MetadataDelayMs profile default      已实现（HMDFS 30000 / GlusterFS 10000）
 D1 BPF standalone smoke              已通过
 D2 executor integration              待执行
 D3 short/medium run                  待执行
@@ -2622,15 +2624,19 @@ executor attach -> trace 输出 -> Go parser -> DAG -> coverage -> directed
 
 1. `make executor`；确认 skeleton 已从修复后的 BPF 重建；
 2. 3-3 环境挂载 `/root/glusterfs-client`，测试根
-   `/root/glusterfs-client/eifuzz_root`；
-3. 短跑（10–20 分钟 / 1000–3000 次执行 / 1–2 proc）；
+   `/root/glusterfs-client/eifuzz_root`；确认 executor 日志的
+   `current dir` 是测试根，trace `[path]` 不带 `dfs-<pid>-<iter>/` 前缀；
+3. 短跑（10–20 分钟；GlusterFS metadata delay 默认 10s，按实际轮数看曲线）；
 4. 先看 executor attach，再看 trace/DAG/coverage/directed。
 
 通过标准：
 
 ```text
 executor attach 成功
+executor cwd = /root/glusterfs-client/eifuzz_root
+trace path 无 dfs- 前缀
 trace events > 0
+fsMds 非空（enable_csan=true 时）
 DAG vertices > 0
 hbPairs 或 ccPairs > 0
 coverage obs/model/plan 都有增长

@@ -261,7 +261,7 @@ static long syz_failure_crash_client(int willCrash) {
   }
   // list the test_dir until it succeeds.
   if (!strcmp(dfs_name, "glusterfs")) {
-    snprintf(test_dir, 100, "/root/%s-client/", dfs_name);
+    snprintf(test_dir, 100, "/root/glusterfs-client/eifuzz_root");
   } else if(!strcmp(dfs_name, "hmdfs")) {
     snprintf(test_dir, 100, "/mnt/hmdfs/100/non_account");
   } else {
