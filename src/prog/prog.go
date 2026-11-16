@@ -65,6 +65,10 @@ type FileMetadata struct {
 // EntryTs is the entry kprobe's bpf_ktime_get_ns(): this event's own
 // execution window is [EntryTs, Timestamp] (0 when the entry state was
 // lost; consumers fall back to the call window then).
+//
+// NodeID/Path/Path2/XattrName/Truncated are GlusterFS-only fields. The HMDFS
+// parser leaves them zero; the GlusterFS parser fills them from its wire
+// event. GlusterFS keeps Ino=0 and does not use EntryIno.
 type HmdfsTraceEvent struct {
 	Timestamp uint64
 	FuncID    uint32
@@ -77,6 +81,13 @@ type HmdfsTraceEvent struct {
 	EntryIno  uint64
 	Mode      uint32
 	EntryTs   uint64
+
+	// GlusterFS only.
+	NodeID    uint64
+	Path      string
+	Path2     string
+	XattrName string
+	Truncated uint32
 }
 
 // HmdfsFuncName maps BPF func_id constants to human-readable operation names.

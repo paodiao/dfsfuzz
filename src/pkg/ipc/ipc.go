@@ -1136,6 +1136,96 @@ func parseHmdfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64
 	return events, ratio, tscOffset
 }
 
+// parseTraceEvents selects the DFS-specific wire parser. HMDFS keeps the
+// existing 112-byte layout; GlusterFS uses its fixed 1228-byte event.
+func (env *Env) parseTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64) {
+	if env != nil && env.config != nil && env.config.DFSName == "glusterfs" {
+		return parseGlusterfsTraceEvents(data)
+	}
+	return parseHmdfsTraceEvents(data)
+}
+
+// parseGlusterfsTraceEvents parses the executor's [ratio][offset][gap][count]
+// header followed by fixed 1228-byte GlusterFS events. The parser must read
+// the full 512/512/128 arrays for every event; path_len/path2_len/
+// xattr_name_len only slice what was read.
+func parseGlusterfsTraceEvents(data *[]byte) ([]prog.HmdfsTraceEvent, float64, int64) {
+	const eventSize = 1228
+	out := *data
+	if len(out) < 28 {
+		return nil, 0, 0
+	}
+	ratioFixed, okRatio := readUint64(&out)
+	ratio := float64(0)
+	if okRatio {
+		ratio = float64(ratioFixed) / 1e9
+	}
+	offsetFixed, okOffset := readUint64(&out)
+	tscOffset := int64(0)
+	if okOffset {
+		tscOffset = int64(offsetFixed)
+	}
+	gap, okGap := readUint64(&out)
+	if !okGap {
+		gap = 0
+	}
+	count, ok := readUint32(&out)
+	if !ok || count == 0 {
+		appendParseDiag("parseGlusterfsTrace: ratio=%.9f gap=%d count=%d remaining=%d",
+			ratio, gap, count, len(out))
+		*data = out
+		return nil, ratio, tscOffset
+	}
+
+	// Bound the allocation by the actual remaining bytes. A corrupt count
+	// must not make the parser allocate GBs; keep the events that fit.
+	if maxCount := uint32(len(out) / eventSize); count > maxCount {
+		appendParseDiag("parseGlusterfsTrace: count %d > max %d, truncating",
+			count, maxCount)
+		count = maxCount
+	}
+	events := make([]prog.HmdfsTraceEvent, 0, count)
+	for i := uint32(0); i < count; i++ {
+		if len(out) < eventSize {
+			appendParseDiag("parseGlusterfsTrace: short event %d: %d/%d",
+				i, len(out), eventSize)
+			break
+		}
+		ev := out[:eventSize]
+		pathLen := prog.HostEndian.Uint32(ev[60:64])
+		path2Len := prog.HostEndian.Uint32(ev[64:68])
+		xattrLen := prog.HostEndian.Uint32(ev[68:72])
+		if pathLen > 512 || path2Len > 512 || xattrLen > 128 {
+			appendParseDiag("parseGlusterfsTrace: event %d bad lengths %d/%d/%d",
+				i, pathLen, path2Len, xattrLen)
+			// The event record is fixed-size; keep the stream aligned for
+			// the fsMd section that follows the trace.
+			out = out[eventSize:]
+			break
+		}
+		events = append(events, prog.HmdfsTraceEvent{
+			Timestamp: prog.HostEndian.Uint64(ev[0:8]),
+			EntryTs:   prog.HostEndian.Uint64(ev[8:16]),
+			FuncID:    prog.HostEndian.Uint32(ev[16:20]),
+			Ret:       int32(prog.HostEndian.Uint32(ev[20:24])),
+			NodeID:    prog.HostEndian.Uint64(ev[24:32]),
+			Off:       prog.HostEndian.Uint64(ev[40:48]),
+			Size:      prog.HostEndian.Uint64(ev[48:56]),
+			Mode:      prog.HostEndian.Uint32(ev[56:60]),
+			Path:      string(ev[76 : 76+pathLen]),
+			Path2:     string(ev[588 : 588+path2Len]),
+			XattrName: string(ev[1100 : 1100+xattrLen]),
+			Truncated: prog.HostEndian.Uint32(ev[72:76]),
+			// GlusterFS v1: Ino and EntryIno stay zero; NodeID is separate.
+		})
+		out = out[eventSize:]
+	}
+	appendParseDiag("parseGlusterfsTrace: ratio=%.9f gap=%d count=%d parsed=%d remaining=%d",
+		ratio, gap, count, len(events), len(out))
+	*data = out
+	return events, ratio, tscOffset
+}
+
 /*
 	//sizeof(struct stat) = 144; sizeof(struct dirent) = 280
 	stat_bytes := (144 + 280) * stat_cnt
@@ -1214,7 +1304,7 @@ func (env *Env) parseServerOutput(idx int, isClient bool, retChan chan parseRet)
 	var hmdfsTraceEvents []prog.HmdfsTraceEvent
 	var tscRatio float64
 	var tscOffset int64
-	hmdfsTraceEvents, tscRatio, tscOffset = parseHmdfsTraceEvents(&out)
+	hmdfsTraceEvents, tscRatio, tscOffset = env.parseTraceEvents(&out)
 	for i := range hmdfsTraceEvents {
 		hmdfsTraceEvents[i].ProgIdx = idx
 	}
@@ -1409,7 +1499,7 @@ func (env *Env) parseClientOutput(p *prog.Prog, idx int, retChan chan parseRet) 
 	var hmdfsTraceEvents []prog.HmdfsTraceEvent
 	var tscRatio float64
 	var tscOffset int64
-	hmdfsTraceEvents, tscRatio, tscOffset = parseHmdfsTraceEvents(&out)
+	hmdfsTraceEvents, tscRatio, tscOffset = env.parseTraceEvents(&out)
 	for i := range hmdfsTraceEvents {
 		hmdfsTraceEvents[i].ProgIdx = idx
 	}
