@@ -61,6 +61,42 @@
 - linkpath AccessMode、跨目录 `RenamePolicy`、DCT seed `readlink` 规则和
   跨节点可见性见总计划 §6.2、§6.5、§8.4。
 
+### 0.3 2026-11-16 P0 复核修订摘要
+
+以下为 5.15 单 VM、GlusterFS 11dev `fuse.so` 的实测结论；实现数值以本节和
+§18 为准。
+
+- **D 探针**：`fuse_async_t` 为 iobuf+0 / finh+8 / this+16 / msg+24 /
+  async+32；`finh = *(u64 *)(arg0 - 24)`。`fuse_in_header` 的
+  opcode/unique/nodeid/pid 在 +4/+8/+16/+32。`pid` 是发起 syscall 的进程，
+  不是 glusterfs worker。
+- **R 探针**：`fuse_state_t` 的 loc=+32 / loc2=+96 / finh=+160 / off=+176 /
+  size=+200 / name=+248；`loc.inode=+16`、`loc2.inode=+112`。
+- **mode**：`inode_t` 没有 `i_mode`，只有 `ia_type`（+92）；1/2/3 =
+  file/dir/symlink，userspace 映射为 `S_IFMT`。`link` 读 `loc2.inode+92`；
+  `rename` 读 `loc.inode+92`；`symlink/mkdir/create` 的新 inode 在 R 时可能为
+  0，用函数默认。
+- **测试根前缀**：FUSE 路径相对挂载根，实际是 `/eifuzz_root/...`；tracer
+  必须 strip `eifuzz_root`。rename/link 的 path2 同样 strip；symlink 的
+  path2 是 raw payload，不 strip。
+- **truncate**：`off = fsi->size`（新大小），`size = 0`；FUSE SETATTR 不提供
+  旧文件大小。read/write 的 off/size 是请求 offset/长度；readdir 的 off/size
+  是目录 offset/缓冲区；xattr 的 size 是请求缓冲区。
+- **RELEASE/RELEASEDIR**：两者都直接 `send_fuse_err`，没有
+  `fuse_fop_resume`，所以只有 D/S、没有 R。v1 保留 RELEASE 18（HMDFS 也
+  trace `hmdfs_file_release_local`），过滤 RELEASEDIR 29（HMDFS 不 trace
+  目录 release）。
+- **hardlink alias**：`inode_path` 对 hardlink 返回任意 dentry；`truncate("q0")`
+  的事件 path 可能是 `h1`。DAG 非 LOOKUP 用调用参数/fd provenance；
+  planned linkpath 可以作为 truncate/write 的调用参数，内核 alias 不是。
+- **xattr**：内部 GETXATTR 会出现 `-61/-95`；D/R 只保留 `user.*`，没有 user R
+  的 S-only 内部 xattr 在 userspace 丢弃。
+- **符号/构建**：`fuse_dispatch` / `fuse_fop_resume` / `send_fuse_iov` 是
+  LOCAL `.symtab`；`send_fuse_iov` 在 P0 build 有 4 个调用点、未被内联；
+  libbpf 没有 `func_name` 时用 `.symtab` + offset。
+- **时间对齐**：直接复用 `tsc_ns_to_global` / `tsc_offset` / `g_prog_end_raw` /
+  ratio/gap；ctl/path 两个 ring 必须按 ts 合并。
+
 ## 1. 已定决策
 
 > 本节是 tracer 视角摘要；v1 权威定义见 `glusterfs-adaptation-plan.md`
@@ -273,22 +309,39 @@ RENAME 的 `fuse_fop_resume` 可用，但 hardlink 的 inode/fd 事件 path 是
 
 | 字段 | 语义 |
 |---|---|
-| `timestamp` | `send_fuse_iov` 结束时间，作为事件结束时间 |
+| `timestamp` | `send_fuse_iov` 返回时间（uretprobe），作为事件结束时间 |
 | `entry_ts` | `fuse_dispatch` 开始时间；缺失时为 0 |
 | `func_id` | 0–14 通用 + 16–20 GlusterFS；15 仅 HMDFS |
 | `ret` | `fuse_out_header.error`；0 成功，负数 errno |
-| `nodeid` | FUSE nodeid；GlusterFS 中是 `inode_t *` |
-| `unique` | FUSE 请求唯一号，仅用于调试/关联 |
-| `off` | 读/写/truncate 的 offset；未知为 0 |
-| `size` | 读/写/truncate 的 size；未知为 0 |
-| `mode` | `loc.inode->i_mode`；未知为 0 |
+| `nodeid` | FUSE nodeid；GlusterFS 中是 `inode_t *`；LOOKUP 时是父目录 |
+| `unique` | FUSE 请求唯一号，D/R/S 关联键 |
+| `off` | read/write 的 offset；truncate 的新大小；readdir 的目录 offset；未知为 0 |
+| `size` | read/write 的请求长度；truncate 为 0；readdir 的缓冲区大小；xattr 的请求缓冲区；未知为 0 |
+| `mode` | `loc.inode->ia_type` 映射成 `S_IFMT`；link 用 `loc2.inode`；未知为 0 |
 | `path_len` | `path` 实际字节数，不含 NUL |
 | `path2_len` | `path2` 实际字节数，不含 NUL |
 | `xattr_name_len` | `xattr_name` 实际字节数，不含 NUL；上限 128 |
 | `truncated` | 位图：bit0=path 截断，bit1=path2 截断，bit2=xattr 截断 |
-| `path` | 归一化路径，不带前导 `/`；根为空 |
-| `path2` | 第二路径：rename 目标 / link 源 / symlink target |
+| `path` | 归一化到**测试根**的路径，不带前导 `/`；测试根为空 |
+| `path2` | rename 目标 / link 源：同样归一化到测试根；symlink target：原始 payload |
 | `xattr_name` | xattr key；非 xattr 事件为空 |
+
+`mode` 的来源不是 `i_mode`：
+
+```text
+inode_t.ia_type = inode + 92
+IA_IFREG 1 -> S_IFREG
+IA_IFDIR 2 -> S_IFDIR
+IA_IFLNK 3 -> S_IFLNK
+其他/0     -> 0（DAG 用函数默认/fsMd 回退）
+```
+
+- `rename`：源 inode 用 `loc.inode + 92`；
+- `link`：源 inode 用 `loc2.inode + 92`（R 发生在 `fuse_link_resume` 之前，
+  `loc.inode` 还是空的）；
+- `symlink/mkdir/create`：新 inode 在 R 时 `ia_type=0`，用函数默认；
+- `symlink` 的 `path2` 是 payload，不能 strip；`rename/link` 的 `path2` 是
+  挂载内路径，必须 strip。
 
 ### 4.2 序列化
 
@@ -302,7 +355,10 @@ count  u32
 events[count]
 ```
 
-每个 event 固定 1228 字节。`path/path2/xattr_name` 按对应 length 截取，不依赖 NUL。
+每个 event 固定 1228 字节。parser 必须按固定 stride 读完整 512/512/128
+字节数组，再按对应 length 截取，不依赖 NUL；不要把 wire event 写成变长
+（§8 的读取顺序必须与本节一致）。C 结构必须 packed，并加
+`_Static_assert(sizeof(struct glusterfs_trace_event) == 1228)`。
 
 ### 4.3 大小与容量
 
@@ -325,8 +381,8 @@ struct glusterfs_ctl_event {
     u32 phase;    /* 16: D=0, S=1 */
     u32 opcode;   /* 20 */
     u64 nodeid;   /* 24 */
-    u32 pid;      /* 32 */
-    s32 error;    /* 36 */
+    u32 pid;      /* 32: finh->pid（发起 syscall 的进程） */
+    s32 error;    /* 36: 仅 S 有值；D/R 为 0 */
 };                /* 40 */
 ```
 
@@ -360,8 +416,13 @@ path_events: max_entries = 4 * 1024 * 1024
 
 - `ctl` 只放 D/S，避免路径字段浪费。
 - `path` 只放 R，携带路径。
-- `path` ring 4 MB 约可容纳 3900 条 R 事件。
+- `path` ring 4 MB / 1204B ≈ 3480 条 R 事件（含 ring 头会略少）。
 - BPF 只采集，不做路径聚合。
+- **两个 ring 是独立消费的，跨 ring 不保证 D/R/S 顺序**。userspace 必须把
+  ctl 和 path 全部 drain 后按 `ts` 合并（同 ts 用 D < R < S），再做
+  pending 聚合；不能先消费一个 ring 就按 S 生成最终事件。
+- 每个请求自身的 D→R→S 因果顺序仍然成立；D/R/S 可以在不同 worker 线程，
+  userspace 只用 `unique` 配对，不按线程/时间片假设连续性。
 
 ### 5.2 探针与偏移
 
@@ -390,17 +451,41 @@ typedef struct _fuse_async {
 finh = *(u64 *)(arg0 - 32 + 8) = *(u64 *)(arg0 - 24)
 ```
 
+`fuse_in_header`（UAPI，40B）：
+
+```text
+len    +0
+opcode +4
+unique +8
+nodeid +16
+uid    +24
+gid    +28
+pid    +32
+```
+
+P0 原始内存已验证：`arg0` 是 `&fasync->async`，`fasync = arg0 - 32`；
+`fasync->iobuf=+0`、`finh=+8`、`this=+16`、`msg=+24`；`finh` 指向输入
+缓冲区 base，`msg = finh + sizeof(fuse_in_header)`。
+
 `fuse_fop_resume`：
 
 ```text
-fuse_state_t.finh      = state + 160
-fuse_state_t.loc       = state + 32
-fuse_state_t.loc2      = state + 96
-loc_t.path             = loc + 0
-fuse_state_t.off       = state + 176
-fuse_state_t.size      = state + 200
-fuse_state_t.name      = state + 248   /* symlink target / xattr key；以 offsetof 复核 */
+fuse_state_t.finh       = state + 160
+fuse_state_t.loc        = state + 32
+fuse_state_t.loc2       = state + 96
+loc_t.path              = loc + 0
+loc_t.inode             = loc + 16
+loc_t.name              = loc + 8
+fuse_state_t.off        = state + 176
+fuse_state_t.size       = state + 200
+fuse_state_t.name       = state + 248   /* symlink target / xattr key */
+fuse_state_t.loc.inode  = state + 48
+fuse_state_t.loc2.inode = state + 112
+inode_t.ia_type         = inode + 92
 ```
+
+`ia_type` 在 P0 build 已验证为 +92（+132 是垃圾值）；`link` 的源 inode 在
+`loc2.inode`，`rename` 的源 inode 在 `loc.inode`。
 
 `send_fuse_iov`：
 
@@ -411,6 +496,50 @@ fuse_out_header = iov_out[0].iov_base
 error   = *(s32 *)(fuse_out_header + 4)
 ```
 
+**S 必须是 uretprobe，且 error 在入口捕获**：
+
+```text
+entry uprobe:
+  send_state[pid_tgid] = {finh, unique, opcode, pid, nodeid, error}
+  error = *(s32 *)(iov_out[0].iov_base + 4)
+return uretprobe:
+  val = send_state[pid_tgid]; 若缺失则跳过
+  S.timestamp = bpf_ktime_get_ns()
+  写 ctl S（用保存的 unique/opcode/pid/nodeid/error）
+  删除 send_state[pid_tgid]
+```
+
+不能在 uretprobe 读 `arg1/arg2`：HMDFS 的 retprobe 教训同样适用；而且
+`send_fuse_err` 是 `return send_fuse_iov(...)`，-O2 可能尾调用，返回时
+caller 栈帧可能已失效。入口捕获 error 后，返回只取时间。
+
+`fuse_release` / `fuse_releasedir` 直接 `send_fuse_err`，不经过
+`fuse_fop_resume`，因此：
+
+```text
+FUSE_RELEASE 18     -> D + S，无 R
+FUSE_RELEASEDIR 29  -> D + S，无 R
+```
+
+v1 保留 18、过滤 29（见 §5.4）；18 的 path 只能从 nodeid 映射或 fd
+provenance 来，不计 `missing_r`。
+
+**符号与 attach**：
+
+```text
+P0 image fuse.so（LOCAL .symtab）：
+  fuse_dispatch    = 0x5e940, 583B
+  fuse_fop_resume  = 0x68be0, 338B
+  send_fuse_iov    = 0x216a0, 832B
+send_fuse_iov 在 P0 build 有 4 个 callq（394/986/2780/3015），未被内联。
+```
+
+- 如果 libbpf 支持 `bpf_uprobe_opts.func_name`，用符号名 attach；
+- 否则用 libelf 解析 `.symtab`，取 `st_value` 后
+  `bpf_program__attach_uprobe(prog, retprobe, -1, fuse_so, offset)`；
+- P0 的 `fuse.so` 有 `.symtab`；如果镜像重建/strip，符号和 offset 都要
+  重新确认。
+
 ### 5.3 用户态内存读取
 
 这些地址都在用户态：
@@ -418,7 +547,8 @@ error   = *(s32 *)(fuse_out_header + 4)
 - `arg0` 指向 `gf_async_t`
 - `fuse_in_header_t *finh`
 - `fuse_state_t *state`
-- `loc.path` / `loc2.path`
+- `state->loc.inode` / `loc2.inode`（读 `ia_type`）
+- `loc.path` / `loc2.path` / `state->name`
 - `iov_out[0].iov_base`
 
 因此 BPF 必须使用用户态读取：
@@ -429,6 +559,14 @@ bpf_probe_read_user_str
 ```
 
 路径拷贝直接写入 ringbuf 预留区，避免在 BPF 栈上同时放 `path[512] + path2[512]`。
+字符串读取失败时 length=0，不视为路径；超过 512/128 时设置对应
+`truncated` 位。raw event 用 packed/手写序列化，并加
+`_Static_assert(sizeof(struct glusterfs_path_event) == 1204)`。
+
+**bpftrace 验证注意**：旧版 bpftrace 对 `$var = arg0 - 24` 这类“变量 + 负
+偏移”可能读 0；P0 用嵌套直接表达式
+`*(uint32 *)(*(uint64 *)(arg0 - 24) + 4)` 验证成功。正式 executor 的 BPF
+用 `PT_REGS_PARM1 - 24`，不受该工具问题影响。
 
 ### 5.4 过滤
 
@@ -447,7 +585,9 @@ FUSE_BATCH_FORGET  42
 
 `FUSE_SETXATTR`/`FUSE_GETXATTR` 不整体过滤；只保留 `user.*`，过滤
 `security.*`、`trusted.*`、`system.*`、虚拟 `glusterfs.*`/GFID 和
-`inode-invalidate`。
+`inode-invalidate`。内部 GETXATTR 在 P0 出现 `-61 (ENODATA)` /
+`-95 (EOPNOTSUPP)`；没有 user R 的 xattr S 在 userspace 丢弃，不能生成
+无 name/path 的最终事件。
 
 保留：
 
@@ -475,8 +615,16 @@ FUSE_BATCH_FORGET  42
 44 READDIRPLUS
 ```
 
-`FUSE_RELEASE` 暂时保留；`FUSE_RELEASEDIR` 第一版过滤。
+`FUSE_RELEASE` 保留：HMDFS 也 trace `hmdfs_file_release_local`，它的
+`FuncRelease` 会匹配 `close`，作为 DAG B/CC 侧。`FUSE_RELEASEDIR` 过滤：
+HMDFS 不 trace 目录 release（`hmdfs_dir_release_merge` 没有对应探针）。
 `FUSE_RENAME2 45` 当前 build 不可达，不映射。
+
+- 18 只有 D/S、没有 R；path 由 OPEN 的 nodeid map 或 fd provenance 提供，
+  不计 `missing_r`。
+- 29 直接过滤，不产生 raw/final event；不要为了目录 close 去补 R。
+- D/R/S 使用同一张 opcode 分类表：18 保留，29 过滤；不能只在某一个探针
+  里放过/丢掉，否则会破坏 unique 配对计数。
 
 ## 6. Userspace 聚合与路径映射
 
@@ -494,44 +642,67 @@ pending: unique -> {
 流程：
 
 ```text
-D:
-  建立 pending；记录 start_ts/opcode/nodeid/pid
-
-R:
-  填 path/path2/off/size/mode/truncated
-
-S:
-  生成最终 glusterfs_trace_event；删除 pending
+stop_collect（父进程）:
+  1. 分别 drain ctl ring（D/S）和 path ring（R）到内存
+  2. 按 ts 合并两路事件（同 ts：D < R < S）
+  3. 按 unique 建 pending；D/R/S 可以以任意跨请求顺序到达
+  4. 每个 unique 最终以 S 生成 glusterfs_trace_event
+  5. 删除 pending；清空 nodeid map（本轮结束）
 ```
+
+- D/R/S 可以在不同 worker 线程；同一 unique 的因果顺序 D→R→S 成立，
+  但跨 unique 会交错，不能假设连续。
+- `pid` 用 `finh->pid`（发起 syscall 的进程），不是 glusterfs worker；
+  pending 只按 `unique` 配对，一个 client VM 只允许一个 mount。
+- 不能在“收到 S”时立即 finalize：ctl/path 两个 ring 独立 drain，S 可能
+  先于 R 被读到；必须先合并/收集完本轮事件。
+- `start_glusterfs_trace()` 在子进程里只做 ring drain（丢弃 stale 事件）；
+  pending/nodeid map 的清理放在父进程 `stop_collect` 末尾，避免 fork COW
+  子进程清了个副本、父进程仍保留上一轮状态。
 
 异常：
 
 | 情况 | 处理 |
 |---|---|
 | S 无 D | 生成事件，`entry_ts=0`，计数 `missing_d` |
-| S 无 R | path 为空，尝试 nodeid 映射，计数 `missing_r` |
+| S 无 R | path 为空，尝试 nodeid 映射；非 xattr、非 18 计数 `missing_r` |
+| S 无 R 且是 xattr | 丢弃（没有 name/path，不能生成最终事件） |
+| S 无 R 且 opcode=18 | 正常；path 走 fd provenance/nodeid，不计 `missing_r` |
+| R 无 D | 保留 pending，等 S；不能直接丢弃 |
 | R 无 S | 丢弃，计数 `missing_s` |
 | D 无 S | stop 时丢弃，计数 `missing_s` |
 | path 截断 | 设置 `truncated` 位；优先用 nodeid 映射补全；仍无完整路径则 DAG 丢弃 |
 | ring 溢出 | 记录 drop 计数，不静默 |
 
+`no_r_by_design` 只有 `FUSE_RELEASE 18`；`FUSE_RELEASEDIR 29` 在 §5.4
+直接过滤，不进入本状态机。
+
 ### 6.2 路径归一化
 
-在 `glusterfs_trace.cc` 中完成：
+在 `glusterfs_trace.cc` 中完成。GlusterFS 的 FUSE 路径相对**挂载根**
+`/root/glusterfs-client`，而 FileTree/调用参数相对**测试根**
+`/root/glusterfs-client/eifuzz_root`；tracer 必须去掉测试根这一层：
 
 ```text
-"/"          -> ""
-"/q0"        -> "q0"
-"/a/b"       -> "a/b"
+/eifuzz_root          -> ""
+/eifuzz_root/q0       -> "q0"
+/eifuzz_root/a/b      -> "a/b"
+/                     -> out-of-root，丢弃
+/.glusterfs/...       -> out-of-root，丢弃
 ```
 
 规则：
 
-- 去掉前导 `/`。
-- 根 `/` 归一化为空字符串。
+- 先去掉前导 `/`，再 strip `trace_root`（GlusterFS 固定 `eifuzz_root`；
+  可通过 init 参数覆盖）。
+- 测试根本身归一化为空字符串。
+- 不在 trace root 下的路径标记 out-of-root，最终事件丢弃并计数；不能把
+  mount root 或 `.glusterfs` 内部路径带进 DAG。
 - 不做 `merge_view/` 前缀。
-- `path2` 同样处理。
+- `path2`：rename/link 是挂载内路径，同样 strip；symlink 的 `path2` 是原始
+  payload，不 strip。
 - 超过 512 字节：截断并设置 `truncated` 位。
+- `nodeid -> path` 映射值也使用同一归一化规则。
 
 ### 6.3 `nodeid -> path`
 
@@ -573,11 +744,22 @@ READDIRPLUS 44
 部分 GETATTR 3
 ```
 
+- 只有存在 R 且 D 的 opcode 属于上表“目标 inode”集合时，才写入映射；
+  LOOKUP/MKDIR/CREATE/UNLINK/RMDIR/RENAME 的 `nodeid` 是父目录，不能写。
+- `RELEASE 18` 没有 R，不能从自己的 R 建立映射；它的 path 来自同程序
+  OPEN 建立的映射或 fd provenance。
+- `nodeid` 指针可能在同一轮内被 inode 释放/复用；映射只做 fallback，
+  DAG 非 LOOKUP 仍以调用参数/fd provenance 为准。
+
 特殊：
 
 ```text
-nodeid == 1 -> 根路径 ""
+nodeid == 1 -> mount root "/"，out-of-root，不映射
+测试根 /eifuzz_root -> strip 后 ""
 ```
+
+不要把 `nodeid == 1` 映射成测试根 `""`：1 是 FUSE 挂载根
+`/root/glusterfs-client`，不是 `/root/glusterfs-client/eifuzz_root`。
 
 hardlink alias：GETATTR/OPEN/WRITE 的 `nodeid` 是目标 inode，事件 path 由
 `inode_path` 决定，可能是 target，也可能是某个 alias。源码依据：
@@ -593,7 +775,13 @@ inode.c: inode_link -> list_add(head)
 DAG 非 LOOKUP 顶点用调用参数/fd provenance（§9），`ev.Path` 只做 fallback/
 校验；不据 `inode_path` 做 `PathSameInode`。
 
-每轮 `start_glusterfs_trace()` 清空 `nodeid -> path`，避免 inode 指针复用。
+每轮在父进程 `stop_collect` 末尾清空 `nodeid -> path`，避免 inode 指针复用；
+`start_glusterfs_trace()` 在 fork 子进程里只 drain ring，不能承担清理职责
+（COW 只改子进程副本）。
+
+P0 实测 `truncate("q0")` 的事件 path 可能是 hardlink alias `h1`，因为
+`inode_path` 在 q0/h1 间任选 dentry。事件 path 不是 canonical 调用参数；
+DAG 必须用调用参数/fd provenance，`ev.Path` 只做 fallback/校验。
 
 ### 6.4 双路径操作
 
@@ -601,16 +789,19 @@ DAG 非 LOOKUP 顶点用调用参数/fd provenance（§9），`ev.Path` 只做 f
 
 - `path` = 旧路径
 - `path2` = 新路径
-- `path2` 为空时表示未捕获；不要用 `path` 代替新路径。
+- 两者都做 trace-root strip；`path2` 为空时表示未捕获，不要用 `path` 代替。
+- mode 来自源 inode：`loc.inode + 92`（P0 目录 rename 已验证 `ia_type=2`）。
+- `path2`/`loc2.inode` 只做 rename 目标校验；DAG 用调用参数 `src/dst`。
 - `RENAME2 45` 在当前 FUSE 7.24 build 无 handler，不映射、不生成。
 
 `LINK 13`：
 
 - `path` = 新链接路径
-- `path2` = 源 inode 路径
-- v1 不写 `EntryIno`。源码确认 `loc.inode` 是源 inode（`inode_ref(loc2.inode)`），
-  但 v1 不需要它；`loc2.path` 可能来自 `inode_path` 的任意源 alias。
-  DAG `link` 顶点用调用参数 `new/old` 作为 `Path/Path2`，不取事件 `loc2.path`。
+- `path2` = 源 inode 路径（可能是 `inode_path` 的任意 alias）
+- R 发生在 `fuse_link_resume` 之前，`loc.inode` 还是空的；**源 inode 的
+  `ia_type`/mode 必须读 `loc2.inode + 92`**，不能读 `loc.inode`。
+- v1 不写 `EntryIno`。DAG `link` 顶点用调用参数 `new/old` 作为
+  `Path/Path2`，不取事件 `loc2.path`。
 
 `SYMLINK 6`：
 
@@ -619,6 +810,9 @@ DAG 非 LOOKUP 顶点用调用参数/fd provenance（§9），`ev.Path` 只做 f
 - `path2` 不是 canonical FileTree 路径；它按 linkpath 的父目录解析。DAG/定向
   使用 target 做路径关系时，必须先用 `linkpath + path2` 还原 canonical target，
   再和 FileTree/调用路径比较；不要直接把 payload 当 FileTree 节点。
+- `path2` 不做 trace-root strip（它是 payload，不是挂载路径）。
+- R 时新 symlink inode 的 `ia_type` 可能是 0；mode 用 FuncSymlink 默认
+  （S_IFLNK/非目录）。
 - v1 不写 `EntryIno`。`loc.inode` 是新 symlink inode；linkpath/target 都由
   syscall 参数精确给出。symlink follow 的底层访问由 VFS 解析到 target 路径，
   DAG `stat(L1)` 仍用调用参数 `L1`，不取 FUSE GETATTR 的 target path。
@@ -633,13 +827,33 @@ DAG 非 LOOKUP 顶点用调用参数/fd provenance（§9），`ev.Path` 只做 f
 
 - `path` = 目标路径
 - `xattr_name` = key
-- 只保留 `user.*`；虚拟 `glusterfs.*`/GFID 不进入事件。
+- `size` 是请求缓冲区/值长度，不是文件大小；`getxattr(size=0)` 是合法的
+  size 查询。
+- 只保留 `user.*`；虚拟 `glusterfs.*`/GFID 不进入事件。内部 GETXATTR 的
+  `-61/-95` 证实了 filter 的必要性；没有 user R 的 S 在 userspace 丢弃。
+- `xattr_name` 不做 trace-root strip。
 
 ### 6.5 mode / off / size
 
-- `mode` 来自 `loc.inode->i_mode`；失败则 0。
-- `off/size` 来自 `fuse_state_t`；失败则 0。
+`mode`：
+
+- 来自 `inode_t.ia_type`（+92），映射成 `S_IFMT`；不是 `i_mode`，也没有
+  `i_mode` 字段。
+- `rename` 用 `loc.inode`；`link` 用 `loc2.inode`；`symlink/mkdir/create`
+  新 inode 在 R 时可能为 0，用函数默认；`symlink` 默认非目录。
+- `funcDefaultIsDir`：`link/symlink/readlink` 默认 false；
+  `getattr/setattr/rename/xattr` 未知，走 mode/fsMd 回退。
 - DAG 的 `eventIsDir` 在 `mode=0` 时使用 `funcDefaultIsDir` 或 fsMd 回退。
+
+`off/size`：
+
+- read/write：`off` = 请求 offset，`size` = 请求长度；
+- truncate：`off` = `fsi->size`（新大小），`size` = 0；FUSE SETATTR 请求
+  不提供旧文件大小；
+- chmod：`off=size=0`（DAG 用 call-name gate 排除，不当成 truncate to 0）；
+- readdir/readdirplus：`off` = 目录 offset，`size` = 缓冲区；
+- getxattr/setxattr：`size` = 请求缓冲区/值长度；
+- 失败/未知：0。
 
 ## 7. Opcode 映射
 
@@ -657,7 +871,8 @@ FUSE_LINK         13 -> link
 FUSE_OPEN         14 -> open
 FUSE_READ         15 -> read
 FUSE_WRITE        16 -> write
-FUSE_RELEASE      18 -> release
+FUSE_RELEASE      18 -> release      （D/S，无 R；保留）
+FUSE_RELEASEDIR   29 -> 过滤          （无 R；HMDFS 不 trace 目录 release）
 FUSE_FSYNC        20 -> fsync
 FUSE_SETXATTR     21 -> setxattr
 FUSE_GETXATTR     22 -> getxattr
@@ -703,6 +918,11 @@ FUSE_SYNCFS/TMPFILE/STATX  当前 header 不存在
 
 GlusterFS 不发送 15；`FuncIDCount=21`；`DagDiag` 数组扩到 21 或动态。
 
+`FuncRelease 12` 在 v1 是**文件 close**：HMDFS 也 trace
+`hmdfs_file_release_local`，并映射到 `close` 调用；close 不是 modifier，但
+可以作为 HB/CC 的 B 侧，DAG pair 保留。`FUSE_RELEASEDIR 29` 不产生事件，
+所以目录 close 没有顶点；这与 HMDFS（只 trace 文件 release）一致。
+
 ## 8. IPC 解析
 
 > 本节只保留 wire→Go parser 的实现细节；v1 角色/DAG/coverage 策略见
@@ -724,7 +944,7 @@ count  u32
 events[count]
 ```
 
-每个 event：
+每个 event 固定 1228 字节（不是变长）：
 
 ```text
 timestamp      u64
@@ -740,9 +960,9 @@ path_len       u32
 path2_len      u32
 xattr_name_len u32
 truncated      u32
-path           path_len bytes
-path2          path2_len bytes
-xattr_name     xattr_name_len bytes
+path           char[512]     /* 读满 512，再按 path_len 截取 */
+path2          char[512]     /* 读满 512，再按 path2_len 截取 */
+xattr_name     char[128]     /* 读满 128，再按 xattr_name_len 截取 */
 ```
 
 严格检查：
@@ -750,8 +970,20 @@ xattr_name     xattr_name_len bytes
 - `path_len <= 512`
 - `path2_len <= 512`
 - `xattr_name_len <= 128`
-- `count` 不超过剩余长度可容纳的事件数
-- 不足时停止解析并保留已解析事件
+- 每个 event 按 1228B stride 前进；`count` 不超过剩余长度可容纳的事件数
+- 不足时停止解析并保留已解析事件；不能按 length 变长读取
+
+parser 填 Go 字段：
+
+```text
+Ino        = 0          /* 不要填 nodeid；v1 不做 PathSameInode */
+NodeID     = nodeid
+Path       = path
+Path2      = path2
+XattrName  = xattr_name
+Truncated  = truncated
+Mode       = mode
+```
 
 `parseOutputs` 的两个 executor 解析路径都要按：
 
@@ -759,7 +991,8 @@ xattr_name     xattr_name_len bytes
 env.config.DFSName == "glusterfs"
 ```
 
-选择 GlusterFS parser；HMDFS 继续用 `parseHmdfsTraceEvents`。
+选择 GlusterFS parser；HMDFS 继续用 `parseHmdfsTraceEvents`。server executor
+即使不采集 trace，也必须写 `count=0` 的 28B 头，否则流顺序会错。
 
 ## 9. Go 事件与 DAG
 
@@ -805,12 +1038,20 @@ HMDFS parser 不填这些字段，保持零值。GlusterFS parser 直接把 wire
 - `ev.Path` 与调用参数/fd provenance 不一致时，以调用侧为准，并计入
   path-mismatch 诊断；LOOKUP/无调用事件才以 `ev.Path` 为权威。
 - `Truncated != 0` 时优先尝试 nodeid 映射；仍失败则丢弃并计数。
-- `Ino` 对 GlusterFS 只作诊断/特征，不用于路径解析。
+- GlusterFS parser 固定 `Ino=0`，`NodeID` 单独保存；不要把 `nodeid` 填进
+  `Ino`，否则 `determinePathRel` 的 same-inode 分支和 delete timeline 会误用
+  inode 指针。
 - GlusterFS v1 不填 `EntryIno`；`SupportsSameInode=false`，
   `determinePathRel` 不比较 `Ino`，只做路径相等/父子/同父/None。
 - 所有匹配到的事件都建顶点；LOOKUP 也建；v1 不做同调用过滤。
-- hardlink 的 FUSE path 可能是 target/alias，但 DAG 非 LOOKUP 顶点按调用侧
-  路径，不据此新增 `PathSameInode`。
+- 文件 `RELEASE 18` 建 `FuncRelease` 顶点；它不是 modifier，但可以作为
+  HB/CC 的 B 侧。目录 `RELEASEDIR 29` 已被过滤，不建顶点。
+- hardlink 的 FUSE path 可能是 target/alias（P0 `truncate("q0")` 显示 `h1`），
+  但 DAG 非 LOOKUP 顶点按调用侧路径/fd provenance，不据此新增
+  `PathSameInode`。planned linkpath 可作为 truncate/write 的**调用参数**；
+  内核选出的 alias 不是调用参数。
+- 路径进入 DAG 前必须已 strip `eifuzz_root`；测试根为 `""`，mount root
+  和 `.glusterfs` 内部路径不能进入顶点。
 
 rename 时间线：
 
@@ -925,10 +1166,13 @@ src/executor/dfs_trace.cc
 接口：
 
 ```c
-void init_dfs_trace(const char *dfs_name);
+void init_dfs_trace(const char *dfs_name, const char *trace_root);
 void start_dfs_trace(void);
 void stop_collect_dfs_trace(void);
 ```
+
+`trace_root` 是挂载根到测试根的相对路径；GlusterFS 固定 `eifuzz_root`，
+HMDFS 不使用（传空）。它只用于 tracer 路径 strip，不写进 FileTree.Prefix。
 
 分发：
 
@@ -944,16 +1188,41 @@ v1 实现不只在 trace 上分发；cwd/restore/metadata/config/node-up/down �
 `executor.cc` 调用点：
 
 ```text
-init_hmdfs_trace()         -> init_dfs_trace(dfs_name)
+init_hmdfs_trace()         -> init_dfs_trace(dfs_name, trace_root)
 start_hmdfs_trace()        -> start_dfs_trace()
 stop_collect_hmdfs_trace() -> stop_collect_dfs_trace()
 ```
 
-调用时机保持不变：
+调用时机：
 
-- `init`：启动时，`calibrate_tsc()` 前。
-- `start`：执行前。
-- `stop_collect`：执行结束、`write_metadata()` 前。
+- `init`：启动时；当前 `executor.cc` 是先 `calibrate_tsc()` 再
+  `init_hmdfs_trace()`，GlusterFS 沿用实际顺序，不依赖校准。
+- `start`：fork 子进程、执行前；只做 ring drain（丢弃 stale 事件）。
+- `stop_collect`：父进程，`clt_finish()`/`g_prog_end_raw` 之后、
+  `write_metadata()` 前。
+
+GlusterFS 时间对齐直接复用现有 HMDFS 代码路径：
+
+```text
+calibrate_tsc() / tsc_ns_to_global() / tsc_offset / tsc_ns_ratio /
+tsc_best_gap / g_prog_end_raw
+```
+
+`stop_collect_dfs_trace()` 必须：
+
+1. 在父进程 drain ctl/path 两个 ring；
+2. 按 `ts` 合并，再做 D/R/S 聚合；
+3. 对 `timestamp` 和 `entry_ts` 调 `tsc_ns_to_global`；
+4. 写与 HMDFS 相同的 `[ratio][offset][gap][count]` 头；
+5. 在父进程末尾清 `pending`/`nodeid` map（不能在 fork 子进程的 start 里清）。
+
+角色：
+
+- GlusterFS server executor 不 attach fuse uprobe；但 `stop_collect` 仍写
+  `count=0` 的 trace 头，保证 `[program output][trace][fsMd]` 流顺序。
+- client executor 才 init/attach；一个 client VM 只允许一个 mount，否则
+  `unique` 会跨 mount 冲突。
+- `trace_root` 只对 client 设置；server 传空。
 
 ## 12. 构建
 
@@ -1082,6 +1351,21 @@ go test ./prog/... ./pkg/ipc/...
 - symlink follow：FUSE GETATTR 事件可以指向 target，但 DAG `stat` 顶点路径
   必须来自调用参数；hardlink 事件 path 可以是 target/alias，DAG 顶点路径
   仍来自调用参数/fd provenance。断言不依赖 `EntryIno`/`PathSameInode`。
+- `ia_type`：file=1/dir=2/symlink=3；`link` 用 `loc2.inode+92`，
+  `rename` 用 `loc.inode+92`，`symlink/mkdir/create` 新 inode 为 0 时走
+  函数默认。
+- 路径：`/eifuzz_root` -> `""`；`/eifuzz_root/q0` -> `q0`；mount root
+  `/` 和 `.glusterfs` 内部路径被丢弃；rename/link path2 strip，symlink
+  payload 不 strip。
+- `truncate`：`off=新大小`、`size=0`；read/write 的 off/size、readdir 的
+  off/size、xattr 的 size 不混淆。
+- `RELEASE 18`：D+S、无 R；path 走 fd provenance；文件 close 产生
+  `FuncRelease` 顶点，可作为 HB/CC 的 B 侧。
+- `RELEASEDIR 29`：过滤，不产生 D/R/S/final event；目录 close 没有顶点。
+- 内部 GETXATTR `-61/-95` 被 `user.*` 过滤；没有 user R 的 S 丢弃。
+- ctl/path 双 ring 合并：构造 S 先于 R drain 的场景，最终事件仍能拿到 path。
+- parser 固定 1228B stride：构造两个连续 event，第二个不会被第一个的
+  `path_len` 错位。
 - checker 空前缀路径匹配、xattr 双向、symlink target。
 - CSAN 只保留 client 固定测试根下 fsMd；server fsMd 不参与 pairwise。
 - `testdirIno` 固定为 `/root/glusterfs-client/eifuzz_root`。
@@ -1100,44 +1384,79 @@ glusterfs_trace.skel.h 生成
 executor 链接成功
 ```
 
+构建机前置条件（点 2）：
+
+```text
+clang 支持 -target bpf
+bpftool 能 gen skeleton
+libbpf.h / libbpf.so 可链接
+libelf / zlib 可链接
+tools/vmlinux.h 来自 5.15 GlusterFS 内核
+```
+
+`fuse_dispatch` / `fuse_fop_resume` / `send_fuse_iov` 是 LOCAL `.symtab`；
+如果 libbpf 的 `bpf_uprobe_opts.func_name` 不可用，用 libelf 解析
+`.symtab` + `st_value` attach。P0 build 的 `send_fuse_iov` 有 4 个 callq，
+没有内联；如果重建后 call 数变化，先检查 noinline。
+
 ### 14.3 单 VM 冒烟
 
 ```bash
-ls /root/glusterfs-client
-touch /root/glusterfs-client/a
-cat /root/glusterfs-client/a
-mkdir /root/glusterfs-client/d
-mv /root/glusterfs-client/a /root/glusterfs-client/b
-rm /root/glusterfs-client/b
-rmdir /root/glusterfs-client/d
-touch /root/glusterfs-client/a
-ln /root/glusterfs-client/a /root/glusterfs-client/hard_a
-ln -s a /root/glusterfs-client/sym_a
-stat /root/glusterfs-client/hard_a
-stat /root/glusterfs-client/sym_a
-readlink /root/glusterfs-client/sym_a
-rm /root/glusterfs-client/hard_a /root/glusterfs-client/sym_a
+ROOT=/root/glusterfs-client/eifuzz_root
+mkdir -p "$ROOT"
+cd "$ROOT"
+rm -rf ./*
+
+touch q0
+cat q0
+mkdir d0
+mv d0 d1
+stat d1
+ln q0 h1
+ln -s q0 s1
+readlink s1
+stat h1
+stat s1
+
+# path truncate（用 syscall，不用 shell 的 ftruncate）
+cat >/tmp/tr.c <<'EOF'
+#include <unistd.h>
+#include <sys/syscall.h>
+int main(void) { return syscall(SYS_truncate, "q0", 12); }
+EOF
+gcc -o /tmp/tr /tmp/tr.c
+/tmp/tr
+
+chmod 600 q0
+setfattr -n user.foo -v bar q0
+getfattr -n user.foo q0
+ls -la
+rm -f h1 s1
 ```
 
 验收：
 
 ```text
-Path/Path2 正确
+Path/Path2 正确，且 path 已 strip /eifuzz_root
 LINK Path=新路径 / Path2=源；SYMLINK Path=linkpath / Path2=target
 READLINK Path=linkpath
 LOOKUP Path=父目录+name 的精确分量
 SETXATTR/GETXATTR Path=目标 / XattrName=user.*
 READDIR 28 / READDIRPLUS 44 都映射 ITERATE
 READ/WRITE fd provenance 路径正确
-FLUSH/p=0 已过滤；GETXATTR 不再整体过滤
+RELEASE 18：D+S、无 R；文件 close 有 FuncRelease 顶点
+RELEASEDIR 29：无 D/R/S/final event；目录 close 无顶点
+FLUSH/p=0 已过滤；GETXATTR 只保留 user.*
+内部 GETXATTR -61/-95 无 final event
 事件数不超过 8192
 DAG vertices/pairs/matchFail 正常
 每轮 restore 后树一致
 
-hardlink：FUSE stat/write 事件 path 可能是 target 或 alias；
+hardlink：truncate("q0") 的事件 path 可能是 h1（P0 实测）；
           DAG 顶点 Path 必须来自调用参数/fd provenance
 symlink：FUSE stat GETATTR 事件 path 可能是 target T；
          DAG stat 顶点 Path 是调用参数 L1；readlink Path=L1
+dir close：ls 只看到 OPENDIR/READDIRPLUS，看不到 RELEASEDIR final event
 ```
 
 ### 14.4 3-3 + replica 3
@@ -1156,14 +1475,17 @@ symlink：FUSE stat GETATTR 事件 path 可能是 target T；
 | 风险 | 处理 |
 |---|---|
 | path 截断 | `truncated` 位；nodeid 映射回退；仍失败则 DAG 丢弃并计数 |
-| nodeid 指针复用 | 每轮 start 清空映射 |
+| nodeid 指针复用 | 父进程 `stop_collect` 末尾清空；不是 start 子进程 |
 | hardlink alias 的事件 path 不确定（target/alias） | 源码已确认 `inode_path` 任意 dentry；v1 DAG 用调用参数/fd provenance，`ev.Path` 只 fallback/校验；不依赖 `PathSameInode`/`entry_ino` |
 | path ring 溢出 | 记录 drop 计数；必要时增大 ring |
 | 事件超过 8192 | 截断并记录；必要时增大上限和输出缓冲区 |
 | HMDFS 回归 | HMDFS wire/C 不变；只新增 Go 字段 |
 | prefix 改造回归 | 默认 `NewFileTree()` 保持 `merge_view/`；新增测试 |
 | restore 只恢复客户端命名空间 | 若 server 侧残留导致不可复现，再评估 brick-level restore |
-| `GETXATTR/FLUSH` 误过滤 | `FLUSH` 继续过滤；`GETXATTR/SETXATTR` 只保留 `user.*`，虚拟/内部 key 过滤 |
+| `GETXATTR/FLUSH` 误过滤 | `FLUSH` 继续过滤；`GETXATTR/SETXATTR` 只保留 `user.*`，虚拟/内部 key 过滤；内部 xattr 的 S-only 事件丢弃 |
+| `RELEASE/RELEASEDIR` 无 R | 18 保留 D/S，path 走 fd provenance，不计 missing_r；29 过滤，不产生 final event |
+| ctl/path 双 ring 顺序 | 两个 ring 全 drain 后按 ts 合并；不能按单 ring 顺序 finalize |
+| 构建机 libbpf/bpftool | 先找 HMDFS 既有构建环境/kernel tree；`func_name` 不可用则用 `.symtab` + offset |
 
 回退：
 
@@ -1207,6 +1529,7 @@ v1 的完整阶段与角色/executor/config 检查点见 `glusterfs-adaptation-p
 uprobe:/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so:fuse_dispatch
 uprobe:/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so:fuse_fop_resume
 uprobe:/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so:send_fuse_iov
+uretprobe:/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so:send_fuse_iov
 ```
 
 偏移：
@@ -1218,8 +1541,10 @@ fuse_fop_resume:     finh = state + 160
                      path2 = state + 96
                      off = state + 176
                      size = state + 200
-send_fuse_iov:       finh = arg1
+                     name = state + 248
+send_fuse_iov:       entry: finh = arg1, iov_out = arg2
                      error = *(s32 *)(iov_out[0].iov_base + 4)
+                     uretprobe: 用入口保存的 finh/error + 当前 ktime
 ```
 
 观测：
@@ -1241,4 +1566,57 @@ S o=44 u=604
 D o=15 u=638 n=106721347771096
 R o=15 u=638 p=
 S o=15 u=638
+```
+
+### 18.1 2026-11-16 P0 复核记录
+
+探针符号（5.15 VM，`/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so`）：
+
+```text
+nm -C:
+  000000000005e940 t fuse_dispatch      583B
+  0000000000068be0 t fuse_fop_resume    338B
+  00000000000216a0 t send_fuse_iov      832B
+
+send_fuse_iov 的 callq = 4（源码 394/986/2780/3015），无内联。
+```
+
+实测布局：
+
+```text
+fuse_async_t: iobuf=+0 finh=+8 this=+16 msg=+24 async=+32
+D:            finh = arg0 - 24
+finh:         opcode=+4 unique=+8 nodeid=+16 pid=+32
+fuse_state_t: loc=+32 loc2=+96 finh=+160 off=+176 size=+200 name=+248
+loc.inode=+16 loc2.inode=+112
+inode_t.ia_type=+92（+132 为垃圾值）
+```
+
+实测语义：
+
+```text
+路径（mount root=/root/glusterfs-client, cwd=eifuzz_root）：
+  stat q0              -> /eifuzz_root/q0
+  mv d0 d1             -> p=/eifuzz_root/d0 p2=/eifuzz_root/d1
+  ln q0 h1             -> p=/eifuzz_root/h1 p2=/eifuzz_root/h0(alias)
+                         ia1=0 ia2=1（link 源在 loc2.inode）
+  ln -s q0 s1          -> p=/eifuzz_root/s1 name=q0 ia1=0
+  readlink s1          -> p=/eifuzz_root/s1 ia1=3
+  truncate syscall q0  -> p=/eifuzz_root/h1(alias) off=12 size=0
+  chmod q0             -> p=/eifuzz_root/h1(alias) off=0 size=0
+  setxattr q0 user.foo -> p=/eifuzz_root/h1(alias) name=user.foo size=3
+  getxattr q0 user.foo -> name=user.foo size=0/256
+  ls -la               -> op=27 p=/eifuzz_root; op=44 p=<null>;
+                          op=29 无 R，且 v1 过滤
+  cat q0               -> op=14/15/18；18 无 R
+内部 GETXATTR S: -61(ENODATA) / -95(EOPNOTSUPP)
+```
+
+bpftrace 注意：
+
+```text
+旧版 bpftrace 对 $var = arg0 - 24 可能读 0；
+用嵌套直接表达式：
+  *(uint32 *)(*(uint64 *)(arg0 - 24) + 4)
+正式 executor 的 BPF 用 PT_REGS_PARM1，不受影响。
 ```

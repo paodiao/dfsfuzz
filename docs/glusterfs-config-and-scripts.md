@@ -482,6 +482,9 @@ node-up.sh start_ip srv_cnt client_cnt "mode" cur_idx
 - server metadata：跳过
 - `testdirIno`：client cwd 的 `st_ino`
 - trace：client-only
+- trace root：`eifuzz_root`（相对挂载根 `/root/glusterfs-client`）；FUSE
+  事件 path 是 `/eifuzz_root/...`，tracer 必须 strip 成测试根相对路径；
+  `FileTree.Prefix` 仍为 `""`，不要把 `eifuzz_root` 写进 FileTree。
 - 路径模型：所有调用参数是相对测试根的 canonical 路径；`symlink` target 在
   调用物化时转换为相对 linkpath 父目录的 payload；target 必须在测试根内。
   PathSet/DCT/`RootPaths` 只保存 canonical target，不保存 payload。
@@ -519,6 +522,8 @@ timing 由 profile 解析，HMDFS 现有值不变：
 
 - 3-3 config 启动后：
   - `enable_syscalls` 与 §1 的 22 个一致，没有 `readv/writev/preadv/pwritev`；
+  - `close` 可执行；文件 close 产生 RELEASE D/S（无 R），目录 close 的
+    RELEASEDIR 29 被 tracer 过滤；两者都不作为 DCT/定向 root/variant；
   - executor 0–2 没有 fuzz 程序；
   - executor 3–5 cwd 指向 `eifuzz_root`；
   - `mount` 选项包含 `attribute-timeout=0,entry-timeout=0`；
