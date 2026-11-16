@@ -4,6 +4,11 @@
 > 范围：C2（固定 root 的 variant 规划）与 DCT/derived 跨节点插入中的 fresh 路径。
 > 关联：`docs/causal-root-cell-design.md`、`docs/seed-derivation-design.md`。
 > 本文只记录现状、边界和待研究项，不修改 C1/C2/DCT 代码或现有设计文档。
+>
+> 2026-11-17 GlusterFS：`freshSameForms` 仍作为完整 fresh-fresh 竞赛矩阵；
+> GlusterFS 的 plannable 只在 `Rel=Same` 且 root 是 `mkdir`/`creat` 时使用该
+> 矩阵，并在对应 combo 的 model 中补充 race ENOENT。最终语义见
+> `docs/glusterfs-adaptation-plan.md` §8.2.3。
 
 ---
 

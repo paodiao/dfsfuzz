@@ -1,7 +1,10 @@
 # GlusterFS FUSE Tracer 实现规格（B 方案）
 
-> 状态：BPF raw 细节参考；v1 总决策已被 `docs/glusterfs-adaptation-plan.md` 取代；代码未实施
-> 日期：2026-11-14（2026-11-15 修订 v1 调用/事件/角色/checker 决策）
+> 状态：BPF raw 细节参考；v1 总决策已被 `docs/glusterfs-adaptation-plan.md` 取代；
+> tracer/parser 已实现。coverage 三层、combo-aware fresh-fresh race、
+> normal dual root 的最终语义见总计划 §8.2.1–§8.2.4。
+> 日期：2026-11-14（2026-11-15 修订 v1 调用/事件/角色/checker 决策；
+> 2026-11-17 补 coverage/dual-root 交叉引用）
 > 范围：GlusterFS 客户端 FUSE tracer、IPC 解析、DAG 路径接入、FileTree 空前缀、GlusterFS 文件树恢复
 > 相关：`docs/glusterfs-adaptation-plan.md`、`docs/glusterfs-config-and-scripts.md`、`docs/glusterfs-nfs-adaptation-plan.md`、`docs/executor-file-tree-restore.md`、`docs/kernel-build-glusterfs-bpf.md`
 >
@@ -24,6 +27,7 @@
 |---|---|
 | wire event 布局、BPF raw event、ring、探针/offset、userspace 聚合、opcode 映射、IPC parser、构建细节 | **本文** |
 | v1 调用集、事件语义、Call→Event matcher、双路径 role、FileTree、DAG/覆盖板、DCT/定向、executor runtime、config/scripts、checker、restore 生命周期、验收 | `docs/glusterfs-adaptation-plan.md` |
+| coverage 三层、combo-aware fresh-fresh race、normal dual root | `docs/glusterfs-adaptation-plan.md` §8.2.1–§8.2.4 |
 | config 22-call 清单、InitialDir、prefill/restore 命令、node-up/down 参数 | `docs/glusterfs-config-and-scripts.md` |
 | restore barrier/生命周期细节 | `docs/executor-file-tree-restore.md` |
 

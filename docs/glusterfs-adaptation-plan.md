@@ -1,7 +1,9 @@
 # GlusterFS 适配总计划（v1）
 
-> 状态：设计定稿（P1 已收敛），代码未实施
-> 日期：2026-11-15
+> 状态：设计定稿（P1 已收敛）；核心实现已落，Ubuntu tests / make executor /
+> D1 runtime smoke 待执行
+> 日期：2026-11-15（2026-11-17 更新 coverage 三层、combo-aware fresh-fresh
+> race、normal dual root、GlusterFS DAG feedback）
 > 范围：GlusterFS 3 server + 3 client、replica 3；HMDFS 行为保持不变；NFS 暂不实现
 > 权威关系：本文是 GlusterFS 适配的总入口。tracer 的 BPF 原始细节参考
 > `docs/glusterfs-tracer-implementation-spec.md`；两者冲突时以本文为准。
@@ -1041,7 +1043,8 @@ GlusterFS 规则：
 - `setxattr` 可作为 root/variant；`getxattr` 只作为 variant。
 - `readlink` 只作为 variant，跟在 symlink root 后；不能做 root。
 - `link/symlink` 先做 seed root；derived DCT 共用 §8.5.6 的 `RootPaths`；
-  causal/directed 的 link/symlink 插入由 profile gate 控制，trace 稳定后开启。
+  causal C1 和 normal directed dual root 的 link/symlink 插入都由
+  `DualPathCausalEnabled` 控制，trace 稳定后一起开启；v1 保持 false。
 - GlusterFS 允许跨目录 rename；HMDFS 保持 same-parent。
 - **GlusterFS v1 不做 `PathSameInode`**：DAG 只按路径相等/几何关系；
   HMDFS 无 hardlink，保留现有分类并继续折叠。
@@ -1051,7 +1054,7 @@ GlusterFS 规则：
 - `readv/writev/preadv/pwritev` 不在 22-call config 中，也没有 alias 映射；
   结构化生成器只认 `read/pread64/write/pwrite64`。
 
-### 8.2.1 覆盖板三层
+### 8.2.1 Coverage 三层
 
 覆盖板拆成三层，禁止混用：
 
@@ -1063,22 +1066,85 @@ GlusterFS 规则：
   planner 主动构造的形态；Direction-3（2a variant 偏置、2b exact plan、
   mutation offset/depth 偏置）只消费这一层。
 
-GlusterFS v1 的单操作 plannable 形态由 `directedVariantKinds` 给出：
+指标统一由 `CoverageLayerStats()` 提供，日志 `dct pool:` 使用：
 
 ```text
-Success-only: open/read/write/stat/pread64/pwrite64/fsync/fdatasync/truncate/
-              getdents64/mkdir/creat/unlink/chmod/link/symlink/readlink
-Success+Failure: rmdir/rename(ENOTEMPTY), getxattr(ENODATA)
-Success+EEXIST: setxattr
+obs        = len(discovered)                  // observed cell
+outModel   = observed - modelFound             // 模型外观察
+modelOnly  = modelFound - plannableFound       // 自然可达但 planner 不构造
+model      = modelFound/modelTarget            // model 层覆盖
+plan       = plannableFound/plannableTarget    // planner 层覆盖
+shapes     = len(knownShapes)                  // observed event shape
 ```
 
-FailurePolicy 与 fresh-fresh 竞赛是两条独立通道：
+`CoverageStats()` 仍返回 model 层的 `(found, target)`，仅用于兼容旧测试/调用；
+HMDFS 的 `plannable` 恒等于 model，保持旧行为。
 
-- 单操作、已有对象上的失败按上表收窄：普通 `mkdir EEXIST`、`creat EISDIR`、
-  `open/stat ENOENT` 等不主动构造；
-- fresh-fresh 竞赛使用完整 `freshSameForms` 矩阵，表示 root/variant 在同一
-  fresh 路径上的并发结果（`mkdir/creat Same EISDIR`、`creat/mkdir Same
-  EEXIST`、`mkdir/mkdir Same EEXIST`、`mkdir/rmdir Same ENOENT` 等）。
+### 8.2.2 Normal dual root
+
+normal dual root 是 **normal directed planner 的一个 pass**，不是独立的
+producer，也不是 C1 的降级实现。调用链：
+
+```text
+PickDirectedBatch
+  ├─ pickCausalRootBatch              // C1/C2；能产出则直接返回
+  └─ pickDirectedBatchNormal
+       └─ planDirectedCells
+            ├─ 普通 existing-node pass
+            ├─ FreshA / FreshA2 / FreshB / FreshSame pass
+            └─ normal dual-root pass
+```
+
+实现规则：
+
+- 普通 pass 的 root 列表排除 `link/symlink`；
+- dual pass 对每个 target/root 生成一个 fresh `RootLinkPath`，并调用
+  `planCausalC2CellsWithParent(..., rootKind=causalRootNormal, ...)`；
+- `BaseA` 是 target；cell/relation 用 target 计算；`RootLinkPath` 只出现在
+  plan/batch 和 readlink 的 B 侧，不进入 `cellKey/comboKey`；
+- `pickDirectedBatchNormal` 的 group 条件加入 `RootLinkPath`，保证一个 batch
+  只执行一个 root linkpath；
+- `insertDirectedBatch` 对 `Anchor==nil` 的 link/symlink root 用
+  `causalRootCallsSeq` materialize target + linkpath；
+- normal dual plan 标记 `Causal=true` 只是为了复用 `validateCausalPlan` 对
+  `RootLinkPath`/readlink 的校验，不表示它来自 C1；
+- 由 `DualPathCausalEnabled` gate。v1 保持 false，所以代码存在但运行时惰性；
+  gate 打开后 causal C1 和 normal dual root 都可用。
+
+### 8.2.3 FreshSame 竞赛矩阵与 combo-aware plannable
+
+单操作 FailurePolicy 仍是独立通道，只主动构造：
+
+```text
+rmdir ENOTEMPTY
+rename ENOTEMPTY
+getxattr ENODATA
+setxattr EEXIST
+```
+
+普通已有对象上的 `mkdir EEXIST`、`creat EISDIR`、`open/stat/... ENOENT`、
+`unlink/rmdir/rename ENOENT` 等不主动构造。
+
+fresh-fresh 竞赛使用完整 `freshSameForms` 矩阵，表示 root/variant 在同一
+fresh 路径上的并发结果，不是单操作失败注入：
+
+```text
+creat/creat Success
+mkdir/mkdir EEXIST
+creat/mkdir EEXIST
+mkdir/creat Failure
+creat/unlink Success/ENOENT
+mkdir/rmdir Success/ENOENT
+creat/stat Success/ENOENT
+mkdir/stat Success/ENOENT
+creat/open Success/ENOENT
+mkdir/open Success/ENOENT
+creat/chmod Success/ENOENT
+mkdir/chmod Success/ENOENT
+creat/read Success(offset 0)
+creat/write Success(offset 0)
+mkdir/getdents64 Success
+```
 
 GlusterFS 的 plannable 因此是 combo-aware 的：
 
@@ -1092,16 +1158,31 @@ Rel=Same 且 root ∈ {mkdir, creat}:
 
 `mkdir EEXIST` 只在 `creat/mkdir Same`、`mkdir/mkdir Same` 这类竞赛 combo 中
 plannable；普通已有目录上的 `mkdir EEXIST` 仍不主动构造。race 中自然可达但
-单操作 model 未列出的形态（如 `mkdir/rmdir ENOENT`、`creat/unlink ENOENT`）
-只在对应 creation-root Same combo 的 model/plannable 中扩展，不污染其它 combo。
+单操作 model 未列出的形态（如 `mkdir/rmdir Same ENOENT`、`creat/unlink Same
+ENOENT`）只在对应 creation-root Same combo 的 model/plannable 中扩展，不污染
+其它 combo，从而保持 `plannable ⊆ model`。
 
 `planDirectedCells.add()` 的 plannable 检查是最后一道不变量：任何 normal plan
 进入 batch 前都必须落在 combo-aware plannable 内。HMDFS 的 plannable 恒等于
 model，保持旧行为；`link/symlink/readlink` 在 `DualPathCausalEnabled=false`
 时对 GlusterFS 不进 plannable，DCT 仍可自然生成并记录。
 
-DAG feedback（board learning + DAG corpus/triage）对 HMDFS/GlusterFS 都启用；
-DAG 只消费 client events，`directDagTriage` 的 owner 是第一个非 nil client。
+### 8.2.4 DAG feedback
+
+DAG feedback（board learning + DAG corpus/triage）对 HMDFS/GlusterFS 都启用。
+DAG 只消费 client events，`directDagTriage` 的 owner 是第一个非 nil client，
+`subNum` 使用绝对 executor index。
+
+corpus 侧沿用全局机制，不做 per-DFS 特判：
+
+- `addInputToCorpus` 按 hash 去重，只有真正新增才增加 `dagCorpusEntries`；
+- `MaxDagCorpus` 在 DAG triage 前做硬 gate（0 = unlimited，长跑按规模配置）；
+- `minimizeCorpus`/`signal.Minimize` 负责修剪并保留 DAG 条目；
+- `saturatedCalls["dag"]` 阻止饱和调用继续吃 corpus；
+- `WorkSmash` 每次固定 `smashIterations`。
+
+D1 观察 `dagCorpusEntries`、`dagCorpusCount`、`MaxDagCorpus`、`dag` saturation
+和 smash 执行预算。
 
 ### 8.3 接入顺序
 
@@ -1342,6 +1423,12 @@ causal root 的 link/symlink 插入由 profile gate（如
 
 DCT 表/生成规则到此冻结。causal root/directed 的 C1/C2 规则见 §8.6；
 两者共享 §8.5.6 的 `DualPathKind`/`RootPaths`，不另写双路径逻辑。
+
+normal directed planner 的 link/symlink root 同样复用该抽象：
+`planDirectedCells` 的 dual pass 调 `planCausalC2CellsWithParent`，由
+`causalRootNormal` 固定 target/linkpath；`RootLinkPath` 只进 plan/batch，
+再经 `insertDirectedBatch` → `causalRootCallsSeq` materialize。该 pass 与
+C1 共用 `DualPathCausalEnabled` gate，v1 保持 false；详见 §8.2.2。
 
 ### 8.6 Causal Root / Directed（GlusterFS v1）
 
@@ -1700,14 +1787,16 @@ C2：
   `freshSameForms` 的 Failure/EEXIST/ENOENT 形态；这是独立通道，不受上面的
   单操作失败限制；
 - HardlinkGroupKey 只影响 size/offset 预测；
-- `DualPathCausalEnabled=false` 时 link/symlink causal 插入不生成。
+- `DualPathCausalEnabled=false` 时 causal C1 和 normal dual root 的
+  link/symlink 插入都不生成。
 
 Coverage：
 
 - cellKey 不含 role/group/RelKind；
 - link/symlink 双 role pair 由 cellKey 去重；
 - readlink 只产生 HB self cell；
-- producibleRets/Types/OffBuckets 按上表；
+- producibleRets/Types/OffBuckets 按上表；creation-root Same combo 另加
+  `freshSameForms` 的 race 形态（含 model race ENOENT 扩展）；
 - `DagPairToVariant` 不改。
 
 HMDFS：
@@ -2097,6 +2186,13 @@ DAG direct 用 `Call="dag"`。GlusterFS 只补 profile/gate，不另写算法：
 - triage 的 `WorkTriage` target list 仍然按同一侧聚合；client/server 不混在
   一个 list 里。
 
+实现状态（2026-11-17）：GlusterFS 已接入完整 DAG feedback（board learning +
+DAG corpus/triage），不是只喂 coverage board。corpus 侧继续使用
+`addInputToCorpus` hash 去重、`MaxDagCorpus` 硬 gate、`minimizeCorpus` 修剪、
+`saturatedCalls["dag"]` 和固定 `smashIterations`。`MaxDagCorpus` 默认 0
+（unlimited），长跑前按规模配置；D1 观察 `dagCorpusEntries`、
+`dagCorpusCount`、`dag` saturation 与 smash 预算。
+
 ### 10.6 QEMU / SSH 与 config 脚本复用
 
 GlusterFS v1 复用原 Monarch 镜像和原 QEMU 启动路径，不复用 HMDFS 的镜像/agent
@@ -2271,6 +2367,8 @@ prefill 创建。
   GlusterFS LOOKUP 直接用事件 `Path`；所有匹配事件建顶点，不做同调用过滤。
 - 不引入 `entry_ino`/canonicalization；hardlink 的 inode_path 任意 alias
   只影响事件 path，不影响 DAG 顶点路径。
+- 状态（2026-11-17）：coverage 三层（observed/model/plannable）、
+  combo-aware FreshSame race、GlusterFS 完整 DAG feedback 已实现。
 
 ### Phase 4：DCT/定向/restore
 
@@ -2288,7 +2386,12 @@ prefill 创建。
   只 HB Success；link/symlink RetB=Success；getxattr RetFailure（ENODATA）；
   setxattr RetEEXIST（XATTR_CREATE）；rmdir/rename RetFailure（ENOTEMPTY）。
 - FailurePolicy 只主动构造 rmdir ENOTEMPTY、rename ENOTEMPTY、getxattr
-  ENODATA、setxattr EEXIST；其他失败不进 directed/producible。
+  ENODATA、setxattr EEXIST；其他单操作失败不进 directed/producible。
+- fresh-fresh 竞赛例外：`Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo 使用
+  完整 `freshSameForms`；这些 Failure/EEXIST/ENOENT race 形态进 plannable，
+  并在 model 中为对应 combo 补充单操作表未列出的 race 形态。
+- normal dual root 已实现：`planDirectedCells` dual pass +
+  `causalRootNormal`；`DualPathCausalEnabled=false` 时 v1 不生成。
 - `HardlinkGroupKey` 只做 directed/C2 authority；`planStateEffect` 中
   link/symlink/setxattr 为 observer。
 - coverage：cellKey 不含 role/group；readlink CC=0；coverage board 使用
@@ -2315,6 +2418,8 @@ prefill 创建。
 ### Phase 5：端到端
 
 - 3-3 验证；HMDFS 回归；文档更新。
+- 状态（2026-11-17）：代码已落，Ubuntu `go test ./prog ./syz-fuzzer`、
+  `make executor`、D1 tracer/coverage smoke 仍待执行。
 
 ## 13. 验收
 
@@ -2418,24 +2523,50 @@ prefill 创建。
   - GlusterFS 不出现 HMDFS agent/peer/settle 等待；client mount barrier 能
     覆盖全部 client 挂载完成。
 
+### 13.1 实现状态与已知边界（2026-11-17）
+
+```text
+coverage 三层                        已实现
+FreshSame combo-aware plannable      已实现
+normal dual root                     已实现，v1 DualPathCausalEnabled=false
+GlusterFS DAG feedback               已启用
+Ubuntu tests / make executor / D1   待执行
+```
+
+已知边界：
+
+- 非 creation-root 的上下文矛盾仍可能保留在 plannable envelope 中，例如
+  `open/mkdir Same Success`、`open/rmdir Same Success`；后续 construction
+  matrix 再收，当前不作为阻塞项。
+- normal dual root 在 v1 不实际生成；gate 打开后才进入 plannable/planner。
+- D1 才能验证 GlusterFS tracer 的 iovec/mode 偏移、symlink target 类型、
+  coverage feedback 和 DAG pair 质量；`dcMisses` 因 race 构造上升是预期，
+  需要与错误计划区分。
+- `MaxDagCorpus` 默认 unlimited；长跑按规模配置并观察 `dag` saturation。
+
 ## 14. 文件落点
 
 - `src/prog/dfs_profile.go`：profile、registry、validation。
 - `src/prog/hmdfs_config.go`：`DFSConfig` 别名、角色字段。
 - `src/prog/dag.go`：事件/角色/path relation/DAG。
-- `src/prog/directed_plan.go`：角色 plan/state effect/authority。
+- `src/prog/directed_plan.go`：角色 plan/state effect/authority；normal dual
+  root pass、`RootLinkPath` grouping、plannable 入池闸门。
 - `src/prog/distributed_choice.go`：call table/DCT/path resolution。
 - `src/prog/generation.go`、`rand.go`、`mutation.go`：client-only generators/mutators；
   `updateCallPathInProg` 的 legacy rename 走 `RenamePolicy`，link/symlink/readlink
   不进入 legacy fallback。
 - `src/prog/path_set.go`：dual-path broad、prefix-aware、rename policy、symlink
   canonical/payload 映射。
-- `src/prog/coverage_board.go`：per-profile board。
+- `src/prog/coverage_board.go`：observed/model/plannable 三层、combo-aware
+  fresh-fresh race forms、Direction-3 potential/enumeration。
+- `src/prog/glusterfs_coverage_test.go`：三层口径、race plannable、normal
+  dual root/insert 的回归测试。
 - `src/prog/causal_root.go`、`seed_derivation.go`、`anchor_path.go`：
   profile planner、`RootPaths`、AnchorPathKind/creator 分类。
 - `src/pkg/ipc/ipc.go`：GlusterFS parser、server/client parse split。
 - `src/checker/conc-fs.go`、`src/checker/symsc`：A 类检查、profile 过滤。
-- `src/syz-fuzzer/proc.go`、`fuzzer.go`：角色 view、seed/corpus 校验。
+- `src/syz-fuzzer/proc.go`、`fuzzer.go`：角色 view、seed/corpus 校验；
+  GlusterFS DAG feedback（board + corpus/triage）与三层 coverage 日志。
 - `src/prog/rand.go`、`generation.go`、`mutation.go`：`RootPath()`/`JoinRoot()`、
   `filenameImpl` 空前缀、client-only generators/mutators。
 - `src/executor/executor.cc`、`common_linux.h`、`glusterfs_trace.*`、

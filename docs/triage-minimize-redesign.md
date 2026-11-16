@@ -694,6 +694,12 @@ MaxDagCorpus 检查
 - `WorkTriage` target list 仍然按同一侧聚合；client/server 不混在一个 list 里。
 - minimize 已全局停用，不再为 GlusterFS 增加 client-view minimize 分支。
 
+实现状态（2026-11-17）：GlusterFS 已接入完整 DAG feedback（board learning +
+DAG corpus/triage），不是只喂 coverage board。corpus 侧仍由
+`addInputToCorpus` hash 去重、`MaxDagCorpus` 硬 gate、`minimizeCorpus`
+修剪、`saturatedCalls["dag"]` 和固定 `smashIterations` 约束；
+`MaxDagCorpus` 默认 0（unlimited），长跑按规模配置。
+
 ## 8. 验证
 
 - client 的多个 call/extra 只生成一个 client `WorkTriage`，只执行一次 triage。

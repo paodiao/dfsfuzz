@@ -4,6 +4,11 @@
 > 范围：`PickDirectedBatch` 的根节点因果锚定、固定 root 的 variant 规划、rename 支持。
 > 术语：本文的 C1/C2 指 causal 两层（anchor→root、root→variant），不是论文中的 C1/C2 两个挑战。
 > 关联：Seed 纯派生设计见 `docs/seed-derivation-design.md`；PathSet/数据/删除部分见 `docs/seed-construction-causal-chain-notes.md`；本文不修改论文或 PPT。
+>
+> 2026-11-17 GlusterFS：normal directed planner 的 link/symlink root 复用
+> `planCausalC2CellsWithParent(..., causalRootNormal, ...)`，`RootLinkPath`
+> 只进 plan/batch；该 pass 与 causal C1 共用 `DualPathCausalEnabled` gate。
+> 语义见 `docs/glusterfs-adaptation-plan.md` §8.2.2。
 
 ---
 
