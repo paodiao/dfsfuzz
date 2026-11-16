@@ -155,6 +155,10 @@ var directedVariantCalls = []string{
 // directedVariantAllowed applies the profile's dual-path gate and the
 // readlink-root restriction.
 func directedVariantAllowed(profile *DFSProfile, root, variant string) bool {
+	if (root == "link" || root == "symlink") &&
+		(profile == nil || !profile.DualPathCausalEnabled()) {
+		return false
+	}
 	if variant == "link" || variant == "symlink" || variant == "readlink" {
 		if profile == nil || !profile.DualPathCausalEnabled() {
 			return false
@@ -720,6 +724,10 @@ func directedVariantKinds(call string, profiles ...*DFSProfile) (kinds []directe
 			{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetENOENT},
 		}, true
 	case "mkdir":
+		if profile.Name == "glusterfs" {
+			// FailurePolicy does not construct mkdir EEXIST.
+			return []directedKind{{offsetBucketNA, RetSuccess}}, true
+		}
 		return []directedKind{
 			{offsetBucketNA, RetSuccess}, {offsetBucketNA, RetEEXIST},
 		}, true
@@ -785,8 +793,10 @@ func variantKindAllowed(variant string, retB RetBucket, bn *directedBNode, root 
 		return false
 	case "link":
 		return retB == RetSuccess && !bn.isDir
-	case "symlink", "readlink":
+	case "symlink":
 		return retB == RetSuccess
+	case "readlink":
+		return retB == RetSuccess && !bn.isDir
 	case "getxattr":
 		switch retB {
 		case RetSuccess:
@@ -2663,6 +2673,11 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 		refTime = int64(p0.Calls[insertPos-1].CheckInfo.Etime) - lcs.tscoffFor(0)
 	}
 	// Root on a clone of node 0.
+	// Non-causal dual-path roots need RootPaths materialization, which is not
+	// wired into this path yet. Causal C1 batches (Anchor != nil) handle them.
+	if batch.Anchor == nil && (batch.Root == "link" || batch.Root == "symlink") {
+		return false
+	}
 	clone0 := p0.Clone()
 	if clone0 == nil {
 		return false

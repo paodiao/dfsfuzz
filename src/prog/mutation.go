@@ -4240,7 +4240,21 @@ func findOpenFdForPath(p *Prog, filePath string, beforeIdx int, want uint8) *Res
 // queryable there; this local hint restores the type gate for the same-batch
 // cases without writing the tree. A path created by both kinds (pathological)
 // is treated as unknown.
-func freshPathKindsBefore(p *Prog, ft *FileTree, end int) map[string]int {
+func callAssumedSucceeded(call *Call) bool {
+	if call == nil {
+		return false
+	}
+	if call.CheckInfo == nil {
+		return true
+	}
+	return call.CheckInfo.Retv == 0
+}
+
+func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfile) map[string]int {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
 	if p == nil {
 		return nil
 	}
@@ -4278,6 +4292,9 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int) map[string]int {
 		if c == nil || c.Meta == nil {
 			continue
 		}
+		if profile.Name == "glusterfs" && !callAssumedSucceeded(c) {
+			continue
+		}
 		switch c.Meta.CallName {
 		case "mkdir":
 			set(extractPathFromCall(c), relTargetDir)
@@ -4296,25 +4313,36 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int) map[string]int {
 				set(linkPath, k)
 			}
 		case "unlink", "rmdir":
-			delete(m, extractPathFromCall(c))
+			if profile.Name == "glusterfs" {
+				delete(m, extractPathFromCall(c))
+			}
 		case "rename":
 			src, dst := extractRenamePaths(c)
 			if k, ok := kindOf(src); ok {
 				set(dst, k)
 			}
-			delete(m, src)
+			if profile.Name == "glusterfs" {
+				delete(m, src)
+			}
 		}
 	}
 	return m
 }
 
-// dctBaseCandidates returns the p0 paths a new DCT root may use. link/symlink
-// targets are always usable; their fresh linkpaths become usable only when the
-// creating call ran before insertPos and succeeded. readlink only contributes
-// its linkpath. This keeps a not-yet-executed linkpath out of the root base.
+// dctBaseCandidates returns the HMDFS legacy candidate set.
 func dctBaseCandidates(p *Prog, insertPos int) []string {
+	return dctBaseCandidatesFor(hmdfsProfile, p, insertPos)
+}
+
+// dctBaseCandidatesFor returns the p0 paths a new DCT root may use.
+// GlusterFS follows the documented rename/link/symlink visibility rules;
+// HMDFS keeps the historical src+dst candidate set.
+func dctBaseCandidatesFor(profile *DFSProfile, p *Prog, insertPos int) []string {
 	if p == nil {
 		return nil
+	}
+	if profile == nil {
+		profile = hmdfsProfile
 	}
 	var out []string
 	for i, call := range p.Calls {
@@ -4325,11 +4353,19 @@ func dctBaseCandidates(p *Prog, insertPos int) []string {
 		switch call.Meta.CallName {
 		case "rename":
 			src, dst := extractRenamePaths(call)
-			if src != "" {
-				out = append(out, src)
+			if profile.Name != "glusterfs" {
+				if src != "" {
+					out = append(out, src)
+				}
+				if dst != "" {
+					out = append(out, dst)
+				}
+				continue
 			}
-			if dst != "" {
+			if before && callAssumedSucceeded(call) && dst != "" {
 				out = append(out, dst)
+			} else if src != "" {
+				out = append(out, src)
 			}
 		case "link":
 			target := extractPathFromCallByArgIdx(call, 0)
@@ -4337,7 +4373,7 @@ func dctBaseCandidates(p *Prog, insertPos int) []string {
 			if target != "" {
 				out = append(out, target)
 			}
-			if before && callSucceeded(call) && linkPath != "" {
+			if before && callAssumedSucceeded(call) && linkPath != "" {
 				out = append(out, linkPath)
 			}
 		case "symlink":
@@ -4346,12 +4382,12 @@ func dctBaseCandidates(p *Prog, insertPos int) []string {
 			if target != "" {
 				out = append(out, target)
 			}
-			if before && callSucceeded(call) && linkPath != "" {
+			if before && callAssumedSucceeded(call) && linkPath != "" {
 				out = append(out, linkPath)
 			}
 		case "readlink":
 			linkPath := extractPathFromCallByArgIdx(call, 0)
-			if before && callSucceeded(call) && linkPath != "" {
+			if before && callAssumedSucceeded(call) && linkPath != "" {
 				out = append(out, linkPath)
 			}
 		default:
@@ -4431,6 +4467,9 @@ func freshLinkPathsBefore(p *Prog, ft *FileTree, end int) map[string]linkPathInf
 		if c == nil || c.Meta == nil {
 			continue
 		}
+		if !callAssumedSucceeded(c) {
+			continue
+		}
 		switch c.Meta.CallName {
 		case "link":
 			linkPath := extractPathFromCallByArgIdx(c, 1)
@@ -4492,7 +4531,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	insertPos := r.biasedRand(len(p0.Calls)+1, 5)
 	var pathCandidates []string
 	if !useFreshPath {
-		pathCandidates = dctBaseCandidates(p0, insertPos)
+		pathCandidates = dctBaseCandidatesFor(lcs.profileOrDefault(), p0, insertPos)
 		if len(pathCandidates) > 0 {
 			basePath = pathCandidates[r.Intn(len(pathCandidates))]
 		}
@@ -4517,7 +4556,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	// calls before the root slot for the creating call (mkdir/creat) and use
 	// its intent as a local hint: a hinted mismatch is treated like a tree
 	// mismatch below, without writing the tree.
-	freshKinds := freshPathKindsBefore(p0, lcs.FileTree, insertPos)
+	freshKinds := freshPathKindsBefore(p0, lcs.FileTree, insertPos, lcs.profileOrDefault())
 	freshLinks := freshLinkPathsBefore(p0, lcs.FileTree, insertPos)
 
 	// The candidate-derived basePath was chosen before the root was known, so
@@ -4879,7 +4918,7 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 		insertPos = len(p0.Calls)
 	}
 
-	freshKinds := freshPathKindsBefore(p0, ft, insertPos)
+	freshKinds := freshPathKindsBefore(p0, ft, insertPos, lcs.profileOrDefault())
 	switch rootCallName {
 	case "mkdir", "creat", "rename":
 		if kind := seedFreshPathKind(derivation); kind != 0 {

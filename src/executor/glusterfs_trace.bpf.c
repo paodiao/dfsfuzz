@@ -23,6 +23,11 @@
 #define GF_S_IFREG 0x8000
 #define GF_S_IFDIR 0x4000
 #define GF_S_IFLNK 0xA000
+#define GF_S_IFMT  0xF000
+#define GF_FUSE_OUT_HEADER_SIZE 16
+#define GF_FUSE_ENTRY_OUT_MODE_OFF 100
+#define GF_FUSE_LOOKUP_MODE_OFF \
+	(GF_FUSE_OUT_HEADER_SIZE + GF_FUSE_ENTRY_OUT_MODE_OFF)
 
 #define GF_PHASE_D 0
 #define GF_PHASE_S 1
@@ -40,10 +45,12 @@ struct gf_send_key {
 struct gf_send_val {
 	u64 unique;
 	u64 nodeid;
+	u64 iov_base;
+	u64 iov_len;
 	u32 opcode;
 	u32 pid;
 	s32 error;
-	u32 pad;
+	u32 mode;
 };
 
 struct {
@@ -192,6 +199,7 @@ int gf_dispatch(struct pt_regs *ctx)
 	e->nodeid = nodeid;
 	e->pid = pid;
 	e->error = 0;
+	e->mode = 0;
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
@@ -305,6 +313,7 @@ int gf_send_entry(struct pt_regs *ctx)
 	u64 finh = (u64)PT_REGS_PARM2(ctx);
 	u64 iov_out = (u64)PT_REGS_PARM3(ctx);
 	u64 iov_base = 0;
+	u64 iov_len = 0;
 	u32 opcode = 0, pid = 0;
 	u64 unique = 0, nodeid = 0;
 	s32 error = 0;
@@ -319,6 +328,8 @@ int gf_send_entry(struct pt_regs *ctx)
 		return 0;
 	if (bpf_probe_read_user(&iov_base, sizeof(iov_base), (void *)iov_out))
 		return 0;
+	if (bpf_probe_read_user(&iov_len, sizeof(iov_len), (void *)(iov_out + 8)))
+		iov_len = 0;
 	if (iov_base)
 		bpf_probe_read_user(&error, sizeof(error), (void *)(iov_base + 4));
 
@@ -328,7 +339,9 @@ int gf_send_entry(struct pt_regs *ctx)
 	val.opcode = opcode;
 	val.pid = pid;
 	val.error = error;
-	val.pad = 0;
+	val.iov_base = iov_base;
+	val.iov_len = iov_len;
+	val.mode = 0;
 	bpf_map_update_elem(&gf_send_state, &key, &val, BPF_ANY);
 	return 0;
 }
@@ -340,11 +353,24 @@ int gf_send_ret(struct pt_regs *ctx)
 	struct gf_send_key key = {0};
 	struct gf_send_val *val;
 	struct glusterfs_ctl_event *e;
+	u32 lookup_mode = 0;
+	s32 reply_err = 0;
 
 	key.pid_tgid = bpf_get_current_pid_tgid();
 	val = bpf_map_lookup_elem(&gf_send_state, &key);
 	if (!val)
 		return 0;
+	if (val->opcode == GF_OP_LOOKUP && val->iov_base &&
+	    val->iov_len >= GF_FUSE_LOOKUP_MODE_OFF + 4) {
+		if (!bpf_probe_read_user(&reply_err, sizeof(reply_err),
+					 (void *)(val->iov_base + 4)) &&
+		    reply_err == 0) {
+			bpf_probe_read_user(&lookup_mode, sizeof(lookup_mode),
+					    (void *)(val->iov_base +
+						     GF_FUSE_LOOKUP_MODE_OFF));
+			lookup_mode &= GF_S_IFMT;
+		}
+	}
 
 	e = bpf_ringbuf_reserve(&gf_ctl_events, sizeof(*e), 0);
 	if (!e) {
@@ -358,6 +384,7 @@ int gf_send_ret(struct pt_regs *ctx)
 	e->nodeid = val->nodeid;
 	e->pid = val->pid;
 	e->error = val->error;
+	e->mode = lookup_mode;
 	bpf_ringbuf_submit(e, 0);
 	bpf_map_delete_elem(&gf_send_state, &key);
 	return 0;

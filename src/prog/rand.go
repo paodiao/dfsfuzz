@@ -2391,8 +2391,22 @@ func (r *randGen) freshChildPath(dirPath, kind string) string {
 // the cell/relation; linkpath is only a program-local binding and is never
 // inserted into FileTree.
 func (r *randGen) freshLinkPath(target, kind string) string {
+	var ft *FileTree
+	if r.hmcfg != nil {
+		ft = r.hmcfg.FileTree
+	}
+	return r.freshLinkPathFor(ft, target, kind)
+}
+
+func (r *randGen) freshLinkPathFor(ft *FileTree, target, kind string) string {
 	parent := parentDirOrRoot(target)
-	return joinTestPath(parent, "Eris_"+kind+"_"+randomSuffix(r.Rand))
+	for i := 0; i < 8; i++ {
+		linkPath := joinTestPath(parent, "Eris_"+kind+"_"+randomSuffix(r.Rand))
+		if ft == nil || ft.FindNode(linkPath) == nil {
+			return linkPath
+		}
+	}
+	return ""
 }
 
 func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op ConcurrentOp, basePath string, cid string, lcs *LayeredChoiceStrategy, ExistingFd *ResultArg, UseExistFd bool, offsetRel OffsetRelationType, sharedOffset uint64) ([]*Call, []*WriteInfo, string) {

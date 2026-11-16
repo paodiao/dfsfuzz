@@ -446,6 +446,23 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 			continue
 		}
 		v.IsDir = eventIsDir(ev, nodeType[v.Path])
+		if glusterfs && ev.FuncID == FuncSymlink {
+			// symlink's B-side type is the canonical target, not the
+			// linkpath. The tracer has no target inode, so resolve it from the
+			// producing program's call prefix plus a deterministic
+			// cross-client fallback.
+			matchIdx := matchEventToCall(ev, p, tscoffs)
+			if isDir, known := pathTypeBefore(ps, ev.ProgIdx, matchIdx, hmcfg.Serv_num,
+				hmcfg.FileTree, v.OldPath); known {
+				v.IsDir = isDir
+			} else if n := findPathNode(hmcfg.FileTree, v.OldPath); n != nil {
+				v.IsDir = n.Type != NodeTypeFile
+			} else if d, ok := nodeType[v.OldPath]; ok {
+				v.IsDir = d
+			} else {
+				v.IsDir = false
+			}
+		}
 		v.Off = ev.Off
 		v.Size = ev.Size
 		if int(v.FuncID) < len(diag.PerFuncVertices) {

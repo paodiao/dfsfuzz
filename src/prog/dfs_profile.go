@@ -330,10 +330,10 @@ func (p *DFSProfile) BasePathIsFile(ft *FileTree, rootCallName, basePath string)
 	if p == nil {
 		p = hmdfsProfile
 	}
-	if profileCallListContains(p.Calls.TargetDirCalls, rootCallName) {
+	if profileExactListContains(p.Calls.TargetDirCalls, rootCallName) {
 		return false
 	}
-	if profileCallListContains(p.Calls.TargetFileCalls, rootCallName) {
+	if profileExactListContains(p.Calls.TargetFileCalls, rootCallName) {
 		return true
 	}
 	return !isDirPath(ft, basePath)

@@ -261,6 +261,8 @@ static void append_event(struct pending_req &p, const struct glusterfs_ctl_event
 	ev.off = p.off;
 	ev.size = p.size;
 	ev.mode = p.mode;
+	if (p.opcode == GF_OP_LOOKUP)
+		ev.mode = s.mode;
 
 	if (p.path.size() > GLUSTERFS_TRACE_PATH_MAX) {
 		p.truncated |= 1;

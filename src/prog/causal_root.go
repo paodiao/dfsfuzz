@@ -245,7 +245,7 @@ func causalC2ComboLive(profile *DFSProfile, root string) (map[comboKey]bool, boo
 		variants[variant] = true
 	}
 	for _, fp := range freshSameForms {
-		if profile.Name == "glusterfs" && fp.ret == RetENOENT {
+		if profile.Name == "glusterfs" && fp.ret != RetSuccess {
 			continue
 		}
 		variants[fp.variant] = true
@@ -432,7 +432,7 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			if fp.root != rootCall {
 				continue
 			}
-			if profile.Name == "glusterfs" && fp.ret == RetENOENT {
+			if profile.Name == "glusterfs" && fp.ret != RetSuccess {
 				continue
 			}
 			cell := directedCell{
@@ -787,7 +787,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 							RootCall:   rootCall,
 							RootPath:   rootPath,
 							RootKind:   causalRootNormal,
-							RootParent: GetParentDir(rootPath),
+							RootParent: parentDirOrRoot(rootPath),
 							RootSource: rootPath,
 							RootDest:   linkPath,
 						}

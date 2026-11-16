@@ -1350,7 +1350,10 @@ func producibleTypes(call string) []bool {
 }
 
 func producibleTypesFor(profile *DFSProfile, call string) []bool {
-	if profile != nil && profile.Name == "glusterfs" {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
+	if profile.Name == "glusterfs" {
 		switch call {
 		case "readlink":
 			return []bool{false}

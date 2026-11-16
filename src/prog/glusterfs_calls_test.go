@@ -232,7 +232,7 @@ func TestGlusterfsDagLinkSymlinkPaths(t *testing.T) {
 		t.Fatalf("link paths = %q/%q, want dir/a/dir/newlink", oldPath, newPath)
 	}
 
-	sym := mkSymlinkCall(t, target, "../dir/a", "dir/sub/link")
+	sym := mkSymlinkCall(t, target, "../a", "dir/sub/link")
 	linkPath, canonical := glusterfsSymlinkVertexPaths(sym)
 	if linkPath != "dir/sub/link" || canonical != "dir/a" {
 		t.Fatalf("symlink paths = %q/%q, want dir/sub/link/dir/a", linkPath, canonical)

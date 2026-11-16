@@ -2307,7 +2307,7 @@ func pickRenameDstPolicy(profile *DFSProfile, ft *FileTree, src string, rel Path
 	switch rel {
 	case PathParent:
 		if parent != "" {
-			if p := ft.FindNode(GetParentDir(parent)); p != nil && p.Type != NodeTypeFile &&
+			if p := ft.FindNode(parentDirOrRoot(parent)); p != nil && p.Type != NodeTypeFile &&
 				p.Type != NodeTypeTmpDir {
 				targetParent = p.FullPath
 			}

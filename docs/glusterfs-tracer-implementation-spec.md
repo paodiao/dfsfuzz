@@ -74,8 +74,9 @@
   size=+200 / name=+248；`loc.inode=+16`、`loc2.inode=+112`。
 - **mode**：`inode_t` 没有 `i_mode`，只有 `ia_type`（+92）；1/2/3 =
   file/dir/symlink，userspace 映射为 `S_IFMT`。`link` 读 `loc2.inode+92`；
-  `rename` 读 `loc.inode+92`；`symlink/mkdir/create` 的新 inode 在 R 时可能为
-  0，用函数默认。
+  `rename` 读 `loc.inode+92`；`LOOKUP` 的 R 时 `loc.inode` 是父目录，由 S 的
+  reply `fuse_entry_out.attr.mode` 解析；`symlink/mkdir/create` 的新 inode 在
+  R 时可能为 0，用函数默认。
 - **测试根前缀**：FUSE 路径相对挂载根，实际是 `/eifuzz_root/...`；tracer
   必须 strip `eifuzz_root`。rename/link 的 path2 同样 strip；symlink 的
   path2 是 raw payload，不 strip。
@@ -318,7 +319,7 @@ RENAME 的 `fuse_fop_resume` 可用，但 hardlink 的 inode/fd 事件 path 是
 | `unique` | FUSE 请求唯一号，D/R/S 关联键 |
 | `off` | read/write 的 offset；truncate 的新大小；readdir 的目录 offset；未知为 0 |
 | `size` | read/write 的请求长度；truncate 为 0；readdir 的缓冲区大小；xattr 的请求缓冲区；未知为 0 |
-| `mode` | `loc.inode->ia_type` 映射成 `S_IFMT`；link 用 `loc2.inode`；未知为 0 |
+| `mode` | `loc.inode->ia_type` 映射成 `S_IFMT`；link 用 `loc2.inode`；LOOKUP 用 S reply 的 `fuse_entry_out.attr.mode`；symlink/mkdir/create 未知为 0 |
 | `path_len` | `path` 实际字节数，不含 NUL |
 | `path2_len` | `path2` 实际字节数，不含 NUL |
 | `xattr_name_len` | `xattr_name` 实际字节数，不含 NUL；上限 128 |
@@ -340,6 +341,9 @@ IA_IFLNK 3 -> S_IFLNK
 - `rename`：源 inode 用 `loc.inode + 92`；
 - `link`：源 inode 用 `loc2.inode + 92`（R 发生在 `fuse_link_resume` 之前，
   `loc.inode` 还是空的）；
+- `lookup`：R 时 `loc.inode` 是父目录，不能用于 entry 类型；由 S 的
+  `send_fuse_iov` reply 解析 `fuse_entry_out.attr.mode`（iov_base + 116），
+  negative lookup/解析失败为 0；
 - `symlink/mkdir/create`：新 inode 在 R 时 `ia_type=0`，用函数默认；
 - `symlink` 的 `path2` 是 payload，不能 strip；`rename/link` 的 `path2` 是
   挂载内路径，必须 strip。
@@ -384,7 +388,8 @@ struct glusterfs_ctl_event {
     u64 nodeid;   /* 24 */
     u32 pid;      /* 32: finh->pid（发起 syscall 的进程） */
     s32 error;    /* 36: 仅 S 有值；D/R 为 0 */
-};                /* 40 */
+    u32 mode;     /* 40: 仅 S 的 LOOKUP reply entry type */
+};                /* 44 */
 ```
 
 ```c
@@ -860,8 +865,11 @@ DAG 必须用调用参数/fd provenance，`ev.Path` 只做 fallback/校验。
 
 - 来自 `inode_t.ia_type`（+92），映射成 `S_IFMT`；不是 `i_mode`，也没有
   `i_mode` 字段。
+- `LOOKUP` 例外：R 时 `loc.inode` 是父目录，entry 类型由 S reply 的
+  `fuse_entry_out.attr.mode` 解析；negative lookup 为 0。
 - `rename` 用 `loc.inode`；`link` 用 `loc2.inode`；`symlink/mkdir/create`
-  新 inode 在 R 时可能为 0，用函数默认；`symlink` 默认非目录。
+  新 inode 在 R 时可能为 0，用函数默认；`symlink` 默认非目录，其 target
+  类型由 DAG 的调用链近似解析。
 - `funcDefaultIsDir`：`link/symlink/readlink` 默认 false；
   `getattr/setattr/rename/xattr` 未知，走 mode/fsMd 回退。
 - DAG 的 `eventIsDir` 在 `mode=0` 时使用 `funcDefaultIsDir` 或 fsMd 回退。

@@ -503,7 +503,11 @@ offset  size  field
   rename/link 的 `path2` 同样 strip；symlink 的 `path2` 是 raw payload，
   不 strip。
 - `mode` 来自 `inode_t.ia_type`（+92）映射 `S_IFMT`，不是 `i_mode`；
-  `link` 用 `loc2.inode`，`rename` 用 `loc.inode`。`truncate` 的 `off` 是
+  `link` 用 `loc2.inode`，`rename` 用 `loc.inode`。`LOOKUP` 的 R 时机
+  `loc.inode` 是父目录，entry 类型由 S reply 的
+  `fuse_entry_out.attr.mode` 解析（iov_base + 116），negative lookup 为 0。
+  `symlink/mkdir/create` 在 R 时 `ia_type=0`，用函数默认；symlink target
+  类型由 DAG 侧的调用链近似解析。`truncate` 的 `off` 是
   新大小、`size=0`；read/write、readdir、xattr 的 off/size 语义见 tracer
   spec §4.1/§6.5。
 - **C 结构必须 `__attribute__((packed))` 或手写序列化**；默认 8 字节对齐时
@@ -545,10 +549,11 @@ offset  size  field
 
 raw path event 也按 packed/手写序列化；默认 8 字节对齐时是 1208B。
 
-`ctl_event` 仍为 40 字节：
+`ctl_event` 为 44 字节：
 
 ```text
-ts u64, unique u64, phase u32, opcode u32, nodeid u64, pid u32, error s32
+ts u64, unique u64, phase u32, opcode u32, nodeid u64, pid u32, error s32,
+mode u32
 ```
 
 ring：

@@ -17,7 +17,7 @@
 #define GLUSTERFS_TRACE_XATTR_MAX 128
 #define MAX_GLUSTERFS_TRACE_EVENTS 8192
 
-#define GLUSTERFS_TRACE_CTL_EVENT_SIZE 40
+#define GLUSTERFS_TRACE_CTL_EVENT_SIZE 44
 #define GLUSTERFS_TRACE_PATH_EVENT_SIZE 1204
 #define GLUSTERFS_TRACE_EVENT_SIZE 1228
 
@@ -81,6 +81,7 @@ struct __attribute__((packed)) glusterfs_ctl_event {
 	unsigned long long nodeid; /* 24 */
 	unsigned int pid;          /* 32 */
 	int error;                 /* 36: S only; D/R 0 */
+	unsigned int mode;         /* 40: S only; LOOKUP reply entry type */
 };
 
 /* path ring: R events. */
@@ -121,14 +122,14 @@ struct __attribute__((packed)) glusterfs_trace_event {
 
 #ifdef __cplusplus
 static_assert(sizeof(struct glusterfs_ctl_event) == GLUSTERFS_TRACE_CTL_EVENT_SIZE,
-              "glusterfs_ctl_event wire size must be 40");
+              "glusterfs_ctl_event wire size must be 44");
 static_assert(sizeof(struct glusterfs_path_event) == GLUSTERFS_TRACE_PATH_EVENT_SIZE,
               "glusterfs_path_event wire size must be 1204");
 static_assert(sizeof(struct glusterfs_trace_event) == GLUSTERFS_TRACE_EVENT_SIZE,
               "glusterfs_trace_event wire size must be 1228");
 #else
 _Static_assert(sizeof(struct glusterfs_ctl_event) == GLUSTERFS_TRACE_CTL_EVENT_SIZE,
-               "glusterfs_ctl_event wire size must be 40");
+               "glusterfs_ctl_event wire size must be 44");
 _Static_assert(sizeof(struct glusterfs_path_event) == GLUSTERFS_TRACE_PATH_EVENT_SIZE,
                "glusterfs_path_event wire size must be 1204");
 _Static_assert(sizeof(struct glusterfs_trace_event) == GLUSTERFS_TRACE_EVENT_SIZE,

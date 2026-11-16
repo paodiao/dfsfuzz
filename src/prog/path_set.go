@@ -41,6 +41,7 @@ type pathMember struct {
 type pathSet struct {
 	Anchor  GroupPosition
 	Members []pathMember
+	Prefix  string
 }
 
 type pathTarget struct {
@@ -442,7 +443,11 @@ func buildPathSet(ps []*Prog, anchor GroupPosition, ft *FileTree, profiles ...*D
 	if len(set) == 0 {
 		return nil, false
 	}
-	return &pathSet{Anchor: anchor, Members: set}, true
+	prefix := ""
+	if ft != nil {
+		prefix = ft.Prefix
+	}
+	return &pathSet{Anchor: anchor, Members: set, Prefix: prefix}, true
 }
 
 func pathSetFindMember(set *pathSet, pos GroupPosition) (*pathMember, bool) {
@@ -554,8 +559,11 @@ func pickPathSetTarget(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *
 	}, true
 }
 
-func pathSetTopRoot(path string) string {
-	p := strings.TrimPrefix(path, MergeViewPrefix)
+func pathSetTopRoot(prefix, path string) string {
+	p := path
+	if prefix != "" {
+		p = strings.TrimPrefix(path, strings.TrimSuffix(prefix, "/")+"/")
+	}
 	if i := strings.IndexByte(p, '/'); i >= 0 {
 		return p[:i]
 	}
@@ -577,7 +585,7 @@ func pathSetRoots(set *pathSet) []string {
 	var roots []string
 	for _, m := range set.Members {
 		for _, spec := range m.Paths {
-			top := pathSetTopRoot(spec.Path)
+			top := pathSetTopRoot(set.Prefix, spec.Path)
 			if top == "" || seen[top] {
 				continue
 			}
@@ -642,10 +650,11 @@ func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (stri
 	if len(roots) == 0 {
 		return "", nil, false
 	}
-	anchorConstraint, ok := memberPathConstraint(ps, set.Anchor)
+	anchor, ok := pathSetFindMember(set, set.Anchor)
 	if !ok {
 		return "", nil, false
 	}
+	anchorConstraint := anchor.Constraint
 	if len(roots) == 1 {
 		var paths []string
 		for _, m := range set.Members {
@@ -705,7 +714,7 @@ func mapPathSetPath(prefix, path, base string, parent string, roots []string) st
 	if path == parent || strings.HasPrefix(path, parent+"/") {
 		return path
 	}
-	top := pathSetTopRoot(path)
+	top := pathSetTopRoot(prefix, path)
 	if top == "" {
 		return ""
 	}
@@ -875,7 +884,7 @@ func pathSetAllPaths(set *pathSet) []string {
 }
 
 func pathSetDirectedBaseKind(ps []*Prog, set *pathSet, target *pathTarget) (int, bool) {
-	anchorConstraint, ok := memberPathConstraint(ps, target.Anchor)
+	anchor, ok := pathSetFindMember(set, target.Anchor)
 	if !ok {
 		return relTargetAny, false
 	}
@@ -883,10 +892,8 @@ func pathSetDirectedBaseKind(ps []*Prog, set *pathSet, target *pathTarget) (int,
 	if !ok {
 		return relTargetAny, false
 	}
-	memberConstraint, ok := memberPathConstraint(ps, member.Pos)
-	if !ok {
-		return relTargetAny, false
-	}
+	anchorConstraint := anchor.Constraint
+	memberConstraint := member.Constraint
 	baseKind := anchorConstraint
 	switch target.Rel {
 	case PathChild:
@@ -1022,10 +1029,7 @@ func pathSetTargetMemberPaths(ps []*Prog, set *pathSet, target *pathTarget,
 	if !ok {
 		return nil
 	}
-	constraint, ok := memberPathConstraint(ps, member.Pos)
-	if !ok {
-		return nil
-	}
+	constraint := member.Constraint
 	seen := make(map[string]bool)
 	var out []string
 	add := func(path string) {

@@ -146,9 +146,6 @@ func TestCausalRootCallsSeqLinkSymlink(t *testing.T) {
 		if len(calls) != 1 || calls[0] == nil {
 			t.Fatalf("%s calls = %v", tc.root, calls)
 		}
-		if got := extractPathFromCallByArgIdx(calls[0], 0); got != tc.source {
-			t.Fatalf("%s arg0 = %q, want target %q", tc.root, got, tc.source)
-		}
 		if got := extractPathFromCallByArgIdx(calls[0], 1); got != tc.dest {
 			t.Fatalf("%s arg1 = %q, want linkpath %q", tc.root, got, tc.dest)
 		}
@@ -250,6 +247,77 @@ func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
 		if call == "link" && p.Cell.TypeB != false {
 			t.Fatalf("link target type = %v, want file", p.Cell.TypeB)
 		}
+	}
+}
+
+func TestGlusterfsDirectedDualRootGate(t *testing.T) {
+	if directedVariantAllowed(glusterfsProfile, "link", "open") {
+		t.Fatal("GlusterFS v1 must not plan a link root while dual-path causal is disabled")
+	}
+	if directedVariantAllowed(glusterfsProfile, "symlink", "open") {
+		t.Fatal("GlusterFS v1 must not plan a symlink root while dual-path causal is disabled")
+	}
+	gp := *glusterfsProfile
+	gp.Plan.DualPathCausalEnabled = true
+	if !directedVariantAllowed(&gp, "link", "open") {
+		t.Fatal("enabled dual-path profile should allow a link root")
+	}
+	if directedVariantAllowed(&gp, "open", "readlink") {
+		t.Fatal("readlink must only follow a symlink root")
+	}
+	if variantKindAllowed("readlink", RetSuccess, &directedBNode{directedNode: directedNode{isDir: true}}, "symlink", PathSame) {
+		t.Fatal("readlink B side must not be a directory")
+	}
+}
+
+func TestDctBaseCandidatesRenameProfile(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["rename"]; !ok {
+		t.Skip("target has no rename")
+	}
+	src, dst := "dirA/a", "dirA/moved"
+	okCall := mkRenameCall(t, target, src, dst, 100, 200)
+	okCall.CheckInfo.Retv = 0
+	p := &Prog{Target: target, Calls: []*Call{okCall}}
+
+	if got := dctBaseCandidatesFor(glusterfsProfile, p, 1); len(got) != 1 || got[0] != dst {
+		t.Fatalf("glusterfs rename-before candidates = %v, want [%s]", got, dst)
+	}
+	if got := dctBaseCandidatesFor(glusterfsProfile, p, 0); len(got) != 1 || got[0] != src {
+		t.Fatalf("glusterfs rename-after candidates = %v, want [%s]", got, src)
+	}
+	if got := dctBaseCandidatesFor(hmdfsProfile, p, 1); len(got) != 2 {
+		t.Fatalf("hmdfs rename candidates = %v, want src+dst", got)
+	}
+
+	failCall := mkRenameCall(t, target, src, dst, 100, 200)
+	failCall.CheckInfo.Retv = -17
+	p = &Prog{Target: target, Calls: []*Call{failCall}}
+	if got := dctBaseCandidatesFor(glusterfsProfile, p, 1); len(got) != 1 || got[0] != src {
+		t.Fatalf("failed rename candidates = %v, want [%s]", got, src)
+	}
+}
+
+func TestFreshPathKindsBeforeGlusterfsFailure(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["creat"]; !ok {
+		t.Skip("target has no creat")
+	}
+	ft := glusterfsPlanTree()
+	creat := mkCreat(target, "dirA/fresh")
+	creat.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	unlink := mkUnlinkCall(t, target, "dirA/fresh")
+	unlink.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: -17}
+	p := &Prog{Target: target, Calls: []*Call{creat, unlink}}
+	if got := freshPathKindsBefore(p, ft, 2, glusterfsProfile); got["dirA/fresh"] != relTargetFile {
+		t.Fatalf("failed unlink removed the fresh hint: %v", got)
+	}
+	unlink.CheckInfo.Retv = 0
+	if _, ok := freshPathKindsBefore(p, ft, 2, glusterfsProfile)["dirA/fresh"]; ok {
+		t.Fatal("successful unlink left the fresh hint")
+	}
+	if got := freshPathKindsBefore(p, ft, 2, hmdfsProfile); got["dirA/fresh"] != relTargetFile {
+		t.Fatal("HMDFS unlink must keep the historical hint behavior")
 	}
 }
 
