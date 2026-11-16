@@ -258,13 +258,13 @@ func TestPathSetRenameDstType(t *testing.T) {
 }
 
 func TestMapPathSetPath(t *testing.T) {
-	if got := mapPathSetPath("merge_view/d1/a", "merge_view/d1", "", nil); got != "merge_view/new/a" {
+	if got := mapPathSetPath(MergeViewPrefix, "merge_view/d1/a", "merge_view/d1", "", nil); got != "merge_view/d1/a" {
 		t.Fatalf("single-root map = %q", got)
 	}
-	if got := mapPathSetPath("merge_view/d1", "merge_view/d1", "", nil); got != "merge_view/new" {
+	if got := mapPathSetPath(MergeViewPrefix, "merge_view/d1", "merge_view/d1", "", nil); got != "merge_view/d1" {
 		t.Fatalf("single-root exact map = %q", got)
 	}
-	got := mapPathSetPath("merge_view/d1/x", "", "merge_view/p", []string{"a"})
+	got := mapPathSetPath(MergeViewPrefix, "merge_view/d1/x", "", "merge_view/p", []string{"a"})
 	if got != "merge_view/p/d1/x" {
 		t.Fatalf("forest map = %q", got)
 	}

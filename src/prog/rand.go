@@ -2788,7 +2788,7 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 
 	basePath2 := ""
 	if rootCallName == "rename" {
-		basePath2 = freshRenameDst(basePath, r.Rand)
+		basePath2 = lcs.pickRenameDstFor(basePath, PathNoRel, r.Rand)
 	}
 	// Failure-shape whitelist (same as insertCallFromDCT): with failShapeProb
 	// rewrite the root target into a shape whose error reaches a traced hmdfs

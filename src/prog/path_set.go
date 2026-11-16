@@ -20,6 +20,8 @@ const (
 	pathRoleCreat
 	pathRoleRenameSrc
 	pathRoleRenameDst
+	pathRoleLinkTarget
+	pathRoleSymlinkTarget
 )
 
 type pathSpec struct {
@@ -280,11 +282,49 @@ func buildPathMembers(ps []*Prog, ft *FileTree) []pathMember {
 				continue
 			}
 			pos := GroupPosition{ProgIdx: pi, CallIdx: ci}
+			name := call.Meta.CallName
+			// readlink's linkpath is a program-local binding, not a FileTree
+			// node; PathSet does not move it on its own.
+			if name == "readlink" {
+				continue
+			}
 			constraint, ok := memberPathConstraint(ps, pos)
 			if !ok {
 				continue
 			}
-			name := call.Meta.CallName
+			switch name {
+			case "link":
+				constraint = relTargetFile
+			case "symlink":
+				constraint = relTargetAny
+			}
+			if name == "link" || name == "symlink" {
+				target := extractPathFromCallByArgIdx(call, 0)
+				if name == "symlink" {
+					linkPath := extractPathFromCallByArgIdx(call, 1)
+					target = symlinkCanonicalTarget(linkPath, target)
+				}
+				target = normalizePathSetPath(target)
+				if target != "" {
+					node := ft.FindNode(target)
+					if node == nil || !nodeMatchesConstraint(node, constraint) {
+						continue
+					}
+					role := pathRoleLinkTarget
+					if name == "symlink" {
+						role = pathRoleSymlinkTarget
+					}
+					members = append(members, pathMember{
+						Pos: pos,
+						Paths: []pathSpec{{
+							Path: target, Kind: pathExisting, Role: role, ArgIdx: 0,
+							TypeConstraint: constraint,
+						}},
+						Constraint: constraint,
+					})
+				}
+				continue
+			}
 			if strings.Contains(name, "rename") {
 				src, dst := extractRenamePaths(call)
 				src = normalizePathSetPath(src)
@@ -332,6 +372,13 @@ func buildPathMembers(ps []*Prog, ft *FileTree) []pathMember {
 				role = pathRoleCreat
 				if ft == nil || ft.FindNode(path) == nil {
 					kind = pathFresh
+				}
+			case strings.Contains(name, "open"):
+				if openPathCreatesFile(p.Target, call) {
+					role = pathRoleCreat
+					if ft == nil || ft.FindNode(path) == nil {
+						kind = pathFresh
+					}
 				}
 			}
 			members = append(members, pathMember{
@@ -440,7 +487,7 @@ func pickPathSetTarget(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *
 	if anchorName == "" {
 		return nil, false
 	}
-	anchorKind := callNameConstraint(anchorName)
+	anchorKind := lcs.profileOrDefault().TargetConstraint(anchorName)
 	rels := []PathRelation{PathSame, PathChild, PathParent, PathSibling}
 	var weights []int
 	var members []*pathMember
@@ -457,7 +504,7 @@ func pickPathSetTarget(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *
 		if name == "" {
 			continue
 		}
-		kind := callNameConstraint(name)
+		kind := lcs.profileOrDefault().TargetConstraint(name)
 		for _, rel := range rels {
 			if rel == PathChild && anchorKind == relTargetFile {
 				continue
@@ -511,8 +558,14 @@ func pathSetTopRoot(path string) string {
 	return p
 }
 
-func pathSetTopPath(top string) string {
-	return MergeViewPrefix + top
+func pathSetTopPath(prefix, top string) string {
+	if top == "" {
+		return ""
+	}
+	if prefix == "" {
+		return top
+	}
+	return strings.TrimSuffix(prefix, "/") + "/" + top
 }
 
 func pathSetRoots(set *pathSet) []string {
@@ -618,7 +671,7 @@ func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (stri
 		}
 		bad := false
 		for _, root := range roots {
-			rootPath := pathSetTopPath(root)
+			rootPath := pathSetTopPath(ft.Prefix, root)
 			if pathUnderRoot(newParent, rootPath) {
 				bad = true
 				break
@@ -632,7 +685,7 @@ func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (stri
 	// as the new parent. The selected directory itself stays in place; the
 	// other top-level paths become its children (Sibling -> Parent/Child).
 	for _, root := range roots {
-		rootPath := pathSetTopPath(root)
+		rootPath := pathSetTopPath(ft.Prefix, root)
 		if node := ft.FindNode(rootPath); node != nil && nodeIsDir(node) {
 			return "", []string{rootPath}, true
 		}
@@ -640,7 +693,7 @@ func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (stri
 	return "", nil, false
 }
 
-func mapPathSetPath(path, base string, parent string, roots []string) string {
+func mapPathSetPath(prefix, path, base string, parent string, roots []string) string {
 	if parent == "" {
 		suffix := strings.TrimPrefix(path, base)
 		return base + suffix
@@ -652,7 +705,8 @@ func mapPathSetPath(path, base string, parent string, roots []string) string {
 	if top == "" {
 		return ""
 	}
-	rest := strings.TrimPrefix(path, MergeViewPrefix+top)
+	rootPath := pathSetTopPath(prefix, top)
+	rest := strings.TrimPrefix(path, rootPath)
 	return parent + "/" + top + rest
 }
 
@@ -886,7 +940,7 @@ func pathSetDirectedCandidates(ps []*Prog, set *pathSet, target *pathTarget, ft 
 			return
 		}
 		seen[parent] = true
-		anchorNew := mapPathSetPath(anchorSpec.Path, "", parent, roots)
+		anchorNew := mapPathSetPath(ft.Prefix, anchorSpec.Path, "", parent, roots)
 		if anchorNew != "" {
 			out = append(out, pathRelocationCandidate{
 				NewParent: parent, AnchorNew: anchorNew, SelectedDir: selectedDir,
@@ -905,7 +959,7 @@ func pathSetDirectedCandidates(ps []*Prog, set *pathSet, target *pathTarget, ft 
 			}
 			bad := false
 			for _, root := range roots {
-				if pathUnderRoot(parent, pathSetTopPath(root)) {
+				if pathUnderRoot(parent, pathSetTopPath(ft.Prefix, root)) {
 					bad = true
 					break
 				}
@@ -916,7 +970,7 @@ func pathSetDirectedCandidates(ps []*Prog, set *pathSet, target *pathTarget, ft 
 		}
 	}
 	for _, root := range roots {
-		rootPath := pathSetTopPath(root)
+		rootPath := pathSetTopPath(ft.Prefix, root)
 		if node := ft.FindNode(rootPath); node != nil && nodeIsDir(node) {
 			add(rootPath, true)
 		}
@@ -943,9 +997,9 @@ func pathSetForestParentBuckets(targetDepth int) []int {
 	return out
 }
 
-func pathSetCandidatePath(path string, cand pathRelocationCandidate, roots []string) string {
+func pathSetCandidatePath(prefix, path string, cand pathRelocationCandidate, roots []string) string {
 	if cand.NewParent != "" {
-		return mapPathSetPath(path, "", cand.NewParent, roots)
+		return mapPathSetPath(prefix, path, "", cand.NewParent, roots)
 	}
 	if cand.OldBase == "" || cand.NewBase == "" {
 		return ""
@@ -987,7 +1041,7 @@ func pathSetTargetMemberPaths(ps []*Prog, set *pathSet, target *pathTarget,
 	} else {
 		add(ft.GetPathByRelation(cand.AnchorNew, "", target.Rel, r.Rand, false, constraint))
 	}
-	add(pathSetCandidatePath(spec.Path, cand, pathSetRoots(set)))
+	add(pathSetCandidatePath(ft.Prefix, spec.Path, cand, pathSetRoots(set)))
 	return out
 }
 
@@ -1027,7 +1081,7 @@ func buildTargetPathPlan(ps []*Prog, set *pathSet, target *pathTarget,
 			case m.Pos == target.Member:
 				mapped.Path = memberPath
 			default:
-				mapped.Path = pathSetCandidatePath(spec.Path, cand, roots)
+				mapped.Path = pathSetCandidatePath(ft.Prefix, spec.Path, cand, roots)
 			}
 			if mapped.Path == "" {
 				return nil, 3, fallbacks, false
@@ -1156,7 +1210,7 @@ func buildPathPlan(ps []*Prog, set *pathSet, base, parent string, roots []string
 	for _, m := range set.Members {
 		update := pathUpdate{Pos: m.Pos}
 		for _, spec := range m.Paths {
-			desired := mapPathSetPath(spec.Path, base, parent, roots)
+			desired := mapPathSetPath(ft.Prefix, spec.Path, base, parent, roots)
 			if desired == "" {
 				return nil, false
 			}
@@ -1369,6 +1423,15 @@ func applyPathSetPlan(ps []*Prog, plan *pathPlan, r *randGen) bool {
 		for _, spec := range update.Specs {
 			if spec.ArgIdx < 0 || spec.ArgIdx >= len(call.Args) {
 				return false
+			}
+			if spec.Role == pathRoleSymlinkTarget {
+				linkPath := extractPathFromCallByArgIdx(call, 1)
+				payload := symlinkPayload(linkPath, spec.Path)
+				if payload == "" ||
+					!updateCallPathByArgIdx(p, call, 0, payload, r) {
+					return false
+				}
+				continue
 			}
 			if !updateCallPathByArgIdx(p, call, spec.ArgIdx, spec.Path, r) {
 				return false

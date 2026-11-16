@@ -2508,6 +2508,15 @@ func pathRelBetween(anchorPath, concPath string) PathRelation {
 // pathOfCall resolves the path of a call, backtracking open/creat for fd calls.
 func pathOfCall(ps []*Prog, pos GroupPosition) string {
 	call := ps[pos.ProgIdx].Calls[pos.CallIdx]
+	if call == nil || call.Meta == nil {
+		return ""
+	}
+	switch call.Meta.CallName {
+	case "link", "symlink", "readlink":
+		// Dual-path calls are planner-owned; their arg0/arg1 roles are not a
+		// single FileTree coordinate and must not enter legacy path mutation.
+		return ""
+	}
 	if p := extractPathFromCall(call); p != "" {
 		return p
 	}
@@ -4556,7 +4565,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	}
 
 	if rootCallName == "rename" {
-		basePath2 = lcs.pickRenameDst(basePath, r.Rand)
+		basePath2 = lcs.pickRenameDstFor(basePath, PathNoRel, r.Rand)
 	}
 	// Failure-shape whitelist: with failShapeProb, rewrite the root target
 	// into a shape whose error actually reaches a traced hmdfs function.

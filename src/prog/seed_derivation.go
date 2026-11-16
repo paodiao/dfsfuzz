@@ -250,15 +250,23 @@ func deriveSeedRootPath(ft *FileTree, anchor seedAnchor, rootCall string, rel Pa
 		if srcNode == nil && !anchor.PathKind.IsFresh() {
 			return seedRootDerivation{}, false
 		}
-		dest := ""
-		for attempt := 0; attempt < 8; attempt++ {
-			dest = freshRenameDst(source, r.Rand)
-			if ft.FindNode(dest) == nil && dest != source {
-				break
+		var dest string
+		if r.profile().Name == "glusterfs" {
+			dest = pickRenameDstPolicy(r.profile(), ft, source, rel, r.Rand)
+		} else {
+			for attempt := 0; attempt < 8; attempt++ {
+				dest = freshRenameDst(source, r.Rand)
+				if ft.FindNode(dest) == nil && dest != source {
+					break
+				}
+				dest = ""
 			}
-			dest = ""
 		}
-		if dest == "" || GetParentDir(dest) != GetParentDir(source) {
+		if dest == "" || dest == source {
+			return seedRootDerivation{}, false
+		}
+		if r.profile().Name != "glusterfs" &&
+			GetParentDir(dest) != GetParentDir(source) {
 			return seedRootDerivation{}, false
 		}
 		out.RootSource = source

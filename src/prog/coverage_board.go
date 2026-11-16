@@ -470,6 +470,16 @@ func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
 	default:
 		// Neither side is a modifier: no pair can form.
 	}
+	if ck.Variant == "readlink" {
+		// Directed readlink is HB-only; CC/ENOENT is a natural observation,
+		// not a planned cell.
+		if rootMod {
+			hb = total
+		} else {
+			hb = 0
+		}
+		cc = 0
+	}
 	return [2]int{hb, cc}
 }
 

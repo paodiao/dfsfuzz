@@ -2265,16 +2265,121 @@ func freshRenameDst(src string, r *rand.Rand) string {
 // requirement (hmdfs_rename_merge compares the parent paths before tracing), so
 // cross-parent destinations are never generated.
 func (lcs *LayeredChoiceStrategy) pickRenameDst(src string, r *rand.Rand) string {
+	return pickRenameDstPolicy(hmdfsProfile, lcsFileTree(lcs), src, PathSibling, r)
+}
+
+func lcsFileTree(lcs *LayeredChoiceStrategy) *FileTree {
+	if lcs == nil {
+		return nil
+	}
+	return lcs.FileTree
+}
+
+func (lcs *LayeredChoiceStrategy) pickRenameDstFor(src string, rel PathRelation, r *rand.Rand) string {
+	profile := hmdfsProfile
+	if lcs != nil && lcs.Profile != nil {
+		profile = lcs.Profile
+	}
+	return pickRenameDstPolicy(profile, lcsFileTree(lcs), src, rel, r)
+}
+
+// pickRenameDstPolicy is the profile-aware RenamePolicy hook. HMDFS keeps the
+// historical same-parent selection. GlusterFS v1 allows cross-parent
+// destinations; for a fresh destination it samples the relation's parent and
+// otherwise falls back to the source parent.
+func pickRenameDstPolicy(profile *DFSProfile, ft *FileTree, src string, rel PathRelation, r *rand.Rand) string {
 	if r == nil {
 		return src + "._renamed_000000"
 	}
-	if lcs == nil || lcs.FileTree == nil {
+	if profile == nil || profile.Name != "glusterfs" {
+		return pickRenameDstHmdfs(ft, src, r)
+	}
+	if ft == nil {
+		return freshRenameDst(src, r)
+	}
+	srcNode := ft.FindNode(src)
+	if srcNode == nil {
+		return freshRenameDst(src, r)
+	}
+	srcIsDir := srcNode.Type != NodeTypeFile
+	parent := GetParentDir(src)
+	targetParent := parent
+	switch rel {
+	case PathParent:
+		if parent != "" {
+			if p := ft.FindNode(GetParentDir(parent)); p != nil && p.Type != NodeTypeFile &&
+				p.Type != NodeTypeTmpDir {
+				targetParent = p.FullPath
+			}
+		}
+	case PathChild:
+		if srcIsDir {
+			var dirs []string
+			for _, n := range ft.GetChildren(srcNode) {
+				if n != nil && n.Type != NodeTypeFile && n.Type != NodeTypeTmpDir {
+					dirs = append(dirs, n.FullPath)
+				}
+			}
+			if len(dirs) > 0 {
+				sort.Strings(dirs)
+				targetParent = dirs[r.Intn(len(dirs))]
+			}
+		}
+	case PathNoRel:
+		if p := ft.getRandomUnrelatedPath(src, r, relTargetDir); p != "" {
+			targetParent = p
+		}
+	}
+	if targetParent == "" {
+		targetParent = parent
+	}
+	// Existing same-class destination in the target parent.
+	if r.Float64() < renameExistingDstProb {
+		parentNode := ft.FindNode(targetParent)
+		if parentNode != nil {
+			var pick []string
+			for _, n := range ft.GetChildren(parentNode) {
+				if n == nil || n.Type == NodeTypeTmpDir || n.FullPath == src {
+					continue
+				}
+				if (n.Type == NodeTypeFile) != (srcNode.Type == NodeTypeFile) {
+					continue
+				}
+				if n.Type != NodeTypeFile && len(n.Children) > 0 && rel != PathNoRel {
+					continue
+				}
+				if pathUnderRoot(n.FullPath, src) {
+					continue
+				}
+				pick = append(pick, n.FullPath)
+			}
+			if len(pick) > 0 {
+				sort.Strings(pick)
+				return pick[r.Intn(len(pick))]
+			}
+		}
+	}
+	base := GetFileName(src)
+	for i := 0; i < 8; i++ {
+		dst := joinTestPath(targetParent, base+"._renamed_"+randomSuffix(r))
+		if dst != src && !pathUnderRoot(dst, src) && ft.FindNode(dst) == nil {
+			return dst
+		}
+	}
+	return ""
+}
+
+func pickRenameDstHmdfs(ft *FileTree, src string, r *rand.Rand) string {
+	if r == nil {
+		return src + "._renamed_000000"
+	}
+	if ft == nil {
 		return freshRenameDst(src, r)
 	}
 	if r.Float64() >= renameExistingDstProb {
 		return freshRenameDst(src, r)
 	}
-	if sib := lcs.existingRenameDstSibling(src, r); sib != "" {
+	if sib := existingRenameDstSibling(ft, src, r); sib != "" {
 		return sib
 	}
 	return freshRenameDst(src, r)
@@ -2288,10 +2393,13 @@ func (lcs *LayeredChoiceStrategy) pickRenameDst(src string, r *rand.Rand) string
 // may not). It is a destination helper only — source selection uses
 // GetPathByRelation with nodeTypeConstraint instead.
 func (lcs *LayeredChoiceStrategy) existingRenameDstSibling(src string, r *rand.Rand) string {
-	if r == nil || lcs == nil || lcs.FileTree == nil {
+	return existingRenameDstSibling(lcsFileTree(lcs), src, r)
+}
+
+func existingRenameDstSibling(ft *FileTree, src string, r *rand.Rand) string {
+	if r == nil || ft == nil {
 		return ""
 	}
-	ft := lcs.FileTree
 	srcNode := ft.FindNode(src)
 	if srcNode == nil {
 		return ""
