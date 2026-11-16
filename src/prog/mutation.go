@@ -3785,11 +3785,15 @@ type GroupPosition struct {
 // base path themselves (mkdir picks a container, creat appends a fresh name)
 // or accept either type, so no check is needed.
 func rootBaseConstraint(call string) (int, bool) {
+	return rootBaseConstraintFor(hmdfsProfile, call)
+}
+
+func rootBaseConstraintFor(profile *DFSProfile, call string) (int, bool) {
 	switch call {
 	case "mkdir", "creat":
 		return relTargetAny, false
 	}
-	switch kind := callNameConstraint(call); kind {
+	switch kind := profile.TargetConstraint(call); kind {
 	case relTargetFile, relTargetDir:
 		return kind, true
 	}
@@ -3818,7 +3822,9 @@ func resolveFdTarget(ps []*Prog, pos GroupPosition) GroupPosition {
 		callName == "truncate" || callName == "chmod" ||
 		callName == "mkdir" || callName == "rmdir" ||
 		callName == "rename" || callName == "stat" ||
-		callName == "unlink" {
+		callName == "unlink" || callName == "link" ||
+		callName == "symlink" || callName == "readlink" ||
+		callName == "getxattr" || callName == "setxattr" {
 		return pos
 	}
 
@@ -4282,13 +4288,13 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int) map[string]int {
 	return m
 }
 
-// basePathIsFileHinted is basePathIsFile with the in-program creation hint
+// basePathIsFileHinted is BasePathIsFile with the in-program creation hint
 // taking precedence over the unknown-path fallback.
-func basePathIsFileHinted(ft *FileTree, rootCallName, basePath string, freshKinds map[string]int) bool {
+func basePathIsFileHinted(profile *DFSProfile, ft *FileTree, rootCallName, basePath string, freshKinds map[string]int) bool {
 	if h, ok := freshKinds[basePath]; ok {
 		return h == relTargetFile
 	}
-	return basePathIsFile(ft, rootCallName, basePath)
+	return profile.BasePathIsFile(ft, rootCallName, basePath)
 }
 
 func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, allowDirected bool) bool {
@@ -4364,7 +4370,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	// at execution, a wasted round). Re-pick a compatible candidate; with none
 	// the type-aware FileTree selection below takes over.
 	if basePath != "" && lcs != nil && lcs.FileTree != nil {
-		if kind, ok := rootBaseConstraint(rootCallName); ok {
+		if kind, ok := rootBaseConstraintFor(lcs.profileOrDefault(), rootCallName); ok {
 			node := lcs.FileTree.FindNode(basePath)
 			mismatch := false
 			if node != nil {
@@ -4403,19 +4409,20 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	}
 
 	if basePath == "" {
-		if r.isDirOnlyCall(rootCallName) {
+		switch lcs.profileOrDefault().TargetConstraint(rootCallName) {
+		case relTargetDir:
 			dirNode := lcs.FileTree.GetRandomDir(r.Rand, cid0, true)
 			if dirNode == nil {
 				return false
 			}
 			basePath = dirNode.FullPath
-		} else if r.isFileOnlyCall(rootCallName) {
+		case relTargetFile:
 			fileNode := lcs.FileTree.GetRandomFile(r.Rand, cid0)
 			if fileNode == nil {
 				return false
 			}
 			basePath = fileNode.FullPath
-		} else {
+		default:
 			if r.bin() {
 				fileNode := lcs.FileTree.GetRandomFile(r.Rand, cid0)
 				if fileNode != nil {
@@ -4494,7 +4501,16 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 			rootFlags = r.target.GetConst("O_DIRECTORY")
 		}
 	}
-	rootCalls := r.generateCallByName(stateFromProg(p0), sCalls, rootCallName, basePath, basePath2, cid0, ExistingFd, useExistFd, rootFileSize, rootFlags)
+	rootPath, rootPath2 := basePath, basePath2
+	rootLinkPath := ""
+	if rootCallName == "link" || rootCallName == "symlink" {
+		rootPath2 = basePath
+		rootPath = r.freshLinkPath(basePath, rootCallName)
+		if rootCallName == "symlink" {
+			rootLinkPath = rootPath
+		}
+	}
+	rootCalls := r.generateCallByName(stateFromProg(p0), sCalls, rootCallName, rootPath, rootPath2, cid0, ExistingFd, useExistFd, rootFileSize, rootFlags)
 	if len(rootCalls) == 0 || hasNilCall(rootCalls) {
 		// A nil call would panic at Serialize; a clean abort leaves ps
 		// untouched and the caller falls back to the standard mutator.
@@ -4527,7 +4543,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	// hint knows better: use it so Same-relation variants follow the actual
 	// type (file-only Same on a fresh dir would open EISDIR; dir-only Same on
 	// a fresh dir would be rejected).
-	baseIsFile := basePathIsFileHinted(lcs.FileTree, rootCallName, basePath, freshKinds)
+	baseIsFile := basePathIsFileHinted(lcs.profileOrDefault(), lcs.FileTree, rootCallName, basePath, freshKinds)
 
 	for nodeIdx := 1; nodeIdx < len(ps); nodeIdx++ {
 		useExistFd = true
@@ -4562,6 +4578,14 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 		concurrentPath := ""
 
 		concurrentPath2 := ""
+		if variant.CallName == "readlink" {
+			// readlink follows the root symlink's program-local linkpath; the
+			// relation-derived path would be the symlink target instead.
+			if rootLinkPath == "" {
+				continue
+			}
+			concurrentPath = rootLinkPath
+		}
 		if variant.CallName == "mkdir" {
 			// mkdir as a variant follows its geometric position: Child
 			// creates a fresh child inside the base, Sibling a fresh sibling
@@ -4589,7 +4613,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 				continue
 			}
 		} else if concurrentPath == "" {
-			constraint := callNameConstraint(variant.CallName)
+			constraint := lcs.profileOrDefault().TargetConstraint(variant.CallName)
 			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, false, constraint)
 			if concurrentPath == "" {
 				// No generatable path of the right type: skip this node's
@@ -4707,8 +4731,17 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 		rootFd = findOpenFdForPath(p0, basePath, insertPos, capNeeded(rootCallName))
 		rootUseFd = rootFd != nil
 	}
+	rootPath, rootPath2 := basePath, basePath2
+	rootLinkPath := ""
+	if rootCallName == "link" || rootCallName == "symlink" {
+		rootPath2 = basePath
+		rootPath = r.freshLinkPath(basePath, rootCallName)
+		if rootCallName == "symlink" {
+			rootLinkPath = rootPath
+		}
+	}
 	rootCalls := r.generateCallByName(stateFromProg(p0), sCalls, rootCallName,
-		basePath, basePath2, hmcfg.Cids[0], rootFd, rootUseFd, rootFileSize, rootFlags)
+		rootPath, rootPath2, hmcfg.Cids[0], rootFd, rootUseFd, rootFileSize, rootFlags)
 	if len(rootCalls) == 0 || hasNilCall(rootCalls) {
 		return false
 	}
@@ -4732,7 +4765,10 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 	}
 
 	rootObservedPath := derivation.RootDest
-	baseIsFile := basePathIsFileHinted(ft, rootCallName, rootObservedPath, freshKinds)
+	if rootCallName == "link" || rootCallName == "symlink" {
+		rootObservedPath = derivation.RootSource
+	}
+	baseIsFile := basePathIsFileHinted(lcs.profileOrDefault(), ft, rootCallName, rootObservedPath, freshKinds)
 
 	for nodeIdx := 1; nodeIdx < len(ps); nodeIdx++ {
 		p := ps[nodeIdx]
@@ -4771,6 +4807,12 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 
 		variantPath := ""
 		variantPath2 := ""
+		if variant.CallName == "readlink" {
+			if rootLinkPath == "" {
+				continue
+			}
+			variantPath = rootLinkPath
+		}
 		switch variant.CallName {
 		case "mkdir":
 			switch variant.PathRelation {
@@ -4788,9 +4830,18 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 			}
 		case "rename":
 			variantPath, variantPath2 = lcs.GetPathsForRenameVariant(rootObservedPath, "", variant.PathRelation, r.Rand, false)
+		case "readlink":
+			// Bound to rootLinkPath above; never derive from the target.
 		default:
-			constraint := callNameConstraint(variant.CallName)
+			constraint := lcs.profileOrDefault().TargetConstraint(variant.CallName)
 			variantPath = ft.GetPathByRelation(rootObservedPath, "", variant.PathRelation, r.Rand, false, constraint)
+		}
+		if variant.CallName == "link" || variant.CallName == "symlink" {
+			if variantPath == "" {
+				continue
+			}
+			variantPath2 = variantPath
+			variantPath = r.freshLinkPath(variantPath, variant.CallName)
 		}
 		// mkdir Same/Parent target existing tree paths (the root itself or its
 		// parent), not a fresh child/sibling. Mirror the generic relation
@@ -4798,7 +4849,7 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 		// DCT-selected variant.
 		if variantPath == "" && variant.CallName == "mkdir" &&
 			(variant.PathRelation == PathSame || variant.PathRelation == PathParent) {
-			constraint := callNameConstraint(variant.CallName)
+			constraint := lcs.profileOrDefault().TargetConstraint(variant.CallName)
 			variantPath = ft.GetPathByRelation(rootObservedPath, "", variant.PathRelation, r.Rand, false, constraint)
 		}
 		if variantPath == "" {

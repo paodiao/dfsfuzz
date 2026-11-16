@@ -26,9 +26,20 @@ type CallProfile struct {
 	FileOnlyCalls   []string
 	FileOrDirCalls  []string
 	FdRequiredCalls []string
-	RootCalls       []string
-	VariantCalls    []string
-	CausalRootCalls []string
+	// Root path-intent tables used by BasePathIsFile. They are narrower than
+	// FileOnlyCalls/DirOnlyCalls: fsync/fdatasync have no type intent in the
+	// HMDFS table, while link requires a regular-file target and symlink may
+	// target either type.
+	TargetFileCalls []string
+	TargetDirCalls  []string
+	// Conflict-weight classes for the DCT initial weights. Exact-name
+	// matches (read must not match pread64).
+	NamespaceCalls    []string
+	DataModCalls      []string
+	DataObserverCalls []string
+	RootCalls         []string
+	VariantCalls      []string
+	CausalRootCalls   []string
 }
 
 type EventProfile struct {
@@ -103,15 +114,25 @@ var GlusterfsCausalRootCalls = []string{
 	"creat", "rename", "link", "symlink", "setxattr",
 }
 
+// GlusterfsChoiceCalls is the DCT root-choice allowlist: the 19 v1 roots plus
+// close as a legal bias source. chooseRootCallName never returns close, so the
+// selectable roots stay at 19.
+var GlusterfsChoiceCalls = append(append([]string{}, GlusterfsRootCalls...), "close")
+
 var hmdfsProfile = &DFSProfile{
 	Name: "hmdfs",
 	Calls: CallProfile{
-		SubCalls:        FsopsSubCalls,
-		ChoiceCalls:     FsopsChoiceCalls,
-		DirOnlyCalls:    DirOnlyCalls,
-		FileOnlyCalls:   FileOnlyCalls,
-		FileOrDirCalls:  FileOrDirCalls,
-		FdRequiredCalls: FdRequiredCalls,
+		SubCalls:          FsopsSubCalls,
+		ChoiceCalls:       FsopsChoiceCalls,
+		DirOnlyCalls:      DirOnlyCalls,
+		FileOnlyCalls:     FileOnlyCalls,
+		FileOrDirCalls:    FileOrDirCalls,
+		FdRequiredCalls:   FdRequiredCalls,
+		TargetFileCalls:   []string{"creat", "truncate", "read", "write", "pread64", "pwrite64", "unlink"},
+		TargetDirCalls:    []string{"mkdir", "rmdir", "getdents64"},
+		NamespaceCalls:    []string{"mkdir", "rmdir", "creat", "unlink", "rename"},
+		DataModCalls:      []string{"write", "pwrite64", "truncate", "fsync", "fdatasync"},
+		DataObserverCalls: []string{"read", "pread64", "stat", "getdents64", "chmod"},
 	},
 	Events: EventProfile{SupportsSameInode: true},
 	Paths:  PathPolicy{RootPrefix: MergeViewPrefix, SameParentRename: true},
@@ -128,15 +149,20 @@ var hmdfsProfile = &DFSProfile{
 var glusterfsProfile = &DFSProfile{
 	Name: "glusterfs",
 	Calls: CallProfile{
-		SubCalls:        GlusterfsSubCalls,
-		ChoiceCalls:     GlusterfsSubCalls,
-		DirOnlyCalls:    []string{"mkdir", "rmdir", "getdents64"},
-		FileOnlyCalls:   []string{"creat", "truncate", "pread64", "pwrite64", "read", "write", "fsync", "fdatasync", "unlink", "link", "symlink", "readlink"},
-		FileOrDirCalls:  []string{"open", "stat", "chmod", "rename", "getxattr", "setxattr"},
-		FdRequiredCalls: []string{"read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "getdents64", "close"},
-		RootCalls:       GlusterfsRootCalls,
-		VariantCalls:    GlusterfsVariantCalls,
-		CausalRootCalls: GlusterfsCausalRootCalls,
+		SubCalls:          GlusterfsSubCalls,
+		ChoiceCalls:       GlusterfsChoiceCalls,
+		DirOnlyCalls:      []string{"mkdir", "rmdir", "getdents64"},
+		FileOnlyCalls:     []string{"creat", "truncate", "pread64", "pwrite64", "read", "write", "fsync", "fdatasync", "unlink", "link", "symlink", "readlink"},
+		FileOrDirCalls:    []string{"open", "stat", "chmod", "rename", "getxattr", "setxattr"},
+		FdRequiredCalls:   []string{"read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "getdents64", "close"},
+		TargetFileCalls:   []string{"creat", "truncate", "read", "write", "pread64", "pwrite64", "fsync", "fdatasync", "unlink", "link"},
+		TargetDirCalls:    []string{"mkdir", "rmdir", "getdents64"},
+		NamespaceCalls:    []string{"mkdir", "rmdir", "creat", "unlink", "rename", "link", "symlink"},
+		DataModCalls:      []string{"write", "pwrite64", "truncate", "fsync", "fdatasync", "setxattr"},
+		DataObserverCalls: []string{"read", "pread64", "stat", "getdents64", "chmod", "readlink", "getxattr"},
+		RootCalls:         GlusterfsRootCalls,
+		VariantCalls:      GlusterfsVariantCalls,
+		CausalRootCalls:   GlusterfsCausalRootCalls,
 	},
 	Events: EventProfile{SupportsSameInode: false},
 	Paths:  PathPolicy{RootPrefix: "", SameParentRename: false, MaxClientNum: 3},
@@ -244,6 +270,44 @@ func (c *Hmdfs_config) IsFileOnlyCall(name string) bool {
 
 func (c *Hmdfs_config) IsFileOrDirCall(name string) bool {
 	return profileCallListContains(c.ProfileOrDefault().Calls.FileOrDirCalls, name)
+}
+
+// TargetConstraint returns the node type a call's path argument must have for
+// dual-path generation. It intentionally differs from the coarse FileOnlyCalls
+// classification: symlink targets and readlink linkpaths may be any type,
+// while link still requires a regular-file target.
+func (p *DFSProfile) TargetConstraint(callName string) int {
+	switch callName {
+	case "link":
+		return relTargetFile
+	case "symlink", "readlink":
+		return relTargetAny
+	}
+	if p == nil {
+		p = hmdfsProfile
+	}
+	if profileCallListContains(p.Calls.FileOnlyCalls, callName) {
+		return relTargetFile
+	}
+	if profileCallListContains(p.Calls.DirOnlyCalls, callName) {
+		return relTargetDir
+	}
+	return relTargetAny
+}
+
+// BasePathIsFile mirrors basePathIsFile with profile root-intent tables
+// instead of the historical HMDFS switch.
+func (p *DFSProfile) BasePathIsFile(ft *FileTree, rootCallName, basePath string) bool {
+	if p == nil {
+		p = hmdfsProfile
+	}
+	if profileCallListContains(p.Calls.TargetDirCalls, rootCallName) {
+		return false
+	}
+	if profileCallListContains(p.Calls.TargetFileCalls, rootCallName) {
+		return true
+	}
+	return !isDirPath(ft, basePath)
 }
 
 func profileCallListContains(list []string, name string) bool {

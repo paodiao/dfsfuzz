@@ -1553,6 +1553,10 @@ func (pp *PredefinedPatterns) GetRandomPattern(r *rand.Rand) *ConcurrentPattern 
 type DistributedChoiceTable struct {
 	mu sync.RWMutex
 
+	// Profile selects call type and role policy; it never changes the DCT
+	// key shape (RootCalls/Variants/Weights stay profile-neutral).
+	Profile *DFSProfile
+
 	RootCalls map[string]bool
 
 	Variants map[string][]CallVariant
@@ -1567,7 +1571,11 @@ func NewDistributedChoiceTable() *DistributedChoiceTable {
 // BuildDefaultDCT builds the DCT for a profile. HMDFS keeps the historical
 // root/variant list; GlusterFS uses its explicit 19/21 lists.
 func BuildDefaultDCT(profile *DFSProfile) *DistributedChoiceTable {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
 	dct := &DistributedChoiceTable{
+		Profile:   profile,
 		RootCalls: make(map[string]bool),
 		Variants:  make(map[string][]CallVariant),
 		Weights:   make(map[string]map[CallVariant]int),
@@ -1590,7 +1598,17 @@ func BuildDefaultDCT(profile *DFSProfile) *DistributedChoiceTable {
 }
 
 func (dct *DistributedChoiceTable) initDefaultConfig() {
+	if dct.Profile == nil {
+		dct.Profile = hmdfsProfile
+	}
 	dct.initConfig(FsopsSubCalls, FsopsSubCalls)
+}
+
+func (dct *DistributedChoiceTable) profileOrDefault() *DFSProfile {
+	if dct != nil && dct.Profile != nil {
+		return dct.Profile
+	}
+	return hmdfsProfile
 }
 
 func (dct *DistributedChoiceTable) initConfig(rootCallNames, variantCallNames []string) {
@@ -1606,9 +1624,19 @@ func (dct *DistributedChoiceTable) initConfig(rootCallNames, variantCallNames []
 		weights := make(map[CallVariant]int)
 
 		for _, variantCall := range variantCallNames {
+			variantRelations := relations
+			// GlusterFS v1: readlink is only a follower of a symlink root and
+			// only in the Same relation; it can never be a root or a
+			// standalone variant of another root.
+			if variantCall == "readlink" && dct.profileOrDefault().Name == "glusterfs" {
+				if rootCall != "symlink" {
+					continue
+				}
+				variantRelations = []PathRelation{PathSame}
+			}
 			if variantCall == "rename" {
-				for _, srcRel := range relations {
-					for _, tgtRel := range relations {
+				for _, srcRel := range variantRelations {
+					for _, tgtRel := range variantRelations {
 						if srcRel == tgtRel {
 							cv := CallVariant{
 								CallName:     variantCall,
@@ -1620,7 +1648,7 @@ func (dct *DistributedChoiceTable) initConfig(rootCallNames, variantCallNames []
 					}
 				}
 			} else {
-				for _, rel := range relations {
+				for _, rel := range variantRelations {
 					cv := CallVariant{
 						CallName:     variantCall,
 						PathRelation: rel,
@@ -1636,12 +1664,8 @@ func (dct *DistributedChoiceTable) initConfig(rootCallNames, variantCallNames []
 	}
 }
 
-// Seed-call categories for the initial weight formula.
-var (
-	nsCalls      = map[string]bool{"mkdir": true, "rmdir": true, "creat": true, "unlink": true, "rename": true}
-	datamodCalls = map[string]bool{"write": true, "pwrite64": true, "truncate": true, "fsync": true, "fdatasync": true}
-	dataobsCalls = map[string]bool{"read": true, "pread64": true, "stat": true, "getdents64": true, "chmod": true}
-)
+// Seed-call categories for the initial weight formula now live in the
+// per-profile CallProfile tables (NamespaceCalls/DataModCalls/DataObserverCalls).
 
 // relBaseOf is the relation base weight: Same 30 / Parent-Child-Sibling 20 /
 // NoRel (and anything else) 10.
@@ -1656,21 +1680,36 @@ func relBaseOf(rel PathRelation) int {
 	}
 }
 
+func profileExactListContains(list []string, name string) bool {
+	for _, n := range list {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
 // conflictCoeffOf returns the pair conflict coefficient in percent:
 // same call 150; namespace x namespace 150; namespace x data-modifier 120;
 // namespace x data-observer 100; data-modifier x data-modifier 120
 // (write x truncate 150); data-modifier x data-observer 120; any pair
 // involving open 120; data-observer x data-observer 50.
-func conflictCoeffOf(rootCall, variantCall string) int {
+func (p *DFSProfile) ConflictCoeffOf(rootCall, variantCall string) int {
+	if p == nil {
+		p = hmdfsProfile
+	}
 	if rootCall == variantCall {
 		return 150
 	}
 	if rootCall == "open" || variantCall == "open" {
 		return 120
 	}
-	rNS, vNS := nsCalls[rootCall], nsCalls[variantCall]
-	rDM, vDM := datamodCalls[rootCall], datamodCalls[variantCall]
-	rOB, vOB := dataobsCalls[rootCall], dataobsCalls[variantCall]
+	rNS := profileExactListContains(p.Calls.NamespaceCalls, rootCall)
+	vNS := profileExactListContains(p.Calls.NamespaceCalls, variantCall)
+	rDM := profileExactListContains(p.Calls.DataModCalls, rootCall)
+	vDM := profileExactListContains(p.Calls.DataModCalls, variantCall)
+	rOB := profileExactListContains(p.Calls.DataObserverCalls, rootCall)
+	vOB := profileExactListContains(p.Calls.DataObserverCalls, variantCall)
 	switch {
 	case rNS && vNS:
 		return 150
@@ -1691,9 +1730,14 @@ func conflictCoeffOf(rootCall, variantCall string) int {
 	return 100
 }
 
+// conflictCoeffOf is the HMDFS legacy wrapper.
+func conflictCoeffOf(rootCall, variantCall string) int {
+	return hmdfsProfile.ConflictCoeffOf(rootCall, variantCall)
+}
+
 // getInitialWeight computes relBase * conflictCoeff, clamped to [5, 45].
 func (dct *DistributedChoiceTable) getInitialWeight(rootCall string, variant CallVariant) int {
-	w := relBaseOf(variant.PathRelation) * conflictCoeffOf(rootCall, variant.CallName) / 100
+	w := relBaseOf(variant.PathRelation) * dct.profileOrDefault().ConflictCoeffOf(rootCall, variant.CallName) / 100
 	if w < 5 {
 		w = 5
 	}
@@ -1743,8 +1787,18 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 	}
 
 	weights := dct.Weights[rootCall]
+	profile := dct.profileOrDefault()
 
 	eligible := func(cv CallVariant) bool {
+		// readlink only follows a symlink root in the Same relation. The DCT
+		// builder already prunes other roots, but keep the gate local so a
+		// stale table or a test-built DCT cannot emit phantom readlink cells.
+		if cv.CallName == "readlink" {
+			if profile.Name == "glusterfs" &&
+				(rootCall != "symlink" || cv.PathRelation != PathSame) {
+				return false
+			}
+		}
 		// mkdir as a variant creates a directory; its target follows the
 		// relation's geometric position: Same hits the base itself (rebuild
 		// timing race), Parent hits the parent (same treatment as Same),
@@ -1775,16 +1829,17 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 		// dir-only calls on a file base are doomed. Other relations target
 		// elsewhere (parent/sibling/unrelated), whose types are handled by
 		// the per-type relOK sets and the downstream constraint filtering.
-		if baseIsFile && cv.PathRelation == PathSame && isDirOnlyCall(cv.CallName) {
+		if baseIsFile && cv.PathRelation == PathSame &&
+			profile.TargetConstraint(cv.CallName) == relTargetDir {
 			return false
 		}
 		if relOKByType != nil {
-			callType := callNameConstraint(cv.CallName)
+			callType := profile.TargetConstraint(cv.CallName)
 			if !relOKByType[callType][cv.PathRelation] {
 				return false
 			}
 		}
-		if !baseIsFile && isFileOnlyVariantRel(cv) {
+		if !baseIsFile && isFileOnlyVariantRel(profile, cv) {
 			return false
 		}
 		return true
@@ -1879,8 +1934,8 @@ func isFileOnlyCallByName(callName string) bool {
 	return false
 }
 
-func isFileOnlyVariantRel(cv CallVariant) bool {
-	return isFileOnlyCallByName(cv.CallName) &&
+func isFileOnlyVariantRel(profile *DFSProfile, cv CallVariant) bool {
+	return profile.TargetConstraint(cv.CallName) == relTargetFile &&
 		(cv.PathRelation == PathSelf || cv.PathRelation == PathSame || cv.PathRelation == PathParent)
 }
 
@@ -1888,17 +1943,12 @@ func isFileOnlyVariantRel(cv CallVariant) bool {
 // variant filtering purposes. The intent of the root call wins over the tree
 // state: mkdir/rmdir/getdents64 operate on directories (a fresh mkdir target
 // is a directory even though it is not in the tree yet); file-intent roots
-// (creat, truncate, read/write family, unlink) operate on files. Ambiguous
-// roots (open/stat/chmod/rename) fall back to the tree state.
+// (creat, truncate, read/write family, unlink, link) operate on files.
+// Ambiguous roots (open/stat/chmod/rename/getxattr/setxattr) fall back to the
+// tree state. Kept as the HMDFS wrapper; profile-aware callers use
+// (*DFSProfile).BasePathIsFile.
 func basePathIsFile(ft *FileTree, rootCallName, basePath string) bool {
-	switch rootCallName {
-	case "mkdir", "rmdir", "getdents64":
-		return false
-	case "creat", "truncate", "read", "write", "pread64", "pwrite64",
-		"fsync", "fdatasync", "unlink":
-		return true
-	}
-	return !isDirPath(ft, basePath)
+	return hmdfsProfile.BasePathIsFile(ft, rootCallName, basePath)
 }
 
 func isDirPath(ft *FileTree, path string) bool {
@@ -1976,6 +2026,9 @@ type LayeredChoiceStrategy struct {
 	DCTFsops              *DistributedChoiceTable
 	CausalDerivationTable *CausalDerivationTable
 	FileTree              *FileTree
+	// Profile is the active per-DFS policy table. It is planner-only and
+	// never part of DCT/coverage keys.
+	Profile *DFSProfile
 
 	// FsopsChoiceTable selects root calls for DCT insertion, built from the
 	// fsops allowlist (close enabled as a legal bias source, never a root).
@@ -1996,11 +2049,16 @@ type LayeredChoiceStrategy struct {
 }
 
 func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoiceStrategy {
+	profile := hmdfsProfile
+	if hmcfg != nil {
+		profile = hmcfg.ProfileOrDefault()
+	}
 	lcs := &LayeredChoiceStrategy{
 		PredefinedPatterns:    NewPredefinedPatterns(),
-		DCTFsops:              BuildDefaultDCT(hmcfg.ProfileOrDefault()),
+		DCTFsops:              BuildDefaultDCT(profile),
 		CausalDerivationTable: newCausalDerivationTable(),
 		FileTree:              nil,
+		Profile:               profile,
 		patternProbability:    0.15,
 	}
 
@@ -2044,6 +2102,13 @@ func (lcs *LayeredChoiceStrategy) ShouldUsePattern(r *rand.Rand) bool {
 
 func (lcs *LayeredChoiceStrategy) GetDCT() *DistributedChoiceTable {
 	return lcs.DCTFsops
+}
+
+func (lcs *LayeredChoiceStrategy) profileOrDefault() *DFSProfile {
+	if lcs != nil && lcs.Profile != nil {
+		return lcs.Profile
+	}
+	return hmdfsProfile
 }
 
 func (lcs *LayeredChoiceStrategy) ChooseConcurrentCall(rootCallName string, r *rand.Rand) *CallVariant {

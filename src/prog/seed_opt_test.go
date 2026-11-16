@@ -337,16 +337,16 @@ func TestBasePathIsFileHinted(t *testing.T) {
 	if lcs.FileTree.FindNode(fresh) != nil {
 		t.Fatalf("fixture path %q unexpectedly in the tree", fresh)
 	}
-	if got := basePathIsFileHinted(lcs.FileTree, "open", fresh, map[string]int{fresh: relTargetDir}); got {
+	if got := basePathIsFileHinted(hmdfsProfile, lcs.FileTree, "open", fresh, map[string]int{fresh: relTargetDir}); got {
 		t.Fatal("hinted directory must not be treated as a file")
 	}
-	if got := basePathIsFileHinted(lcs.FileTree, "open", fresh, map[string]int{fresh: relTargetFile}); !got {
+	if got := basePathIsFileHinted(hmdfsProfile, lcs.FileTree, "open", fresh, map[string]int{fresh: relTargetFile}); !got {
 		t.Fatal("hinted file must be treated as a file")
 	}
-	if got := basePathIsFileHinted(lcs.FileTree, "open", fresh, nil); !got {
+	if got := basePathIsFileHinted(hmdfsProfile, lcs.FileTree, "open", fresh, nil); !got {
 		t.Fatal("no hint: ambiguous root must keep the unknown-path file fallback")
 	}
-	if got := basePathIsFileHinted(lcs.FileTree, "mkdir", fresh, nil); got {
+	if got := basePathIsFileHinted(hmdfsProfile, lcs.FileTree, "mkdir", fresh, nil); got {
 		t.Fatal("no hint: directory-intent root must stay a directory")
 	}
 }

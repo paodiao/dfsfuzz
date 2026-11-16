@@ -1,6 +1,9 @@
 package prog
 
-import "testing"
+import (
+	"math/rand"
+	"testing"
+)
 
 func TestCoverageBoardCallListsUseProfile(t *testing.T) {
 	roots, variants := coverageBoardCallLists(glusterfsProfile)
@@ -141,5 +144,127 @@ func TestGlusterfsOffsetAndRetModel(t *testing.T) {
 		if !seen[want] {
 			t.Fatalf("link ret model missing %v: %v", want, rets)
 		}
+	}
+}
+
+func TestGlusterfsProfileTargetConstraint(t *testing.T) {
+	cases := map[string]int{
+		"link":     relTargetFile,
+		"symlink":  relTargetAny,
+		"readlink": relTargetAny,
+		"getxattr": relTargetAny,
+		"setxattr": relTargetAny,
+		"mkdir":    relTargetDir,
+		"rmdir":    relTargetDir,
+		"creat":    relTargetFile,
+	}
+	for call, want := range cases {
+		if got := glusterfsProfile.TargetConstraint(call); got != want {
+			t.Fatalf("glusterfs TargetConstraint(%q) = %d, want %d", call, got, want)
+		}
+	}
+
+	_, _, _, lcs := seedOptLCS(t)
+	filePath, dirPath := "merge_view/dirA/a", "merge_view/dirA"
+	if glusterfsProfile.BasePathIsFile(lcs.FileTree, "link", filePath) != true {
+		t.Fatal("link target must be file-intent")
+	}
+	if glusterfsProfile.BasePathIsFile(lcs.FileTree, "symlink", dirPath) {
+		t.Fatal("symlink target may be a directory")
+	}
+	if !glusterfsProfile.BasePathIsFile(lcs.FileTree, "symlink", filePath) {
+		t.Fatal("symlink target may be a file")
+	}
+	if glusterfsProfile.BasePathIsFile(lcs.FileTree, "rmdir", dirPath) {
+		t.Fatal("rmdir must be dir-intent")
+	}
+	if !glusterfsProfile.BasePathIsFile(lcs.FileTree, "fsync", dirPath) {
+		t.Fatal("glusterfs fsync is file-intent")
+	}
+	// HMDFS keeps the historical fallback: fsync has no type intent and the
+	// tree decides.
+	if hmdfsProfile.BasePathIsFile(lcs.FileTree, "fsync", dirPath) {
+		t.Fatal("hmdfs fsync on a directory must fall back to the tree type")
+	}
+}
+
+func TestGlusterfsDCTReadlinkFollower(t *testing.T) {
+	dct := BuildDefaultDCT(glusterfsProfile)
+	if dct.Profile != glusterfsProfile {
+		t.Fatal("DCT did not retain its profile")
+	}
+	if len(dct.RootCalls) != len(GlusterfsRootCalls) {
+		t.Fatalf("glusterfs roots = %d, want %d", len(dct.RootCalls), len(GlusterfsRootCalls))
+	}
+	for _, forbidden := range []string{"close", "readlink", "getxattr"} {
+		if dct.RootCalls[forbidden] {
+			t.Fatalf("%q must not be a GlusterFS root", forbidden)
+		}
+	}
+	for _, root := range []string{"open", "link", "symlink"} {
+		for _, cv := range dct.Variants[root] {
+			if cv.CallName == "readlink" && root != "symlink" {
+				t.Fatalf("readlink variant leaked under root %q", root)
+			}
+		}
+	}
+	for _, cv := range dct.Variants["symlink"] {
+		if cv.CallName == "readlink" && cv.PathRelation != PathSame {
+			t.Fatalf("readlink relation = %v, want Same", cv.PathRelation)
+		}
+	}
+
+	// The runtime gate is independent of the table: even a stale/hand-built
+	// DCT cannot produce readlink under a non-symlink root.
+	stale := &DistributedChoiceTable{
+		Profile:   glusterfsProfile,
+		RootCalls: map[string]bool{"open": true},
+		Variants: map[string][]CallVariant{
+			"open": {{CallName: "readlink", PathRelation: PathSame}},
+		},
+		Weights: map[string]map[CallVariant]int{
+			"open": {{CallName: "readlink", PathRelation: PathSame}: 30},
+		},
+	}
+	if v := stale.ChooseVariant("open", rand.New(rand.NewSource(1))); v != nil {
+		t.Fatalf("stale DCT produced variant %+v under open", v)
+	}
+}
+
+func TestGlusterfsConflictWeights(t *testing.T) {
+	cases := []struct {
+		root, variant string
+		want          int
+	}{
+		{"link", "link", 150},
+		{"link", "open", 120},
+		{"link", "read", 100},      // namespace x observer
+		{"setxattr", "write", 120}, // data-mod x data-mod
+		{"readlink", "getxattr", 50},
+	}
+	for _, tc := range cases {
+		if got := glusterfsProfile.ConflictCoeffOf(tc.root, tc.variant); got != tc.want {
+			t.Fatalf("ConflictCoeffOf(%q,%q) = %d, want %d",
+				tc.root, tc.variant, got, tc.want)
+		}
+	}
+	if got := conflictCoeffOf("fsync", "read"); got != 120 {
+		t.Fatalf("hmdfs fsync/read = %d, want 120", got)
+	}
+	if got := conflictCoeffOf("fsync", "fsync"); got != 150 {
+		t.Fatalf("hmdfs fsync/fsync = %d, want 150", got)
+	}
+}
+
+func TestGlusterfsResolveFdTargetPathCalls(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	link := mkLinkCall(t, target, "a", "b")
+	p := &Prog{Target: target, Calls: []*Call{link}}
+	pos := GroupPosition{ProgIdx: 0, CallIdx: 0}
+	if got := resolveFdTarget([]*Prog{p}, pos); got != pos {
+		t.Fatalf("resolveFdTarget(link) = %+v, want %+v", got, pos)
 	}
 }

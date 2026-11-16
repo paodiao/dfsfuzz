@@ -2251,7 +2251,10 @@ func patternOpsFeasible(lcs *LayeredChoiceStrategy, pattern *ConcurrentPattern, 
 			case PathSelf, PathSelfTwo, PathSame:
 				continue
 			}
-			typ := callNameConstraint(op.CallName)
+			typ := hmdfsProfile.TargetConstraint(op.CallName)
+			if lcs != nil && lcs.Profile != nil {
+				typ = lcs.Profile.TargetConstraint(op.CallName)
+			}
 			if !relOKByType[typ][rel] {
 				return false
 			}
@@ -2459,7 +2462,10 @@ func (r *randGen) generateCallFromPatternOp(s *state, sCalls *SpecialCalls, op C
 		}
 	} else if len(op.PathArgs) == 1 {
 		pathArg := op.PathArgs[0]
-		constraint := callNameConstraint(op.CallName)
+		constraint := hmdfsProfile.TargetConstraint(op.CallName)
+		if lcs != nil && lcs.Profile != nil {
+			constraint = lcs.Profile.TargetConstraint(op.CallName)
+		}
 		path = lcs.FileTree.GetPathByRelation(basePath, "", pathArg.Relation, r.Rand, false, constraint)
 	}
 
@@ -2735,13 +2741,13 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 		return ps
 	}
 
-	if r.isDirOnlyCall(rootCallName) {
+	if r.profile().TargetConstraint(rootCallName) == relTargetDir {
 		dirNode := lcs.FileTree.GetRandomDir(r.Rand, hmcfg.Cids[0], true)
 		if dirNode == nil {
 			return ps
 		}
 		basePath = dirNode.FullPath
-	} else if r.isFileOnlyCall(rootCallName) {
+	} else if r.profile().TargetConstraint(rootCallName) == relTargetFile {
 		fileNode := lcs.FileTree.GetRandomFile(r.Rand, hmcfg.Cids[0])
 		if fileNode == nil {
 			return ps
@@ -2805,9 +2811,13 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 		}
 	}
 	rootPath, rootPath2 := basePath, basePath2
+	rootLinkPath := ""
 	if rootCallName == "link" || rootCallName == "symlink" {
 		rootPath2 = basePath
 		rootPath = r.freshLinkPath(basePath, rootCallName)
+		if rootCallName == "symlink" {
+			rootLinkPath = rootPath
+		}
 	}
 	rootCalls := r.generateCallByName(s, sCalls, rootCallName, rootPath, rootPath2, cid0, nil, false, rootFileSize, rootFlags)
 	if len(rootCalls) == 0 || hasNilCall(rootCalls) {
@@ -2826,7 +2836,7 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 		p := &Prog{Target: r.target}
 		cid := hmcfg.Cids[nodeIdx]
 
-		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, basePathIsFile(lcs.FileTree, rootCallName, basePath), basePath, true)
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, r.profile().BasePathIsFile(lcs.FileTree, rootCallName, basePath), basePath, true)
 		if variant == nil {
 			// No generatable variant for this base (e.g. no relation is
 			// currently available): keep the node slot with a stat call
@@ -2840,6 +2850,17 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 
 		concurrentPath := ""
 		concurrentPath2 := ""
+		if variant.CallName == "readlink" {
+			// readlink only follows the root symlink's linkpath; that binding
+			// is not a FileTree node, so relation generation cannot find it.
+			if rootLinkPath == "" {
+				if fp := r.fallbackStatNode(s, sCalls, basePath); fp != nil {
+					ps = append(ps, fp)
+				}
+				continue
+			}
+			concurrentPath = rootLinkPath
+		}
 		if variant.CallName == "mkdir" {
 			// mkdir as a variant follows its geometric position: Child
 			// creates a fresh child inside the base, Sibling a fresh sibling
@@ -2869,7 +2890,7 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 				continue
 			}
 		} else if concurrentPath == "" {
-			constraint := callNameConstraint(variant.CallName)
+			constraint := r.profile().TargetConstraint(variant.CallName)
 			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, false, constraint)
 			if concurrentPath == "" {
 				// No generatable path of the right type for this variant:
@@ -2890,7 +2911,7 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 				if nodeIsDir(node) {
 					concurrentFlags = r.target.GetConst("O_DIRECTORY")
 				}
-			} else if !basePathIsFile(lcs.FileTree, rootCallName, basePath) {
+			} else if !r.profile().BasePathIsFile(lcs.FileTree, rootCallName, basePath) {
 				// Fresh target of a directory-intent root (e.g. mkdir): the
 				// open variant must carry O_DIRECTORY or VFS rejects it
 				// before the hmdfs trace point.
@@ -2944,6 +2965,15 @@ func (r *randGen) fallbackStatNode(s *state, sCalls *SpecialCalls, basePath stri
 	p.Calls = append(p.Calls, c)
 	p.IsFsops = true
 	return p
+}
+
+// profile returns the active DFS policy. randGen instances built without a
+// config (tests, stash helpers) keep HMDFS behavior.
+func (r *randGen) profile() *DFSProfile {
+	if r != nil && r.hmcfg != nil {
+		return r.hmcfg.ProfileOrDefault()
+	}
+	return hmdfsProfile
 }
 
 // isDirOnlyCall / isFileOnlyCall use the active DFS profile's lists; falling
