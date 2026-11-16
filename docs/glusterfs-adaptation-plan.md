@@ -1,9 +1,9 @@
 # GlusterFS 适配总计划（v1）
 
-> 状态：设计定稿（P1 已收敛）；核心实现已落，Ubuntu tests / make executor /
-> D1 runtime smoke 待执行
+> 状态：设计定稿（P1 已收敛）；核心实现已落；D1 BPF standalone smoke 已通过，
+> D2 executor 集成 smoke 待执行
 > 日期：2026-11-15（2026-11-17 更新 coverage 三层、combo-aware fresh-fresh
-> race、normal dual root、GlusterFS DAG feedback）
+> race、normal dual root、GlusterFS DAG feedback；D1 BPF smoke 通过）
 > 范围：GlusterFS 3 server + 3 client、replica 3；HMDFS 行为保持不变；NFS 暂不实现
 > 权威关系：本文是 GlusterFS 适配的总入口。tracer 的 BPF 原始细节参考
 > `docs/glusterfs-tracer-implementation-spec.md`；两者冲突时以本文为准。
@@ -1182,8 +1182,8 @@ corpus 侧沿用全局机制，不做 per-DFS 特判：
 - `saturatedCalls["dag"]` 阻止饱和调用继续吃 corpus；
 - `WorkSmash` 每次固定 `smashIterations`。
 
-D1 观察 `dagCorpusEntries`、`dagCorpusCount`、`MaxDagCorpus`、`dag` saturation
-和 smash 执行预算。
+D2/D3 观察 `dagCorpusEntries`、`dagCorpusCount`、`MaxDagCorpus`、`dag`
+saturation 和 smash 执行预算。
 
 ### 8.3 接入顺序
 
@@ -2191,7 +2191,7 @@ DAG direct 用 `Call="dag"`。GlusterFS 只补 profile/gate，不另写算法：
 DAG corpus/triage），不是只喂 coverage board。corpus 侧继续使用
 `addInputToCorpus` hash 去重、`MaxDagCorpus` 硬 gate、`minimizeCorpus` 修剪、
 `saturatedCalls["dag"]` 和固定 `smashIterations`。`MaxDagCorpus` 默认 0
-（unlimited），长跑前按规模配置；D1 观察 `dagCorpusEntries`、
+（unlimited），长跑前按规模配置；D2/D3 观察 `dagCorpusEntries`、
 `dagCorpusCount`、`dag` saturation 与 smash 预算。
 
 ### 10.6 QEMU / SSH 与 config 脚本复用
@@ -2419,8 +2419,9 @@ prefill 创建。
 ### Phase 5：端到端
 
 - 3-3 验证；HMDFS 回归；文档更新。
-- 状态（2026-11-17）：代码已落，Ubuntu `go test ./prog ./syz-fuzzer`、
-  `make executor`、D1 tracer/coverage smoke 仍待执行。
+- 状态（2026-11-17）：代码已落；D1 BPF standalone smoke 已通过。
+  Ubuntu `go test ./prog ./syz-fuzzer`、`make executor`、D2 executor
+  集成 smoke 仍待执行。
 
 ## 13. 验收
 
@@ -2531,8 +2532,29 @@ coverage 三层                        已实现
 FreshSame combo-aware plannable      已实现
 normal dual root                     已实现，v1 DualPathCausalEnabled=false
 GlusterFS DAG feedback               已启用
-Ubuntu tests / make executor / D1   待执行
+D1 BPF standalone smoke              已通过
+D2 executor integration              待执行
+D3 short/medium run                  待执行
+D4 long run / experiments            待执行
 ```
+
+D1 BPF standalone 证据：
+
+```text
+attach: 3 uprobes + 1 uretprobe
+LOOKUP positive mode: 0x4000 (dir) / 0x8000 (file) / 0xA000 (symlink)
+negative LOOKUP: ret=-ENOENT, mode=0
+path: 已 strip 成 lk/f、lk、lk/l，不带 eifuzz_root/ 前缀
+lookup check: total>0, positive_mode_zero=0, negative_mode_nonzero=0
+missing_d=0, missing_s=0, dropped=0, unmapped=0
+```
+
+D1 同时发现并修复了两个真实问题：
+
+- LOOKUP S 事件原来从 `iov_out[0]`（`fuse_out_header`）读 mode；实际 payload
+  在 `iov_out[1]`，`entry_out.attr.mode` 位于 payload + 100；
+- standalone 的 `--trace-root` 必须是相对 mount root 的 `eifuzz_root`，
+  不能传 `/root/glusterfs-client/eifuzz_root`。
 
 已知边界：
 
@@ -2540,10 +2562,140 @@ Ubuntu tests / make executor / D1   待执行
   `open/mkdir Same Success`、`open/rmdir Same Success`；后续 construction
   matrix 再收，当前不作为阻塞项。
 - normal dual root 在 v1 不实际生成；gate 打开后才进入 plannable/planner。
-- D1 才能验证 GlusterFS tracer 的 iovec/mode 偏移、symlink target 类型、
-  coverage feedback 和 DAG pair 质量；`dcMisses` 因 race 构造上升是预期，
-  需要与错误计划区分。
+- `missing_r` 当前包含 root GETATTR 的无 path R 事件（D/S 有、R 无），
+  后续可单独分类；不影响 LOOKUP mode 验证。
+- `dcMisses` 因 fresh-fresh race 构造上升是预期，需要与错误计划区分。
 - `MaxDagCorpus` 默认 unlimited；长跑按规模配置并观察 `dag` saturation。
+
+### 13.2 D 验证阶段
+
+D 不是“只跑测试”，而是**验证驱动开发**：先跑最小闭环，用指标决定是否还要
+改 trace/parser/DAG/coverage/planner。D1 已经通过 smoke 发现并修复了 BPF
+LOOKUP 和 trace-root 两个代码问题。
+
+#### D1：BPF standalone smoke（已通过）
+
+工具：
+
+```text
+src/executor/glusterfs_trace_test.cc
+make glusterfs-trace-test
+```
+
+运行条件：
+
+```text
+--fuse-so /usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so
+--trace-root eifuzz_root
+```
+
+覆盖：
+
+- attach 成功；
+- ctl D/S + path R 合并；
+- MKDIR/CREATE/OPEN/WRITE/READ/GETATTR/SETATTR/RENAME；
+- link/symlink/readlink 的 path/path2；
+- setxattr/getxattr user.*；
+- LOOKUP 正文件/正目录/symlink/负 lookup；
+- 错误 ret/errno。
+
+通过标准：
+
+```text
+LOOKUP 正 mode = 0x8000/0x4000/0xA000
+负 LOOKUP mode = 0
+path 已 strip
+missing_d/s = 0
+dropped/unmapped = 0
+lookup check positive_mode_zero=0, negative_mode_nonzero=0
+```
+
+#### D2：executor 集成 smoke（下一步）
+
+目标：
+
+```text
+executor attach -> trace 输出 -> Go parser -> DAG -> coverage -> directed
+```
+
+步骤：
+
+1. `make executor`；确认 skeleton 已从修复后的 BPF 重建；
+2. 3-3 环境挂载 `/root/glusterfs-client`，测试根
+   `/root/glusterfs-client/eifuzz_root`；
+3. 短跑（10–20 分钟 / 1000–3000 次执行 / 1–2 proc）；
+4. 先看 executor attach，再看 trace/DAG/coverage/directed。
+
+通过标准：
+
+```text
+executor attach 成功
+trace events > 0
+DAG vertices > 0
+hbPairs 或 ccPairs > 0
+coverage obs/model/plan 都有增长
+directed dcPlans > 0
+dcHits > 0
+cfgErr 不增长
+无 executor parse/Serialize 错误
+MaxDagCorpus/saturatedCalls 未失控
+```
+
+失败定位顺序：
+
+```text
+1. executor attach
+2. trace events / matchFail / progIdxBad
+3. DAG vertices/pairs / PathRel / typeFunc / inoFunc
+4. coverage obs/model/plan
+5. directed plans/hits/noPlan/insertFail
+```
+
+#### D3：短/中跑与 noPlan 决策
+
+D3 先看指标，不预设阈值：
+
+- `dcNoPlans`、`dcMisses`、`dcBatches`；
+- `obs/outModel/modelOnly/model/plan`；
+- `dagCorpusEntries`、`MaxDagCorpus`、`dag` saturation；
+- `cfgErr`、`insertFail`、fallback 频率。
+
+只有在 D2/D3 数据表明 plannable 与 planner 枚举不一致时，才进入代码修复：
+
+- 加 `noPlan` 原因计数器；
+- construction matrix / `plannableComboStaticallyUnreachableFor`；
+- 收紧 `plannableFormsForCombo`；
+- 调整 FreshSame race/model 表。
+
+#### D4：长跑与对照实验
+
+D2/D3 通过后再做：
+
+- 小时级/长跑；
+- 覆盖曲线、bug 数、首现时间；
+- DAG 反馈开/关对照；
+- 覆盖率、corpus、smash 预算分析。
+
+### 13.3 noPlan 分类
+
+`directCell=plans/hits/misses/noPlan/insertFail` 里的 `noPlan` 是聚合计数，
+不能直接判定为 bug。至少要区分：
+
+| 类别 | 含义 | 是否通常需要改代码 |
+|---|---|---|
+| no live combo | `plannableTarget=0`、全部 discovered、combo unreachable | 否，饱和 |
+| no pickable cell | live combo 但 cell 全被 `cellUnreachable`/domain 过滤 | 否，先看抑制原因 |
+| enumeration empty | potential > 0，但 `planDirectedCells`/C2 没有任何 plan | 可能是，construction matrix/plannable 过宽 |
+| tree too small | batch 需要至少 2 个 client 或缺少可构造节点 | 否，环境/预算 |
+| cfgErr | 配置/前置条件异常 | 是/查配置，不算 noPlan |
+
+D2 先看 trace/DAG/coverage 是否健康；如果 `dcNoPlans` 高，再决定：
+
+- 加 `noPlanNoCombo`/`noPlanNoCell`/`noPlanEnumEmpty`/`noPlanTree` 计数器；
+- 或直接上 construction matrix。
+
+当前不写死 `dcNoPlans` 阈值；阈值应由 D2/D3 的实际执行率、树规模和
+batch 预算决定。
 
 ## 14. 文件落点
 

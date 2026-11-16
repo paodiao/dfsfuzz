@@ -177,8 +177,13 @@ rename/delete 时间线思路，见 dag.go），成本高、收益边际。
 **影响**：当前默认值均适用（10s 延迟与 hmdfs writeback 周期匹配、DAG 反馈默认开），功能不受影响；但做**对比实验**（如关闭 DAG 反馈的消融组）或**调参**时无法从配置控制，只能改代码或手动传 flag。
 
 GlusterFS v1 也启用完整 DAG feedback（board learning + DAG corpus/triage），
-沿用同一组 flag。`MaxDagCorpus=0` 是 unlimited，长跑前按规模设置；D1 观察
-`dagCorpusEntries`、`dagCorpusCount`、`dag` saturation 与 smash 预算。
+沿用同一组 flag。`MaxDagCorpus=0` 是 unlimited，长跑前按规模设置。
+
+D1（BPF standalone）已通过：LOOKUP mode、path strip、D/S/R 合并正常，
+`missing_d/missing_s=0`。D1 只能证明 BPF/harness；D2 仍需用 `make executor`
+跑 3-3 短跑，观察 `dagCorpusEntries`、`dagCorpusCount`、`dag` saturation、
+`hmdfs trace events`、DAG vertices/pairs 与 smash 预算是否一致。注意
+`missing_r` 会包含 root/无路径 GETATTR，属统计口径，不是 DAG 回归。
 
 **不修理由**：当前实验默认值已满足需求；补通道需改 mgrconfig + qemu.go 两处（+ 配置文件），收益待实验需要时再实现。
 

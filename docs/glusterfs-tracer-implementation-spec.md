@@ -1,10 +1,11 @@
 # GlusterFS FUSE Tracer 实现规格（B 方案）
 
 > 状态：BPF raw 细节参考；v1 总决策已被 `docs/glusterfs-adaptation-plan.md` 取代；
-> tracer/parser 已实现。coverage 三层、combo-aware fresh-fresh race、
+> tracer/parser 已实现；D1 BPF standalone smoke 已通过（2026-11-17）。
+> coverage 三层、combo-aware fresh-fresh race、
 > normal dual root 的最终语义见总计划 §8.2.1–§8.2.4。
 > 日期：2026-11-14（2026-11-15 修订 v1 调用/事件/角色/checker 决策；
-> 2026-11-17 补 coverage/dual-root 交叉引用）
+> 2026-11-17 补 coverage/dual-root 交叉引用、D1 smoke 结果）
 > 范围：GlusterFS 客户端 FUSE tracer、IPC 解析、DAG 路径接入、FileTree 空前缀、GlusterFS 文件树恢复
 > 相关：`docs/glusterfs-adaptation-plan.md`、`docs/glusterfs-config-and-scripts.md`、`docs/glusterfs-nfs-adaptation-plan.md`、`docs/executor-file-tree-restore.md`、`docs/kernel-build-glusterfs-bpf.md`
 >
@@ -1538,8 +1539,9 @@ dir close：ls 只看到 OPENDIR/READDIRPLUS，看不到 RELEASEDIR final event
 
 ### 14.3.1 Standalone BPF tracer
 
-不依赖 executor/fuzzer 的独立 smoke 工具（只新增 test 源文件，不改
-`glusterfs_trace.cc/.h`、BPF C 或 executor）：
+不依赖 executor/fuzzer 的独立 smoke 工具。harness 本身只新增 test 源文件，
+不改 `glusterfs_trace.cc/.h` 和 executor；D1 期间单独修复了 BPF LOOKUP
+payload iovec（见下文“D1 结果”），生产 merge 逻辑未改。
 
 ```bash
 cd src
@@ -1590,6 +1592,44 @@ final event 的 `path` 应是 `lk/f`、`lk`、`lk/l`、`lk/missing`，不是
 - raw S 正确但 final 错 -> merge 问题；raw S 错 -> iovec[1] payload
   指针/长度或 `entry_out.attr.mode`（payload+100）偏移问题；
 - `missing_d/missing_s` 不应异常增长。
+
+#### D1 结果（2026-11-17，单 VM）
+
+状态：**通过**。测试环境为单 client + 单 GlusterFS 挂载，测试根
+`/root/glusterfs-client/eifuzz_root`。
+
+修复记录：
+
+- `send_fuse_iov` 的 `iov_out[0]` 是 16B `fuse_out_header`，payload 在
+  `iov_out[1]`；旧代码把 `iov_base` 当 payload 读 `+116`，导致正 LOOKUP
+  mode 全是 `0x6000`（其实是 header 后内存）。BPF 现在按 `count >= 2`
+  抓 `iov_out[1].iov_base/len`，从 payload + 100 读
+  `fuse_entry_out.attr.mode`；`send_fuse_err`（count=1）没有 payload，
+  负 LOOKUP `mode=0`。
+- `--trace-root` 必须是 `eifuzz_root`（相对 mount root）。传
+  `/eifuzz_root` 会让 `normalize_trace_path` 匹配失败、final path 带前缀。
+
+观测结果：
+
+```text
+[ctl S] opcode=1 error=0 mode=0x4000   -> final LOOKUP path=""
+[ctl S] opcode=1 error=0 mode=0x4000   -> final LOOKUP path="lk"
+[ctl S] opcode=1 error=0 mode=0x8000   -> final LOOKUP path="lk/f"
+[ctl S] opcode=1 error=0 mode=0xA000   -> final LOOKUP path="lk/l"
+[ctl S] opcode=1 error=-2 mode=0       -> final LOOKUP ret=-ENOENT path="lk/missing"
+
+[lookup check] total=26 positive_mode_zero=0 negative_mode_nonzero=0
+missing_d=0 missing_s=0 drop_xattr=0 out_root=0 path2_out_root=0
+unmapped=0 dropped=0
+```
+
+同时确认了 GETATTR/SETATTR、FILE_OPEN、READLINK、MKDIR、CREATE、
+SYMLINK（`path2="f"`）、SETXATTR/GETXATTR、WRITE 的 off/size 字段。
+
+已知统计口径：`missing_r` 会包含 root/无路径 GETATTR（D/S 有、path R 无），
+例如 `[final] GETATTR ret=0 mode=0x0 path=""`。这不是 LOOKUP mode
+回归；后续可单独统计 `missing_r_root_getattr` 或把 root GETATTR 从
+`missing_r` 排除。D2 集成 smoke 以 `make executor` + 3-3 短跑为准。
 
 ### 14.4 3-3 + replica 3
 
