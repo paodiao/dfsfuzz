@@ -1269,7 +1269,7 @@ $(GLUSTERFS_BPF_SKEL): $(GLUSTERFS_BPF_OBJ)
 
 - `tools/vmlinux.h`：HMDFS 内核完整 BTF，保持现有。
 - `tools/glusterfs/vmlinux.h`：GlusterFS 5.15 内核完整 BTF
-  （P0 文件 7,620,032B / 317,647 行），不是手写 minimal 头。
+  （P0 文件 7,620,032B / 358,698 行），不是手写 minimal 头。
 - `executor` 目标同时生成两个 skeleton，并链接
   `executor/executor.cc $(HMDFS_TRACE_SRC) $(GLUSTERFS_TRACE_SRC)`；
   `make clean` 同时删除两个 `.bpf.o/.skel.h`。

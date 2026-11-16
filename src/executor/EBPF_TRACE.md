@@ -227,46 +227,48 @@ ssh "$VM" 'uname -r; ls -l /sys/kernel/btf/vmlinux'
 scp "$VM":/sys/kernel/btf/vmlinux /tmp/glusterfs-5.15.btf
 ```
 
-Dump it on the build host:
+Dump it on the build host. Both the dump and build commands below run from
+the repository's `src/` directory:
 
 ```bash
-mkdir -p src/tools/glusterfs
+mkdir -p tools/glusterfs
 bpftool btf dump file /tmp/glusterfs-5.15.btf format c \
-    > src/tools/glusterfs/vmlinux.h
+    > tools/glusterfs/vmlinux.h
 ```
 
-The result is a full BTF dump (approximately 7.6 MB / 317k lines), not a
+The result is a full BTF dump (approximately 7.6 MB / 358k lines), not a
 hand-written minimal header.
 
 ### HMDFS
 
-Keep the existing `src/tools/vmlinux.h`; it is generated from the HMDFS test
+Keep the existing `tools/vmlinux.h`; it is generated from the HMDFS test
 kernel. Do **not** replace it with the GlusterFS BTF.
 
 ---
 
 ## Step 2: Build the BPF Objects
 
-Use per-DFS include directories:
+Run from the repository's `src/` directory; each DFS uses its own include
+directory:
 
 ```bash
 # HMDFS: full HMDFS kernel BTF
 clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
-      -I src/tools \
-      -c src/executor/hmdfs_trace.bpf.c \
-      -o src/executor/hmdfs_trace.bpf.o
+      -Itools \
+      -c executor/hmdfs_trace.bpf.c \
+      -o executor/hmdfs_trace.bpf.o
 
 # GlusterFS: full GlusterFS 5.15 BTF
 clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
-      -I src/tools/glusterfs \
-      -c src/executor/glusterfs_trace.bpf.c \
-      -o src/executor/glusterfs_trace.bpf.o
+      -Itools/glusterfs \
+      -c executor/glusterfs_trace.bpf.c \
+      -o executor/glusterfs_trace.bpf.o
 
 # Skeleton headers
-bpftool gen skeleton src/executor/hmdfs_trace.bpf.o \
-      > src/executor/hmdfs_trace.skel.h
-bpftool gen skeleton src/executor/glusterfs_trace.bpf.o \
-      > src/executor/glusterfs_trace.skel.h
+bpftool gen skeleton executor/hmdfs_trace.bpf.o \
+      > executor/hmdfs_trace.skel.h
+bpftool gen skeleton executor/glusterfs_trace.bpf.o \
+      > executor/glusterfs_trace.skel.h
 ```
 
 `src/Makefile` uses `HMDFS_BPF_INC=-Itools` and
