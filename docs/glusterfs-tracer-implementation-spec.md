@@ -1535,6 +1535,52 @@ symlink：FUSE stat GETATTR 事件 path 可能是 target T；
 dir close：ls 只看到 OPENDIR/READDIRPLUS，看不到 RELEASEDIR final event
 ```
 
+### 14.3.1 Standalone BPF tracer
+
+不依赖 executor/fuzzer 的独立 smoke 工具（只新增 test 源文件，不改
+`glusterfs_trace.cc/.h`、BPF C 或 executor）：
+
+```bash
+cd src
+make glusterfs-trace-test
+# host 上产物：
+# bin/linux_amd64/glusterfs-trace-test
+```
+
+拷贝到目标 VM 后以 root 运行：
+
+```bash
+./glusterfs-trace-test \
+  --fuse-so /usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so \
+  --trace-root /eifuzz_root --raw
+```
+
+交互：Enter/c 收集，q 退出。`--raw` 会同时打印：
+
+```text
+[ctl D] ... opcode=... error=... mode=...
+[ctl S] ... opcode=... error=... mode=...
+[path]  ... path=... path2=... xattr=...
+[final] func=... ret=... mode=... path=...
+```
+
+LOOKUP 必须单独验证。remount 后对新路径执行：
+
+```bash
+stat /eifuzz_root/lk/f       # 正文件：S mode=0x8000
+stat /eifuzz_root/lk         # 正目录：S mode=0x4000
+lstat /eifuzz_root/lk/l      # symlink：S mode=0xA000
+stat /eifuzz_root/lk/missing # 负 lookup：error=-ENOENT, mode=0
+```
+
+判定：
+
+- 正 LOOKUP 的 raw S `mode` 和 final `mode` 都不能为 0；
+- 负 LOOKUP `mode=0` 正常；
+- raw S 正确但 final 错 -> merge 问题；raw S 错 -> `iov_base + 116`
+  偏移/长度/error gate 问题；
+- `missing_d/missing_s` 不应异常增长。
+
 ### 14.4 3-3 + replica 3
 
 单 VM 通过后验证：

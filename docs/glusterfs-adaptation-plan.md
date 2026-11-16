@@ -2571,6 +2571,9 @@ Ubuntu tests / make executor / D1   待执行
   `filenameImpl` 空前缀、client-only generators/mutators。
 - `src/executor/executor.cc`、`common_linux.h`、`glusterfs_trace.*`、
   `dfs_runtime.*`：runtime/tracer、`in_userspace`、crash recovery test_dir。
+- `src/executor/glusterfs_trace_test.cc`、`src/Makefile` 的
+  `glusterfs-trace-test`：不依赖 executor/fuzzer 的 standalone BPF
+  smoke harness（复用生产 trace 合并逻辑，执行器源文件不变）。
 - `src/vm/qemu/qemu.go`：原镜像启动、GlusterFS server data.img、HMDFS gate；
   key 登录与 SSH 配置。
 - `src/dfs-config/glusterfs/*`：config/node-up/node-down/prefill；config 脚本
