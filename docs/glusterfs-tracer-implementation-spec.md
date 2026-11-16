@@ -572,6 +572,18 @@ bpf_probe_read_user_str
 `truncated` 位。raw event 用 packed/手写序列化，并加
 `_Static_assert(sizeof(struct glusterfs_path_event) == 1204)`。
 
+5.15 verifier 已确认该写法合法：
+
+```text
+bpf_probe_read_user_str.arg1 = ARG_PTR_TO_UNINIT_MEM
+verifier mem_types 包含 PTR_TO_MEM
+bpf_ringbuf_reserve.ret_type = RET_PTR_TO_ALLOC_MEM_OR_NULL
+  -> NULL 检查后 PTR_TO_MEM，mem_size = sizeof(glusterfs_path_event) = 1204
+path +52/512、path2 +564/512、xattr +1076/128 均在 [0, 1204) 内。
+```
+
+因此 path/path2/xattr 直接写 ringbuf 预留区不需要 per-CPU scratch map。
+
 **bpftrace 验证注意**：旧版 bpftrace 对 `$var = arg0 - 24` 这类“变量 + 负
 偏移”可能读 0；P0 用嵌套直接表达式
 `*(uint32 *)(*(uint64 *)(arg0 - 24) + 4)` 验证成功。正式 executor 的 BPF

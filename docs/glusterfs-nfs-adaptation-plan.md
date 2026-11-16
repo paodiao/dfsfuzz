@@ -135,13 +135,14 @@
 - 新增：
   - `src/executor/glusterfs_trace.bpf.c` / `.cc` / `.h`
   - `src/executor/nfs_trace.bpf.c` / `.cc` / `.h`
-  - `src/executor/dfs_trace.h` / `.cc`（按 `dfs_name` 分发 init/start/stop）
+  - `src/executor/dfs_runtime.h` / `.cc`（`DfsRuntimeOps` 表；B2 只填 trace 子集）
   - `src/executor/trace_common.h` / `.cc`（事件格式、TSC 校准、输出序列化、路径前缀；只共享工具）
 - `src/Makefile`：新增两套 BPF 源/对象/skeleton，executor 目标链接两个 `.cc`，clean 加产物。
 - executor 调用点：
-  - `init_hmdfs_trace()` → `init_dfs_trace(dfs_name)`（`:711`）
-  - `start_hmdfs_trace()` → `start_dfs_trace()`（`:2068`）
-  - `stop_collect_hmdfs_trace()` → `stop_collect_dfs_trace()`（`:1944`）
+  - `rt = dfs_runtime_ops(dfs_name)`
+  - `init_hmdfs_trace()` → `rt->init_trace(is_client, trace_root)`（`:711`）
+  - `start_hmdfs_trace()` → `rt->start_trace()`（`:2068`）
+  - `stop_collect_hmdfs_trace()` → `rt->stop_trace()`（`:1944`）
 - 事件契约的 v1 修订：HMDFS 保持 0–15；GlusterFS 新增 16 LINK、17 SYMLINK、18 READLINK、19 GETXATTR、20 SETXATTR，READDIR 28/44 都映射 ITERATE。详见 `glusterfs-adaptation-plan.md` §4。
 - GlusterFS 采用 B 方案：独立 wire event，不修改 HMDFS 的 112 字节事件；`pkg/ipc` 增加 `parseGlusterfsTraceEvents`，Go 层给 `HmdfsTraceEvent` 增加 `NodeID/Path/Path2/XattrName/Truncated` 可选字段，`prog.BuildVertices` 增加 Path 路径。
 - 路径统一为相对 FileTree 根：HMDFS 为 `merge_view/...`；非 HMDFS 为固定测试根下相对路径（空前缀）；剥掉 `/root/glusterfs-client/eifuzz_root/` 或 `/root/nfs-client/eifuzz_root/`。
@@ -249,7 +250,7 @@ GlusterFS 不使用 HMDFS 的 server-side brick 恢复，也不执行 `gluster v
 ### 3.1 模块拆分
 
 - 每个 DFS 一套独立的 BPF 程序 + 用户态加载/收集逻辑。
-- `dfs_trace` 只做分发，不含具体探针。
+- `DfsRuntimeOps` 表只做分发，不含具体探针。
 - `trace_common` 只放公共工具，不引用 HMDFS 内部实现。
 
 > 2026-11-15 历史标记：§3.2–§3.3 的 0–14 事件契约、旧 opcode 映射和旧路径规则
@@ -361,10 +362,12 @@ FUSE_RELEASE      -> release
 
 ### 3.5 executor 接入
 
-- `init_dfs_trace(dfs_name)` 在启动时按 DFS 选择模块。
-- `start_dfs_trace()` 在程序执行前启动收集。
-- `stop_collect_dfs_trace()` 在执行结束、`write_metadata` 前停止、排序、转换时间戳并写输出。
-- HMDFS 行为不变；GlusterFS/NFS 不再调用 `init_hmdfs_trace`。
+- `dfs_runtime_ops(dfs_name)` 在启动时选择 `DfsRuntimeOps` 表。
+- `rt->init_trace(is_client, trace_root)` 在启动时初始化 tracer；`trace_root`
+  只对 GlusterFS client 非空。
+- `rt->start_trace()` 在程序执行前启动收集。
+- `rt->stop_trace()` 在执行结束、`write_metadata` 前停止、排序、转换时间戳并写输出。
+- HMDFS 行为不变；GlusterFS/NFS 不再直接调用 `init_hmdfs_trace`。
 
 ### 3.6 `merge_view` 前缀解耦（已定：空前缀）
 
@@ -682,7 +685,7 @@ FUSE_RELEASE      -> release
 ### 7.4 待实现
 
 - `glusterfs_trace.bpf.c` / `.cc` / `.h`。
-- `dfs_trace` 分发。
+- `dfs_runtime` 分发（`DfsRuntimeOps`）。
 - `src/Makefile` 的 BPF skeleton 规则。
 - `parseGlusterfsTraceEvents` 与 IPC 分支。
 - DAG `Path/Path2` 接入。
