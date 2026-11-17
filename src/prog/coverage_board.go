@@ -709,6 +709,7 @@ func cellKeyOf(p *DAGPair, persistDir string) (cellKey, bool) {
 		// and a late setattr/open ENOENT must land in the same cell.
 		offB = offsetBucketNA
 	}
+	bPath := pairBPath(p)
 	ck := cellKey{
 		Root:     root,
 		Variant:  variant.CallName,
@@ -717,9 +718,9 @@ func cellKeyOf(p *DAGPair, persistDir string) (cellKey, bool) {
 		RetA:     p.A.RetBucket,
 		RetB:     p.B.RetBucket,
 		OffB:     offB,
-		DepthB:   DepthBucketOf(p.B.Path),
+		DepthB:   DepthBucketOf(bPath),
 		TypeB:    p.B.IsDir,
-		PersistB: pathInDir(p.B.Path, persistDir),
+		PersistB: pathInDir(bPath, persistDir),
 	}
 	return ck, true
 }
@@ -747,7 +748,8 @@ func (b *coverageBoard) recordPairs(newPairs []DAGPair) {
 		// stays untouched.
 		if p.A != nil && p.B != nil {
 			shape := hashShape(p.Temporal, p.PathRel,
-				featuresOfDir(p.A, b.persistDir), featuresOfDir(p.B, b.persistDir))
+				featuresOfPath(p.A, pairAPath(p), b.persistDir),
+				featuresOfPath(p.B, pairBPath(p), b.persistDir))
 			if !b.knownShapes[shape] {
 				b.knownShapes[shape] = true
 				b.shapeEpoch++
