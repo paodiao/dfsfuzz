@@ -4742,13 +4742,21 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 		refTime = int64(p0.Calls[insertPos-1].CheckInfo.Etime) - lcs.tscoffFor(0)
 	}
 
-	// The variant picker and the fresh-target open flags judge the base by
-	// basePathIsFile, whose ambiguous-root fallback treats an unknown path as
-	// a file. When the base is an in-program fresh path, the local creation
-	// hint knows better: use it so Same-relation variants follow the actual
-	// type (file-only Same on a fresh dir would open EISDIR; dir-only Same on
-	// a fresh dir would be rejected).
-	baseIsFile := basePathIsFileHinted(lcs.profileOrDefault(), lcs.FileTree, rootCallName, basePath, freshKinds)
+	// A rename root's destination is a fresh path in the HB form; remember
+	// its type (rename preserves the source class) so the variant picker and
+	// path generator can use dst without a FileTree node.
+	if rootCallName == "rename" && basePath2 != "" && lcs.FileTree != nil &&
+		lcs.FileTree.FindNode(basePath2) == nil {
+		if h, ok := freshKinds[basePath]; ok {
+			freshKinds[basePath2] = h
+		} else if n := lcs.FileTree.FindNode(basePath); n != nil {
+			if n.Type == NodeTypeFile {
+				freshKinds[basePath2] = relTargetFile
+			} else {
+				freshKinds[basePath2] = relTargetDir
+			}
+		}
+	}
 
 	for nodeIdx := 1; nodeIdx < len(ps); nodeIdx++ {
 		useExistFd = true
@@ -4756,13 +4764,21 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 		p := ps[nodeIdx]
 		cid := hmcfg.Cids[nodeIdx]
 
-		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, baseIsFile, basePath, allowDirected)
+		// Choose temporal first: CC observes the entry/source path, HB
+		// observes the rename result/destination. ChooseTemporal ignores its
+		// variant argument today.
+		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, CallVariant{}, r.Rand)
+		observedPath := basePath
+		if rootCallName == "rename" && temporal == TemporalHB {
+			observedPath = basePath2
+		}
+		baseIsFile := basePathIsFileHinted(lcs.profileOrDefault(), lcs.FileTree, rootCallName, observedPath, freshKinds)
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, baseIsFile, observedPath, allowDirected)
 		if variant == nil {
 			// No usable variant for this base: skip this node's insertion for
 			// this round (ps is already full — no node is dropped).
 			continue
 		}
-		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, *variant, r.Rand)
 
 		// One timing helper per variant, mirroring insertDirectedBatch: the HB
 		// form places the variant at the first boundary after the root, the CC
@@ -4800,17 +4816,17 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 			// itself and are handled by the generic relation path below.
 			switch variant.PathRelation {
 			case PathChild:
-				concurrentPath = r.freshChildPath(basePath, "mkdir")
+				concurrentPath = r.freshChildPath(observedPath, "mkdir")
 			case PathSibling:
-				concurrentPath = r.freshChildPath(GetParentDir(basePath), "mkdir")
+				concurrentPath = r.freshChildPath(GetParentDir(observedPath), "mkdir")
 			case PathNoRel:
-				if dir := lcs.FileTree.getRandomUnrelatedPath(basePath, r.Rand, relTargetDir); dir != "" {
+				if dir := lcs.FileTree.getRandomUnrelatedPath(observedPath, r.Rand, relTargetDir); dir != "" {
 					concurrentPath = r.freshChildPath(dir, "mkdir")
 				}
 			}
 		}
 		if variant.CallName == "rename" {
-			concurrentPath, concurrentPath2 = lcs.GetPathsForRenameVariant(basePath, "", variant.PathRelation, r.Rand, false)
+			concurrentPath, concurrentPath2 = lcs.GetPathsForRenameVariant(observedPath, "", variant.PathRelation, r.Rand, false)
 			if concurrentPath == "" {
 				// Rename relation not generatable here (rare under relOK
 				// filtering): skip this node's variant insertion for this
@@ -4819,7 +4835,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 			}
 		} else if concurrentPath == "" {
 			constraint := lcs.profileOrDefault().TargetConstraint(variant.CallName)
-			concurrentPath = lcs.FileTree.GetPathByRelation(basePath, "", variant.PathRelation, r.Rand, false, constraint)
+			concurrentPath = lcs.FileTree.GetPathByRelation(observedPath, "", variant.PathRelation, r.Rand, false, constraint)
 			if concurrentPath == "" {
 				// No generatable path of the right type: skip this node's
 				// variant insertion for this round (ps is already full).
@@ -4973,20 +4989,20 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 		refTime = int64(p0.Calls[rootStart-1].CheckInfo.Etime) - lcs.tscoffFor(0)
 	}
 
-	rootObservedPath := derivation.RootDest
-	if lcs.profileOrDefault().Name == "glusterfs" {
-		rootObservedPath = rp.ObservedPath()
-	}
-	baseIsFile := basePathIsFileHinted(lcs.profileOrDefault(), ft, rootCallName, rootObservedPath, freshKinds)
-
 	for nodeIdx := 1; nodeIdx < len(ps); nodeIdx++ {
 		p := ps[nodeIdx]
 		cid := hmcfg.Cids[nodeIdx]
-		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, baseIsFile, rootObservedPath, allowDirected)
+		// Decide the temporal form before the variant/path. For a rename
+		// root the variant observes the entry (CC) or result (HB) path; a
+		// single profile-fixed ObservedPath would be wrong for one form.
+		// ChooseTemporal currently ignores its variant argument.
+		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, CallVariant{}, r.Rand)
+		observedPath := rp.ObservedPathFor(temporal)
+		baseIsFile := basePathIsFileHinted(lcs.profileOrDefault(), ft, rootCallName, observedPath, freshKinds)
+		variant := lcs.ChooseConcurrentCallFiltered(rootCallName, r.Rand, baseIsFile, observedPath, allowDirected)
 		if variant == nil {
 			continue
 		}
-		temporal := lcs.GetDCT().ChooseTemporal(rootCallName, *variant, r.Rand)
 
 		variantPos := rootStart
 		if temporal == TemporalHB {
@@ -5029,21 +5045,21 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 				if baseIsFile {
 					continue
 				}
-				variantPath = r.freshChildPath(rootObservedPath, "mkdir")
+				variantPath = r.freshChildPath(observedPath, "mkdir")
 			case PathSibling:
-				variantPath = r.freshChildPath(GetParentDir(rootObservedPath), "mkdir")
+				variantPath = r.freshChildPath(GetParentDir(observedPath), "mkdir")
 			case PathNoRel:
-				if dir := ft.getRandomUnrelatedPath(rootObservedPath, r.Rand, relTargetDir); dir != "" {
+				if dir := ft.getRandomUnrelatedPath(observedPath, r.Rand, relTargetDir); dir != "" {
 					variantPath = r.freshChildPath(dir, "mkdir")
 				}
 			}
 		case "rename":
-			variantPath, variantPath2 = lcs.GetPathsForRenameVariant(rootObservedPath, "", variant.PathRelation, r.Rand, false)
+			variantPath, variantPath2 = lcs.GetPathsForRenameVariant(observedPath, "", variant.PathRelation, r.Rand, false)
 		case "readlink":
 			// Bound to rootLinkPath above; never derive from the target.
 		default:
 			constraint := lcs.profileOrDefault().TargetConstraint(variant.CallName)
-			variantPath = ft.GetPathByRelation(rootObservedPath, "", variant.PathRelation, r.Rand, false, constraint)
+			variantPath = ft.GetPathByRelation(observedPath, "", variant.PathRelation, r.Rand, false, constraint)
 		}
 		if variant.CallName == "link" || variant.CallName == "symlink" {
 			if variantPath == "" {
@@ -5059,7 +5075,7 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 		if variantPath == "" && variant.CallName == "mkdir" &&
 			(variant.PathRelation == PathSame || variant.PathRelation == PathParent) {
 			constraint := lcs.profileOrDefault().TargetConstraint(variant.CallName)
-			variantPath = ft.GetPathByRelation(rootObservedPath, "", variant.PathRelation, r.Rand, false, constraint)
+			variantPath = ft.GetPathByRelation(observedPath, "", variant.PathRelation, r.Rand, false, constraint)
 		}
 		if variantPath == "" {
 			continue

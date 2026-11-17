@@ -12,6 +12,12 @@ func TestDualPathProjection(t *testing.T) {
 		rename.Dest() != "dir/dst" || rename.ObservedPath() != "dir/src" {
 		t.Fatalf("rename projection = %+v", rename)
 	}
+	if got := rename.ObservedPathFor(TemporalConcurrent); got != "dir/src" {
+		t.Fatalf("rename CC observed = %q, want source", got)
+	}
+	if got := rename.ObservedPathFor(TemporalHB); got != "dir/dst" {
+		t.Fatalf("rename HB observed = %q, want destination", got)
+	}
 	link := rootPaths("link", "dir/a", "dir/l1")
 	if link.Kind != DualLink || link.Source() != "dir/a" ||
 		link.Dest() != "dir/l1" || link.ObservedPath() != "dir/a" {

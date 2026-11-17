@@ -1379,8 +1379,10 @@ symlink:       Source=target,  Dest=linkpath
 readlink:      Source=Dest=linkpath
 ```
 
-`rootObservedPath` 默认取 `Source`；readlink 特例取 `LinkPath`。
-derived DCT、causal root/directed 共用这套 `RootPaths`，不另写双路径逻辑。
+DCT/derived 的 observed path 按 temporal 选：CC 取 `Source`（rename=src），
+HB 取 `Dest`（rename=dst）；非 rename root 仍取 `ObservedPath`
+（link/symlink=target，readlink=linkpath）。derived DCT、causal root/directed
+共用这套 `RootPaths`，不另写双路径逻辑。
 `RootPaths` 中的 target/linkpath 都是相对测试根的 canonical 路径；symlink
 payload 只在构造 `symlink` 调用时由 `dirname(linkpath)` 到 canonical target
 计算，不能存进 `RootPaths`/DCT/PathSet key。
@@ -1447,12 +1449,15 @@ readlink:    不做 C1 anchor
 
 - link/symlink anchor 的 `anchorNodes` 同时包含 target 和 linkpath；
 - `causalPairRelation(anchor.Source, anchor.Path, ...)` 会看 `{pre, post}`
-  两个候选，target 不会丢；
+  两个候选，target 不会丢；rename anchor 的 A 侧只用 post/dst，不把 src
+  当成 A；
 - C1 root 增加 `causalRootDual`：
   - `RootPath = target`（C1 cell 的 B 侧）
   - `RootSource = target`
   - `RootDest = linkpath`
   - linkpath 只用于 root 生成和 readlink variant，不进 C1 cell。
+- C1 root 是 rename 时，B 侧 cell/relation 用 `RootSource`（src），
+  `RootDest`（dst）只用于 materialize。
 
 调用集：
 
@@ -1535,7 +1540,7 @@ C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
 | `getxattr` | target | Success / RetFailure（ENODATA） | root 是 modifier 时 CC+HB | file/dir |
 | `setxattr` | target | Success / RetEEXIST（XATTR_CREATE） | root 是 modifier 时 CC+HB | file/dir |
 | `rmdir` | target | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | dir |
-| `rename` | dst | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | file/dir |
+| `rename` | src | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | file/dir |
 
 - link/symlink 的 linkpath fresh，不进 `BaseB`/cell；
 - link/symlink 的 EEXIST 不进入 v1 cell 模型；
@@ -1549,7 +1554,7 @@ C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
   link/symlink      -> target, target
   readlink          -> linkpath, linkpath
   getxattr/setxattr -> path, path
-  rename            -> src, dst
+  rename            -> src, src   // HB/CC B uses the entry/source path
   其他               -> path, path
   ```
 
@@ -1711,6 +1716,8 @@ read(L1) + write(T)
 - C1 root=link/symlink：B 侧用 target，cell 不记录 linkpath；
 - C2 link/symlink variant：B 侧用 target，linkpath fresh 不进 cell；
 - C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，TypeB=false；
+- C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；
+- C1 rename root：B 侧用 src，dst 只用于 materialize/RetB；
 - getxattr/setxattr：B 侧用 target，TypeB=file/dir；
 - close 不进入 C1/C2 producible；文件 close 只作为非 modifier 的 B/CC
   pair 做自然观测，不生成 close-root cell；目录 close 无事件；

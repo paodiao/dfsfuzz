@@ -54,9 +54,11 @@ func (rp RootPaths) Dest() string {
 	}
 }
 
-// ObservedPath is the path whose resulting object the root call is observed
-// on. Link/symlink roots are observed on the target (the linkpath is a fresh
-// program-local binding); readlink is observed on its linkpath.
+// ObservedPath is the construction-time/entry path used for variant selection.
+// Link/symlink roots are observed on the target (the linkpath is a fresh
+// program-local binding); readlink is observed on its linkpath. Rename callers
+// must choose the temporal form explicitly: CC observes PrePath/Source, HB
+// observes PostPath/Dest.
 func (rp RootPaths) ObservedPath() string {
 	switch rp.Kind {
 	case DualLink, DualSymlink:
@@ -65,6 +67,20 @@ func (rp RootPaths) ObservedPath() string {
 		return rp.LinkPath
 	}
 	return rp.PrePath
+}
+
+// ObservedPathFor chooses the temporal observation path for DCT/derived
+// insertion. A rename's concurrent form still sees the entry/source path while
+// its HB form sees the completed result/destination. Non-rename roots observe
+// the same path in both forms.
+func (rp RootPaths) ObservedPathFor(temporal TemporalRel) string {
+	if rp.Kind == DualRename {
+		if temporal == TemporalHB {
+			return rp.PostPath
+		}
+		return rp.PrePath
+	}
+	return rp.ObservedPath()
 }
 
 func dualKindForCall(call string) DualPathKind {
