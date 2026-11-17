@@ -4944,6 +4944,21 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 			}
 		}
 	}
+	if rootCallName == "rename" && basePath2 != "" && ft.FindNode(basePath2) == nil {
+		// Keep the fresh destination's type available even when the
+		// derivation did not carry a kind: rename preserves the source class.
+		if _, ok := freshKinds[basePath2]; !ok {
+			if h, ok := freshKinds[basePath]; ok {
+				freshKinds[basePath2] = h
+			} else if n := ft.FindNode(basePath); n != nil {
+				if n.Type == NodeTypeFile {
+					freshKinds[basePath2] = relTargetFile
+				} else {
+					freshKinds[basePath2] = relTargetDir
+				}
+			}
+		}
+	}
 
 	rootFileSize := directedNodeSize(lcs, basePath)
 	rootFlags := directedNodeFlags(r, lcs, basePath)
