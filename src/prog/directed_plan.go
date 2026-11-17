@@ -390,9 +390,12 @@ func buildDirectedView(ft *FileTree, persistDir string) *directedView {
 		idx0[n.FullPath] = len(v.bNodes) - 1
 	}
 	// Synthesized rename-variant B nodes (dual-path 2b2). The cell anchors on
-	// the destination (bn.path), while Same classifies through the source
-	// (prePath => BaseB2), so the witness sets are the destination's (fresh:
-	// the source's, which shares the parent chain) minus the source slot:
+	// the source (bn.cellPath()/BaseB2), while bn.path is the destination used
+	// only to materialize rename(src,dst) and shape RetB. Witness sets are
+	// always source-based: Same is srcPath, Child uses the source parent,
+	// Parent the source children, and Sibling the source parent's children
+	// (skipping the source and, for an existing same-parent destination, the
+	// destination):
 	//   fresh: one node per source (the source is a variant-side path, so a
 	//     TmpDir is allowed); the destination is a fresh sibling name
 	//     materialized at batch assembly (plan.BaseB stays empty here). The E
@@ -410,45 +413,47 @@ func buildDirectedView(ft *FileTree, persistDir string) *directedView {
 			parentKids[n.Parent] = append(parentKids[n.Parent], n)
 		}
 	}
-	appendRename := func(src, dst string, fresh bool, srcSibDirIdx int, srcTmp bool) {
-		base := dst
-		if fresh {
-			base = src
-		}
-		orig := v.bNodes[idx0[base]]
+	appendRename := func(src, dst string, fresh bool, srcTmp bool) {
+		srcNode := v.bNodes[idx0[src]]
 		bn := directedBNode{
-			directedNode:   orig.directedNode,
-			anc:            orig.anc,
-			sub:            orig.sub,
-			parentEligible: orig.parentEligible,
-			sibFile:        orig.sibFile,
-			sibDir:         orig.sibDir,
-			sibFileIdx:     orig.sibFileIdx,
-			sibDirIdx:      orig.sibDirIdx,
+			directedNode:   srcNode.directedNode,
+			isTmpDir:       srcNode.isTmpDir,
+			anc:            srcNode.anc,
+			sub:            srcNode.sub,
+			parentEligible: srcNode.parentEligible,
+			sibFile:        srcNode.sibFile,
+			sibDir:         srcNode.sibDir,
+			sibFileIdx:     srcNode.sibFileIdx,
+			sibDirIdx:      srcNode.sibDirIdx,
 			sibFileIdx2:    -1,
 			sibDirIdx2:     -1,
 			srcPath:        src,
 			srcTmp:         srcTmp,
 			renameFresh:    fresh,
 		}
+		bn.depth = DepthBucketOf(src)
+		bn.persist = pathInDir(src, persistDir)
 		if fresh {
-			// Dims/type come from the source; a fresh destination has no
-			// descendants and only the source slot is skipped. The placeholder
-			// is normalized like freshRenameDst so it stays a prefix of the
-			// materialized name (pre-suffixed sources otherwise break the
-			// persist-prefix relation).
-			bn.sub = witnessCands{}
+			// The destination name is materialized at batch assembly. The
+			// placeholder is normalized like freshRenameDst so it stays a
+			// prefix of the materialized name; the source class and parent are
+			// still the witness source.
 			bn.path = renamePlaceholder(src)
-			bn.depth = DepthBucketOf(bn.path)
-			bn.persist = pathInDir(bn.path, persistDir)
 		} else {
-			// Skip the destination (orig.sibDirIdx) and the source, keeping the
-			// skip indices ascending.
-			lo, hi := orig.sibDirIdx, srcSibDirIdx
-			if hi < lo {
-				lo, hi = hi, lo
+			bn.path = dst
+			// Skip the source (already in sib*Idx) and the destination when it
+			// is an A-eligible same-parent sibling. The source is a
+			// variant-side path, so a TmpDir source has no sibling slot.
+			if GetParentDir(src) == GetParentDir(dst) {
+				if i := sort.SearchStrings(bn.sibFile, dst); i < len(bn.sibFile) && bn.sibFile[i] == dst {
+					bn.sibFileIdx2 = i
+				}
+				if i := sort.SearchStrings(bn.sibDir, dst); i < len(bn.sibDir) && bn.sibDir[i] == dst {
+					bn.sibDirIdx2 = i
+				}
+				bn.sibFileIdx, bn.sibFileIdx2 = orderedSkipIndices(bn.sibFileIdx, bn.sibFileIdx2)
+				bn.sibDirIdx, bn.sibDirIdx2 = orderedSkipIndices(bn.sibDirIdx, bn.sibDirIdx2)
 			}
-			bn.sibDirIdx, bn.sibDirIdx2 = lo, hi
 		}
 		v.bNodes = append(v.bNodes, bn)
 	}
@@ -456,7 +461,7 @@ func buildDirectedView(ft *FileTree, persistDir string) *directedView {
 		if s.Parent == nil {
 			continue
 		}
-		appendRename(s.FullPath, renamePlaceholder(s.FullPath), true, -1, s.Type == NodeTypeTmpDir)
+		appendRename(s.FullPath, renamePlaceholder(s.FullPath), true, s.Type == NodeTypeTmpDir)
 	}
 	for _, d := range all {
 		if d.Parent == nil || d.Type != NodeTypeDir || len(d.Children) == 0 {
@@ -474,15 +479,7 @@ func buildDirectedView(ft *FileTree, persistDir string) *directedView {
 		if src == "" {
 			continue
 		}
-		orig := v.bNodes[idx0[d.FullPath]]
-		// The source is a variant-side path: a TmpDir source is not in the
-		// A-eligible sibling list, so there is no slot to skip (it is not a
-		// Sibling candidate anyway).
-		si := sort.SearchStrings(orig.sibDir, src)
-		if si >= len(orig.sibDir) || orig.sibDir[si] != src {
-			si = -1
-		}
-		appendRename(src, d.FullPath, false, si, srcTmp)
+		appendRename(src, d.FullPath, false, srcTmp)
 	}
 	// Synthesized fresh-path variant B nodes (A1 mkdir/creat): one per (parent
 	// directory, call). The Child witness is the direct A-eligible parent, the
@@ -524,6 +521,61 @@ func buildDirectedView(ft *FileTree, persistDir string) *directedView {
 	return v
 }
 
+// orderedSkipIndices returns two sibling skip indices in ascending order.
+// -1 means "slot absent"; pickSibling applies the two increments independently.
+func orderedSkipIndices(a, b int) (int, int) {
+	if a >= 0 && b >= 0 && b < a {
+		return b, a
+	}
+	return a, b
+}
+
+// directedAShape is the root-side event-shape context of a plan.
+type directedAShape struct {
+	depth   uint64
+	isDir   bool
+	persist bool
+}
+
+// directedAShapeForPlan resolves the A-side event dims of a plan. Fresh A
+// paths are materialized later; the prefix placeholder carries the same
+// depth/persist margins and the root call fixes the type. A rename root
+// (FreshA2) observes the source in the concurrent form and the fresh
+// destination in the HB form, so the host path is temporal-aware. The source
+// always carries the type (rename preserves it).
+func directedAShapeForPlan(plan *directedPlan, byPath map[string]directedAShape, persistDir string) (directedAShape, bool) {
+	if plan == nil {
+		return directedAShape{}, false
+	}
+	switch {
+	case plan.FreshA, plan.FreshSame:
+		host := directedFreshPlaceholder(plan.Cell.Combo.Root, plan.BaseA2)
+		return directedAShape{
+			depth:   DepthBucketOf(host),
+			isDir:   plan.Cell.Combo.Root == "mkdir",
+			persist: pathInDir(host, persistDir),
+		}, true
+	case plan.FreshA2:
+		in, ok := byPath[plan.BaseA]
+		if !ok {
+			return directedAShape{}, false
+		}
+		hostPath := plan.BaseA
+		if plan.Cell.Temporal == TemporalHB && plan.BaseA2 != "" {
+			hostPath = plan.BaseA2
+		}
+		host := renamePlaceholder(hostPath)
+		return directedAShape{
+			depth:   DepthBucketOf(host),
+			isDir:   in.isDir,
+			persist: pathInDir(host, persistDir),
+		}, true
+	default:
+		in, ok := byPath[plan.BaseA]
+		return in, ok
+	}
+}
+
 // witnessFor returns the A base path that puts B in relation rel to A for the
 // given root call, or ok=false when no A-eligible witness exists or the root's
 // type constraint does not fit.
@@ -531,9 +583,9 @@ func (bn *directedBNode) witnessFor(rel PathRelation, root string, r *rand.Rand)
 	switch rel {
 	case PathSame:
 		// A = B must itself be a valid root base: TmpDir B has no Same witness.
-		// Rename B anchors on the destination but classifies Same through the
-		// source (prePath), so its Same witness is srcPath. A synthesized fresh
-		// B has no existing A at all (fresh-fresh pairs are planned directly).
+		// The rename variant's cell path is the source, so its Same witness is
+		// srcPath. A synthesized fresh B has no existing A at all (fresh-fresh
+		// pairs are planned directly).
 		if bn.freshB {
 			return "", false
 		}
@@ -1644,52 +1696,13 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	// A-side dims of every ordinary node (the witnesses): the event-shape
 	// guard needs the depth/persist/type of the root call's observed path, and
 	// looking it up in the view avoids a tree lock per plan.
-	type aShape struct {
-		depth   uint64
-		isDir   bool
-		persist bool
-	}
-	byPath := make(map[string]aShape, len(view.bNodes))
+	byPath := make(map[string]directedAShape, len(view.bNodes))
 	for i := range view.bNodes {
 		bn := &view.bNodes[i]
 		if bn.srcPath != "" || bn.freshB {
 			continue
 		}
-		byPath[bn.path] = aShape{depth: bn.depth, isDir: bn.isDir, persist: bn.persist}
-	}
-	// aShapeFor resolves the A-side event dims of a plan. Fresh A paths are
-	// materialized later; the prefix placeholder (directedFreshPlaceholder,
-	// or the normalized rename destination) carries the same depth/persist
-	// margins and the root call fixes the type. For a rename root (FreshA2)
-	// the fresh destination is a same-parent sibling of the source, so the
-	// source carries the type.
-	aShapeFor := func(plan *directedPlan) (aShape, bool) {
-		switch {
-		case plan.FreshA, plan.FreshSame:
-			host := directedFreshPlaceholder(plan.Cell.Combo.Root, plan.BaseA2)
-			return aShape{
-				depth:   DepthBucketOf(host),
-				isDir:   plan.Cell.Combo.Root == "mkdir",
-				persist: pathInDir(host, hmcfg.Persistence_dir),
-			}, true
-		case plan.FreshA2:
-			// Rename root: the observed A path is the fresh destination (a
-			// same-parent sibling of the source). The placeholder is normalized
-			// exactly like freshRenameDst so the persist margin matches; the
-			// source carries the type.
-			if in, ok := byPath[plan.BaseA]; ok {
-				host := renamePlaceholder(plan.BaseA)
-				return aShape{
-					depth:   DepthBucketOf(host),
-					isDir:   in.isDir,
-					persist: pathInDir(host, hmcfg.Persistence_dir),
-				}, true
-			}
-			return aShape{}, false
-		default:
-			in, ok := byPath[plan.BaseA]
-			return in, ok
-		}
+		byPath[bn.path] = directedAShape{depth: bn.depth, isDir: bn.isDir, persist: bn.persist}
 	}
 	// shapeCovered reports whether every possible event shape of the planned
 	// pair is already known: the cell can then only reproduce information the
@@ -1700,7 +1713,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	// witness could realize an unknown shape, so this is an approximation at
 	// the (cell, representative-A) granularity.
 	shapeCovered := func(plan *directedPlan) bool {
-		a, ok := aShapeFor(plan)
+		a, ok := directedAShapeForPlan(plan, byPath, hmcfg.Persistence_dir)
 		if !ok {
 			return false
 		}
@@ -2701,12 +2714,20 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 			return false
 		}
 		if plan.Cell.Combo.Rel == PathSame {
-			return plan.BaseA == plan.BaseB
+			// Only the concurrent form observes the pre-state source. After
+			// HB the root is at the fresh destination, so B=source is
+			// Sibling, not Same; that form belongs to the dedicated
+			// PathSibling pass.
+			return plan.Cell.Temporal == TemporalConcurrent && plan.BaseA == plan.BaseB
 		}
-		if plan.BaseA == plan.BaseB || plan.BaseA2 == plan.BaseB {
+		rootPath := plan.BaseA2
+		if plan.Cell.Temporal == TemporalConcurrent {
+			rootPath = plan.BaseA
+		}
+		if rootPath == "" || rootPath == plan.BaseB {
 			return false
 		}
-		return pathRelBetween(plan.BaseA2, plan.BaseB) == plan.Cell.Combo.Rel
+		return pathRelBetween(rootPath, plan.BaseB) == plan.Cell.Combo.Rel
 	default: // FreshB: synthesized mkdir/creat under BaseB2.
 		parent := ft.FindNode(plan.BaseB2)
 		if parent == nil || parent.Type == NodeTypeFile {

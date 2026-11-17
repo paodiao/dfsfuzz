@@ -195,11 +195,15 @@ func TestPickDirectedBatchBuildsConstructiblePlan(t *testing.T) {
 			if a == nil {
 				t.Fatalf("plan BaseA missing from tree: %q", plan.BaseA)
 			}
-			if DepthBucketOf(plan.BaseB) != plan.Cell.DepthB {
-				t.Fatalf("depth mismatch for %q", plan.BaseB)
+			cellB := plan.BaseB
+			if plan.Cell.Combo.Variant == "rename" {
+				cellB = plan.BaseB2
 			}
-			if plan.Cell.PersistB != (hmcfg.Persistence_dir != "" && strings.HasPrefix(plan.BaseB, hmcfg.Persistence_dir)) {
-				t.Fatalf("persist mismatch for %q", plan.BaseB)
+			if DepthBucketOf(cellB) != plan.Cell.DepthB {
+				t.Fatalf("depth mismatch for %q", cellB)
+			}
+			if plan.Cell.PersistB != (hmcfg.Persistence_dir != "" && strings.HasPrefix(cellB, hmcfg.Persistence_dir)) {
+				t.Fatalf("persist mismatch for %q", cellB)
 			}
 			if plan.Cell.Combo.Variant == "rename" {
 				src := hmcfg.FileTree.FindNode(plan.BaseB2)
@@ -232,7 +236,7 @@ func TestPickDirectedBatchBuildsConstructiblePlan(t *testing.T) {
 					if plan.BaseA == plan.BaseB || plan.BaseA == plan.BaseB2 {
 						t.Fatalf("rename non-Same A must differ from src/dst: %q", plan.BaseA)
 					}
-					if got := pathRelBetween(plan.BaseA, plan.BaseB); got != plan.Cell.Combo.Rel {
+					if got := pathRelBetween(plan.BaseA, plan.BaseB2); got != plan.Cell.Combo.Rel {
 						t.Fatalf("relation mismatch: %v vs %v", got, plan.Cell.Combo.Rel)
 					}
 				}
@@ -1184,7 +1188,8 @@ func renameFixture(t *testing.T) (*Target, *Hmdfs_config, *SpecialCalls, *Layere
 		Init_file: map[string][]string{
 			cids[0]: {
 				"merge_view/dirW/src", "merge_view/dirW/sib",
-				"merge_view/dirW/dstDir/inside", "merge_view/dirW/sub/kid",
+				"merge_view/dirW/dstDir/inside", "merge_view/dirW/srcDir/kid",
+				"merge_view/dirW/sub/kid",
 			},
 		},
 	})
@@ -1278,7 +1283,7 @@ func TestDirectedPlanRenameFreshWitnesses(t *testing.T) {
 // non-empty plain dir destination pairs with the first non-file sibling
 // directory (a TmpDir source is allowed: it is a variant-side path), and all
 // four relations are constructible (Same via the source prePath, Sibling/Child
-// through the parent, Parent through dst's children).
+// through the parent, Parent through the source's children).
 func TestDirectedPlanRenameENOTEMPTY(t *testing.T) {
 	target, hmcfg, _, lcs := renameFixture(t)
 	ps := directedPlanBaseProgs(target)
@@ -1289,7 +1294,7 @@ func TestDirectedPlanRenameENOTEMPTY(t *testing.T) {
 		sib    = "merge_view/dirW/sib"
 		dstDir = "merge_view/dirW/dstDir"
 		srcDir = "merge_view/dirW/srcDir"
-		inside = "merge_view/dirW/dstDir/inside"
+		srcKid = "merge_view/dirW/srcDir/kid"
 	)
 	var (
 		checked                                  int
@@ -1323,8 +1328,8 @@ func TestDirectedPlanRenameENOTEMPTY(t *testing.T) {
 			}
 			seenChild = true
 		case PathParent:
-			if p.BaseA != inside {
-				t.Fatalf("enotempty Parent A = %q, want the destination child %q", p.BaseA, inside)
+			if p.BaseA != srcKid {
+				t.Fatalf("enotempty Parent A = %q, want the source child %q", p.BaseA, srcKid)
 			}
 			seenParent = true
 		}
@@ -1335,6 +1340,60 @@ func TestDirectedPlanRenameENOTEMPTY(t *testing.T) {
 	if !seenSame || !seenSib || !seenChild || !seenParent {
 		t.Fatalf("missing relation coverage: same=%v sibling=%v child=%v parent=%v",
 			seenSame, seenSib, seenChild, seenParent)
+	}
+}
+
+// TestRenameVariantParentWitnessUsesSource pins the source-based witness for
+// the ENOTEMPTY rename form: Parent must sample a child of the source, not a
+// child of the destination directory.
+func TestRenameVariantParentWitnessUsesSource(t *testing.T) {
+	target, hmcfg, _, lcs := renameFixture(t)
+	view := buildDirectedView(lcs.FileTree, hmcfg.Persistence_dir)
+	var bn *directedBNode
+	for i := range view.bNodes {
+		if view.bNodes[i].srcPath == "merge_view/dirW/srcDir" &&
+			view.bNodes[i].path == "merge_view/dirW/dstDir" {
+			bn = &view.bNodes[i]
+			break
+		}
+	}
+	if bn == nil {
+		t.Fatal("synthesized srcDir->dstDir rename node missing")
+	}
+	got, ok := bn.witnessFor(PathParent, "stat", newRand(target, rand.NewSource(1)).Rand)
+	if !ok || got != "merge_view/dirW/srcDir/kid" {
+		t.Fatalf("rename Parent witness = %q (ok=%v), want source child", got, ok)
+	}
+	if got == "merge_view/dirW/dstDir/inside" {
+		t.Fatal("rename Parent witness still sampled the destination child")
+	}
+}
+
+// TestDirectedAShapeFreshA2Temporal pins the temporal-aware rename-root shape:
+// CC observes the source, HB observes the fresh destination.
+func TestDirectedAShapeFreshA2Temporal(t *testing.T) {
+	byPath := map[string]directedAShape{
+		"merge_view/a": {depth: DepthBucketOf("merge_view/a"), isDir: true},
+	}
+	persistDir := "merge_view/dirB"
+	plan := func(temporal TemporalRel) *directedPlan {
+		return &directedPlan{
+			Cell:    directedCell{Combo: comboKey{Root: "rename"}, Temporal: temporal},
+			BaseA:   "merge_view/a",
+			BaseA2:  "merge_view/dirB/nested/b",
+			FreshA2: true,
+		}
+	}
+	cc, ok := directedAShapeForPlan(plan(TemporalConcurrent), byPath, persistDir)
+	if !ok || cc.depth != DepthBucketOf("merge_view/a") || cc.persist {
+		t.Fatalf("CC shape = %+v (ok=%v), want source depth/persist", cc, ok)
+	}
+	hb, ok := directedAShapeForPlan(plan(TemporalHB), byPath, persistDir)
+	if !ok || hb.depth != DepthBucketOf("merge_view/dirB/nested/b") || !hb.persist {
+		t.Fatalf("HB shape = %+v (ok=%v), want destination depth/persist", hb, ok)
+	}
+	if !hb.isDir {
+		t.Fatal("rename shape must keep the source class")
 	}
 }
 
@@ -1349,6 +1408,7 @@ func TestValidateRenamePlanLive(t *testing.T) {
 		sib    = "merge_view/dirW/sib"
 		dstDir = "merge_view/dirW/dstDir"
 		srcDir = "merge_view/dirW/srcDir"
+		srcKid = "merge_view/dirW/srcDir/kid"
 		inside = "merge_view/dirW/dstDir/inside"
 		sub    = "merge_view/dirW/sub"
 	)
@@ -1366,7 +1426,7 @@ func TestValidateRenamePlanLive(t *testing.T) {
 	valid := []directedPlan{
 		plan(PathSame, RetSuccess, src, fresh, src, false),
 		plan(PathChild, RetSuccess, dirW, fresh, src, false),
-		plan(PathParent, RetFailure, inside, dstDir, srcDir, true),
+		plan(PathParent, RetFailure, srcKid, dstDir, srcDir, true),
 		plan(PathSibling, RetFailure, sib, dstDir, srcDir, true),
 	}
 	for i, p := range valid {
@@ -1918,6 +1978,10 @@ func TestValidateFreshPlanLive(t *testing.T) {
 			FreshA: freshA, FreshA2: freshA2, FreshB: freshB, FreshSame: freshSame,
 		}
 	}
+	cc := func(p directedPlan) directedPlan {
+		p.Cell.Temporal = TemporalConcurrent
+		return p
+	}
 	valid := []directedPlan{
 		plan("mkdir", "stat", PathParent, RetSuccess, true, freshChild, dirW, dirW, "", true, false, false, false),
 		plan("creat", "open", PathSibling, RetSuccess, false, freshFile, src, dirW, "", true, false, false, false),
@@ -1925,7 +1989,7 @@ func TestValidateFreshPlanLive(t *testing.T) {
 		plan("open", "creat", PathSibling, RetSuccess, false, src, freshFile, "", dirW, false, false, true, false),
 		plan("mkdir", "mkdir", PathSame, RetEEXIST, true, freshChild, freshChild, dirW, "", false, false, false, true),
 		plan("creat", "unlink", PathSame, RetENOENT, false, freshFile, freshFile, dirW, "", false, false, false, true),
-		plan("rename", "stat", PathSame, RetSuccess, false, src, src, src+"._renamed_test", "", false, true, false, false),
+		cc(plan("rename", "stat", PathSame, RetSuccess, false, src, src, src+"._renamed_test", "", false, true, false, false)),
 		plan("rename", "open", PathSibling, RetSuccess, false, src, "merge_view/dirW/sib", src+"._renamed_test", "", false, true, false, false),
 		// G-c scope S: lookup/metadata/open races and dir-root forms.
 		plan("creat", "stat", PathSame, RetENOENT, false, freshFile, freshFile, dirW, "", false, false, false, true),
@@ -1935,7 +1999,9 @@ func TestValidateFreshPlanLive(t *testing.T) {
 		// loop (root unlink removes the source) and truncate via the FreshA2
 		// rename root.
 		plan("unlink", "rename", PathSame, RetENOENT, false, src, dirW+"/dst._renamed_x", "", src, false, false, false, false),
-		plan("rename", "truncate", PathSame, RetENOENT, false, src, src, src+"._renamed_test", "", false, true, false, false),
+		// After HB the rename root is at the fresh destination, so a truncate
+		// on the moved-away source is a Sibling relation, not Same.
+		plan("rename", "truncate", PathSibling, RetENOENT, false, src, src, src+"._renamed_test", "", false, true, false, false),
 	}
 	// The size-0 data-path form carries the pinned offset bucket (Zero), which
 	// the helper's default NA cannot express.
@@ -1955,6 +2021,7 @@ func TestValidateFreshPlanLive(t *testing.T) {
 		plan("open", "mkdir", PathChild, RetSuccess, true, src, freshChild, "", src, false, false, true, false),                         // parent is a file
 		plan("mkdir", "mkdir", PathSame, RetSuccess, true, freshChild, freshChild, dirW, "", false, false, false, true),                 // bad ret
 		plan("rename", "stat", PathSame, RetSuccess, false, sub, sub, sub+"._renamed_test", "", false, true, false, false),              // TmpDir root src
+		plan("rename", "stat", PathSame, RetSuccess, false, src, src, src+"._renamed_test", "", false, true, false, false),              // HB Same twin
 		plan("rename", "stat", PathSame, RetSuccess, false, src, src, "merge_view/dirW/dstDir/x", "", false, true, false, false),        // cross-parent
 		plan("mkdir", "stat", PathParent, RetSuccess, true, sub+"/mut_dir_test", sub, sub, "", true, false, false, false),               // TmpDir root container
 		plan("mkdir", "mkdir", PathSame, RetEEXIST, true, sub+"/mut_dir_test", sub+"/mut_dir_test", sub, "", false, false, false, true), // TmpDir host
