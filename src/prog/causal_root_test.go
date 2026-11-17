@@ -458,7 +458,6 @@ func TestCausalRootRenameC2Relations(t *testing.T) {
 		}
 		byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, p.RootCall, p.RootPath,
 			p.RootParent, p.RootSource, p.RootDest, p.RootRenameReplace, p.RootKind, r)
-		sawSourceSame := false
 		for _, ck := range cells {
 			q := byCell[ck]
 			if q == nil {
@@ -466,15 +465,13 @@ func TestCausalRootRenameC2Relations(t *testing.T) {
 			}
 			varPre, varPost := q.BaseB, q.BaseB
 			if q.Cell.Combo.Variant == "rename" {
-				varPre = q.BaseB2
-			}
-			if varPre == p.RootSource {
-				sawSourceSame = true
+				varPre, varPost = q.BaseB2, q.BaseB2
 			}
 			if varPre == "" || varPost == "" {
 				continue
 			}
-			rel, ok := causalPairRelation(p.RootSource, p.RootDest, varPre, varPost)
+			// Rename root A is the destination; rename variant B is the source.
+			rel, ok := causalPairRelation(p.RootDest, p.RootDest, varPre, varPost)
 			if !ok {
 				t.Fatalf("planned C2 plan has no observed relation: root=%+v plan=%+v", p, q)
 			}
@@ -482,9 +479,6 @@ func TestCausalRootRenameC2Relations(t *testing.T) {
 				t.Fatalf("C2 relation = %v, want %v: root=%+v plan=%+v",
 					q.Cell.Combo.Rel, rel, p, q)
 			}
-		}
-		if !sawSourceSame {
-			t.Fatalf("rename root has no source-Same C2 plan: %+v", p)
 		}
 		tested++
 	}
@@ -523,11 +517,12 @@ func TestValidateCausalPlanRenameRelations(t *testing.T) {
 			Causal:  true,
 		}
 	}
-	if !validateCausalPlan(hmcfg, lcs, mk(PathSame)) {
-		t.Fatal("rename-source Same rejected")
+	// HB A is dst, B is src: same-parent different names is Sibling, not Same.
+	if !validateCausalPlan(hmcfg, lcs, mk(PathSibling)) {
+		t.Fatal("rename destination/source Sibling rejected")
 	}
-	if validateCausalPlan(hmcfg, lcs, mk(PathSibling)) {
-		t.Fatal("rename-source Sibling accepted")
+	if validateCausalPlan(hmcfg, lcs, mk(PathSame)) {
+		t.Fatal("rename destination/source Same accepted")
 	}
 }
 
@@ -545,7 +540,7 @@ func TestValidateCausalPlanPersistence(t *testing.T) {
 	plan := func(persist bool) *directedPlan {
 		return &directedPlan{
 			Cell: directedCell{
-				Combo:    comboKey{Root: "rename", Variant: "stat", Rel: PathSame},
+				Combo:    comboKey{Root: "rename", Variant: "stat", Rel: PathSibling},
 				RetB:     RetENOENT,
 				OffB:     offsetBucketNA,
 				PersistB: persist,
@@ -771,7 +766,7 @@ func TestValidateCausalPlanRootChecks(t *testing.T) {
 	renamePlan := func(root string) *directedPlan {
 		return &directedPlan{
 			Cell: directedCell{
-				Combo:    comboKey{Root: root, Variant: "stat", Rel: PathSame},
+				Combo:    comboKey{Root: root, Variant: "stat", Rel: PathSibling},
 				RetB:     RetENOENT,
 				OffB:     offsetBucketNA,
 				PersistB: false,

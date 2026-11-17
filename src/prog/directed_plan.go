@@ -259,6 +259,27 @@ type directedBNode struct {
 	freshParent string
 }
 
+// cellPath is the B-side path used by coverage/relation. For a rename variant
+// that is the source (the path at entry); path/dst is only the destination
+// used to materialize the call and predict RetB.
+func (bn *directedBNode) cellPath() string {
+	if bn != nil && bn.srcPath != "" {
+		return bn.srcPath
+	}
+	if bn == nil {
+		return ""
+	}
+	return bn.path
+}
+
+func (bn *directedBNode) cellDepth() uint64 {
+	return DepthBucketOf(bn.cellPath())
+}
+
+func (bn *directedBNode) cellPersist(persistDir string) bool {
+	return pathInDir(bn.cellPath(), persistDir)
+}
+
 // directedView is the planning view: every node of the global merged view
 // except the merge_view root itself. It is built under one FileTree read lock
 // and is deliberately uncapped: the enumeration is B-driven (A is derived from
@@ -1822,7 +1843,8 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 						cell := directedCell{
 							Combo: comboKey{Root: root, Variant: variant, Rel: rel},
 							RetB:  retB, OffB: bucket,
-							PersistB: bn.persist, DepthB: bn.depth, TypeB: bn.isDir,
+							PersistB: bn.cellPersist(hmcfg.Persistence_dir),
+							DepthB:   bn.cellDepth(), TypeB: bn.isDir,
 						}
 						cell.Temporal = TemporalConcurrent
 						if _, ok := planByCell[cell.toKey()]; ok {
@@ -2015,6 +2037,15 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 						BaseB: bn.path, BOffset: off, BLen: blen,
 					}
 					add(plan)
+					if rel == PathSame {
+						// CC-only: the rename has not completed, so A's pre
+						// path is the source and B=source is Same. After HB the
+						// root's post path is the fresh destination, so the same
+						// construction is a Sibling relation (and B=source has
+						// moved away); the dedicated PathSibling pass owns that
+						// cell, so do not add an HB twin here.
+						continue
+					}
 					if !(dest && destructiveHBDoomed(variant, kind.retB)) {
 						plan.Cell.Temporal = TemporalHB
 						add(plan)
@@ -2405,8 +2436,14 @@ func validateDirectedPlanLive(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, p
 		default:
 			return false
 		}
-		if db.isDir != plan.Cell.TypeB || db.depth != plan.Cell.DepthB ||
-			db.persist != plan.Cell.PersistB {
+		// Rename preserves the source class; db still validates the
+		// destination shape (fresh/E/ENOTEMPTY), while the cell's B path and
+		// depth/persist are anchored on the source.
+		if db.isDir != plan.Cell.TypeB {
+			return false
+		}
+		srcNode := mkNode(src)
+		if srcNode.depth != plan.Cell.DepthB || srcNode.persist != plan.Cell.PersistB {
 			return false
 		}
 		if plan.Cell.Combo.Rel == PathSame {
@@ -2414,10 +2451,10 @@ func validateDirectedPlanLive(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, p
 			// source is then the root base and must be A-eligible.
 			return src.Type != NodeTypeTmpDir && plan.BaseA == plan.BaseB2
 		}
-		if plan.BaseA == plan.BaseB || plan.BaseA == plan.BaseB2 {
+		if plan.BaseA == plan.BaseB2 {
 			return false
 		}
-		return pathRelBetween(plan.BaseA, plan.BaseB) == plan.Cell.Combo.Rel
+		return pathRelBetween(plan.BaseA, plan.BaseB2) == plan.Cell.Combo.Rel
 	}
 	b := ft.FindNode(plan.BaseB)
 	if b == nil {
@@ -2588,8 +2625,10 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 		if (src.Type == NodeTypeFile) != !plan.Cell.TypeB {
 			return false
 		}
-		if DepthBucketOf(plan.BaseB) != plan.Cell.DepthB ||
-			pathInDir(plan.BaseB, hmcfg.Persistence_dir) != plan.Cell.PersistB {
+		// Rename B's cell is anchored on the source (entry path); BaseB is
+		// the destination used to materialize rename(src,dst) and shape RetB.
+		if DepthBucketOf(plan.BaseB2) != plan.Cell.DepthB ||
+			pathInDir(plan.BaseB2, hmcfg.Persistence_dir) != plan.Cell.PersistB {
 			return false
 		}
 		if plan.Cell.RetB != RetSuccess {
