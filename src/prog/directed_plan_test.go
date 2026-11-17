@@ -1188,8 +1188,7 @@ func renameFixture(t *testing.T) (*Target, *Hmdfs_config, *SpecialCalls, *Layere
 		Init_file: map[string][]string{
 			cids[0]: {
 				"merge_view/dirW/src", "merge_view/dirW/sib",
-				"merge_view/dirW/dstDir/inside", "merge_view/dirW/srcDir/kid",
-				"merge_view/dirW/sub/kid",
+				"merge_view/dirW/dstDir/inside", "merge_view/dirW/sub/kid",
 			},
 		},
 	})
@@ -1286,6 +1285,7 @@ func TestDirectedPlanRenameFreshWitnesses(t *testing.T) {
 // through the parent, Parent through the source's children).
 func TestDirectedPlanRenameENOTEMPTY(t *testing.T) {
 	target, hmcfg, _, lcs := renameFixture(t)
+	hmcfg.FileTree.AddNode("merge_view/dirW/srcDir/kid", NodeTypeFile, hmcfg.Cids[0])
 	ps := directedPlanBaseProgs(target)
 	plans, _ := planDirectedCells(ps, lcs, hmcfg, newRand(target, rand.NewSource(1)))
 	const (
@@ -1301,11 +1301,12 @@ func TestDirectedPlanRenameENOTEMPTY(t *testing.T) {
 		seenSame, seenSib, seenChild, seenParent bool
 	)
 	for _, p := range plans {
-		if p.Cell.Combo.Variant != "rename" || p.Cell.RetB != RetFailure {
+		if p.Cell.Combo.Variant != "rename" || p.Cell.RetB != RetFailure ||
+			p.BaseB != dstDir || p.BaseB2 != srcDir {
 			continue
 		}
 		checked++
-		if p.BaseB != dstDir || p.BaseB2 != srcDir || !p.Cell.TypeB {
+		if !p.Cell.TypeB {
 			t.Fatalf("unexpected enotempty plan: %+v", p)
 		}
 		if p.BaseA == p.BaseB || p.BaseA == p.BaseB2 {
@@ -1348,6 +1349,7 @@ func TestDirectedPlanRenameENOTEMPTY(t *testing.T) {
 // child of the destination directory.
 func TestRenameVariantParentWitnessUsesSource(t *testing.T) {
 	target, hmcfg, _, lcs := renameFixture(t)
+	hmcfg.FileTree.AddNode("merge_view/dirW/srcDir/kid", NodeTypeFile, hmcfg.Cids[0])
 	view := buildDirectedView(lcs.FileTree, hmcfg.Persistence_dir)
 	var bn *directedBNode
 	for i := range view.bNodes {
@@ -1402,6 +1404,7 @@ func TestDirectedAShapeFreshA2Temporal(t *testing.T) {
 // A guard and the prePath-based Same relation.
 func TestValidateRenamePlanLive(t *testing.T) {
 	_, hmcfg, _, lcs := renameFixture(t)
+	hmcfg.FileTree.AddNode("merge_view/dirW/srcDir/kid", NodeTypeFile, hmcfg.Cids[0])
 	const (
 		dirW   = "merge_view/dirW"
 		src    = "merge_view/dirW/src"
