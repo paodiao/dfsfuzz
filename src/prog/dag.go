@@ -658,15 +658,17 @@ func isLinkSymlinkVertex(v *DAGVertex) bool {
 	if v == nil {
 		return false
 	}
-	return v.FuncID == FuncLink || v.FuncID == FuncSymlink ||
-		v.CallName == "link" || v.CallName == "symlink"
+	// Role semantics follow the traced function, not the syscall name: a
+	// LOOKUP event produced while resolving a rename/link call is still a
+	// LOOKUP vertex, not the rename/link operation itself.
+	return v.FuncID == FuncLink || v.FuncID == FuncSymlink
 }
 
 func isRenameVertex(v *DAGVertex) bool {
 	if v == nil {
 		return false
 	}
-	return v.FuncID == FuncRename || v.CallName == "rename"
+	return v.FuncID == FuncRename
 }
 
 // pairRolePathsForSide returns the GlusterFS link/symlink role paths for one
@@ -678,12 +680,8 @@ func pairRolePathsForSide(v *DAGVertex, side pairSide, temporal TemporalRel) []s
 	if v == nil {
 		return nil
 	}
-	name := v.CallName
-	if name == "" {
-		name = callNameOfFunc(v.FuncID)
-	}
-	switch name {
-	case "link", "symlink":
+	switch v.FuncID {
+	case FuncLink, FuncSymlink:
 		target := prePath(v)
 		if target == "" {
 			target = v.Path
@@ -695,7 +693,7 @@ func pairRolePathsForSide(v *DAGVertex, side pairSide, temporal TemporalRel) []s
 			return []string{target, v.Path}
 		}
 		return []string{target}
-	case "rename":
+	case FuncRename:
 		// HB A is the post-state destination; HB B and CC are the
 		// entry-state source. The destination still exists on the vertex for
 		// materialization, but it is not the relation/cell path here.
@@ -710,11 +708,6 @@ func pairRolePathsForSide(v *DAGVertex, side pairSide, temporal TemporalRel) []s
 			return nil
 		}
 		return []string{src}
-	case "readlink":
-		if v.Path == "" {
-			return nil
-		}
-		return []string{v.Path}
 	default:
 		if v.Path == "" {
 			return nil
@@ -750,7 +743,7 @@ func classifyPairPaths(profile *DFSProfile, A, B *DAGVertex, aPath, bPath string
 // src; link/symlink HB A=target/linkpath, HB B/CC=target). Everything else
 // keeps the legacy single-relation behavior.
 func relationPathsFor(profile *DFSProfile, A, B *DAGVertex, ordered bool, temporal TemporalRel) []pairPathRel {
-	if profile != nil &&
+	if profile != nil && A.FuncID != FuncLookup && B.FuncID != FuncLookup &&
 		(isLinkSymlinkVertex(A) || isLinkSymlinkVertex(B) ||
 			isRenameVertex(A) || isRenameVertex(B)) {
 		aPaths := pairRolePathsForSide(A, pairSideA, temporal)
