@@ -119,12 +119,12 @@ func TestMutateGroupDataDirectedZeroSizeMid(t *testing.T) {
 // the producible grid stay zero.
 func TestUncoveredDimPots(t *testing.T) {
 	newTestCoverageBoard(t)
-	beforeOff := covBoard.uncoveredOffPots([]string{"pwrite64"})
+	beforeOff := covBoard.directedPairOffPots([]string{"pwrite64"})
 	if beforeOff[offsetBucketMid] == 0 {
 		t.Fatalf("fixture has no uncovered Mid cells: %v", beforeOff)
 	}
-	beforeDepth := covBoard.uncoveredDepthPots("open", "pwrite64", PathSame)
-	beforePot := CoveragePotential("open", "pwrite64", PathSame)
+	beforeDepth := covBoard.directedPairDepthPots("open", "pwrite64", PathSame)
+	beforePot := DirectedPairPotential("open", "pwrite64", PathSame)
 
 	p := DAGPair{
 		A: &DAGVertex{CallName: "open", Path: "merge_view/dirA/a",
@@ -136,7 +136,7 @@ func TestUncoveredDimPots(t *testing.T) {
 	}
 	RecordCoveragePairs([]DAGPair{p})
 
-	afterOff := covBoard.uncoveredOffPots([]string{"pwrite64"})
+	afterOff := covBoard.directedPairOffPots([]string{"pwrite64"})
 	if got, want := afterOff[offsetBucketMid], beforeOff[offsetBucketMid]-1; got != want {
 		t.Fatalf("Mid pot = %d, want %d (before %v)", got, want, beforeOff)
 	}
@@ -149,35 +149,35 @@ func TestUncoveredDimPots(t *testing.T) {
 		}
 	}
 	// The recorded cell's path sits at depth bucket 2.
-	afterDepth := covBoard.uncoveredDepthPots("open", "pwrite64", PathSame)
+	afterDepth := covBoard.directedPairDepthPots("open", "pwrite64", PathSame)
 	if got, want := afterDepth[2], beforeDepth[2]-1; got != want {
 		t.Fatalf("depth-2 pot = %d, want %d (before %v)", got, want, beforeDepth)
 	}
 	if afterDepth[1] != beforeDepth[1] || afterDepth[3] != beforeDepth[3] {
 		t.Fatalf("other depth pots changed: %v -> %v", beforeDepth, afterDepth)
 	}
-	if got := CoveragePotential("open", "pwrite64", PathSame); got != beforePot-1 {
+	if got := DirectedPairPotential("open", "pwrite64", PathSame); got != beforePot-1 {
 		t.Fatalf("combo potential = %d, want %d", got, beforePot-1)
 	}
-	if pots := covBoard.uncoveredDepthPots("open", "pwrite64", PathNoRel); pots != [4]int{} {
+	if pots := covBoard.directedPairDepthPots("open", "pwrite64", PathNoRel); pots != [4]int{} {
 		t.Fatalf("NoRel pots = %v, want zero (outside the producible grid)", pots)
 	}
 }
 
-// TestUncoveredOffPotsSkipENOENT pins the ENOENT filter of the offset
+// TestDirectedPairOffPotsSkipENOENT pins the ENOENT filter of the offset
 // aggregation: with every Success truncate cell covered and only the ENOENT
 // cells left, the offset pots must be all zero (a failed lookup never carries
 // an offset bucket), while the depth margin still counts those cells (the
 // lookup path is real).
-func TestUncoveredOffPotsSkipENOENT(t *testing.T) {
+func TestDirectedPairOffPotsSkipENOENT(t *testing.T) {
 	newTestCoverageBoard(t)
 	coverBoardCellsExcept(t, func(ck comboKey, c cellKey) bool {
 		return ck.Variant == "truncate" && c.RetB == RetENOENT
 	})
-	if pots := covBoard.uncoveredOffPots([]string{"truncate"}); pots != [5]int{} {
+	if pots := covBoard.directedPairOffPots([]string{"truncate"}); pots != [5]int{} {
 		t.Fatalf("ENOENT cells leaked into the offset pots: %v", pots)
 	}
-	if pots := covBoard.uncoveredDepthPots("open", "truncate", PathSame); pots == [4]int{} {
+	if pots := covBoard.directedPairDepthPots("open", "truncate", PathSame); pots == [4]int{} {
 		t.Fatal("ENOENT cells must still count toward the depth margin")
 	}
 }

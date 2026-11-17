@@ -3021,7 +3021,7 @@ func mutateGroupPathDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 					continue
 				}
 			}
-			pot := CoveragePotential(anchorName, m.opName, rel)
+			pot := DirectedPairPotential(anchorName, m.opName, rel)
 			if pot <= 0 {
 				continue
 			}
@@ -3038,7 +3038,7 @@ func mutateGroupPathDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 
 	// Depth target from the same (primary) ordering; bucket 0 is outside the
 	// merge-view domain.
-	depths := covBoard.uncoveredDepthPots(anchorName, member.opName, rel)
+	depths := covBoard.directedPairDepthPots(anchorName, member.opName, rel)
 	depths[0] = 0
 	targetDepth := pickWeightedIndex(depths[:], r.Rand)
 	if targetDepth <= 0 {
@@ -3441,7 +3441,7 @@ func mutateGroupDataDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 	if len(variants) == 0 {
 		return false
 	}
-	pots := covBoard.uncoveredOffPots(variants)
+	pots := covBoard.directedPairOffPots(variants)
 	bucket := pickWeightedIndex(pots[:], r.Rand)
 	if bucket < offsetBucketZero || bucket > offsetBucketBeyond {
 		return false

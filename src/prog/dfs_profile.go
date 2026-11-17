@@ -114,6 +114,10 @@ var GlusterfsRootCalls = []string{
 var GlusterfsVariantCalls = append(append([]string{}, GlusterfsRootCalls...),
 	"getxattr", "readlink")
 
+// GlusterfsCausalRootCalls is the C1/normal directed root allowlist. rmdir is
+// intentionally absent: it remains a DCT/model root, a C2 variant and a C1
+// anchor, but its empty-dir Success and ENOTEMPTY Failure root forms are not
+// both implemented in the fixed-root planner.
 var GlusterfsCausalRootCalls = []string{
 	"open", "read", "write", "pread64", "pwrite64", "truncate", "stat",
 	"chmod", "fsync", "fdatasync", "getdents64", "unlink", "mkdir",

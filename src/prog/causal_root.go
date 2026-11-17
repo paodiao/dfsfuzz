@@ -274,7 +274,7 @@ func causalC2ComboLive(profile *DFSProfile, root string) (map[comboKey]bool, boo
 			combos = append(combos, comboKey{Root: root, Variant: variant, Rel: rel})
 		}
 	}
-	return covBoard.comboSelectableFlags(combos), true
+	return covBoard.rootDirectedSelectableFlags(combos), true
 }
 
 // planCausalC2Cells enumerates C2 plans for a root that C1 has already fixed.

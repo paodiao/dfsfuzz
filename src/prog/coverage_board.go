@@ -67,9 +67,10 @@ type shapeDrainEntry struct {
 //	model     - producible + found. A finite static estimate of naturally
 //	            reachable cells, used only for bounded diagnostics (model=,
 //	            outModel=). It is not a completeness claim.
-//	plannable - plannable + plannableFound. The forms FailurePolicy and the
-//	            directed planner actively construct. Direction-3 (2a variant
-//	            bias, 2b exact plans, mutation biases) consumes only this layer.
+//	plannable - plannable + plannableFound. Generic directed-pair forms that
+//	            FailurePolicy and the directed planner actively construct.
+//	            comboKey.Root is the A-side call and may be a root or anchor;
+//	            root-directed views apply DirectedRootCalls separately.
 //
 // The per-temporal arrays are indexed by TemporalRel (HB=0, CC=1). All fields
 // are guarded by mu.
@@ -78,8 +79,8 @@ type coverageBoard struct {
 	discovered     map[cellKey]int
 	producible     map[comboKey][2]int // model: producible cells per temporal form
 	found          map[comboKey][2]int // model: discovered cells per temporal form
-	plannable      map[comboKey][2]int // planner: constructible cells per temporal form
-	plannableFound map[comboKey][2]int // planner: discovered cells per temporal form
+	plannable      map[comboKey][2]int // directed pair: constructible cells per temporal form
+	plannableFound map[comboKey][2]int // directed pair: discovered cells per temporal form
 	knownShapes    map[uint64]bool     // observed event shapes (call-name agnostic)
 	// shapeEpoch increments on every newly observed shape; shapeDrainCache
 	// entries are valid only at the epoch they were written, since shapes
@@ -112,7 +113,7 @@ type coverageBoard struct {
 	// cellUnreachable drops the cell from the 2b enumeration pool once the
 	// threshold is reached. A hit, or a fresh discovery of the cell, clears
 	// both. cellSuppressed counts the currently cell-suppressed cells per
-	// combo, so comboPotentials can answer the 2b-available potential in O(1)
+	// combo, so rootDirectedPotentials can answer the 2b-available potential in O(1)
 	// and skip fully suppressed combos immediately (the combo-level unreachable
 	// ledger only retires them after blind Direction-3 picks). cellPlans/hits/
 	// misses/noPlans/insertFails are the directCell diagnostics (cellPlans
@@ -351,19 +352,22 @@ func CoverageStats() (found, target int) {
 //	Observed    - all distinct first-sighting cells (including out-of-model)
 //	OutOfModel  - observed cells outside the model layer
 //	Model*      - the finite natural-reachability estimate
-//	Plannable*  - the FailurePolicy/planner constructible set
+//	Plannable*  - the generic directed-pair constructible set (A may be a
+//	              root or an anchor)
+//	RootPlannableTarget - the root-directed subset of PlannableTarget
 //
 // ModelOnly = ModelFound - PlannableFound is the number of observed cells that
 // are naturally reachable but not actively planned (e.g. GlusterFS mkdir
 // EEXIST); it is derived by the caller to keep the snapshot redundancy-free.
 type CoverageSnapshot struct {
-	ObservedCells   int
-	ObservedShapes  int
-	OutOfModel      int
-	ModelFound      int
-	ModelTarget     int
-	PlannableFound  int
-	PlannableTarget int
+	ObservedCells       int
+	ObservedShapes      int
+	OutOfModel          int
+	ModelFound          int
+	ModelTarget         int
+	PlannableFound      int
+	PlannableTarget     int
+	RootPlannableTarget int
 }
 
 // CoverageLayerStats returns one consistent snapshot of the three layers.
@@ -386,12 +390,19 @@ func CoverageBoardReady() bool {
 	return covBoard.isReady()
 }
 
-// CoveragePotential returns the directed-scope uncovered plannable-cell count
-// of a combo (both temporal forms); 0 when the board is not ready, the combo is
-// not in the plannable grid, or it is suppressed as unreachable (directed-
-// failure accounting).
+// DirectedPairPotential returns the uncovered directed-pair cell count of one
+// combo. Root here is the A-side call name (a root or an anchor); this is the
+// generic directed-pair view, not the root-directed subset.
+func DirectedPairPotential(root, variant string, rel PathRelation) int {
+	return covBoard.directedPairPotential(root, variant, rel)
+}
+
+// CoveragePotential is kept as a compatibility wrapper.
+//
+// Deprecated: use DirectedPairPotential for the directed-pair view, or the
+// root-directed coverage APIs for root-role accounting.
 func CoveragePotential(root, variant string, rel PathRelation) int {
-	return covBoard.uncoveredPotential(root, variant, rel)
+	return DirectedPairPotential(root, variant, rel)
 }
 
 // DirectedCellStats returns the Phase 2b counters: directed cells inserted
@@ -591,10 +602,12 @@ func cellInForms(forms []cellForm, ck cellKey, typeList []bool) bool {
 	return false
 }
 
-// plannableComboEnabled applies the combo-level construction gate. HMDFS is
-// always enabled (plannable == model); GlusterFS keeps link/symlink/readlink
-// out of the active target set until the dual-path gate is enabled.
-func (b *coverageBoard) plannableComboEnabled(ck comboKey) bool {
+// directedPairComboEnabled is the role-agnostic combo-level construction gate.
+// comboKey.Root is the A-side call name: it is a root call in root-directed
+// planning and an anchor call in group/PathSet planning. This gate therefore
+// only applies pair-wide restrictions (dual-path/readlink); root eligibility
+// belongs to rootDirectedComboEnabled.
+func (b *coverageBoard) directedPairComboEnabled(ck comboKey) bool {
 	if b.profile == nil || b.profile.Name != "glusterfs" {
 		return true
 	}
@@ -607,6 +620,20 @@ func (b *coverageBoard) plannableComboEnabled(ck comboKey) bool {
 	return true
 }
 
+// rootDirectedComboEnabled additionally requires ck.Root to be a directed root
+// call. It is used only by the root-directed planner/ledger; the generic
+// directed-pair potential keeps accepting anchor calls such as rmdir.
+func (b *coverageBoard) rootDirectedComboEnabled(ck comboKey) bool {
+	if !b.directedPairComboEnabled(ck) {
+		return false
+	}
+	if b.profile == nil || b.profile.Name != "glusterfs" {
+		// HMDFS keeps the historical plannable == model contract.
+		return true
+	}
+	return profileCallListContains(b.profile.DirectedRootCalls(), ck.Root)
+}
+
 // computeProducibleLocked computes the model layer's per-temporal cell counts.
 // See computeCellCountLocked for the shared dimension rules.
 func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
@@ -616,7 +643,7 @@ func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
 
 // computePlannableLocked computes the planner layer's per-temporal cell counts.
 func (b *coverageBoard) computePlannableLocked(ck comboKey) [2]int {
-	if !b.plannableComboEnabled(ck) {
+	if !b.directedPairComboEnabled(ck) {
 		return [2]int{}
 	}
 	if ck.Variant == "readlink" {
@@ -844,19 +871,19 @@ func (b *coverageBoard) cellInModel(ck cellKey) bool {
 	return cellInForms(forms, ck, types)
 }
 
-// cellInPlannable reports whether the cell lies inside the plannable layer:
-// the combo is in the plannable grid, its temporal form is producible, and
-// RetB/OffB/TypeB are among the planner's constructible forms. HMDFS falls
-// back to cellInModel so its legacy plannable == model behavior is exact;
-// GlusterFS uses directedVariantKinds for standalone forms and the complete
-// fresh-fresh race matrix for creation-root Same combos. The caller must hold
-// b.mu.
+// cellInPlannable reports whether the cell lies inside the generic directed
+// pair plannable layer: the combo is in the plannable grid, its temporal form
+// is producible, and RetB/OffB/TypeB are among the planner's constructible
+// forms. The A-side call may be a root or an anchor. HMDFS falls back to
+// cellInModel so its legacy plannable == model behavior is exact; GlusterFS
+// uses directedVariantKinds for standalone forms and the complete fresh-fresh
+// race matrix for creation-root Same combos. The caller must hold b.mu.
 func (b *coverageBoard) cellInPlannable(ck cellKey) bool {
 	if b.profile == nil || b.profile.Name != "glusterfs" {
 		return b.cellInModel(ck)
 	}
 	ckm := comboKey{Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel}
-	if !b.plannableComboEnabled(ckm) {
+	if !b.directedPairComboEnabled(ckm) {
 		return false
 	}
 	prod, ok := b.plannable[ckm]
@@ -868,6 +895,18 @@ func (b *coverageBoard) cellInPlannable(ck cellKey) bool {
 	}
 	return cellInForms(plannableFormsFor(b.profile, ck.Variant), ck,
 		producibleTypesFor(b.profile, ck.Variant))
+}
+
+// cellInRootDirectedPlannable reports whether the cell belongs to the
+// root-directed plannable subset. Unlike cellInPlannable, it requires the
+// A-side call to be in the profile's DirectedRootCalls list. The caller must
+// hold b.mu.
+func (b *coverageBoard) cellInRootDirectedPlannable(ck cellKey) bool {
+	ckm := comboKey{Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel}
+	if !b.rootDirectedComboEnabled(ckm) {
+		return false
+	}
+	return b.cellInPlannable(ck)
 }
 
 // shapesAllKnown reports whether every candidate shape of a planned cell is
@@ -1001,10 +1040,10 @@ func (b *coverageBoard) direction3ShapeDrain(rootCall, variant string, rel PathR
 		aFunc, DepthBucketOf(basePath), isDir, persist, dagRel)
 }
 
-// uncoveredPotentials returns the uncovered plannable-cell counts of the
-// given candidates under one read lock (per-combo lookup of the precomputed
-// tables).
-func (b *coverageBoard) uncoveredPotentials(root string, cands []CallVariant) []int {
+// directedPairPotentials returns the uncovered directed-pair cell counts of
+// the given candidates under one read lock (per-combo lookup of the precomputed
+// tables). The A-side call may be a root or an anchor.
+func (b *coverageBoard) directedPairPotentials(root string, cands []CallVariant) []int {
 	res := make([]int, len(cands))
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1030,15 +1069,16 @@ func (b *coverageBoard) uncoveredPotentials(root string, cands []CallVariant) []
 	return res
 }
 
-// pickByCoveragePotential samples a candidate with probability proportional
-// to its uncovered plannable-cell count (potential roulette). Roulette, not
-// argmax, is deliberate: argmax would direct the whole budget onto a single
-// combo until its potential drains below the runner-up, whereas roulette
-// spreads across combos in proportion to what they still have to offer.
+// pickByDirectedPairPotential samples a candidate with probability
+// proportional to its uncovered directed-pair cell count (potential roulette).
+// Roulette, not argmax, is deliberate: argmax would direct the whole budget
+// onto a single combo until its potential drains below the runner-up, whereas
+// roulette spreads across combos in proportion to what they still have to
+// offer.
 // Returns (nil, 0) when every candidate has zero potential (so the caller
 // falls back to the weighted sampler).
-func pickByCoveragePotential(cand []CallVariant, rootCall string, r *rand.Rand) (*CallVariant, int) {
-	pots := covBoard.uncoveredPotentials(rootCall, cand)
+func pickByDirectedPairPotential(cand []CallVariant, rootCall string, r *rand.Rand) (*CallVariant, int) {
+	pots := covBoard.directedPairPotentials(rootCall, cand)
 	idx := pickWeightedIndex(pots, r)
 	if idx < 0 {
 		return nil, 0
@@ -1072,8 +1112,9 @@ func pickWeightedIndex(pots []int, r *rand.Rand) int {
 	return -1
 }
 
-// uncoveredPotential is the single-combo variant of uncoveredPotentials.
-func (b *coverageBoard) uncoveredPotential(root, variant string, rel PathRelation) int {
+// directedPairPotential is the single-combo variant of
+// directedPairPotentials.
+func (b *coverageBoard) directedPairPotential(root, variant string, rel PathRelation) int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if !b.ready {
@@ -1106,7 +1147,7 @@ func (b *coverageBoard) uncoveredPotential(root, variant string, rel PathRelatio
 // standalone variant forms. fn receives the full cell. The caller must hold
 // b.mu for reading.
 func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKey)) {
-	if !b.ready || b.unreachable[ck] || !b.plannableComboEnabled(ck) {
+	if !b.ready || b.unreachable[ck] || !b.directedPairComboEnabled(ck) {
 		return
 	}
 	prod, ok := b.plannable[ck]
@@ -1172,13 +1213,13 @@ func (b *coverageBoard) forEachUncoveredCell(ck comboKey, fn func(off, depth uin
 	})
 }
 
-// uncoveredOffPots aggregates, for every combo whose variant is in variants
-// (any root and relation), the uncovered cells per offset bucket. The result
-// is indexed by the offset bucket value (offsetBucketNA..offsetBucketBeyond).
+// directedPairOffPots aggregates, for every combo whose variant is in variants
+// (any A-side call and relation), the uncovered cells per offset bucket. The
+// result is indexed by the offset bucket value (offsetBucketNA..offsetBucketBeyond).
 // RetENOENT cells are skipped: a failed path lookup never enters the offset
 // bucket space (offsetBucketOf requires an offset FuncID), so the model's
 // ENOENT x bucket cells are unobservable for this margin.
-func (b *coverageBoard) uncoveredOffPots(variants []string) [5]int {
+func (b *coverageBoard) directedPairOffPots(variants []string) [5]int {
 	var pots [5]int
 	if len(variants) == 0 {
 		return pots
@@ -1208,10 +1249,10 @@ func (b *coverageBoard) uncoveredOffPots(variants []string) [5]int {
 	return pots
 }
 
-// uncoveredDepthPots aggregates the uncovered cells of one combo per depth
+// directedPairDepthPots aggregates the uncovered cells of one combo per depth
 // bucket (the DepthB margin). ENOENT cells count here: a failed lookup has a
 // real path and depth even though its offset bucket is NA.
-func (b *coverageBoard) uncoveredDepthPots(root, variant string, rel PathRelation) [4]int {
+func (b *coverageBoard) directedPairDepthPots(root, variant string, rel PathRelation) [4]int {
 	var pots [4]int
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1386,13 +1427,11 @@ func (b *coverageBoard) cellUnreachableCount() int {
 	return len(b.cellUnreachable)
 }
 
-// comboSelectableFlags reports which of the given combos are in the plannable
-// grid and not suppressed at the combo (directed) scope. Batch form used by the
-// Phase 2b plan enumerator. Zero-potential combos stay selectable here; the
-// potential filters (comboPotentials / uncoveredPotentials) decide whether
-// they are worth targeting. Keeping zero combos membership-true also preserves
-// HMDFS's legacy causal-C2 prefilter behavior.
-func (b *coverageBoard) comboSelectableFlags(cks []comboKey) map[comboKey]bool {
+// rootDirectedSelectableFlags reports which of the given root-directed combos
+// are in the plannable grid and not suppressed at the combo scope. Batch form
+// used by the Phase 2b plan enumerator. Zero-potential combos stay selectable
+// here; rootDirectedPotentials decides whether they are worth targeting.
+func (b *coverageBoard) rootDirectedSelectableFlags(cks []comboKey) map[comboKey]bool {
 	res := make(map[comboKey]bool, len(cks))
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1400,7 +1439,7 @@ func (b *coverageBoard) comboSelectableFlags(cks []comboKey) map[comboKey]bool {
 		return res
 	}
 	for _, ck := range cks {
-		if b.unreachable[ck] || !b.plannableComboEnabled(ck) {
+		if b.unreachable[ck] || !b.rootDirectedComboEnabled(ck) {
 			continue
 		}
 		if _, ok := b.plannable[ck]; ok {
@@ -1410,17 +1449,16 @@ func (b *coverageBoard) comboSelectableFlags(cks []comboKey) map[comboKey]bool {
 	return res
 }
 
-// comboPotentials returns the 2b-available uncovered potential of each combo
-// in one batch (0 when the board is not ready, the combo is outside the
-// plannable grid, has no plannable cells, or is suppressed at the combo
-// scope). plannableFound[t] counts distinct discovered plannable cells and
-// cellSuppressed subtracts the cells the 2b miss ledger currently suppresses,
-// so a combo whose remaining uncovered cells are all cell-suppressed reads 0
-// and the planner skips it immediately instead of waiting for the combo-level
-// blind-pick retirement. The 2a APIs (uncoveredPotentials / CoveragePotential)
-// use the same plannable layer; generation-side natural observations remain in
-// the observed/model ledgers but are not active targets.
-func (b *coverageBoard) comboPotentials(cks []comboKey) []int {
+// rootDirectedPotentials returns the 2b-available uncovered potential of each
+// root-directed combo in one batch (0 when the board is not ready, the combo is
+// outside the root-directed grid, has no plannable cells, or is suppressed at
+// the combo scope). plannableFound[t] counts distinct discovered plannable
+// cells and cellSuppressed subtracts the cells the 2b miss ledger currently
+// suppresses, so a combo whose remaining uncovered cells are all
+// cell-suppressed reads 0 and the planner skips it immediately. The generic
+// directed-pair APIs (directedPairPotentials / DirectedPairPotential) keep
+// accepting anchor calls such as rmdir.
+func (b *coverageBoard) rootDirectedPotentials(cks []comboKey) []int {
 	res := make([]int, len(cks))
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -1428,11 +1466,11 @@ func (b *coverageBoard) comboPotentials(cks []comboKey) []int {
 		return res
 	}
 	for i, ck := range cks {
-		if b.unreachable[ck] {
+		if b.unreachable[ck] || !b.rootDirectedComboEnabled(ck) {
 			continue
 		}
 		prod, ok := b.plannable[ck]
-		if !ok || !b.plannableComboEnabled(ck) {
+		if !ok {
 			continue
 		}
 		found := b.plannableFound[ck]
@@ -1478,8 +1516,11 @@ func (b *coverageBoard) layerStats() CoverageSnapshot {
 	for _, f := range b.plannableFound {
 		s.PlannableFound += f[0] + f[1]
 	}
-	for _, p := range b.plannable {
+	for ck, p := range b.plannable {
 		s.PlannableTarget += p[0] + p[1]
+		if b.rootDirectedComboEnabled(ck) {
+			s.RootPlannableTarget += p[0] + p[1]
+		}
 	}
 	s.OutOfModel = s.ObservedCells - s.ModelFound
 	return s

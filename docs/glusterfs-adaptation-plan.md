@@ -1474,6 +1474,11 @@ C1 root:
   fsync, fdatasync, getdents64, unlink, mkdir, creat, rename,
   link, symlink, setxattr
 
+rmdir:
+  DCT/model root, C2 variant, C1 anchor 支持；
+  C1/normal directed root 不支持（Success 空目录 / ENOTEMPTY 非空目录
+  两种 root 形态尚未同时进入 fixed-root planner）。
+
 C2 variant:
   open, stat, chmod, fsync, fdatasync, getdents64, read, write,
   pread64, pwrite64, truncate, rmdir, rename, unlink, mkdir, creat,
@@ -1734,6 +1739,13 @@ read(L1) + write(T)
   同 cell 由 `cellKey` 去重，不同 relation 分别记录；
 - `DagPairToVariant` 不改；readlink 非 symlink root 由 producible/cellInModel
   过滤。
+- `comboKey.Root` 是 A 侧 call 名，不区分 root/anchor：在 root-directed
+  planner 里它是 root，在 group/PathSet 的 directed pair 里它可能是 anchor。
+  因此 `Plannable*` 是 generic directed-pair 层；`RootPlannableTarget` 才是
+  root-directed 子集。
+- `rmdir-root` 是 model-only：DCT root、C2 variant、C1 anchor 都支持；
+  `rootDirectedComboEnabled` 根据 `DirectedRootCalls` 排除它，但不把
+  `DirectedPairPotential`/`DirectedPairDepthPots` 等 anchor 视图一起清零。
 
 producible 表：
 

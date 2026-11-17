@@ -546,7 +546,7 @@ func pickPathSetTarget(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *
 					continue
 				}
 			}
-			pot := CoveragePotential(anchorName, name, rel)
+			pot := DirectedPairPotential(anchorName, name, rel)
 			if pot <= 0 {
 				continue
 			}
@@ -562,7 +562,7 @@ func pickPathSetTarget(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *
 	member := members[idx]
 	rel := pickedRels[idx]
 	memberName := pathSetCallName(ps, member.Pos)
-	depths := covBoard.uncoveredDepthPots(anchorName, memberName, rel)
+	depths := covBoard.directedPairDepthPots(anchorName, memberName, rel)
 	depths[0] = 0
 	depth := pickWeightedIndex(depths[:], r.Rand)
 	if depth <= 0 {

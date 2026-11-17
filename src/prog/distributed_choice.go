@@ -1872,7 +1872,7 @@ func (dct *DistributedChoiceTable) chooseVariant(rootCall string, r *rand.Rand, 
 	// roulette); exhausted/unreachable candidates fall back to the normal
 	// sampler (never aim at a combo with nothing left to offer).
 	if allowDirected && CoverageBoardReady() && r.Float64() < directedBiasProb {
-		if v, pot := pickByCoveragePotential(cand, rootCall, r); v != nil {
+		if v, pot := pickByDirectedPairPotential(cand, rootCall, r); v != nil {
 			if !covBoard.direction3ShapeDrain(rootCall, v.CallName, v.PathRelation, basePath, !baseIsFile) {
 				covBoard.noteDirectedPick(comboKey{Root: rootCall, Variant: v.CallName, Rel: v.PathRelation}, pot)
 				return v

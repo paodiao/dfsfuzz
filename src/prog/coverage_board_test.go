@@ -38,14 +38,14 @@ func mkCoveragePair(rootCall, variantCall string, rel PathRel, temporal Temporal
 	}
 }
 
-// TestCoveragePotentialArithmetic pins the arithmetic producible model for a
+// TestDirectedPairPotentialArithmetic pins the arithmetic producible model for a
 // representative combo: write x write @ Same with persist=on and depths
 // {1,2,3} has retA pinned to Success, so 1x2x4x2x3x1 = 48 cells per temporal
 // form; there is no target subset (full scoring), so both forms count:
 // 48+48 = 96.
-func TestCoveragePotentialArithmetic(t *testing.T) {
+func TestDirectedPairPotentialArithmetic(t *testing.T) {
 	newTestCoverageBoard(t)
-	if pot := CoveragePotential("write", "write", PathSame); pot != 96 {
+	if pot := DirectedPairPotential("write", "write", PathSame); pot != 96 {
 		t.Fatalf("potential = %d, want 96", pot)
 	}
 }
@@ -53,7 +53,7 @@ func TestCoveragePotentialArithmetic(t *testing.T) {
 // TestCoverageModifierGates pins the ExtractPairs-based producible gates:
 // HB needs a modifier root, CC needs at least one modifier side, and a combo
 // with two non-modifier sides produces nothing. Numbers use the same fake
-// board as TestCoveragePotentialArithmetic (persist on, depths {1,2,3});
+// board as TestDirectedPairPotentialArithmetic (persist on, depths {1,2,3});
 // read/write/mkdir variants are single-type (file/dir).
 func TestCoverageModifierGates(t *testing.T) {
 	newTestCoverageBoard(t)
@@ -68,8 +68,8 @@ func TestCoverageModifierGates(t *testing.T) {
 		{"write", "write", 96}, // HB+CC regression anchor
 	}
 	for _, c := range cases {
-		if pot := CoveragePotential(c.root, c.variant, PathSame); pot != c.want {
-			t.Fatalf("CoveragePotential(%s,%s,Same) = %d, want %d", c.root, c.variant, pot, c.want)
+		if pot := DirectedPairPotential(c.root, c.variant, PathSame); pot != c.want {
+			t.Fatalf("DirectedPairPotential(%s,%s,Same) = %d, want %d", c.root, c.variant, pot, c.want)
 		}
 	}
 }
@@ -99,8 +99,8 @@ func TestCoveragePersistDepth(t *testing.T) {
 		{"write", "read", 32},  // 1x4x1x4 per form, HB+CC
 	}
 	for _, c := range cases {
-		if pot := CoveragePotential(c.root, c.variant, PathSame); pot != c.want {
-			t.Fatalf("deep persist: CoveragePotential(%s,%s,Same) = %d, want %d",
+		if pot := DirectedPairPotential(c.root, c.variant, PathSame); pot != c.want {
+			t.Fatalf("deep persist: DirectedPairPotential(%s,%s,Same) = %d, want %d",
 				c.root, c.variant, pot, c.want)
 		}
 	}
@@ -120,7 +120,7 @@ func TestCoveragePersistDepth(t *testing.T) {
 	if covBoard.depths[3] {
 		t.Fatal("bucket 3 unexpectedly modeled by the shallow test tree")
 	}
-	if pot := CoveragePotential("write", "write", PathSame); pot != 32 {
+	if pot := DirectedPairPotential("write", "write", PathSame); pot != 32 {
 		t.Fatalf("out-of-domain persist: potential = %d, want 32", pot)
 	}
 }
@@ -130,15 +130,15 @@ func TestCoveragePersistDepth(t *testing.T) {
 // cell is idempotent.
 func TestCoverageRecordPair(t *testing.T) {
 	newTestCoverageBoard(t)
-	pot0 := CoveragePotential("write", "write", PathSame)
+	pot0 := DirectedPairPotential("write", "write", PathSame)
 	p := mkCoveragePair("write", "write", PathSamePath, TemporalHB,
 		RetSuccess, RetFailure, "merge_view/persist/f")
 	RecordCoveragePairs([]DAGPair{p})
-	if pot := CoveragePotential("write", "write", PathSame); pot != pot0-1 {
+	if pot := DirectedPairPotential("write", "write", PathSame); pot != pot0-1 {
 		t.Fatalf("potential after first record = %d, want %d", pot, pot0-1)
 	}
 	RecordCoveragePairs([]DAGPair{p})
-	if pot := CoveragePotential("write", "write", PathSame); pot != pot0-1 {
+	if pot := DirectedPairPotential("write", "write", PathSame); pot != pot0-1 {
 		t.Fatalf("potential after duplicate record = %d, want %d", pot, pot0-1)
 	}
 	found, target := CoverageStats()
@@ -176,8 +176,8 @@ func TestCoverageBiasPickRoulette(t *testing.T) {
 		{CallName: "stat", PathRelation: PathSame},
 		{CallName: "getdents64", PathRelation: PathSame},
 	}
-	pots := covBoard.uncoveredPotentials("mkdir", cand)
-	v, pot := pickByCoveragePotential(cand, "mkdir", r)
+	pots := covBoard.directedPairPotentials("mkdir", cand)
+	v, pot := pickByDirectedPairPotential(cand, "mkdir", r)
 	if v == nil || pot <= 0 {
 		t.Fatalf("roulette pick = %v pot=%d, want non-nil >0", v, pot)
 	}
@@ -198,7 +198,7 @@ func TestCoverageBiasPickRoulette(t *testing.T) {
 func TestCoverageUnreachableRetirement(t *testing.T) {
 	newTestCoverageBoard(t)
 	ck := comboKey{Root: "write", Variant: "truncate", Rel: PathSame}
-	pot0 := CoveragePotential(ck.Root, ck.Variant, ck.Rel)
+	pot0 := DirectedPairPotential(ck.Root, ck.Variant, ck.Rel)
 	if pot0 <= 0 {
 		t.Fatalf("combo has no potential: %d", pot0)
 	}
@@ -208,7 +208,7 @@ func TestCoverageUnreachableRetirement(t *testing.T) {
 	if !covBoard.unreachable[ck] {
 		t.Fatal("combo not marked unreachable after threshold misses")
 	}
-	if pot := CoveragePotential(ck.Root, ck.Variant, ck.Rel); pot != 0 {
+	if pot := DirectedPairPotential(ck.Root, ck.Variant, ck.Rel); pot != 0 {
 		t.Fatalf("directed-scope potential = %d, want 0 for a suppressed combo", pot)
 	}
 	// A discovery lifts the suppression.
@@ -221,7 +221,7 @@ func TestCoverageUnreachableRetirement(t *testing.T) {
 	if covBoard.unreachable[ck] {
 		t.Fatal("suppression not lifted by a discovery")
 	}
-	if pot := CoveragePotential(ck.Root, ck.Variant, ck.Rel); pot != pot0-1 {
+	if pot := DirectedPairPotential(ck.Root, ck.Variant, ck.Rel); pot != pot0-1 {
 		t.Fatalf("directed potential after discovery = %d, want %d", pot, pot0-1)
 	}
 }
@@ -307,7 +307,7 @@ func TestCoverageUnreachableRebaseline(t *testing.T) {
 			t.Fatalf("combo marked unreachable despite production in window %d", i/cadence)
 		}
 	}
-	if pot := CoveragePotential(ck.Root, ck.Variant, ck.Rel); pot <= 0 {
+	if pot := DirectedPairPotential(ck.Root, ck.Variant, ck.Rel); pot <= 0 {
 		t.Fatalf("productive combo potential = %d, want > 0", pot)
 	}
 }
@@ -340,7 +340,7 @@ func TestCoverageBoardNotReady(t *testing.T) {
 	if CoverageBoardReady() {
 		t.Fatal("board reported ready before init")
 	}
-	if pot := CoveragePotential("mkdir", "write", PathSame); pot != 0 {
+	if pot := DirectedPairPotential("mkdir", "write", PathSame); pot != 0 {
 		t.Fatalf("potential before init = %d, want 0", pot)
 	}
 	RecordCoveragePairs([]DAGPair{mkCoveragePair("mkdir", "write", PathSamePath, TemporalHB,
@@ -349,7 +349,7 @@ func TestCoverageBoardNotReady(t *testing.T) {
 		t.Fatalf("records before init counted: %d", found)
 	}
 	cand := []CallVariant{{CallName: "write", PathRelation: PathSame}}
-	if v, pot := pickByCoveragePotential(cand, "mkdir", rand.New(rand.NewSource(1))); v != nil || pot != 0 {
+	if v, pot := pickByDirectedPairPotential(cand, "mkdir", rand.New(rand.NewSource(1))); v != nil || pot != 0 {
 		t.Fatalf("directed pick before init = %v/%d, want nil/0", v, pot)
 	}
 }
@@ -443,13 +443,13 @@ func TestCoverageDepthDomain(t *testing.T) {
 	if covBoard.cellUncovered(ck) {
 		t.Fatal("unmodeled-depth cell accepted as a directed target")
 	}
-	pot0 := CoveragePotential(combo.Root, combo.Variant, combo.Rel)
+	pot0 := DirectedPairPotential(combo.Root, combo.Variant, combo.Rel)
 	f0 := covBoard.found[combo]
 	RecordCoveragePairs([]DAGPair{deep})
 	if f := covBoard.found[combo]; f[0]+f[1] != f0[0]+f0[1] {
 		t.Fatalf("unmodeled-depth discovery counted: found=%v, want %v", f, f0)
 	}
-	if pot := CoveragePotential(combo.Root, combo.Variant, combo.Rel); pot != pot0 {
+	if pot := DirectedPairPotential(combo.Root, combo.Variant, combo.Rel); pot != pot0 {
 		t.Fatalf("potential changed on unmodeled-depth discovery: %d, want %d", pot, pot0)
 	}
 
@@ -470,7 +470,7 @@ func TestCoverageDepthDomain(t *testing.T) {
 	if f := covBoard.found[combo]; f[0]+f[1] != f0[0]+f0[1]+1 {
 		t.Fatalf("modeled-depth discovery not counted: found=%v, want %v", f, f0[0]+f0[1]+1)
 	}
-	if pot := CoveragePotential(combo.Root, combo.Variant, combo.Rel); pot != pot0-1 {
+	if pot := DirectedPairPotential(combo.Root, combo.Variant, combo.Rel); pot != pot0-1 {
 		t.Fatalf("potential after modeled discovery = %d, want %d", pot, pot0-1)
 	}
 }
@@ -485,7 +485,7 @@ func TestCoverageNoRelExcluded(t *testing.T) {
 	if _, ok := covBoard.producible[ck]; ok {
 		t.Fatal("NoRel combo present in the producible grid")
 	}
-	if pot := CoveragePotential("write", "truncate", PathNoRel); pot != 0 {
+	if pot := DirectedPairPotential("write", "truncate", PathNoRel); pot != 0 {
 		t.Fatalf("directed potential for NoRel = %d, want 0", pot)
 	}
 }
@@ -523,7 +523,7 @@ func TestCoverageEventShapeIgnoresCallNames(t *testing.T) {
 func TestCoverageFoundModelGate(t *testing.T) {
 	newTestCoverageBoard(t)
 	found0, _ := CoverageStats()
-	pot0 := CoveragePotential("mkdir", "stat", PathSame)
+	pot0 := DirectedPairPotential("mkdir", "stat", PathSame)
 	if pot0 <= 0 {
 		t.Fatalf("fixture combo has no potential: %d", pot0)
 	}
@@ -542,12 +542,12 @@ func TestCoverageFoundModelGate(t *testing.T) {
 	if found1, _ := CoverageStats(); found1 != found0 {
 		t.Fatalf("out-of-model observation moved found: %d -> %d", found0, found1)
 	}
-	if pot1 := CoveragePotential("mkdir", "stat", PathSame); pot1 != pot0 {
+	if pot1 := DirectedPairPotential("mkdir", "stat", PathSame); pot1 != pot0 {
 		t.Fatalf("out-of-model observation moved potential: %d -> %d", pot0, pot1)
 	}
 	// The in-model Success form still counts.
 	RecordCoveragePairs([]DAGPair{mkPair(RetSuccess)})
-	if pot2 := CoveragePotential("mkdir", "stat", PathSame); pot2 != pot0-1 {
+	if pot2 := DirectedPairPotential("mkdir", "stat", PathSame); pot2 != pot0-1 {
 		t.Fatalf("in-model observation must decrement potential: %d -> %d", pot0, pot2)
 	}
 	if found2, _ := CoverageStats(); found2 != found0+1 {
@@ -562,7 +562,7 @@ func TestCoverageFoundModelGate(t *testing.T) {
 func TestCoverageVariantNameOutOfDomain(t *testing.T) {
 	newTestCoverageBoard(t)
 	found0, _ := CoverageStats()
-	pot0 := CoveragePotential("open", "pwrite64", PathSame)
+	pot0 := DirectedPairPotential("open", "pwrite64", PathSame)
 	if pot0 <= 0 {
 		t.Fatalf("fixture combo has no potential: %d", pot0)
 	}
@@ -578,7 +578,7 @@ func TestCoverageVariantNameOutOfDomain(t *testing.T) {
 	if found1, _ := CoverageStats(); found1 != found0 {
 		t.Fatalf("variant-name observation moved found: %d -> %d", found0, found1)
 	}
-	if pot := CoveragePotential("open", "pwrite64", PathSame); pot != pot0 {
+	if pot := DirectedPairPotential("open", "pwrite64", PathSame); pot != pot0 {
 		t.Fatalf("variant-name observation moved the base combo potential: %d -> %d", pot0, pot)
 	}
 	if ck, ok := cellKeyOf(&p, covBoard.persistDir); !ok || covBoard.discovered[ck] == 0 {
@@ -595,7 +595,7 @@ func TestCoverageTruncateENOENTModel(t *testing.T) {
 	newTestCoverageBoard(t)
 	// open root is a non-modifier; truncate is a modifier -> CC only.
 	// typeList {file}, depthMult 6, offCount 4 (Success) + 1 (ENOENT) = 5.
-	if pot := CoveragePotential("open", "truncate", PathSame); pot != 30 {
+	if pot := DirectedPairPotential("open", "truncate", PathSame); pot != 30 {
 		t.Fatalf("open/truncate potential = %d, want 30", pot)
 	}
 	if covBoard.cellInModel(cellKey{
@@ -620,23 +620,24 @@ func TestCoverageTruncateENOENTModel(t *testing.T) {
 	if found1, _ := CoverageStats(); found1 != found0+1 {
 		t.Fatalf("truncate ENOENT observation must count: found %d -> %d", found0, found1)
 	}
-	if pot := CoveragePotential("open", "truncate", PathSame); pot != 29 {
+	if pot := DirectedPairPotential("open", "truncate", PathSame); pot != 29 {
 		t.Fatalf("potential after truncate ENOENT = %d, want 29", pot)
 	}
 }
 
-// TestCoverageComboPotentialsCellSuppressed pins the 2b-available potential:
-// comboPotentials subtracts the cells the 2b miss ledger currently suppresses
-// (a fully cell-suppressed combo reads 0 immediately), while the 2a model API
-// CoveragePotential keeps the raw model potential.
-func TestCoverageComboPotentialsCellSuppressed(t *testing.T) {
+// TestCoverageRootDirectedPotentialsCellSuppressed pins the 2b-available
+// potential: rootDirectedPotentials subtracts the cells the 2b miss ledger
+// currently suppresses
+// (a fully cell-suppressed combo reads 0 immediately), while the generic
+// DirectedPairPotential view keeps the raw directed-pair potential.
+func TestCoverageRootDirectedPotentialsCellSuppressed(t *testing.T) {
 	newTestCoverageBoard(t)
 	ck := comboKey{Root: "write", Variant: "write", Rel: PathSame}
-	pot0 := CoveragePotential(ck.Root, ck.Variant, ck.Rel)
+	pot0 := DirectedPairPotential(ck.Root, ck.Variant, ck.Rel)
 	if pot0 <= 0 {
 		t.Fatalf("fixture combo has no potential: %d", pot0)
 	}
-	if got := covBoard.comboPotentials([]comboKey{ck})[0]; got != pot0 {
+	if got := covBoard.rootDirectedPotentials([]comboKey{ck})[0]; got != pot0 {
 		t.Fatalf("available potential = %d, want %d", got, pot0)
 	}
 	var cells []cellKey
@@ -652,10 +653,10 @@ func TestCoverageComboPotentialsCellSuppressed(t *testing.T) {
 	if got := covBoard.cellSuppressed[ck]; got != len(cells) {
 		t.Fatalf("suppressed counter = %d, want %d", got, len(cells))
 	}
-	if got := covBoard.comboPotentials([]comboKey{ck})[0]; got != 0 {
+	if got := covBoard.rootDirectedPotentials([]comboKey{ck})[0]; got != 0 {
 		t.Fatalf("fully suppressed combo available potential = %d, want 0", got)
 	}
-	if got := CoveragePotential(ck.Root, ck.Variant, ck.Rel); got != pot0 {
+	if got := DirectedPairPotential(ck.Root, ck.Variant, ck.Rel); got != pot0 {
 		t.Fatalf("2a model potential moved: %d -> %d", pot0, got)
 	}
 	// A hit on a suppressed cell discovers it (found+1) and clears its
@@ -663,13 +664,13 @@ func TestCoverageComboPotentialsCellSuppressed(t *testing.T) {
 	// unavailable as a plan target; the raw 2a model potential drops by the
 	// one now-discovered cell (it ignores suppression but subtracts found).
 	covBoard.noteDirectedHit(cells[0])
-	if got := covBoard.comboPotentials([]comboKey{ck})[0]; got != 0 {
+	if got := covBoard.rootDirectedPotentials([]comboKey{ck})[0]; got != 0 {
 		t.Fatalf("available potential after one hit = %d, want 0", got)
 	}
 	if got := covBoard.cellSuppressed[ck]; got != len(cells)-1 {
 		t.Fatalf("suppressed counter after hit = %d, want %d", got, len(cells)-1)
 	}
-	if got := CoveragePotential(ck.Root, ck.Variant, ck.Rel); got != pot0-1 {
+	if got := DirectedPairPotential(ck.Root, ck.Variant, ck.Rel); got != pot0-1 {
 		t.Fatalf("2a model potential after hit: %d -> %d, want %d", pot0, got, pot0-1)
 	}
 	// A discovered cell can no longer be re-suppressed (noteDirectedMiss
@@ -677,7 +678,7 @@ func TestCoverageComboPotentialsCellSuppressed(t *testing.T) {
 	for i := 0; i < cellMissThreshold; i++ {
 		covBoard.noteDirectedMiss(cells[0])
 	}
-	if got := covBoard.comboPotentials([]comboKey{ck})[0]; got != 0 {
+	if got := covBoard.rootDirectedPotentials([]comboKey{ck})[0]; got != 0 {
 		t.Fatalf("available potential after re-suppression = %d, want 0", got)
 	}
 }
@@ -851,7 +852,7 @@ func TestCoverageShapeDrainFallback(t *testing.T) {
 	// Cross-check the guard, not saturation: a non-open combo still has cell
 	// potential, yet its candidate shapes are all known, so the skipped
 	// directed budget is the guard's doing.
-	if pot := CoveragePotential("mkdir", "stat", PathSame); pot == 0 {
+	if pot := DirectedPairPotential("mkdir", "stat", PathSame); pot == 0 {
 		t.Fatal("fixture: drained combo has no cell potential")
 	}
 	if !covBoard.shapeDrained(comboKey{Root: "mkdir", Variant: "stat", Rel: PathSame},

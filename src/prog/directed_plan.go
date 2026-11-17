@@ -1765,7 +1765,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	}
 	// Live combos only: plannable, not combo-suppressed, and with potential
 	// left. plannableFound[t] counts distinct discovered plannable cells and
-	// comboPotentials subtracts the currently cell-suppressed cells, so
+	// rootDirectedPotentials subtracts the currently cell-suppressed cells, so
 	// potential 0 means no 2b-available cell is left (discovered or
 	// suppressed): the prefilter is exact for the planner, not just an
 	// optimization.
@@ -1781,8 +1781,8 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 			}
 		}
 	}
-	enabled := covBoard.comboSelectableFlags(combos)
-	pots := covBoard.comboPotentials(combos)
+	enabled := covBoard.rootDirectedSelectableFlags(combos)
+	pots := covBoard.rootDirectedPotentials(combos)
 	rootsByVariantRel := make(map[string]map[PathRelation][]string)
 	comboLive := make(map[comboKey]bool, len(combos))
 	for i, ck := range combos {
