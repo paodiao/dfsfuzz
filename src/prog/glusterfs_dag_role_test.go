@@ -79,13 +79,14 @@ func TestGlusterfsLinkBCellUsesTarget(t *testing.T) {
 	}
 }
 
-// TestGlusterfsRenamePairStillUsesLegacyPath pins the deliberate scope of the
-// role-path patch: rename-involved pairs keep the legacy union relation and
-// dst-based cell path until the src/dst semantics are decided separately.
-func TestGlusterfsRenamePairStillUsesLegacyPath(t *testing.T) {
+// TestGlusterfsRenameBUsesSourcePath pins the B-side rule: rename B's
+// relation/cell path is the source, while the destination is only used to
+// materialize rename(src,dst). A write at the destination before the rename is
+// a sibling, not the same path.
+func TestGlusterfsRenameBUsesSourcePath(t *testing.T) {
 	write := DAGVertex{
 		FuncID: FuncWrite, CallName: "write",
-		Path: "dirA/a", RetBucket: RetSuccess,
+		Path: "dirA/b", RetBucket: RetSuccess,
 		Stime: 100, Etime: 200, ProgIdx: 0,
 	}
 	rename := DAGVertex{
@@ -98,37 +99,83 @@ func TestGlusterfsRenamePairStillUsesLegacyPath(t *testing.T) {
 		t.Fatalf("hb pairs = %d, want 1: %+v", len(hb), hb)
 	}
 	p := hb[0]
-	if p.APath != "" || p.BPath != "" {
-		t.Fatalf("rename pair unexpectedly got role paths: %+v", p)
+	if p.BPath != "dirA/a" || p.PathRel != PathSameParent {
+		t.Fatalf("rename B pair = %+v, want src dirA/a + SameParent", p)
 	}
 	ck, ok := cellKeyOf(&p, "")
 	if !ok {
 		t.Fatal("cellKeyOf failed for rename pair")
 	}
-	if ck.DepthB != DepthBucketOf("dirA/b") {
-		t.Fatalf("rename DepthB = %d, want destination bucket %d", ck.DepthB, DepthBucketOf("dirA/b"))
+	if ck.DepthB != DepthBucketOf("dirA/a") {
+		t.Fatalf("rename DepthB = %d, want source bucket %d", ck.DepthB, DepthBucketOf("dirA/a"))
 	}
 }
 
-// TestHmdfsLinkPairsKeepLegacySinglePair pins the profile gate: the dual-role
-// extractor is GlusterFS-only, so an HMDFS link-shaped vertex keeps the old
-// single-pair behavior.
-func TestHmdfsLinkPairsKeepLegacySinglePair(t *testing.T) {
-	link := DAGVertex{
-		FuncID: FuncLink, CallName: "link",
-		Path: "merge_view/d/l1", OldPath: "merge_view/d/a",
-		RetBucket: RetSuccess, Stime: 100, Etime: 200, ProgIdx: 0,
+// TestGlusterfsRenameRoleCases covers the four HB orderings that used to be
+// conflated by the {dst,src} union.
+func TestGlusterfsRenameRoleCases(t *testing.T) {
+	mk := func(fid uint32, name, path, old string, st, et uint64) DAGVertex {
+		return DAGVertex{FuncID: fid, CallName: name, Path: path, OldPath: old,
+			RetBucket: RetSuccess, Stime: st, Etime: et, ProgIdx: 0}
 	}
-	unlink := DAGVertex{
-		FuncID: FuncUnlink, CallName: "unlink",
-		Path: "merge_view/d/l1", RetBucket: RetSuccess,
-		Stime: 300, Etime: 400, ProgIdx: 0,
+	cases := []struct {
+		name string
+		a, b DAGVertex
+		rel  PathRel
+		bp   string
+	}{
+		{
+			name: "rename A then stat old source",
+			a:    mk(FuncRename, "rename", "dirA/b", "dirA/a", 100, 200),
+			b:    mk(FuncGetattr, "stat", "dirA/a", "", 300, 400),
+			rel:  PathSameParent, bp: "dirA/a",
+		},
+		{
+			name: "rename A then stat new destination",
+			a:    mk(FuncRename, "rename", "dirA/b", "dirA/a", 100, 200),
+			b:    mk(FuncGetattr, "stat", "dirA/b", "", 300, 400),
+			rel:  PathSamePath, bp: "dirA/b",
+		},
+		{
+			name: "write old source then rename B",
+			a:    mk(FuncWrite, "write", "dirA/a", "", 100, 200),
+			b:    mk(FuncRename, "rename", "dirA/b", "dirA/a", 300, 400),
+			rel:  PathSamePath, bp: "dirA/a",
+		},
+		{
+			name: "write destination then rename B",
+			a:    mk(FuncWrite, "write", "dirA/b", "", 100, 200),
+			b:    mk(FuncRename, "rename", "dirA/b", "dirA/a", 300, 400),
+			rel:  PathSameParent, bp: "dirA/a",
+		},
 	}
-	hb, cc := ExtractPairsFor(hmdfsProfile, []DAGVertex{link, unlink}, nil)
-	if len(cc) != 0 || len(hb) != 1 {
-		t.Fatalf("pairs = hb %d / cc %d, want 1/0", len(hb), len(cc))
+	for _, tc := range cases {
+		hb, _ := ExtractPairsFor(glusterfsProfile, []DAGVertex{tc.a, tc.b}, nil)
+		if len(hb) != 1 {
+			t.Fatalf("%s: hb pairs = %d, want 1: %+v", tc.name, len(hb), hb)
+		}
+		p := hb[0]
+		if p.PathRel != tc.rel || p.BPath != tc.bp {
+			t.Fatalf("%s: pair = %+v, want rel=%v BPath=%q", tc.name, p, tc.rel, tc.bp)
+		}
 	}
-	if hb[0].PathRel != PathSamePath || hb[0].BPath != "" {
-		t.Fatalf("HMDFS pair = %+v, want legacy linkpath Same pair", hb[0])
+}
+
+// TestHmdfsRenameUsesRolePaths pins that the rename rule is shared by HMDFS,
+// not a GlusterFS-only special case.
+func TestHmdfsRenameUsesRolePaths(t *testing.T) {
+	write := DAGVertex{
+		FuncID: FuncWrite, CallName: "write",
+		Path: "merge_view/d/a", RetBucket: RetSuccess,
+		Stime: 100, Etime: 200, ProgIdx: 0,
+	}
+	rename := DAGVertex{
+		FuncID: FuncRename, CallName: "rename",
+		Path: "merge_view/d/b", OldPath: "merge_view/d/a",
+		RetBucket: RetSuccess, Stime: 300, Etime: 400, ProgIdx: 0,
+	}
+	hb, _ := ExtractPairsFor(hmdfsProfile, []DAGVertex{write, rename}, nil)
+	if len(hb) != 1 || hb[0].BPath != "merge_view/d/a" || hb[0].PathRel != PathSamePath {
+		t.Fatalf("HMDFS rename pair = %+v, want source Same", hb)
 	}
 }

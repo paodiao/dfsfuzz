@@ -695,6 +695,21 @@ func pairRolePathsForSide(v *DAGVertex, side pairSide, temporal TemporalRel) []s
 			return []string{target, v.Path}
 		}
 		return []string{target}
+	case "rename":
+		// HB A is the post-state destination; HB B and CC are the
+		// entry-state source. The destination still exists on the vertex for
+		// materialization, but it is not the relation/cell path here.
+		if temporal == TemporalHB && side == pairSideA {
+			if v.Path == "" {
+				return nil
+			}
+			return []string{v.Path}
+		}
+		src := prePath(v)
+		if src == "" {
+			return nil
+		}
+		return []string{src}
 	case "readlink":
 		if v.Path == "" {
 			return nil
@@ -730,14 +745,14 @@ func classifyPairPaths(profile *DFSProfile, A, B *DAGVertex, aPath, bPath string
 	return PathNone
 }
 
-// relationPathsFor returns the path relation(s) for one event pair. GlusterFS
-// link/symlink role pairs are enumerated explicitly; everything else keeps the
-// legacy single-relation behavior (including HMDFS and any rename-involved
-// pair, whose src/dst semantics are handled separately).
+// relationPathsFor returns the path relation(s) for one event pair. Rename and
+// link/symlink role pairs are enumerated explicitly (rename HB A=dst, HB B/CC=
+// src; link/symlink HB A=target/linkpath, HB B/CC=target). Everything else
+// keeps the legacy single-relation behavior.
 func relationPathsFor(profile *DFSProfile, A, B *DAGVertex, ordered bool, temporal TemporalRel) []pairPathRel {
-	if profile != nil && profile.Name == "glusterfs" &&
-		(isLinkSymlinkVertex(A) || isLinkSymlinkVertex(B)) &&
-		!isRenameVertex(A) && !isRenameVertex(B) {
+	if profile != nil &&
+		(isLinkSymlinkVertex(A) || isLinkSymlinkVertex(B) ||
+			isRenameVertex(A) || isRenameVertex(B)) {
 		aPaths := pairRolePathsForSide(A, pairSideA, temporal)
 		bPaths := pairRolePathsForSide(B, pairSideB, temporal)
 		var out []pairPathRel
