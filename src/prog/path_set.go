@@ -254,11 +254,24 @@ func (d *pathDSU) union(a, b int) {
 	}
 }
 
-func normalizePathSetPath(path string) string {
+// normalizePathSetPath aligns a call-argument path with the FileTree namespace.
+// HMDFS keeps its merge_view prefix; GlusterFS has an empty prefix and must
+// not inherit NormalizeMergeViewPath's merge_view/ prepend. FindNode already
+// applies the same prefix internally, so specs must use this canonical form.
+func normalizePathSetPath(ft *FileTree, path string) string {
 	if path == "" {
 		return ""
 	}
-	return NormalizeMergeViewPath(path)
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "/")
+	if ft == nil || ft.Prefix == "" {
+		return path
+	}
+	prefix := strings.TrimSuffix(ft.Prefix, "/")
+	if path == prefix || strings.HasPrefix(path, prefix+"/") {
+		return path
+	}
+	return prefix + "/" + path
 }
 
 func pathSetNodeConstraint(ft *FileTree, path string) int {
@@ -309,7 +322,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 					linkPath := extractPathFromCallByArgIdx(call, 1)
 					target = symlinkCanonicalTarget(linkPath, target)
 				}
-				target = normalizePathSetPath(target)
+				target = normalizePathSetPath(ft, target)
 				if target != "" {
 					node := ft.FindNode(target)
 					if node == nil || !nodeMatchesConstraint(node, constraint) {
@@ -332,8 +345,8 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 			}
 			if strings.Contains(name, "rename") {
 				src, dst := extractRenamePaths(call)
-				src = normalizePathSetPath(src)
-				dst = normalizePathSetPath(dst)
+				src = normalizePathSetPath(ft, src)
+				dst = normalizePathSetPath(ft, dst)
 				sourceType := pathSetNodeConstraint(ft, src)
 				var specs []pathSpec
 				if src != "" {
@@ -361,7 +374,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 			if path == "" {
 				continue
 			}
-			path = normalizePathSetPath(path)
+			path = normalizePathSetPath(ft, path)
 			if path == "" {
 				continue
 			}
@@ -723,7 +736,7 @@ func mapPathSetPath(prefix, path, base string, parent string, roots []string) st
 	return parent + "/" + top + rest
 }
 
-func pathSetFreshParentCreated(ps []*Prog, pos GroupPosition, parent string) bool {
+func pathSetFreshParentCreated(ps []*Prog, ft *FileTree, pos GroupPosition, parent string) bool {
 	if pos.ProgIdx < 0 || pos.ProgIdx >= len(ps) {
 		return false
 	}
@@ -739,7 +752,7 @@ func pathSetFreshParentCreated(ps []*Prog, pos GroupPosition, parent string) boo
 		}
 		name := call.Meta.CallName
 		if strings.Contains(name, "mkdir") {
-			if normalizePathSetPath(extractPathFromCall(call)) == parent {
+			if normalizePathSetPath(ft, extractPathFromCall(call)) == parent {
 				return true
 			}
 		}
@@ -755,7 +768,7 @@ func pathSetParentValidAt(ps []*Prog, pos GroupPosition, parent string, ft *File
 	if node != nil && nodeIsDir(node) {
 		return true
 	}
-	return pathSetFreshParentCreated(ps, pos, parent)
+	return pathSetFreshParentCreated(ps, ft, pos, parent)
 }
 
 func pathSetParentValid(ps []*Prog, pos GroupPosition, path string, ft *FileTree) bool {

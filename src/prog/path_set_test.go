@@ -95,7 +95,7 @@ func TestPathSetFreshParentCreatedOnlyMkdir(t *testing.T) {
 	ps := []*Prog{{Target: target, Calls: []*Call{
 		mkCreat(target, "merge_view/dirA/newfile"),
 	}}}
-	if pathSetFreshParentCreated(ps, GroupPosition{ProgIdx: 0, CallIdx: 1}, "merge_view/dirA/newfile") {
+	if pathSetFreshParentCreated(ps, NewFileTree(), GroupPosition{ProgIdx: 0, CallIdx: 1}, "merge_view/dirA/newfile") {
 		t.Fatal("creat must not count as a directory creator")
 	}
 }
