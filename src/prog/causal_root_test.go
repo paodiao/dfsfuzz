@@ -980,6 +980,47 @@ func TestCausalRootC1RejectsNestedFreshRootPlan(t *testing.T) {
 	}
 }
 
+func TestCausalRootRelPathsLinkTargetOnly(t *testing.T) {
+	cases := []struct {
+		name     string
+		kind     causalRootKind
+		call     string
+		path     string
+		source   string
+		dest     string
+		wantPre  string
+		wantPost string
+	}{
+		{
+			name: "link target", kind: causalRootNormal, call: "link",
+			path: "dirA/a", source: "dirA/a", dest: "dirB/l1",
+			wantPre: "dirA/a", wantPost: "dirA/a",
+		},
+		{
+			name: "symlink target", kind: causalRootNormal, call: "symlink",
+			path: "dirA/a", source: "dirA/a", dest: "dirB/l2",
+			wantPre: "dirA/a", wantPost: "dirA/a",
+		},
+		{
+			name: "rename destination", kind: causalRootRename, call: "rename",
+			path: "dirA/b", source: "dirA/a", dest: "dirA/b",
+			wantPre: "dirA/b", wantPost: "dirA/b",
+		},
+		{
+			name: "ordinary root", kind: causalRootNormal, call: "stat",
+			path: "dirA/a", source: "dirA/a", dest: "dirA/a",
+			wantPre: "dirA/a", wantPost: "dirA/a",
+		},
+	}
+	for _, tc := range cases {
+		pre, post := causalRootRelPaths(tc.kind, tc.call, tc.path, tc.source, tc.dest)
+		if pre != tc.wantPre || post != tc.wantPost {
+			t.Fatalf("%s: paths = %q/%q, want %q/%q",
+				tc.name, pre, post, tc.wantPre, tc.wantPost)
+		}
+	}
+}
+
 func TestCausalRootC1FreshParentEligibility(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	ps := directedPlanBaseProgs(target)

@@ -194,11 +194,21 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 // causalRootRelPaths returns the root's pre/post paths for C2 relation
 // classification. A rename root is the HB A side and uses its destination
 // (post-state) for every relation; all other roots have one effective path.
-func causalRootRelPaths(rootKind causalRootKind, rootPath, rootSource, rootDest string) (string, string) {
+func causalRootRelPaths(rootKind causalRootKind, rootCall, rootPath, rootSource, rootDest string) (string, string) {
 	if rootKind == causalRootRename {
 		// HB A uses the rename's post-state destination. Source/Dest remain
 		// available for materializing rename(src,dst).
 		return rootDest, rootDest
+	}
+	if rootCall == "link" || rootCall == "symlink" {
+		// Ordinary link/symlink variants classify through the target. The
+		// linkpath is a program-local binding and only the readlink variant
+		// (handled separately) observes it.
+		target := rootSource
+		if target == "" {
+			target = rootPath
+		}
+		return target, target
 	}
 	return rootPath, rootPath
 }
@@ -254,7 +264,13 @@ func causalC2ComboLive(profile *DFSProfile, root string) (map[comboKey]bool, boo
 	rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
 	combos := make([]comboKey, 0, len(variants)*len(rels))
 	for variant := range variants {
-		for _, rel := range rels {
+		variantRels := rels
+		if variant == "readlink" {
+			// readlink only follows the root linkpath, so its only
+			// constructible relation is Same.
+			variantRels = []PathRelation{PathSame}
+		}
+		for _, rel := range variantRels {
 			combos = append(combos, comboKey{Root: root, Variant: variant, Rel: rel})
 		}
 	}
@@ -370,10 +386,7 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		planA, planA2 = rootSource, rootDest
 		freshA2 = true
 	}
-	rootPre, rootPost := causalRootRelPaths(rootKind, rootPath, rootSource, rootDest)
-	if (rootCall == "link" || rootCall == "symlink") && rootSource != "" && rootDest != "" {
-		rootPre, rootPost = rootSource, rootDest
-	}
+	rootPre, rootPost := causalRootRelPaths(rootKind, rootCall, rootPath, rootSource, rootDest)
 	destructiveSame := func(varPre string, rel PathRelation) bool {
 		if rel != PathSame {
 			return false
@@ -539,11 +552,13 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			if variant == "rename" {
 				continue // rename is a later stage
 			}
-			if (variant == "link" || variant == "symlink" || variant == "readlink") &&
-				!profile.DualPathCausalEnabled() {
+			if variant == "readlink" {
+				// readlink is the single linkpath-follower form below: its B
+				// must be the root LinkPath, not an arbitrary tree node.
 				continue
 			}
-			if variant == "readlink" && rootCall != "symlink" {
+			if (variant == "link" || variant == "symlink") &&
+				!profile.DualPathCausalEnabled() {
 				continue
 			}
 			if !nodeFitsConstraintFor(profile, bn.directedNode, variant) {
@@ -583,7 +598,9 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		}
 	}
 	if profile.DualPathCausalEnabled() && rootCall == "symlink" && rootDest != "" {
-		if rel, ok := causalPairRelation(rootPre, rootPost, rootDest, rootDest); ok {
+		// readlink observes the linkpath role of the symlink root; the
+		// ordinary target-based root relation does not apply here.
+		if rel, ok := causalPairRelation(rootDest, rootDest, rootDest, rootDest); ok {
 			cell := directedCell{
 				Combo:    comboKey{Root: rootCall, Variant: "readlink", Rel: rel},
 				Temporal: TemporalHB,
@@ -1656,8 +1673,10 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 		rootPre, rootPost = plan.BaseA2, plan.BaseA2
 	}
 	if (plan.Cell.Combo.Root == "link" || plan.Cell.Combo.Root == "symlink") &&
-		plan.RootLinkPath != "" {
-		rootPost = plan.RootLinkPath
+		plan.Cell.Combo.Variant == "readlink" && plan.RootLinkPath != "" {
+		// readlink is the linkpath follower: its B is the root linkpath, so
+		// the root A role is the linkpath, not the target.
+		rootPre, rootPost = plan.RootLinkPath, plan.RootLinkPath
 	}
 	varPre, varPost := plan.BaseB, plan.BaseB
 	if plan.Cell.Combo.Variant == "rename" {

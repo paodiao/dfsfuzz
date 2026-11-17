@@ -210,6 +210,39 @@ func TestValidateCausalPlanReadlink(t *testing.T) {
 	}
 }
 
+func TestValidateCausalPlanLinkRootTargetOnly(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	hmcfg := &Hmdfs_config{Profile: glusterfsProfile, DfsName: "glusterfs", Node_num: 3,
+		Cids: hmdfsSmokeCids(), FileTree: glusterfsPlanTree()}
+	lcs := NewLayeredChoiceStrategy(hmcfg, target)
+	const (
+		targetPath = "dirA/a"
+		sibling    = "dirB/c"
+		linkPath   = "dirB/l1"
+	)
+	node := hmcfg.FileTree.FindNode(sibling)
+	if node == nil {
+		t.Fatalf("sibling %q missing", sibling)
+	}
+	plan := &directedPlan{
+		Cell: directedCell{
+			Combo:    comboKey{Root: "link", Variant: "stat", Rel: PathSibling},
+			RetB:     RetSuccess,
+			OffB:     offsetBucketNA,
+			PersistB: pathInDir(sibling, hmcfg.Persistence_dir),
+			DepthB:   DepthBucketOf(sibling),
+			TypeB:    node.Type != NodeTypeFile,
+		},
+		BaseA:        targetPath,
+		BaseB:        sibling,
+		RootLinkPath: linkPath,
+		Causal:       true,
+	}
+	if validateCausalPlan(hmcfg, lcs, plan) {
+		t.Fatalf("link root relation through linkpath accepted: %+v", plan)
+	}
+}
+
 func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
 	target := hmdfsSmokeTarget(t)
 	if _, ok := target.SyscallMap["symlink"]; !ok {
