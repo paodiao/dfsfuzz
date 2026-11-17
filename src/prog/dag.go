@@ -234,13 +234,21 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 	inoToPathByNode := make(map[int]map[uint64]string)
 	inoToPath := make(map[uint64]string)
 	nodeType := make(map[string]bool)
+	fsMdPrefix := MergeViewPrefix
+	if hmcfg != nil {
+		if hmcfg.FileTree != nil {
+			fsMdPrefix = hmcfg.FileTree.Prefix
+		} else {
+			fsMdPrefix = hmcfg.NamespacePrefix()
+		}
+	}
 	for nodeIdx, fsMd := range fsMds {
 		if fsMd == nil {
 			continue
 		}
 		m := make(map[uint64]string, len(fsMd))
 		for path, md := range fsMd {
-			path = NormalizeMergeViewPath(path) // fsMd keys are "./<rel>" — align with call-argument paths
+			path = NormalizeFsMdPath(fsMdPrefix, path) // fsMd keys are "./<rel>" — align with call-argument paths
 			ino := inoKey(md.StatMd.Ino)
 			if _, ok := m[ino]; !ok {
 				m[ino] = path

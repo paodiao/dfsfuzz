@@ -2512,13 +2512,25 @@ func IsUnderRoot(prefix, path string) bool {
 	return path == root || strings.HasPrefix(path, prefix) || strings.HasPrefix(path, root+"/")
 }
 
+// NormalizeFsMdPath aligns an fsMd key with the active FileTree namespace.
+// fsMd keys are relative to the test cwd and may carry a leading "./"; prefix
+// is the FileTree's namespace (merge_view for HMDFS, empty for GlusterFS).
+func NormalizeFsMdPath(prefix, path string) string {
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "/")
+	if prefix == "" {
+		return path
+	}
+	root := strings.TrimSuffix(prefix, "/")
+	if path == root || strings.HasPrefix(path, root+"/") {
+		return path
+	}
+	return root + "/" + path
+}
+
 // NormalizeMergeViewPath preserves the historical HMDFS wrapper.
 func NormalizeMergeViewPath(path string) string {
-	path = strings.TrimPrefix(path, "./") // fsMd relative keys carry a leading "./"
-	if !strings.HasPrefix(path, MergeViewPrefix) {
-		return MergeViewPrefix + strings.TrimPrefix(path, "/")
-	}
-	return path
+	return NormalizeFsMdPath(MergeViewPrefix, path)
 }
 
 func SortCallVariants(variants []CallVariant) {
@@ -2775,8 +2787,11 @@ func findCidFromHmcfg(path string, hmcfg *Hmdfs_config) string {
 
 func SyncFileTreeFromFsMd(fsMd map[string]FileMetadata, ownerMap map[string]string, hmcfg *Hmdfs_config) {
 	if hmcfg.FileTree == nil {
-		hmcfg.FileTree = NewFileTree()
+		// Keep the namespace profile-aware: GlusterFS uses an empty prefix,
+		// while HMDFS keeps merge_view.
+		hmcfg.FileTree = NewFileTreeForConfig(hmcfg)
 	}
+	fsMdPrefix := hmcfg.FileTree.Prefix
 
 	hmcfg.FileTree.mu.Lock()
 	defer hmcfg.FileTree.mu.Unlock()
@@ -2796,7 +2811,7 @@ func SyncFileTreeFromFsMd(fsMd map[string]FileMetadata, ownerMap map[string]stri
 	// All normalized fsMd paths: an empty directory has no child path in it.
 	paths := make([]string, 0, len(fsMd))
 	for p := range fsMd {
-		paths = append(paths, NormalizeMergeViewPath(p))
+		paths = append(paths, NormalizeFsMdPath(fsMdPrefix, p))
 	}
 	isDirEmpty := func(dirPath string) bool {
 		prefix := dirPath + "/"
@@ -2821,7 +2836,7 @@ func SyncFileTreeFromFsMd(fsMd map[string]FileMetadata, ownerMap map[string]stri
 	}
 
 	for path, md := range fsMd {
-		path = NormalizeMergeViewPath(path) // fsMd keys are "./<rel>" — align with the tree's merge_view/... keys
+		path = NormalizeFsMdPath(fsMdPrefix, path) // fsMd keys are "./<rel>" — align with the tree namespace
 		oldNode := oldNodes[path]
 
 		if oldNode == nil {
