@@ -93,6 +93,24 @@ func TestChooseTemporal(t *testing.T) {
 	}
 }
 
+// TestChooseTemporalIndependentOfVariant pins the contract the DCT insertion
+// path relies on: temporal is chosen before the variant, so the draw must not
+// depend on the variant argument.
+func TestChooseTemporalIndependentOfVariant(t *testing.T) {
+	dct := NewDistributedChoiceTable()
+	readRand := rand.New(rand.NewSource(17))
+	writeRand := rand.New(rand.NewSource(17))
+	readVariant := CallVariant{CallName: "read", PathRelation: PathSame}
+	writeVariant := CallVariant{CallName: "write", PathRelation: PathSibling}
+	for i := 0; i < 40; i++ {
+		gotRead := dct.ChooseTemporal("open", readVariant, readRand)
+		gotWrite := dct.ChooseTemporal("open", writeVariant, writeRand)
+		if gotRead != gotWrite {
+			t.Fatalf("draw %d depends on variant: read=%v write=%v", i, gotRead, gotWrite)
+		}
+	}
+}
+
 // TestFirstBoundaryAfter covers the causal-insertion position: the first
 // boundary at or after refTime. Boundaries of the three calls (windows
 // [100,200] [300,400] [500,600]) are 0 / 200 / 400 / 600.

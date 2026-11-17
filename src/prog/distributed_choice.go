@@ -1967,6 +1967,11 @@ func isDirPath(ft *FileTree, path string) bool {
 // Modifier roots are 50/50; non-modifier roots always use the concurrent form
 // (an HB placement after such a root cannot produce an HB pair of this combo:
 // the earlier vertex would be the non-modifier root).
+// ChooseTemporal selects the temporal form of a root/variant pair. The
+// variant argument is currently intentionally unused: callers must choose the
+// temporal form before selecting the variant and its observed path (a rename
+// root observes the source in CC and the destination in HB). Do not make the
+// draw depend on variant without revisiting those callers.
 func (dct *DistributedChoiceTable) ChooseTemporal(rootCall string, variant CallVariant, r *rand.Rand) TemporalRel {
 	if !isModifierCall(rootCall) {
 		return TemporalConcurrent

@@ -98,7 +98,7 @@ unsupported/ignored，不能静默保留（尤其避免 `readv/writev` 这类“
 | readv/writev alias | 不做 alias；config 不启用 `readv/writev/preadv/pwritev`，只用 `read/pread64/write/pwrite64`。配置校验报告 unsupported。 |
 | Call → Event matcher | 22-call 表；`creat` 和 `open(O_CREAT)` 只映射 `CREATE`，不映射 `FILE_OPEN`；`open` 按 flags 区分 CREATE/DIR_OPEN/FILE_OPEN；`getdents64` → ITERATE。详见 §5.3。 |
 | PathSameInode / hardlink identity | **GlusterFS v1 不做 `PathSameInode`**，不增加 `RelKind`，不改 `cellKey/comboKey`，也不加 `entry_ino`。保留 link/symlink 的 `Path/Path2`、program-local bindings、`HardlinkGroupKey` 和 authority；HMDFS 保持现有分类并折叠为 `PathSame`。源码已确认 LINK/SYMLINK/UNLINK/RMDIR/RENAME 的 `loc.inode` 可用，但 v1 的 DAG 路径改用调用参数/fd provenance，不依赖它（见 §4.3、§5.2）。 |
-| PathSet 双路径 | broad 支持 `link/symlink/readlink/rename`；target/linkpath 都是 canonical 测试根路径，symlink payload 在调用物化时重算；rename dst 由 `RenamePolicy` 在迁移阶段选，existing 优先、fresh 兜底。详见 §8.7。 |
+| PathSet 双路径 | broad 支持 `link/symlink/readlink/rename`；v1 只迁移 link/symlink 的 target，linkpath 是 program-local fresh binding 不随 PathSet 迁移；rename src/dst 都迁移，dst 由 `RenamePolicy` 在迁移阶段选，existing 优先、fresh 兜底。详见 §8.7。 |
 
 补充：
 
@@ -1380,8 +1380,9 @@ readlink:      Source=Dest=linkpath
 ```
 
 DCT/derived 的 observed path 按 temporal 选：CC 取 `Source`（rename=src），
-HB 取 `Dest`（rename=dst）；非 rename root 仍取 `ObservedPath`
-（link/symlink=target，readlink=linkpath）。derived DCT、causal root/directed
+HB 取 `Dest`（rename=dst）；非 rename root 取 `EntryPath`
+（link/symlink=target，readlink=linkpath）。`ObservedPath` 仅保留为 deprecated
+兼容别名，不能用于 rename 的 HB 观察路径。derived DCT、causal root/directed
 共用这套 `RootPaths`，不另写双路径逻辑。
 `RootPaths` 中的 target/linkpath 都是相对测试根的 canonical 路径；symlink
 payload 只在构造 `symlink` 调用时由 `dirname(linkpath)` 到 canonical target
@@ -1448,8 +1449,10 @@ readlink:    不做 C1 anchor
 ```
 
 - link/symlink anchor 的 `anchorNodes` 同时包含 target 和 linkpath；
-- `causalPairRelation(anchor.Source, anchor.Path, ...)` 会看 `{pre, post}`
-  两个候选，target 不会丢；rename anchor 的 A 侧只用 post/dst，不把 src
+- link/symlink anchor 的 A 侧候选是 target/linkpath，
+  `causalPairRelation(anchor.Source, anchor.Path, ...)` 会看 `{pre, post}`
+  两个候选，target 不会丢；
+- rename anchor 的 A 侧只用 post/dst，`src` 只作为 B/CC 候选，不把 src
   当成 A；
 - C1 root 增加 `causalRootDual`：
   - `RootPath = target`（C1 cell 的 B 侧）
@@ -1542,6 +1545,9 @@ C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
 | `rmdir` | target | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | dir |
 | `rename` | src | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | file/dir |
 
+- C2 root 是 link/symlink 时，普通 variant 的 root A 用 target；唯一例外是
+  readlink：B 用 root `LinkPath`，root A 也用 linkpath，relation 只能是
+  `Same`；普通 variant 循环不生成 readlink；
 - link/symlink 的 linkpath fresh，不进 `BaseB`/cell；
 - link/symlink 的 EEXIST 不进入 v1 cell 模型；
 - readlink 只允许 `root=symlink`，不规划 CC，不规划 EINVAL；
@@ -1715,7 +1721,10 @@ read(L1) + write(T)
 - `cellKey`/`comboKey` 不加入 role/RelKind/HardlinkGroupKey；
 - C1 root=link/symlink：B 侧用 target，cell 不记录 linkpath；
 - C2 link/symlink variant：B 侧用 target，linkpath fresh 不进 cell；
-- C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，TypeB=false；
+- C2 root 是 link/symlink 时，普通 variant 的 A 侧用 target；readlink 的
+  A 侧用 root `LinkPath`；
+- C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，relation 只 Same，
+  TypeB=false；
 - C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；
 - C1 rename root：B 侧用 src，dst 只用于 materialize/RetB；
 - getxattr/setxattr：B 侧用 target，TypeB=file/dir；
@@ -1815,15 +1824,16 @@ HMDFS：
 
 PathSet 是 mutation 的路径分量迁移，不是 DCT/定向 cell 规划。现有
 `pathMember.Paths []pathSpec`、`pathSpec.ArgIdx` 和 `applyPathSetPlan` 已经
-支持一个成员多个路径（`rename` 已这样用），v1 不排除双路径调用。
+支持一个成员多个路径（`rename` 已这样用）。v1 对 link/symlink 只迁移
+target；linkpath 是 program-local fresh binding，不进入 PathSet。
 
 #### 8.7.1 支持范围
 
 | 调用 | PathSet broad | PathSet directed target arm |
 |---|---|---|
 | `rename(src,dst)` | 支持；src/dst 都迁移，走 `RenamePolicy` | 不参与；双路径成员整体排除 |
-| `link(target,linkpath)` | 支持；target/linkpath 都迁移 | 不参与；`len(Paths)!=1` |
-| `symlink(target,linkpath)` | 支持；canonical target/linkpath 都迁移，物化时重算 payload | 不参与；`len(Paths)!=1` |
+| `link(target,linkpath)` | 支持；v1 只迁移 target；linkpath 保持 fresh binding | 不参与；`len(Paths)!=1` |
+| `symlink(target,linkpath)` | 支持；v1 只迁移 canonical target；linkpath 保持 fresh binding，物化时重算 payload | 不参与；`len(Paths)!=1` |
 | `readlink(linkpath,...)` | 跟随 symlink linkpath，不独立迁移 | 不参与；call-name gate 显式排除 |
 | `open(O_CREAT)` | 单路径，补 `pathRoleCreat` | 可单路径 target |
 
@@ -1831,23 +1841,26 @@ PathSet 是 mutation 的路径分量迁移，不是 DCT/定向 cell 规划。现
 - `PathSet` 内部只保存 canonical 路径（相对测试根）；不保存 symlink payload。
 - `link/symlink` 的 target **不是 fixed baseline**：它和 `rename` source 一样属于
   路径分量，按 anchor 关系派生并参与映射；target 可以是 baseline existing，也可以是同一程序/plan 中更早 creator 产生、执行时存在的 fresh 路径；映射后必须重新校验存在性/类型。
-- `linkpath` 可以在任意已有父目录下；fresh 且不得与 target 相同。
+- `linkpath` 可以在任意已有父目录下；fresh 且不得与 target 相同。v1 只把
+  linkpath 作为调用参数/readlink follower 使用，不把它加入 PathSet 迁移。
 - `symlink` 的 target 必须是测试根内文件/目录；payload 由
   `dirname(linkpath)` 到 canonical target 计算，允许 `..`，但解析后不得逃出
   测试根。
-- `readlink` 的 linkpath 必须和对应 `symlink` 的 linkpath 同步；不能单独迁移。
 - `link` 的 target 是普通路径参数，按 cwd/test root 解析，不做 payload 转换。
+- 后续若实现 linkpath 迁移，`readlink` 的 linkpath 才需要和对应 symlink 的
+  linkpath 同步；v1 不实现该迁移。
 
 #### 8.7.2 映射与校验
 
-- `buildPathMembers` 为 link/symlink 生成两个 `pathSpec`：
+- v1 的 `buildPathMembers` 为 link/symlink 只生成一个 target `pathSpec`：
   ```text
-  link:     arg0 target (existing/fresh file), arg1 linkpath (fresh file)
-  symlink:  arg0 canonical target (existing/fresh file/dir), arg1 linkpath (fresh symlink)
-  readlink: arg0 linkpath (symlink binding follower)
+  link:     arg0 target (existing/fresh file); arg1 linkpath 不迁移
+  symlink:  arg0 canonical target (existing/fresh file/dir); arg1 linkpath 不迁移
+  readlink: arg0 linkpath (symlink binding follower，不独立迁移)
   ```
-- `pathSpec` 增加 role（或等价的 move policy）：target/linkpath/readlink 三者
-  不能共用一个“普通路径”分支。
+- 后续 linkpath 迁移 feature 才需要为 link/symlink 生成第二个 `pathSpec`
+  （linkpath：fresh file / fresh symlink），并增加 target/linkpath/readlink
+  的 role 区分；v1 不这样做。
 - `symlink` 的 arg0 是 payload，不是 canonical target。新增共享 helper
   `symlinkCanonicalTarget(linkpath, payload)`（解析后必须在测试根内），并在
   以下位置使用：
@@ -1858,35 +1871,29 @@ PathSet 是 mutation 的路径分量迁移，不是 DCT/定向 cell 规划。现
   - `applyPathSetToCall` 的 payload 重算；
   - checker 的 `SymlinkPath` 归一化。
   `link` 的 arg0 是普通路径，不需要这个 helper。
-- `pathSetSpecValidWithParent`：
+- v1 `pathSetSpecValidWithParent`：
   - link target 必须是普通文件；
   - symlink target 必须是文件/目录；
   - target 可以是 baseline 已有路径，或同一 plan 中更早的 creator 产生的
     fresh 路径；映射后必须仍是测试根内路径；
-  - target 校验用 `pathSetTargetValid`，不能只 `FindNode(target)`；需要检查
-    `freshKinds`/`freshLinks`、creator 位置/类型，以及 consumer 之前是否已创建；
-  - linkpath fresh，parent 必须是 baseline 目录或同一 plan 中更早的 fresh
-    `mkdir`；
-  - target != linkpath；
-  - readlink 的 linkpath 必须能找到同一 PathSet/程序中的 symlink。
-- `pathSetMemberValid` 在 `pathSetConnected` 之外检查跨参数约束；不能只看路径
-  连通性。
-- `applyPathSetPlan` 对 symlink 必须两阶段：
-  1. 先映射并写入 linkpath；
-  2. 用新的 canonical target + 新 linkpath 计算 payload；
-  3. 最后写入 target。
-  不能沿用 generic 逐 spec 直接写 arg0，否则会把 canonical target 当 payload
-  写进 symlink。
+  - target != linkpath。
+- 后续 linkpath 迁移 feature 才需要：
+  - `pathSetTargetValid`/`freshKinds`/`freshLinks` 的完整 target 校验；
+  - linkpath fresh、parent 是 baseline 目录或同一 plan 中更早的 fresh `mkdir`；
+  - `pathSetMemberValid` 检查跨参数约束；
+  - `applyPathSetPlan` 对 symlink 两阶段：先写 linkpath，再用新 canonical
+    target + 新 linkpath 计算 payload，最后写 target；
+  - readlink 的 linkpath 与对应 symlink linkpath 同步；
+  - `pathSpec` role/kind 区分 linkpath（fresh file / fresh symlink）。
 - `pathSetTopRoot`/`pathSetTopPath`/`mapPathSetPath`/`pathSetTargetLevel` 改为
   prefix-aware，用 `FileTree.Prefix`/`RootPrefix`，不能硬编码 `MergeViewPrefix`。
-- `pathSetCommonPrefix`/`pathSetRoots` 使用全部可迁移 spec；不要因为 target 是
-  baseline 路径就把它排除。
+- `pathSetCommonPrefix`/`pathSetRoots` 使用全部可迁移 spec；v1 中 link/symlink
+  的可迁移 spec 只有 target。
 - `open(O_CREAT)` 在 `buildPathMembers` 中按 `openCallCreatesFile` 标成
   `pathRoleCreat`，fresh 路径走 `pathFresh`。
-- `pathSpec.Kind`/`TypeConstraint` 必须按 role 填：link target（existing/fresh
-  file）、linkpath（fresh file）、symlink target（existing/fresh file/dir）、
-  symlink linkpath（fresh symlink）、readlink path（binding follower）；不能全
-  用 `relTargetAny`。
+- v1 `pathSpec.Kind`/`TypeConstraint` 只需按 target role 填：link target
+  （existing/fresh file）、symlink target（existing/fresh file/dir）；不能全用
+  `relTargetAny`。
 
 #### 8.7.3 RenamePolicy 在迁移阶段调用
 
@@ -2503,10 +2510,11 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   - symlink target 在所有内部结构中都是相对测试根的 canonical 路径；
     调用 payload 相对 linkpath parent；`readlink`/DAG/checker 能还原 canonical
     target；任何 target/payload 都不能逃出测试根。
-  - PathSet broad 支持 link/symlink/readlink/rename：target/linkpath 都迁移，
-    readlink 跟随 symlink，symlink payload 迁移后重算；rename dst 按
-    `RenamePolicy` 选，existing 优先、fresh 兜底；fresh sibling fallback 在
-    source parent 有效时总可构造。
+  - PathSet broad 支持 link/symlink/readlink/rename：v1 只迁移 link/symlink
+    的 target，linkpath 保持 program-local fresh binding；readlink 不独立迁移；
+    symlink payload 在 target 迁移后重算；rename dst 按 `RenamePolicy` 选，
+    existing 优先、fresh 兜底；fresh sibling fallback 在 source parent 有效时
+    总可构造。
   - PathSet directed target arm 只接受 `len(Paths)==1` 的成员；rename/link/
     symlink 整体排除，readlink 由 call-name gate 排除。
   - PathSet link/symlink target 支持 baseline existing 或更早 creator 的 fresh

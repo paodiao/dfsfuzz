@@ -9,7 +9,7 @@ import (
 func TestDualPathProjection(t *testing.T) {
 	rename := rootPaths("rename", "dir/src", "dir/dst")
 	if rename.Kind != DualRename || rename.Source() != "dir/src" ||
-		rename.Dest() != "dir/dst" || rename.ObservedPath() != "dir/src" {
+		rename.Dest() != "dir/dst" || rename.EntryPath() != "dir/src" {
 		t.Fatalf("rename projection = %+v", rename)
 	}
 	if got := rename.ObservedPathFor(TemporalConcurrent); got != "dir/src" {
@@ -18,19 +18,22 @@ func TestDualPathProjection(t *testing.T) {
 	if got := rename.ObservedPathFor(TemporalHB); got != "dir/dst" {
 		t.Fatalf("rename HB observed = %q, want destination", got)
 	}
+	if got := rename.ObservedPath(); got != "dir/src" {
+		t.Fatalf("deprecated ObservedPath alias = %q, want entry/source", got)
+	}
 	link := rootPaths("link", "dir/a", "dir/l1")
 	if link.Kind != DualLink || link.Source() != "dir/a" ||
-		link.Dest() != "dir/l1" || link.ObservedPath() != "dir/a" {
+		link.Dest() != "dir/l1" || link.EntryPath() != "dir/a" {
 		t.Fatalf("link projection = %+v", link)
 	}
 	sym := rootPaths("symlink", "dir/a", "dir/l2")
 	if sym.Kind != DualSymlink || sym.Source() != "dir/a" ||
-		sym.Dest() != "dir/l2" || sym.ObservedPath() != "dir/a" {
+		sym.Dest() != "dir/l2" || sym.EntryPath() != "dir/a" {
 		t.Fatalf("symlink projection = %+v", sym)
 	}
 	read := rootPaths("readlink", "dir/l2", "dir/l2")
 	if read.Kind != DualReadlink || read.Source() != "dir/l2" ||
-		read.Dest() != "dir/l2" || read.ObservedPath() != "dir/l2" {
+		read.Dest() != "dir/l2" || read.EntryPath() != "dir/l2" {
 		t.Fatalf("readlink projection = %+v", read)
 	}
 }
@@ -56,8 +59,8 @@ func TestDeriveSeedRootPathLinkSymlink(t *testing.T) {
 	if lcs.FileTree.FindNode(link.LinkPath) != nil {
 		t.Fatalf("linkpath unexpectedly exists: %q", link.LinkPath)
 	}
-	if got := link.RootPaths().ObservedPath(); got != anchor.Path {
-		t.Fatalf("link observed path = %q, want target", got)
+	if got := link.RootPaths().EntryPath(); got != anchor.Path {
+		t.Fatalf("link entry path = %q, want target", got)
 	}
 
 	dirAnchor := anchor

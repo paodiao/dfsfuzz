@@ -317,6 +317,10 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				constraint = relTargetAny
 			}
 			if name == "link" || name == "symlink" {
+				// v1 PathSet broad migrates the target only. The linkpath is a
+				// program-local fresh binding and is intentionally not a
+				// pathSpec; adding it requires the deferred linkpath migration
+				// feature (role/validation/two-stage symlink payload).
 				target := extractPathFromCallByArgIdx(call, 0)
 				if name == "symlink" {
 					linkPath := extractPathFromCallByArgIdx(call, 1)
