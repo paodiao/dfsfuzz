@@ -247,6 +247,12 @@ func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
 		if call == "link" && p.Cell.TypeB != false {
 			t.Fatalf("link target type = %v, want file", p.Cell.TypeB)
 		}
+		wantRel, ok := causalPairRelation(p.Anchor.Source, p.Anchor.Path,
+			p.RootPath, p.RootPath)
+		if !ok || p.Anchor.Relation != wantRel {
+			t.Fatalf("%s C1 relation = %v, target %q gives %v (ok=%v)",
+				call, p.Anchor.Relation, p.RootPath, wantRel, ok)
+		}
 	}
 }
 

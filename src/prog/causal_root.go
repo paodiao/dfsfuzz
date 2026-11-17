@@ -752,8 +752,11 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 							!causalRenameRootPathAllowed(anchor, linkPath) {
 							continue
 						}
+						// C1: link/symlink is the B side. The C1 cell and
+						// relation use the target only; linkpath is an
+						// auxiliary binding and must not form a second C1 pair.
 						actualRel, ok := causalPairRelation(anchor.Source, anchor.Path,
-							rootPath, linkPath)
+							rootPath, rootPath)
 						if !ok {
 							continue
 						}
