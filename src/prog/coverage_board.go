@@ -619,6 +619,13 @@ func (b *coverageBoard) computePlannableLocked(ck comboKey) [2]int {
 	if !b.plannableComboEnabled(ck) {
 		return [2]int{}
 	}
+	if ck.Variant == "readlink" {
+		// Directed readlink follows the symlink root's linkpath, so it is
+		// constructible only under a symlink root and only as Same.
+		if ck.Root != "symlink" || ck.Rel != PathSame {
+			return [2]int{}
+		}
+	}
 	if forms, ok := plannableFreshSameFormsFor(b.profile, ck); ok {
 		return b.computeCellCountLocked(ck, forms, nil)
 	}
@@ -748,8 +755,8 @@ func (b *coverageBoard) recordPairs(newPairs []DAGPair) {
 		// stays untouched.
 		if p.A != nil && p.B != nil {
 			shape := hashShape(p.Temporal, p.PathRel,
-				featuresOfPath(p.A, pairAPath(p), b.persistDir),
-				featuresOfPath(p.B, pairBPath(p), b.persistDir))
+				featuresOfPairPath(p.A, pairAPath(p), b.persistDir, p.APathType),
+				featuresOfPairPath(p.B, pairBPath(p), b.persistDir, p.BPathType))
 			if !b.knownShapes[shape] {
 				b.knownShapes[shape] = true
 				b.shapeEpoch++

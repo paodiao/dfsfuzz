@@ -179,3 +179,78 @@ func TestHmdfsRenameUsesRolePaths(t *testing.T) {
 		t.Fatalf("HMDFS rename pair = %+v, want source Same", hb)
 	}
 }
+
+// TestRenameLookupRolePaths pins the lookup role rule: the lookup's resolved
+// Path is the only role candidate. Its OldPath ambiguity must not reintroduce
+// a rename-destination Same pair.
+func TestRenameLookupRolePaths(t *testing.T) {
+	for _, profile := range []*DFSProfile{hmdfsProfile, glusterfsProfile} {
+		rename := DAGVertex{
+			FuncID: FuncRename, CallName: "rename",
+			Path: "dirA/b", OldPath: "dirA/a",
+			RetBucket: RetSuccess, Stime: 100, Etime: 200, ProgIdx: 0,
+		}
+		lookupSource := DAGVertex{
+			FuncID: FuncLookup, CallName: "lookup",
+			Path: "dirA/a", OldPath: "dirA/b",
+			RetBucket: RetSuccess, Stime: 300, Etime: 400, ProgIdx: 0,
+		}
+		hb, _ := ExtractPairsFor(profile, []DAGVertex{rename, lookupSource}, nil)
+		if len(hb) != 1 {
+			t.Fatalf("%s: rename+lookup source pairs = %d, want 1: %+v",
+				profile.Name, len(hb), hb)
+		}
+		p := hb[0]
+		if p.PathRel != PathSameParent || p.BPath != "dirA/a" {
+			t.Fatalf("%s: rename+lookup source pair = %+v, want src Sibling",
+				profile.Name, p)
+		}
+
+		lookupDest := lookupSource
+		lookupDest.Path, lookupDest.OldPath = "dirA/b", "dirA/a"
+		hb, _ = ExtractPairsFor(profile, []DAGVertex{rename, lookupDest}, nil)
+		if len(hb) != 1 || hb[0].PathRel != PathSamePath || hb[0].BPath != "dirA/b" {
+			t.Fatalf("%s: rename+lookup dest pair = %+v, want dst Same",
+				profile.Name, hb)
+		}
+	}
+}
+
+// TestLinkRolePathTypeBit pins the pair-aware type override: a symlink whose
+// target is a directory has a directory target role but a file linkpath role.
+func TestLinkRolePathTypeBit(t *testing.T) {
+	sym := DAGVertex{
+		FuncID: FuncSymlink, CallName: "symlink",
+		Path: "dirA/l2", OldPath: "dirA/a", IsDir: true,
+		RetBucket: RetSuccess, Stime: 100, Etime: 200, ProgIdx: 0,
+	}
+	unlink := DAGVertex{
+		FuncID: FuncUnlink, CallName: "unlink",
+		Path: "dirA/l2", RetBucket: RetSuccess,
+		Stime: 300, Etime: 400, ProgIdx: 0,
+	}
+	hb, _ := ExtractPairsFor(glusterfsProfile, []DAGVertex{sym, unlink}, nil)
+	if len(hb) != 2 {
+		t.Fatalf("symlink HB pairs = %d, want target+linkpath: %+v", len(hb), hb)
+	}
+	byPath := make(map[string]DAGPair, len(hb))
+	for _, p := range hb {
+		byPath[p.APath] = p
+	}
+	target, ok := byPath["dirA/a"]
+	if !ok || target.APathType != pairPathTypeDir {
+		t.Fatalf("target role = %+v, want directory type", target)
+	}
+	link, ok := byPath["dirA/l2"]
+	if !ok || link.APathType != pairPathTypeFile {
+		t.Fatalf("linkpath role = %+v, want file type", link)
+	}
+	tf := featuresOfPairPath(target.A, target.APath, "", target.APathType)
+	lf := featuresOfPairPath(link.A, link.APath, "", link.APathType)
+	if (tf>>10)&1 != 1 {
+		t.Fatalf("target role type bit = %d, want dir", (tf>>10)&1)
+	}
+	if (lf>>10)&1 != 0 {
+		t.Fatalf("linkpath role type bit = %d, want file", (lf>>10)&1)
+	}
+}

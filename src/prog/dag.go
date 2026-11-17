@@ -96,20 +96,40 @@ type DAGVertex struct {
 	Size      uint64 // entry-time file size for write/read/truncate (entry kprobe); else 0
 }
 
+// pairPathType overrides the type bit of a role-selected pair path. The zero
+// value keeps the vertex's IsDir, so pairs without an explicit role (and all
+// non-role pairs) keep their legacy feature vector.
+type pairPathType uint8
+
+const (
+	pairPathTypeDefault pairPathType = iota
+	pairPathTypeFile
+	pairPathTypeDir
+)
+
+func pairPathTypeOf(isDir bool) pairPathType {
+	if isDir {
+		return pairPathTypeDir
+	}
+	return pairPathTypeFile
+}
+
 // DAGPair is an ordered pair of vertices with temporal and path relations.
 //
 // APath/BPath carry the role-selected paths that produced PathRel and feed
-// the coverage cell/event-shape dimensions. They are currently set only for
-// GlusterFS link/symlink role pairs (HB A target/linkpath, HB B/CC target);
-// an empty field means "use A.Path/B.Path", preserving HMDFS and legacy
-// rename behavior.
+// the coverage cell/event-shape dimensions. APathType/BPathType override the
+// type bit when the role path is not the vertex's primary path (link/symlink
+// HB A linkpath role is always a file). An empty APath/BPath means "use
+// A.Path/B.Path"; pairPathTypeDefault then keeps A.IsDir/B.IsDir.
 type DAGPair struct {
-	A        *DAGVertex
-	B        *DAGVertex
-	APath    string
-	BPath    string
-	Temporal TemporalRel
-	PathRel  PathRel
+	A         *DAGVertex
+	B         *DAGVertex
+	APath     string
+	BPath     string
+	APathType pairPathType
+	BPathType pairPathType
+	Temporal  TemporalRel
+	PathRel   PathRel
 }
 
 // DagDiag captures per-round diagnostics of the DAG feedback pipeline
@@ -647,10 +667,18 @@ const (
 	pairSideB
 )
 
+// pairRolePath is one role-selected path and its type-bit override.
+type pairRolePath struct {
+	path string
+	typ  pairPathType
+}
+
 // pairPathRel is one role-selected path pair and its relation.
 type pairPathRel struct {
 	aPath string
 	bPath string
+	aType pairPathType
+	bType pairPathType
 	rel   PathRel
 }
 
@@ -671,12 +699,13 @@ func isRenameVertex(v *DAGVertex) bool {
 	return v.FuncID == FuncRename
 }
 
-// pairRolePathsForSide returns the GlusterFS link/symlink role paths for one
-// side of a pair. HB A enumerates both target and linkpath; HB B and CC use
-// the target only (linkpath is a program-local binding). Other calls keep the
-// single Path. The caller invokes this only for the GlusterFS link/symlink
-// branch; HMDFS and rename-involved pairs keep the legacy candidates.
-func pairRolePathsForSide(v *DAGVertex, side pairSide, temporal TemporalRel) []string {
+// pairRolePathsForSide returns the role paths for one side of a pair. Rename
+// HB A uses the post-state destination; HB B and CC use the entry-state
+// source. Link/symlink HB A enumerates both target and linkpath (the linkpath
+// role is never a directory); HB B and CC use the target only. Lookup keeps
+// only its resolved Path: OldPath is an alternative classification hypothesis,
+// not a second role. Everything else keeps the single Path.
+func pairRolePathsForSide(v *DAGVertex, side pairSide, temporal TemporalRel) []pairRolePath {
 	if v == nil {
 		return nil
 	}
@@ -689,30 +718,46 @@ func pairRolePathsForSide(v *DAGVertex, side pairSide, temporal TemporalRel) []s
 		if target == "" {
 			return nil
 		}
+		targetType := pairPathTypeOf(v.IsDir)
 		if temporal == TemporalHB && side == pairSideA && v.Path != "" && v.Path != target {
-			return []string{target, v.Path}
+			// The linkpath entry itself is a file (hardlink) or a symlink
+			// entry, never a directory, regardless of the target type.
+			return []pairRolePath{
+				{path: target, typ: targetType},
+				{path: v.Path, typ: pairPathTypeFile},
+			}
 		}
-		return []string{target}
+		return []pairRolePath{{path: target, typ: targetType}}
 	case FuncRename:
 		// HB A is the post-state destination; HB B and CC are the
 		// entry-state source. The destination still exists on the vertex for
 		// materialization, but it is not the relation/cell path here.
+		typ := pairPathTypeOf(v.IsDir)
 		if temporal == TemporalHB && side == pairSideA {
 			if v.Path == "" {
 				return nil
 			}
-			return []string{v.Path}
+			return []pairRolePath{{path: v.Path, typ: typ}}
 		}
 		src := prePath(v)
 		if src == "" {
 			return nil
 		}
-		return []string{src}
+		return []pairRolePath{{path: src, typ: typ}}
+	case FuncLookup:
+		// The resolved lookup path is the only role path. OldPath is the
+		// rename source/destination ambiguity candidate used by the legacy
+		// union classifier; consuming it here would reintroduce a false
+		// rename-destination Same pair.
+		if v.Path == "" {
+			return nil
+		}
+		return []pairRolePath{{path: v.Path, typ: pairPathTypeOf(v.IsDir)}}
 	default:
 		if v.Path == "" {
 			return nil
 		}
-		return []string{v.Path}
+		return []pairRolePath{{path: v.Path, typ: pairPathTypeOf(v.IsDir)}}
 	}
 }
 
@@ -743,7 +788,7 @@ func classifyPairPaths(profile *DFSProfile, A, B *DAGVertex, aPath, bPath string
 // src; link/symlink HB A=target/linkpath, HB B/CC=target). Everything else
 // keeps the legacy single-relation behavior.
 func relationPathsFor(profile *DFSProfile, A, B *DAGVertex, ordered bool, temporal TemporalRel) []pairPathRel {
-	if profile != nil && A.FuncID != FuncLookup && B.FuncID != FuncLookup &&
+	if profile != nil &&
 		(isLinkSymlinkVertex(A) || isLinkSymlinkVertex(B) ||
 			isRenameVertex(A) || isRenameVertex(B)) {
 		aPaths := pairRolePathsForSide(A, pairSideA, temporal)
@@ -751,11 +796,14 @@ func relationPathsFor(profile *DFSProfile, A, B *DAGVertex, ordered bool, tempor
 		var out []pairPathRel
 		for _, aPath := range aPaths {
 			for _, bPath := range bPaths {
-				rel := classifyPairPaths(profile, A, B, aPath, bPath)
+				rel := classifyPairPaths(profile, A, B, aPath.path, bPath.path)
 				if rel == PathNone {
 					continue
 				}
-				out = append(out, pairPathRel{aPath: aPath, bPath: bPath, rel: rel})
+				out = append(out, pairPathRel{
+					aPath: aPath.path, bPath: bPath.path,
+					aType: aPath.typ, bType: bPath.typ, rel: rel,
+				})
 			}
 		}
 		return out
@@ -802,7 +850,9 @@ func ExtractPairsFor(profile *DFSProfile, vertices []DAGVertex, diag *DagDiag) (
 				for _, r := range rels {
 					diag.RelHist[r.rel]++
 					ccPairs = append(ccPairs, DAGPair{
-						A: A, B: B, APath: r.aPath, BPath: r.bPath,
+						A: A, B: B,
+						APath: r.aPath, BPath: r.bPath,
+						APathType: r.aType, BPathType: r.bType,
 						Temporal: TemporalConcurrent, PathRel: r.rel,
 					})
 				}
@@ -820,7 +870,9 @@ func ExtractPairsFor(profile *DFSProfile, vertices []DAGVertex, diag *DagDiag) (
 				for _, r := range rels {
 					diag.RelHist[r.rel]++
 					hbPairs = append(hbPairs, DAGPair{
-						A: A, B: B, APath: r.aPath, BPath: r.bPath,
+						A: A, B: B,
+						APath: r.aPath, BPath: r.bPath,
+						APathType: r.aType, BPathType: r.bType,
 						Temporal: TemporalHB, PathRel: r.rel,
 					})
 				}
@@ -838,7 +890,9 @@ func ExtractPairsFor(profile *DFSProfile, vertices []DAGVertex, diag *DagDiag) (
 				for _, r := range rels {
 					diag.RelHist[r.rel]++
 					hbPairs = append(hbPairs, DAGPair{
-						A: B, B: A, APath: r.aPath, BPath: r.bPath,
+						A: B, B: A,
+						APath: r.aPath, BPath: r.bPath,
+						APathType: r.aType, BPathType: r.bType,
 						Temporal: TemporalHB, PathRel: r.rel,
 					})
 				}
@@ -974,10 +1028,8 @@ func callNameOfFunc(fid uint32) string {
 // preserve the relation established through its pre path (source), so a
 // post-only check drops the rename Parent/Child forms (variant rename + Parent
 // and root rename + Child in particular). The cell's depth/persist dims are
-// taken from pairBPath: for role-selected link/symlink pairs that is the
-// target, while legacy rename pairs still use B's post path (dst), which is
-// sound because every generated HMDFS destination is a same-parent sibling of
-// its source; cross-parent rename would need the matched B path instead.
+// taken from pairBPath: for rename B/CC that is the entry-state source, and
+// for link/symlink it is the target.
 // determinePathRel classifies a pair as PathParentChild only when some
 // candidate combination has an ancestry relation, so for real extracted pairs
 // one of the two loops below always matches; the false return is defensive
@@ -1630,11 +1682,25 @@ func packFeatures(funcID uint32, ret RetBucket, depth uint64, isDir, persist boo
 // an explicit persist prefix. Role-selected DAG pairs pass APath/BPath here so
 // a link/symlink B side is measured at its target, not its linkpath.
 func featuresOfPath(v *DAGVertex, path, persistDir string) uint64 {
+	return featuresOfPairPath(v, path, persistDir, pairPathTypeDefault)
+}
+
+// featuresOfPairPath is featuresOfPath with the role path's type bit override.
+// pairPathTypeDefault keeps the vertex's IsDir; link/symlink HB A linkpath
+// roles pass pairPathTypeFile even when the symlink target is a directory.
+func featuresOfPairPath(v *DAGVertex, path, persistDir string, typ pairPathType) uint64 {
 	if v == nil {
 		return 0
 	}
+	isDir := v.IsDir
+	switch typ {
+	case pairPathTypeFile:
+		isDir = false
+	case pairPathTypeDir:
+		isDir = true
+	}
 	persist := pathInDir(path, persistDir)
-	return packFeatures(v.FuncID, v.RetBucket, DepthBucketOf(path), v.IsDir, persist, offsetBucketOf(v))
+	return packFeatures(v.FuncID, v.RetBucket, DepthBucketOf(path), isDir, persist, offsetBucketOf(v))
 }
 
 // featuresOfDir packs a vertex's feature vector under an explicit persist
@@ -1761,8 +1827,8 @@ func hashPair(p DAGPair, hmcfg *Hmdfs_config) uint64 {
 		pd = hmcfg.Persistence_dir
 	}
 	return hashShape(p.Temporal, p.PathRel,
-		featuresOfPath(p.A, pairAPath(&p), pd),
-		featuresOfPath(p.B, pairBPath(&p), pd))
+		featuresOfPairPath(p.A, pairAPath(&p), pd, p.APathType),
+		featuresOfPairPath(p.B, pairBPath(&p), pd, p.BPathType))
 }
 
 func fnv1a64() uint64 {

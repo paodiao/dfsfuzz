@@ -188,10 +188,12 @@ func TestGlusterfsPlannableDualPathGate(t *testing.T) {
 		RetSuccess, offsetBucketNA, false)
 	symlinkCell := glusterfsCoverageCell("write", "symlink", PathSibling, TemporalHB,
 		RetSuccess, offsetBucketNA, false)
-	readlinkCell := glusterfsCoverageCell("symlink", "readlink", PathSibling, TemporalHB,
+	readlinkCell := glusterfsCoverageCell("symlink", "readlink", PathSame, TemporalHB,
+		RetSuccess, offsetBucketNA, false)
+	readlinkSibling := glusterfsCoverageCell("symlink", "readlink", PathSibling, TemporalHB,
 		RetSuccess, offsetBucketNA, false)
 	if covBoard.cellInPlannable(linkCell) || covBoard.cellInPlannable(symlinkCell) ||
-		covBoard.cellInPlannable(readlinkCell) {
+		covBoard.cellInPlannable(readlinkCell) || covBoard.cellInPlannable(readlinkSibling) {
 		t.Fatal("disabled dual-path gate must keep link/symlink/readlink out of plannable")
 	}
 	covBoard.mu.RUnlock()
@@ -209,9 +211,14 @@ func TestGlusterfsPlannableDualPathGate(t *testing.T) {
 	if !covBoard.cellInPlannable(readlinkCell) {
 		t.Fatal("enabled gate must make symlink-root readlink plannable")
 	}
+	if covBoard.cellInPlannable(readlinkSibling) {
+		t.Fatal("readlink only follows the root linkpath and must be Same-only")
+	}
 	badReadlink := glusterfsCoverageCell("write", "readlink", PathSibling, TemporalHB,
 		RetSuccess, offsetBucketNA, false)
-	if covBoard.cellInPlannable(badReadlink) {
+	badReadlinkSame := glusterfsCoverageCell("write", "readlink", PathSame, TemporalHB,
+		RetSuccess, offsetBucketNA, false)
+	if covBoard.cellInPlannable(badReadlink) || covBoard.cellInPlannable(badReadlinkSame) {
 		t.Fatal("readlink must not be plannable under a non-symlink root")
 	}
 }
