@@ -5,7 +5,8 @@
 > coverage 三层、combo-aware fresh-fresh race、
 > normal dual root 的最终语义见总计划 §8.2.1–§8.2.4。
 > 日期：2026-11-14（2026-11-15 修订 v1 调用/事件/角色/checker 决策；
-> 2026-11-17 补 coverage/dual-root 交叉引用、D1 smoke 结果）
+> 2026-11-17 补 coverage/dual-root 交叉引用、D1 smoke 结果；
+> 2026-11-18 补 NewFileTreeForConfig 与 PathSet target-only 引用）
 > 范围：GlusterFS 客户端 FUSE tracer、IPC 解析、DAG 路径接入、FileTree 空前缀、GlusterFS 文件树恢复
 > 相关：`docs/glusterfs-adaptation-plan.md`、`docs/glusterfs-config-and-scripts.md`、`docs/glusterfs-nfs-adaptation-plan.md`、`docs/executor-file-tree-restore.md`、`docs/kernel-build-glusterfs-bpf.md`
 >
@@ -1113,6 +1114,9 @@ type FileTree struct {
 
 - `NewFileTree()` 默认 `merge_view/`，现有测试不变。
 - `NewFileTreeWithPrefix(prefix)` 显式设置。
+- `NewFileTreeForConfig(c)` 按 `Profile.Tree.Prefix`/`RootPrefix` 建树；
+  `NewLayeredChoiceStrategy` 在 `hmcfg.FileTree == nil` 时用它再
+  `InitFromHmdfsConfig`，不能退回固定 `merge_view/` 的 `NewFileTree()`。
 - 空前缀 Root：`Name=""`、`FullPath=""`。
 - HMDFS Root：`merge_view`。
 - **FileTree 不建模 link/symlink**：v1 baseline 无链接，每轮 restore 回
@@ -1416,8 +1420,8 @@ go test ./prog/... ./pkg/ipc/...
 - symlink `Path2` payload 与 canonical target：linkpath 在测试根/子目录两种情形；
   payload 解析后不逃出测试根；DAG/cell 使用 canonical target。
 - PathSet 空前缀。
-- PathSet dual-path link/symlink/readlink：canonical target/linkpath 迁移、
-  symlink payload 重算、readlink follower。
+- PathSet link/symlink target-only：canonical target 迁移、linkpath 保持
+  program-local、symlink payload 重算、readlink follower 不独立迁移。
 - PathSet directed target arm 只接受 `len(Paths)==1` 的成员；rename/link/
   symlink 整体排除，readlink 由 call-name gate 排除；target creator 用
   `freshKinds`/`freshLinks` 校验。

@@ -1,6 +1,6 @@
 # Seed 纯派生构造设计
 
-> 状态：设计讨论稿（2026-10-28）；初版代码已实现，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-09 复核项代码已落，补充 rename anchor A+、derived mkdir Same/Parent fallback、1 层 fresh 边界和 fresh anchor + rename root Child 负向覆盖；部分计划测试待补，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 link/symlink target/linkpath、canonical/payload、open O_CREAT 与 PathSet 边界。
+> 状态：设计讨论稿（2026-10-28）；初版代码已实现，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-09 复核项代码已落，补充 rename anchor A+、derived mkdir Same/Parent fallback、1 层 fresh 边界和 fresh anchor + rename root Child 负向覆盖；部分计划测试待补，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 link/symlink target/linkpath、canonical/payload、open O_CREAT 与 PathSet 边界。2026-11-18 对齐 PathSet v1 target-only：link/symlink 只迁移 canonical target，linkpath 不迁移。
 > 范围：from-scratch seed 的路径派生、`insertCallFromDCT` 的 base 路径选择，以及 mutation/seed expansion 的边界。
 > 关联：`docs/causal-root-cell-design.md`、`docs/seed-optimization-plan.md`、`docs/seed-construction-causal-chain-notes.md`。
 > 本文只记录设计与待讨论项，不修改论文或代码。
@@ -580,9 +580,10 @@ GlusterFS v1 的派生规则：
 - `readlink` root 不支持；只作为 symlink root 的 variant，路径取 root LinkPath。
 - `RootPaths` 保存 canonical target/linkpath；symlink payload 只在构造调用时
   计算，不能进入 anchor/pathSpec/DCT key。
-- PathSet broad 迁移 link/symlink/readlink 的规则见
+- PathSet broad v1 对 link/symlink 只迁移 canonical target；linkpath 保持
+  program-local fresh binding，不随 PathSet 迁移。规则见
   `docs/seed-construction-causal-chain-notes.md` §1.5；derived 只负责生成，
-  不重复实现 PathSet 的双路径映射。
+  不重复实现 PathSet 的映射。
 
 ### 6.4 失败处理
 
@@ -891,7 +892,8 @@ derived 模式不再执行：
 - `TestDerivedSymlinkPayload`（待补）：
   - linkpath 在测试根时 payload == target；
   - linkpath 在子目录时 payload 为相对 linkpath parent 的路径；
-  - PathSet 迁移 target/linkpath 后 payload 重算且 canonical target 不变。
+  - PathSet 迁移 canonical target 后 payload 重算；linkpath 不变，canonical
+    target 保持一致。
 - `TestDerivedInsertUsesP0Anchor`：
   - root base 与 p0 anchor 相关；
   - seed expansion root 在 anchor 后。

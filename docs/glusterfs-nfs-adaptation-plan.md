@@ -1,7 +1,8 @@
 # GlusterFS / NFS 适配记录
 
 > 状态：历史适配记录；GlusterFS v1 总决策以 `docs/glusterfs-adaptation-plan.md` 为准
-> 日期：2026-10-21（2026-11-15 修订 v1 调用/角色/checker/executor/config）
+> 日期：2026-10-21（2026-11-15 修订 v1 调用/角色/checker/executor/config；
+> 2026-11-18 对齐 PathSet v1 target-only）
 > 范围：EIFuzz 在 GlusterFS / NFS 上的适配；HMDFS 逻辑保持不变
 > 相关：`docs/glusterfs-adaptation-plan.md`、`docs/glusterfs-config-and-scripts.md`、`docs/glusterfs-tracer-implementation-spec.md`
 >
@@ -378,6 +379,8 @@ FUSE_RELEASE      -> release
 #### 3.6.1 数据模型
 
 - `FileTree.Prefix string`；`NewFileTree()` 默认 `MergeViewPrefix`（`merge_view/`），新增 `NewFileTreeWithPrefix(prefix)`，测试默认不动。
+- `NewFileTreeForConfig(c)` 按 `Profile.Tree.Prefix`/`RootPrefix` 建树；
+  `NewLayeredChoiceStrategy` 的 fallback 使用它，不退回 `NewFileTree()`。
 - `Hmdfs_config.RootPrefix string`：HMDFS `merge_view/`，非 HMDFS `""`；`proc.go` 创建 FileTree 时传入。
 - 空前缀 Root：`Name=""`、`FullPath=""`；子节点 FullPath 用 `JoinRoot`，避免 `"/file"`。HMDFS Root 仍 `merge_view`。
 
@@ -468,13 +471,15 @@ FUSE_RELEASE      -> release
 - `dag.go` 的 `mergeRoot`、`firstComponentUnderRoot` 使用 `ft.Prefix` / `RootPrefix`；
 - 专用 tracer 输出路径按当前 FileTree 根归一化；HMDFS trace 保持 `merge_view/...`；
 - `path_set.go`：`normalizePathSetPath`、`pathSetTopRoot`、`pathSetTopPath`、`mapPathSetPath` 去掉硬编码 `MergeViewPrefix`，改为接受 prefix/FileTree；空前缀时 top root 从相对路径第一段取。
-- PathSet 的 dual-path 规则以 `docs/glusterfs-adaptation-plan.md` §8.7 和
-  `docs/seed-construction-causal-chain-notes.md` §1.5 为准：link/symlink/
-  readlink/rename 的 canonical target/linkpath 一起迁移，symlink payload 在
-  调用物化时重算，rename dst 由 RenamePolicy 选；prefix 改造不能只改普通
-  单路径成员，否则 link/symlink 会在空前缀下错位。
+- PathSet 的 v1 规则以 `docs/glusterfs-adaptation-plan.md` §8.7 和
+  `docs/seed-construction-causal-chain-notes.md` §1.5 为准：link/symlink
+  只迁移 canonical target，linkpath 保持 program-local；readlink 不独立迁移；
+  rename src/dst 都迁移，dst 由 RenamePolicy 选；symlink payload 在 target
+  迁移后重算。prefix 改造不能只改普通单路径成员，否则 link/symlink target
+  会在空前缀下错位。
 - PathSet directed target arm 的成员要求是 `len(Paths)==1`；rename/link/
-  symlink 整体排除，readlink 由 call-name gate 排除。双路径只走 broad。
+  symlink 整体排除，readlink 由 call-name gate 排除。rename 的 src/dst 只在
+  broad relocation 中处理；link/symlink 的 linkpath 不进入 PathSet。
 - `symlinkCanonicalTarget(linkpath, payload)` 是共享 helper；PathSet/DCT/DAG/
   checker 都必须用它，不能把 payload 当 FileTree 路径。
 
@@ -492,8 +497,8 @@ FUSE_RELEASE      -> release
 - 新增空前缀深度桶测试；
 - 新增空前缀 DAG/checker 测试；
 - 新增空前缀 PathSet 构建、迁移与 target arm 测试；
-- 新增空前缀 dual-path link/symlink/readlink PathSet 测试（canonical target 迁移、
-  symlink payload 重算、readlink follower）；
+- 新增空前缀 link/symlink target-only PathSet 测试（canonical target 迁移、
+  linkpath 不变、symlink payload 重算、readlink follower）；
 - GlusterFS/NFS 冒烟路径：`file`、`a/b`。
 
 **P5：验收与回退**

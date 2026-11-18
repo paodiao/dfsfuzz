@@ -1,6 +1,7 @@
 # PathSet 与突变分析：路径突变、数据突变、删除突变
 
-> 状态：PathSet 核心已实现（2026-10-25）；2026-11-15 补充 GlusterFS v1 双路径 / canonical-payload / prefix 决策；
+> 状态：PathSet 核心已实现（2026-10-25）；2026-11-15 补充 GlusterFS v1 canonical-payload / prefix 决策；
+> 2026-11-18 同步 v1 target-only、PathStateTracking current state、creator binding 与目录 rename prefix remap；
 > cross-compile/vet 通过，运行时测试待 Ubuntu。
 > 范围：PathSet 路径突变；附带数据突变、删除突变分析。
 > 原则：保留“倾向 / 待定 / 建议”标记，未定方案不写成已决。
@@ -74,10 +75,7 @@ const (
     pathRoleRenameSrc
     pathRoleRenameDst
     pathRoleLinkTarget
-    pathRoleLinkPath
     pathRoleSymlinkTarget
-    pathRoleSymlinkLinkPath
-    pathRoleReadlinkPath
 )
 
 type pathSpec struct {
@@ -86,6 +84,14 @@ type pathSpec struct {
     Role           pathRole
     ArgIdx         int
     TypeConstraint int
+    // Fresh target binding: the earlier creator that makes Path exist.
+    CreatorPos    GroupPosition
+    CreatorArgIdx int
+    HasCreator    bool
+    // CurrentKind is the creator's file/dir class for a fresh consumer or
+    // a path recreated after an in-program deletion.
+    CurrentKind int
+    Recreated   bool
 }
 
 type pathMember struct {
@@ -101,12 +107,12 @@ type pathMember struct {
 - fd-only 调用本身不进入成员列表，也不单独作为路径突变目标；
 - `rename` 的源和目标都进入 `Paths`，通过 `Role` 区分
   `pathRoleRenameSrc` / `pathRoleRenameDst`；
-- `link` 的 target/linkpath 都进入 `Paths`，分别用
-  `pathRoleLinkTarget` / `pathRoleLinkPath`；
-- `symlink` 的 target/linkpath 都进入 `Paths`，分别用
-  `pathRoleSymlinkTarget` / `pathRoleSymlinkLinkPath`；
-- `readlink` 的 linkpath 用 `pathRoleReadlinkPath`，只作为 symlink linkpath 的
-  follower，不独立迁移；
+- `link` 只把 target 加入 `Paths`（`pathRoleLinkTarget`）；linkpath 是
+  program-local fresh binding，不进入 `pathSpec`；
+- `symlink` 只把 canonical target 加入 `Paths`
+  （`pathRoleSymlinkTarget`）；linkpath 同样是 program-local fresh binding；
+- `readlink` 不进入 `Paths`，只作为 symlink linkpath 的 follower；
+  v1 不迁移 linkpath，因此没有 readlink/linkpath 同步迁移问题；
 - `Constraint` 用 `memberPathConstraint` 得到，已包含 owner 的全部同程序 fd
   使用者，保证移动后类型合法。
 
@@ -117,8 +123,9 @@ GlusterFS v1 的路径表示：
   `rename` source 一样参与 PathSet 映射，映射后再校验存在性/类型；
 - `symlink` 的 target 不在 `pathSpec` 中保存 payload；payload 由
   `dirname(linkpath)` 到 canonical target 计算，只在构造调用时生成；
-- `linkpath` 可以在任意已有父目录；fresh 且不得等于 target；
-- `readlink` 的 linkpath 必须与对应 symlink 的 linkpath 同步迁移；
+- `linkpath` 可以在任意已有父目录；fresh 且不得等于 target；linkpath 是
+  program-local binding，不随 PathSet 迁移；
+- `readlink` 只跟随对应 symlink 的 linkpath，不独立迁移；
 - `link` 的 target 是普通路径参数，按 cwd/test root 解析，不做 payload 转换。
 
 路径类型必须参与校验：
@@ -194,12 +201,13 @@ merge_view/d1/x -> P/d1/x
 
 #### 双路径成员（link / symlink / readlink / rename）
 
-GlusterFS v1 的 PathSet broad 支持双路径：
+GlusterFS v1 的 PathSet broad 对 link/symlink 只迁移 canonical target；
+linkpath 是 program-local fresh binding，不进入 PathSet：
 
 ```text
-link:     target 和 linkpath 都映射
-symlink:  canonical target 和 linkpath 都映射；payload 在调用物化时重算
-readlink: linkpath 跟随 symlink linkpath
+link:     target 映射；linkpath 不迁移
+symlink:  canonical target 映射；linkpath 不迁移；payload 在调用物化时重算
+readlink: 不独立迁移；只作为 symlink linkpath 的 follower
 rename:   src/dst 都映射，但 dst 由 RenamePolicy 选，不做 generic suffix map
 ```
 
@@ -210,20 +218,23 @@ rename:   src/dst 都映射，但 dst 由 RenamePolicy 选，不做 generic suff
 - `symlink` 的 arg0 是 payload，不是 canonical target。`buildPathMembers` 必须用
   共享 `symlinkCanonicalTarget(linkpath, payload)` 还原 canonical target；
   同一 helper 也用于 `collectSeedAnchors`、DCT baseCandidate、DAG/checker。
-- `symlink` 的 target 不保存 payload；迁移后按
-  `dirname(newLinkpath)` 到 `newCanonicalTarget` 重算。
-- `symlink` apply 必须两阶段：先写 linkpath，再算 payload，最后写 target；
-  不能沿用 generic 逐 spec 直接写 arg0。
-- `readlink` 必须和 symlink 同进同出；不能只移动 readlink 的 linkpath。
+- `symlink` 的 target 不保存 payload；迁移后按原 linkpath 到
+  `newCanonicalTarget` 重算 payload。
+- `linkpath` 是 program-local binding：可以在任意已有父目录，fresh 且不得等于
+  target；v1 不把它加入 `pathSpec`，也不随 PathSet 迁移。
+- `readlink` 只跟随对应 symlink 的 linkpath，不独立迁移；v1 没有
+  readlink/linkpath 同步迁移。
 - `link` 的 target 是普通路径参数，按 cwd/test root 解析；不需要 payload 转换。
-- `pathSetSpecValidWithParent` 要区分 target/linkpath/readlink role，不能只按
-  “存在/不存在”判断。target 校验要检查 FileTree、`freshKinds`/`freshLinks`、
-  creator 位置/类型；不能只 `FindNode(target)`。
+- link/symlink 的 `pathSetSpecValidWithParent` 只校验 target role，不能只按
+  “存在/不存在”判断：target 校验要检查 FileTree、`freshKinds`/`freshLinks`、
+  creator 位置/类型；不能只 `FindNode(target)`。linkpath/readlink role 留给
+  后续 linkpath 迁移 feature，v1 不生成。
 - `pathSetMemberValid` 检查 `link/symlink` 的 target != linkpath、类型、
-  linkpath freshness、readlink binding；不能只靠 `pathSetConnected`。
-- `pathSpec.Kind`/`TypeConstraint` 按 role 填：link target（existing/fresh
-  file）、linkpath（fresh file）、symlink target（existing/fresh file/dir）、
-  symlink linkpath（fresh symlink）、readlink path（binding follower）。
+  嵌套链接拒绝（`freshLinkPathsBefore`，含 rename 后的 linkpath）；不能只靠
+  `pathSetConnected`。
+- `pathSpec.Kind`/`TypeConstraint` 按 target role 填：link target
+  （existing/fresh file）、symlink target（existing/fresh file/dir）；
+  linkpath/readlink 的 role 和校验在 v1 不生成。
 - PathSet directed target arm v1 要求**整个成员 `len(Paths)==1`**；rename/
   link/symlink 整体不参与，readlink 由 call-name gate 显式排除。不是“从双路径
   成员里选一个 spec”。以后扩展 target arm 时再加 `AnchorSpec`/`MemberSpec`。
@@ -253,7 +264,8 @@ rename:   src/dst 都映射，但 dst 由 RenamePolicy 选，不做 generic suff
   不应因为 existing dst 不存在而让 rename 失败；
 - `pathSetFallbackPath` 对 rename dst 不能绕过 policy；无候选就失败；
 - HMDFS policy 仍只返回 same-parent 候选，行为不变；
-- directed target arm 对 rename 仍不支持；双路径只在 broad relocation 中处理。
+- directed target arm 对 rename 仍不支持；rename 的 src/dst 只在 broad
+  relocation 中处理；link/symlink 的 linkpath 不进入 PathSet。
 
 #### 没有合法 P
 
@@ -324,6 +336,8 @@ level 0 > 1a > 1b > 2
 
 1. 在 clone 上构建完整映射；
 2. 校验 existing / fresh（父目录存在或同程序先前创建）/ rename source / rename destination；
+   `PathStateTracking=true` 时先按 in-program current state 覆盖 baseline：
+   tombstone、current kind、rename prefix remap、fresh creator binding；
 3. 校验 fd owner 和所有使用者；
 4. 校验 rename 两条路径；
 5. 校验 plan 完整性和 fresh parent 可执行性；
@@ -379,10 +393,10 @@ level 0 > 1a > 1b > 2
 5. 目标选择与目标等级 —— 已实现；
 6. 数据突变、删除突变回归 —— 代码未改，运行时回归待 Ubuntu。
 
-当前 `path_set.go` 仍硬编码 `MergeViewPrefix`；GlusterFS v1 必须按
-`docs/glusterfs-nfs-adaptation-plan.md` §3.6.8 的 prefix 方案改成
-`FileTree.Prefix`/`RootPrefix`，并在空前缀下重新跑 PathSet 构建/迁移/target
-arm 测试。双路径 link/symlink/readlink 与 rename policy 迁移也在 Phase 4 落地。
+当前 `path_set.go` 已按 `FileTree.Prefix`/`RootPrefix` 做 prefix-aware；
+GlusterFS v1 的 PathSet broad 对 link/symlink 只迁移 target，linkpath 保持
+program-local；rename dst 由 `RenamePolicy` 选。空前缀 PathSet 构建/迁移/target
+arm 测试和运行时回归待 Ubuntu。
 
 ### 1.9 已知限制
 
@@ -391,7 +405,17 @@ arm 测试。双路径 link/symlink/readlink 与 rename policy 迁移也在 Phas
   - 不把上一轮执行的 `CheckInfo` 成功/失败作为 hard gate；文件树每轮恢复后，上一轮的 fresh parent 结果不能可靠外推到下一轮。
   - 跨程序 fresh parent 的上一轮 `CheckInfo` 时间关系只作为 soft valid 证据，不作为 hard guarantee。
   - 不跟踪“前面的 mkdir 之后、当前 member 之前又被 rmdir/unlink 删除”的情况；这类路径可能通过校验但在实际执行时 parent 已不存在。
+  - 该限制只针对 fresh parent；`PathStateTracking=true` 时 target 的 current
+    state（tombstone/current kind/rename prefix）另按 §1.5 和
+    `glusterfs-adaptation-plan.md` §8.7.2 处理。
   - 当前接受这个近似，不把它当作高优先级正确性问题。
+
+- **baseline 后代目录 rename 不 remap**
+  - `PathStateTracking=true` 的 prefix remap 只覆盖 fresh maps；baseline
+    FileTree 中未记录的 descendant 不移动。
+  - 例如 baseline `dirA/f` 被 `rename dirA dirB` 移走后，`link dirB/f` 仍
+    可能被当作 baseline 路径；这是 v1 已知 false negative，不做完整 baseline
+    overlay。
 
 - **directed target arm 不支持 rename**
   - `pickPathSetTarget()` 要求 anchor 和 member 都是 `pathSetSinglePath`，即每个 member 只有一个 `pathSpec`。
@@ -422,11 +446,20 @@ arm 测试。双路径 link/symlink/readlink 与 rename policy 迁移也在 Phas
    - source/destination 不能形成 no-op；
    - destination 由 RenamePolicy 选，不能绕过 policy fallback。
 5. link/symlink：
-   - target 是 canonical 测试根路径，映射后存在且类型匹配；
-   - linkpath fresh，parent 有效，target != linkpath；
-   - symlink payload 由映射后的 canonical target/linkpath 重算，解析后不逃出
-     测试根；
-   - readlink linkpath 必须和对应 symlink linkpath 一致。
+   - target 是 canonical 测试根路径，映射后是 baseline existing，或同一 plan
+     中更早 creator 产生的 fresh 路径（含被 creator 重建的 baseline 路径）；
+   - `PathStateTracking=true` 时还要检查 current state：被 unlink/rmdir/rename
+     删除且未重建的 target 拒绝；creator 重建的 baseline 路径按 `CurrentKind`
+     校验；
+   - fresh target 必须记录 `CreatorPos`/`CreatorArgIdx`，映射后对齐到
+     creator 的 mapped path；`CurrentKind` 决定 file/dir；
+   - link target 不能是目录类 creator；target 不能是 `freshLinkPathsBefore`
+     中的 linkpath（含 rename 后的 linkpath），不能形成嵌套链接；
+   - linkpath fresh，parent 有效，target != linkpath；linkpath 是
+     program-local binding，不随 PathSet 迁移；
+   - symlink payload 由映射后的 canonical target 和原 linkpath 重算，解析后
+     不逃出测试根；
+   - readlink 只跟随对应 symlink 的 linkpath，不独立迁移。
 
 #### Cross-Prog fresh parent：soft valid
 
@@ -498,7 +531,7 @@ legacy fallback（`mutateGroupPathDirected` / `findGroupCalls` /
 - `validatePathSetPlan()` 必须基于 mapped path 查找 same-Prog 更早的 mapped mkdir；跨 Prog 才使用 `tscoffs` 归一化后的 `CheckInfo` 时间关系，并将其标记为 soft parent。
 - 重复 fresh path 只记 `DuplicateFresh` 诊断，不 hard reject、不降权。
 
-实现状态（2026-11-09）：`pathPlanQuality`、`validatePathSetPlan()`、provisional spec/parent 校验和 `DuplicateFresh` 诊断已实现；Linux cross-compile/vet 通过，Ubuntu runtime 待验证。
+实现状态（2026-11-18）：`pathPlanQuality`、`validatePathSetPlan()`、provisional spec/parent 校验和 `DuplicateFresh` 诊断已实现；PathStateTracking current state、fresh target creator binding、目录 rename prefix remap 已落地；Linux cross-compile/vet 通过，Ubuntu runtime 待验证。
 
 ---
 
@@ -613,4 +646,4 @@ legacy fallback（`mutateGroupPathDirected` / `findGroupCalls` /
 
 ## 7. 一句话总结
 
-> PathSet 路径突变保持路径关系连通：单顶层做前缀迁移，多顶层做森林换父目录，回退按固定关系阶梯执行，不引入关系分数；GlusterFS v1 broad 支持 link/symlink/readlink/rename 双路径，canonical target/linkpath 一起迁移，symlink payload 在调用物化时重算，rename dst 由 RenamePolicy 选（existing 优先、fresh 兜底）；数据突变路径不变，基本不动；删除突变只要接受“破坏性删除、只保证 fd 安全”，当前实现可以保留。因果根与 root→variant 两层设计见 `docs/causal-root-cell-design.md`。
+> PathSet 路径突变保持路径关系连通：单顶层做前缀迁移，多顶层做森林换父目录，回退按固定关系阶梯执行，不引入关系分数；GlusterFS v1 broad 对 link/symlink 只迁移 canonical target，linkpath 是 program-local binding 不迁移，readlink 不独立迁移，rename src/dst 都迁移且 dst 由 RenamePolicy 选（existing 优先、fresh 兜底）；symlink payload 在 target 迁移后重算；`PathStateTracking=true` 时按 in-program current state 处理 tombstone/current kind/creator binding，并对目录 rename 做 fresh-map prefix remap；数据突变路径不变，基本不动；删除突变只要接受“破坏性删除、只保证 fd 安全”，当前实现可以保留。因果根与 root→variant 两层设计见 `docs/causal-root-cell-design.md`。

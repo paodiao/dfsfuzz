@@ -1,9 +1,9 @@
 # GlusterFS 适配总计划（v1）
 
-> 状态：设计定稿（P1 已收敛）；核心实现已落；D1 BPF standalone smoke 已通过，
-> D2 executor 集成 smoke 待执行
-> 日期：2026-11-15（2026-11-17 更新 coverage 三层、combo-aware fresh-fresh
-> race、normal dual root、GlusterFS DAG feedback；D1 BPF smoke 通过）
+> 状态：设计定稿（P1 已收敛）；核心实现已落；P2 review #7–#11 已收口；
+> D1 BPF standalone smoke 已通过，D2/D3/D4 待执行
+> 日期：2026-11-15（2026-11-18 更新 P2 收口、PathSet current state /
+> creator binding / rename prefix remap、coverage cell 与 FileTree fallback）
 > 范围：GlusterFS 3 server + 3 client、replica 3；HMDFS 行为保持不变；NFS 暂不实现
 > 权威关系：本文是 GlusterFS 适配的总入口。tracer 的 BPF 原始细节参考
 > `docs/glusterfs-tracer-implementation-spec.md`；两者冲突时以本文为准。
@@ -152,7 +152,9 @@ type DFSProfile struct {
   `CallFuncClasses(call, isDir, flags)` 正向映射、`funcMatchesCall` 反向映射；
   `SupportsSameInode`（HMDFS=true，GlusterFS v1=false）。
 - `PathPolicy`：namespace 前缀、根、深度、same-parent/cross-parent、free path 约束。
-- `PlanProfile`：DCT/定向板/因果链的 root/variant/causal 集、variant kinds、state effect。
+- `PlanProfile`：DCT/定向板/因果链的 root/variant/causal 集、variant kinds、
+  state effect、`PathStateTracking`（in-program current state；HMDFS=false，
+  GlusterFS=true）。
 - `TreeProfile`：FileTree 前缀、节点类型；v1 不在 FileTree 建模
   symlink/hardlink（链接路径走 program-local bindings）。
 - `GenProfile`：生成器与取值模型、参数策略。
@@ -350,6 +352,10 @@ GlusterFS: RootPath = "";           JoinRoot("file0") = "file0"
 ```
 
 - `FileTree.Prefix`/`Hmdfs_config.RootPrefix`：HMDFS `merge_view/`，GlusterFS `""`。
+- `NewFileTreeForConfig(hmcfg)` 是 config-derived 构造器：按
+  `Profile.Tree.Prefix`/`RootPrefix` 建树；`NewLayeredChoiceStrategy` 在
+  `hmcfg.FileTree == nil` 时用它再 `InitFromHmdfsConfig`，不能退回固定
+  `merge_view/` 的 `NewFileTree()`。`NewFileTree()` 仍作为 HMDFS/测试默认。
 - `RootPath()`/`JoinRoot(rel)` 是 profile 路径原语；不能生成 `./file0` 或 `/file0`。
 - `rand.go:389 filenameImpl` 不能再用 `dir="."` 或 HMDFS 的 `merge_view`；
   改用 `JoinRoot(...)`。`rand.go`/`generation.go`/`mutation.go` 里所有
@@ -1068,9 +1074,11 @@ GlusterFS 规则：
   Direction-3（2a variant 偏置、2b exact plan、mutation offset/depth 偏置）
   只消费这一层。`comboKey.Root` 是 A 侧 call 名，不区分 root/anchor。
 - **root-directed**：`rootDirected*` 从 plannable 里按
-  `profile.DirectedRootCalls()` 快照再过滤一层；`rootDirectedPotentials`
-  和 `RootPlannableTarget` 属于这一层。rmdir-root 是 model-only：DCT root、
-  C2 variant、C1 anchor 支持，但不是 C1/normal directed root。
+  `profile.DirectedRootCalls()` 快照再过滤一层；过滤是精确 call-name 匹配
+  （`profileExactListContains`），不是子串/前缀匹配，`open$dir` 等变体不会
+  被当成 `open` root。`rootDirectedPotentials` 和 `RootPlannableTarget`
+  属于这一层。rmdir-root 是 model-only：DCT root、C2 variant、C1 anchor
+  支持，但不是 C1/normal directed root。
 
 指标统一由 `CoverageLayerStats()` 提供，日志 `dct pool:` 使用：
 
@@ -1464,6 +1472,10 @@ readlink:    不做 C1 anchor
   两个候选，target 不会丢；
 - rename anchor 的 A 侧只用 post/dst，`src` 只作为 B/CC 候选，不把 src
   当成 A；
+- C1 root 候选的 source 子树过滤只对成功 rename anchor 生效，由
+  `causalAnchor.SourceMoved` 显式标记；不能用 `Source != Path` 推断，
+  因为 link/symlink anchor 的 `Source=target` 也满足该条件。link/symlink
+  target 及其后代不能被当成“被移走的 source 子树”；
 - C1 root 增加 `causalRootDual`：
   - `RootPath = target`（root materialization）
   - `RootSource = target`
@@ -1757,6 +1769,10 @@ read(L1) + write(T)
   TypeB=false；
 - C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；
 - C1 rename root：B 侧用 src，dst 只用于 materialize/RetB；
+- `cellKeyOf` 的 `TypeB` 用 `pairPathIsDir(p.B, p.BPathType)`，与
+  `featuresOfPairPath` 共用 role path type override；不能直接用
+  `DAGVertex.IsDir`，否则 link/symlink target/linkpath role 的 TypeB
+  与 planner/features 不一致；
 - getxattr/setxattr：B 侧用 target，TypeB=file/dir；
 - close 不进入 C1/C2 producible；文件 close 只作为非 modifier 的 B/CC
   pair 做自然观测，不生成 close-root cell；目录 close 无事件；
@@ -1769,7 +1785,7 @@ read(L1) + write(T)
   因此 `Plannable*` 是 generic directed-pair 层；`RootPlannableTarget` 才是
   root-directed 子集。
 - `rmdir-root` 是 model-only：DCT root、C2 variant、C1 anchor 都支持；
-  `rootDirectedComboEnabled` 根据 `DirectedRootCalls` 排除它，但不把
+  `rootDirectedComboEnabled` 根据 `DirectedRootCalls` 精确匹配排除它，但不把
   `DirectedPairPotential`/`DirectedPairDepthPots` 等 anchor 视图一起清零。
 
 producible 表：
@@ -1919,9 +1935,21 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
     creator 重建的 baseline 路径上（仍受 creator binding 约束）。
     HMDFS 保持 `false`，继续 baseline-first；GlusterFS 和未来支持 link 的
     DFS 设 `true`；
-  - `PathStateTracking=true` 时目录 rename 对 fresh kind、link binding、
-    tombstone 和 creator 路径做 prefix remap；HMDFS `false` 保持 exact
-    src/dst 行为；
+  - `PathStateTracking=true` 时目录 rename 的 prefix remap 覆盖：
+    - `freshPathKindsBefore`：`dst` 根继承 `src` 的 kind，`src` 子树 kind
+      移到 `dst` 子树；
+    - `freshLinkPathsBefore`：program-local linkpath binding 移到 `dst`，
+      binding 的 `Target` 也在 `src` 子树内时一起 remap；这里指嵌套链接
+      拒绝用的 binding，不是 PathSet linkpath 迁移；
+    - `freshPathAbsentBefore`：`src` 根标记 tombstone，`src` 子树 tombstone
+      移到 `dst`，并清除 `dst` 子树旧 tombstone；目录 tombstone 按 prefix
+      覆盖后代（`pathSetAbsentIn`）；
+    - `freshPathCreatorBefore`：候选 creator 路径先经过其后的 rename 事件
+      映射，再与 target 比较；
+  - prefix remap 只覆盖 fresh maps；baseline FileTree 中未记录的后代不
+    remap。例如 baseline `dirA/f` 被 `rename dirA dirB` 移走后，
+    `link dirB/f` 仍是已知 false negative，不做完整 baseline overlay；
+  - HMDFS/`PathStateTracking=false` 保持 exact src/dst，不启用 prefix remap；
   - fresh link/symlink target 在 `pathSpec` 中记录
     `CreatorPos`/`CreatorArgIdx` 和 `CurrentKind`；`buildPathPlan`/
     `buildTargetPathPlan` 映射后把 target 对齐到 creator 的 mapped path；
@@ -2478,9 +2506,10 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
 - coverage：cellKey 不含 role/group；readlink CC=0；coverage board 使用
   profile root/variant 列表，不再用全局 `FsopsSubCalls`。
 - 跨目录 rename；link/symlink A/HB 随机 role。
-- PathSet broad：dual-path link/symlink/readlink/rename；canonical target +
-  symlink payload 两阶段 apply；rename 迁移时按 `RenamePolicy` 选 dst（existing
-  优先、fresh 兜底）；directed target arm v1 只接受 `len(Paths)==1` 的成员。
+- PathSet broad：link/symlink 只迁移 canonical target，linkpath 保持
+  program-local binding；readlink 不独立迁移；rename src/dst 都迁移，dst 按
+  `RenamePolicy` 选（existing 优先、fresh 兜底）；symlink payload 在 target
+  迁移后重算；directed target arm v1 只接受 `len(Paths)==1` 的成员。
 - PathSet target creator：link/symlink target 支持 baseline existing 或更早
   creator 的 fresh 路径；`symlinkCanonicalTarget` 共享。
 - legacy fallback：rename 走 `RenamePolicy`，HMDFS same-parent 行为不变；
@@ -2499,9 +2528,10 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
 ### Phase 5：端到端
 
 - 3-3 验证；HMDFS 回归；文档更新。
-- 状态（2026-11-17）：代码已落；D1 BPF standalone smoke 已通过。
-  Ubuntu `go test ./prog ./syz-fuzzer`、`make executor`、D2 executor
-  集成 smoke 仍待执行。
+- 状态（2026-11-18）：P2 review #7–#11 已收口，PathSet current state /
+  creator binding / rename prefix remap 文档已同步；D1 BPF standalone
+  smoke 已通过。Ubuntu `go test ./prog ./syz-fuzzer`、`make executor`、
+  D2/D3/D4 仍待执行。
 
 ## 13. 验收
 
@@ -2605,7 +2635,7 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   - GlusterFS 不出现 HMDFS agent/peer/settle 等待；client mount barrier 能
     覆盖全部 client 挂载完成。
 
-### 13.1 实现状态与已知边界（2026-11-17）
+### 13.1 实现状态与已知边界（2026-11-18）
 
 ```text
 coverage 三层                        已实现
@@ -2615,6 +2645,8 @@ GlusterFS DAG feedback               已启用
 GlusterFS executor cwd/restore/metadata 已实现
 MetadataDelayMs profile default      已实现（HMDFS 30000 / GlusterFS 10000）
 GlusterFS CSAN/symsc A/B             已实现
+P2 review #7–#11                     已修复，cross-compile/vet 通过
+PathSet current state/rename remap   已实现，runtime 待验证
 D1 BPF standalone smoke              已通过
 D2 executor integration              待执行
 D3 short/medium run                  待执行
@@ -2798,8 +2830,8 @@ batch 预算决定。
 - `src/prog/generation.go`、`rand.go`、`mutation.go`：client-only generators/mutators；
   `updateCallPathInProg` 的 legacy rename 走 `RenamePolicy`，link/symlink/readlink
   不进入 legacy fallback。
-- `src/prog/path_set.go`：dual-path broad、prefix-aware、rename policy、symlink
-  canonical/payload 映射。
+- `src/prog/path_set.go`：link/symlink target-only broad、prefix-aware、
+  rename policy、symlink canonical/payload 映射。
 - `src/prog/coverage_board.go`：observed/model/plannable 三层、combo-aware
   fresh-fresh race forms、Direction-3 potential/enumeration。
 - `src/prog/glusterfs_coverage_test.go`：三层口径、race plannable、normal

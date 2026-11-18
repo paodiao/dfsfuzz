@@ -1,6 +1,6 @@
 # 因果根与 root→variant 两层种子构造设计
 
-> 状态：设计定稿（2026-10-27）；普通/fd/fresh/rename root、FreshB、C2 combo filter、完整 pre/post relation 已实现；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-10-28 补充 C1 anchor PathKind、fresh anchor 关系矩阵、C2 fresh-parent 与 `open(O_CREAT)` 支持；已实现，Ubuntu runtime 待验证。2026-11-09 设计复核：补充 rename anchor 的 source 子树 root path 约束、1 层 fresh/nested fresh parent 边界、C2 FreshA normal parent 的 `aEligible` 防御，并把 anchor success 偏好文档与当前实现对齐；复核项代码已落，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 的 link/symlink target/linkpath、canonical/payload、readlink follower 与 PathSet 双路径边界。
+> 状态：设计定稿（2026-10-27）；普通/fd/fresh/rename root、FreshB、C2 combo filter、完整 pre/post relation 已实现；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-10-28 补充 C1 anchor PathKind、fresh anchor 关系矩阵、C2 fresh-parent 与 `open(O_CREAT)` 支持；已实现，Ubuntu runtime 待验证。2026-11-09 设计复核：补充 rename anchor 的 source 子树 root path 约束、1 层 fresh/nested fresh parent 边界、C2 FreshA normal parent 的 `aEligible` 防御，并把 anchor success 偏好文档与当前实现对齐；复核项代码已落，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 的 link/symlink target/linkpath、canonical/payload、readlink follower 与 PathSet 双路径边界。2026-11-18 复核：#7 rename source 子树过滤改为显式 `SourceMoved`，link/symlink target 不再被误过滤；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。
 > 范围：`PickDirectedBatch` 的根节点因果锚定、固定 root 的 variant 规划、rename 支持。
 > 术语：本文的 C1/C2 指 causal 两层（anchor→root、root→variant），不是论文中的 C1/C2 两个挑战。
 > 关联：Seed 纯派生设计见 `docs/seed-derivation-design.md`；PathSet/数据/删除部分见 `docs/seed-construction-causal-chain-notes.md`；本文不修改论文或 PPT。
@@ -332,6 +332,8 @@ readlink: path = symlink 的 linkpath
   symlink: Path=linkpath, Source=target, Dest=linkpath
   readlink: 不做 C1 anchor
   ```
+- link/symlink anchor 的 `Source` 是 target，不是被移走的 rename source；
+  这两个 anchor 的 `SourceMoved=false`，因此 §2.6 的 source 子树过滤不适用。
 - C1 cell 的 B 侧只使用 target；C2 target-role 的 B 侧使用 target，
   linkpath-role 只在 HB 的 A 侧使用 linkpath；readlink 的 B 侧使用 linkpath。
 - link/symlink target 是 **anchor 关系派生** 的 canonical 路径，不是 fixed
@@ -341,7 +343,7 @@ readlink: path = symlink 的 linkpath
 - `readlink` 只读一跳；DAG/checker 用 `linkpath + payload` 还原 canonical
   target，不能把 payload 当 FileTree 路径。
 - 禁止嵌套链接：link/symlink target 不能是已有 linkpath/symlink。
-- PathSet broad 的 link/symlink/readlink 双路径规则见
+- PathSet broad 的 link/symlink target-only / readlink follower 规则见
   `docs/seed-construction-causal-chain-notes.md` §1.5；C1/C2 不另写一套绑定逻辑。
 - C2 FreshB/FreshSame、fresh root + fresh child、nested fresh parent 的限制不变；
   GlusterFS v1 不扩展这些形态。
@@ -363,7 +365,11 @@ root:   只能使用 rename 成功后的路径
 - `anchor.Source` 的 parent/sibling 在 rename 成功后仍然存在，可以作为 root 路径候选；
 - `anchor.Source` 本身和 source 后代位于被 rename 移走的子树，不能作为 root 路径候选；
 - source parent/sibling 候选仍必须通过普通的 `FindNode`、`aEligible`、type/depth/persist 约束，不是无条件合法路径；
-- 该过滤只对 rename anchor 生效，条件是 `source != "" && source != anchor.Path`；普通 anchor 的 `source == path`，必须跳过过滤，否则会误删普通 anchor 的 root 路径；
+- 该过滤只对成功 rename anchor 生效，条件是
+  `anchor.SourceMoved && source != "" && source != anchor.Path`。
+  `SourceMoved` 由 anchor call 显式标记；不能用 `source != anchor.Path`
+  推断，因为 link/symlink anchor 的 `Source=target` 也满足该条件，会把
+  target 子树误删。普通 anchor 的 `source == path` 同样必须跳过过滤；
 - 该过滤对 normal root、fresh root、rename root 都生效；
 - existing root path 在 `ft.FindNode(rootPath)` 前过滤；fresh root 在 `directedFreshPlaceholder` 生成后、plan/cell 生成前过滤；不要在 fresh parent lookup 之前做路径级过滤；
 - 过滤还必须覆盖由 destination sibling 枚举间接产生的 source 子树路径；
@@ -655,7 +661,8 @@ C1 已选出但 C2 失败时，不把 C1 cell 记为 miss。
 - link/symlink target 由 anchor 关系派生，不是 fixed baseline；映射后仍在测试根内；
 - symlink payload 由 canonical target/linkpath 计算，解析后不逃出测试根；
 - readlink 跟随 symlink linkpath；payload 能还原 canonical target；
-- PathSet broad 双路径 link/symlink/readlink/rename 与 rename policy 顺序回归；
+- PathSet broad 的 link/symlink target-only、readlink follower、rename src/dst
+  与 rename policy 顺序回归；
 - both fresh Child：`RootParent == anchor.Path` 的 fresh parent validation 通过；
 - C2 both-fresh Child：`planCausalC2Cells` 接受同一 anchor path 的 fresh dir parent；
 - C2 both-fresh Child：`validateCausalPlan` 的 `FreshA` 放行同一 fresh parent；
@@ -700,7 +707,8 @@ C1 已选出但 C2 失败时，不把 C1 cell 记为 miss。
 8. 路径碰撞策略：不做跨计划保留；E destination 不做跨计划保留；
 9. C1 anchor PathKind、fresh anchor matrix、`open(O_CREAT)` 边界：已实现；
 10. 2026-11-09 复核：rename source 子树过滤、1 层 fresh/nested fresh parent 限制、C2 FreshA normal parent 防御、anchor success 偏好文档对齐：代码已落，Linux 交叉编译/vet 通过；
-11. Ubuntu runtime 与 benchmark：待执行。
+11. 2026-11-18 复核：rename source 子树过滤改用显式 `SourceMoved`；link/symlink 的 `Source=target` 不再触发过滤；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证；
+12. Ubuntu runtime 与 benchmark：待执行。
 
 ---
 
@@ -717,7 +725,9 @@ C1 已选出但 C2 失败时，不把 C1 cell 记为 miss。
   - `causalAnchor` 的 `PathKind` / `IsDir`；
   - `planCausalC2Cells` / `validateCausalPlan` 的 both fresh Child fresh-parent 支持；
   - C2 plan 的 `RootParentKind` / `RootParentIsDir`；
-  - 2026-11-09 复核已落：rename anchor 的 source 子树 root path 过滤；C1 `addFreshPlan` 使用 `freshParentNodeEligible`；C2 FreshA normal parent 的 `aEligible` 防御。
+  - 2026-11-09 复核已落：rename anchor 的 source 子树 root path 过滤；C1 `addFreshPlan` 使用 `freshParentNodeEligible`；C2 FreshA normal parent 的 `aEligible` 防御；
+  - 2026-11-18 复核已落：`causalAnchor.SourceMoved` 与
+    `causalRenameRootPathAllowed`，只对成功 rename anchor 过滤 source 子树。
 - `src/prog/target.go`：
   - `LookupConst(name) (uint64, bool)`，可选常量不触发 `GetConst` panic。
 - `src/prog/distributed_choice.go`：
@@ -741,7 +751,8 @@ C1 已选出但 C2 失败时，不把 C1 cell 记为 miss。
   - 如需 anchor-risk 诊断再扩展。
 - `src/prog/causal_root_test.go`：
   - C1/C2、rename、FreshB、relation、combo filter、fallback、RNG、pending；
-  - 2026-11-09 复核测试：rename source 子树过滤、source parent/sibling 保留、nested fresh-root plan 拒绝、normal root Parent/Sibling 保留、C2 FreshA normal parent `aEligible` 拒绝。
+  - 2026-11-09 复核测试：rename source 子树过滤、source parent/sibling 保留、nested fresh-root plan 拒绝、normal root Parent/Sibling 保留、C2 FreshA normal parent `aEligible` 拒绝；
+  - 2026-11-18 复核测试：link/symlink target 子树不被 rename source 过滤，rename source 子树仍拒绝。
 
 ---
 
