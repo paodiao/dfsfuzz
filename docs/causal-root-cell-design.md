@@ -453,7 +453,7 @@ C2 只做：
 
 - 枚举 variant 调用、路径关系、路径；
 - 检查 C2 cell 未覆盖；
-- 检查 combo 是否仍可被 directed selection 使用（`comboSelectableFlags` 等价的 retired 过滤）；
+- 检查 combo 是否仍可被 directed selection 使用（`rootDirectedSelectableFlags` 等价的 retired 过滤）；
 - root 必须 `RetA=Success`；
 - variant 可以 Success/ENOENT/Failure；
 - variant 路径以实际 pre/post relation 为准；

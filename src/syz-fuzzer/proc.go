@@ -1617,10 +1617,10 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 			proc.lastDCTBoardLog = now
 			cov := prog.CoverageLayerStats()
 			modelOnly := cov.ModelFound - cov.PlannableFound
-			appendDiagLog("dct pool: obs=%d outModel=%d modelOnly=%d model=%d/%d plan=%d/%d shapes=%d unreach=%d cellUnreach=%d",
+			appendDiagLog("dct pool: obs=%d outModel=%d modelOnly=%d model=%d/%d plan=%d/%d rootPlan=%d shapes=%d unreach=%d cellUnreach=%d",
 				cov.ObservedCells, cov.OutOfModel, modelOnly,
 				cov.ModelFound, cov.ModelTarget, cov.PlannableFound, cov.PlannableTarget,
-				cov.ObservedShapes, prog.UnreachableComboCount(), prog.CellUnreachableCount())
+				cov.RootPlannableTarget, cov.ObservedShapes, prog.UnreachableComboCount(), prog.CellUnreachableCount())
 		}
 	}
 	if stat != StatTriage && stat != StatMinimize && csanPassed &&

@@ -1063,23 +1063,30 @@ GlusterFS 规则：
   都记录，包括模型外返回值；这一层不受 model/plannable 的 gate 控制。
 - **model**：`producible` + `found`。静态自然可达性估计，只用于
   `model=` / `outModel=` 等有界诊断，不是完整性声明，也不驱动选择。
-- **plannable**：`plannable` + `plannableFound`。FailurePolicy 和 directed
-  planner 主动构造的形态；Direction-3（2a variant 偏置、2b exact plan、
-  mutation offset/depth 偏置）只消费这一层。
+- **plannable**：`plannable` + `plannableFound`。generic directed-pair
+  构造层：FailurePolicy 和 directed pair（root 或 anchor）主动构造的形态；
+  Direction-3（2a variant 偏置、2b exact plan、mutation offset/depth 偏置）
+  只消费这一层。`comboKey.Root` 是 A 侧 call 名，不区分 root/anchor。
+- **root-directed**：`rootDirected*` 从 plannable 里按
+  `profile.DirectedRootCalls()` 快照再过滤一层；`rootDirectedPotentials`
+  和 `RootPlannableTarget` 属于这一层。rmdir-root 是 model-only：DCT root、
+  C2 variant、C1 anchor 支持，但不是 C1/normal directed root。
 
 指标统一由 `CoverageLayerStats()` 提供，日志 `dct pool:` 使用：
 
 ```text
 obs        = len(discovered)                  // observed cell
 outModel   = observed - modelFound             // 模型外观察
-modelOnly  = modelFound - plannableFound       // 自然可达但 planner 不构造
+modelOnly  = modelFound - plannableFound       // generic 层：自然可达但 planner 不构造
 model      = modelFound/modelTarget            // model 层覆盖
-plan       = plannableFound/plannableTarget    // planner 层覆盖
+plan       = plannableFound/plannableTarget    // generic directed-pair 层覆盖
+rootPlan   = rootPlannableTarget               // root-directed 子集 target
 shapes     = len(knownShapes)                  // observed event shape
 ```
 
 `CoverageStats()` 仍返回 model 层的 `(found, target)`，仅用于兼容旧测试/调用；
-HMDFS 的 `plannable` 恒等于 model，保持旧行为。
+HMDFS 的 generic `plannable` 恒等于 model，保持旧行为；其
+`RootPlannableTarget` 仍按 HMDFS effective root list 过滤。
 
 ### 8.2.2 Normal dual root
 
@@ -1786,7 +1793,7 @@ ENOENT` 等 race cell 在这些 combo 内是 model/plannable；普通已有对�
   root/variant 列表；
 - `computeProducibleLocked` 对 `variant=readlink` 必须设置 `hb=total, cc=0`，
   否则 directed 会看到不可构造的 readlink CC cell；
-- `directedVariantCalls`/`causalC2ComboLive`/`CoveragePotential` 共用同一
+- `directedVariantCalls`/`causalC2ComboLive`/`DirectedPairPotential` 共用同一
   temporal 规则。
 
 #### 8.6.7 Causal 验收清单

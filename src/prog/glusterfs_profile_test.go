@@ -5,6 +5,29 @@ import (
 	"testing"
 )
 
+// TestGlusterfsRootCallPartition pins the model-root vs directed-root split:
+// every directed root must exist in the model/DCT root list, and the only
+// current model-only root is rmdir. Adding a directed root later must update
+// this test together with the planner and coverage tests.
+func TestGlusterfsRootCallPartition(t *testing.T) {
+	roots, _ := coverageBoardCallLists(glusterfsProfile)
+	directed := glusterfsProfile.DirectedRootCalls()
+	for _, root := range directed {
+		if !profileCallListContains(roots, root) {
+			t.Fatalf("directed root %q missing from model roots %v", root, roots)
+		}
+	}
+	var modelOnly []string
+	for _, root := range roots {
+		if !profileCallListContains(directed, root) {
+			modelOnly = append(modelOnly, root)
+		}
+	}
+	if len(modelOnly) != 1 || modelOnly[0] != "rmdir" {
+		t.Fatalf("model-only roots = %v, want [rmdir]", modelOnly)
+	}
+}
+
 func TestCoverageBoardCallListsUseProfile(t *testing.T) {
 	roots, variants := coverageBoardCallLists(glusterfsProfile)
 	if len(roots) != len(GlusterfsRootCalls) {

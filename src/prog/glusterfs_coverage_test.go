@@ -223,8 +223,6 @@ func TestGlusterfsPlannableDualPathGate(t *testing.T) {
 	}
 }
 
-// TestGlusterfsPlannableSubsetOfModel is the table-drift guard: every
-// plannable form stays inside the model's dimensions.
 // TestGlusterfsRmdirRootModelOnly pins the root-vs-anchor split: rmdir is a
 // DCT/model root and a directed variant/anchor, but not a root-directed plan.
 // Generic directed-pair potential must keep accepting it for anchor use.
@@ -252,17 +250,21 @@ func TestGlusterfsRmdirRootModelOnly(t *testing.T) {
 	if inRootPlannable {
 		t.Fatalf("rmdir-root cell wrongly inside root-directed plannable: %+v", cell)
 	}
-	pots := covBoard.rootDirectedPotentials([]comboKey{{
-		Root: "rmdir", Variant: "stat", Rel: PathSame,
-	}})
+	ck := comboKey{Root: "rmdir", Variant: "stat", Rel: PathSame}
+	pots := covBoard.rootDirectedPotentials([]comboKey{ck})
 	if len(pots) != 1 || pots[0] != 0 {
 		t.Fatalf("rmdir-root directed potential = %v, want 0", pots)
+	}
+	if covBoard.rootDirectedSelectableFlags([]comboKey{ck})[ck] {
+		t.Fatal("rmdir-root must not be root-directed selectable")
 	}
 	if got := DirectedPairPotential("rmdir", "stat", PathSame); got <= 0 {
 		t.Fatalf("rmdir anchor/variant potential = %d, want > 0", got)
 	}
 }
 
+// TestGlusterfsPlannableSubsetOfModel is the table-drift guard: every
+// plannable form stays inside the model's dimensions.
 func TestGlusterfsPlannableSubsetOfModel(t *testing.T) {
 	glusterfsCoverageConfig(t, true)
 

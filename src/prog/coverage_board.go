@@ -81,7 +81,11 @@ type coverageBoard struct {
 	found          map[comboKey][2]int // model: discovered cells per temporal form
 	plannable      map[comboKey][2]int // directed pair: constructible cells per temporal form
 	plannableFound map[comboKey][2]int // directed pair: discovered cells per temporal form
-	knownShapes    map[uint64]bool     // observed event shapes (call-name agnostic)
+	// directedRoots is a snapshot of profile.DirectedRootCalls taken at board
+	// init. Root-directed views use this snapshot so a later profile-list
+	// mutation cannot leave plannable counts and root filtering out of sync.
+	directedRoots map[string]bool
+	knownShapes   map[uint64]bool // observed event shapes (call-name agnostic)
 	// shapeEpoch increments on every newly observed shape; shapeDrainCache
 	// entries are valid only at the epoch they were written, since shapes
 	// never disappear within a board generation. The cache is replaced
@@ -279,6 +283,12 @@ func InitCoverageBoard(hmcfg *Hmdfs_config) {
 	b.persistDir = hmcfg.Persistence_dir
 	b.profile = hmcfg.ProfileOrDefault()
 	b.dualPath = b.profile != nil && b.profile.DualPathCausalEnabled()
+	if b.profile != nil {
+		b.directedRoots = make(map[string]bool)
+		for _, root := range b.profile.DirectedRootCalls() {
+			b.directedRoots[root] = true
+		}
+	}
 	if b.persistDir != "" {
 		b.persistBucket = DepthBucketOf(b.persistDir)
 	}
@@ -627,11 +637,15 @@ func (b *coverageBoard) rootDirectedComboEnabled(ck comboKey) bool {
 	if !b.directedPairComboEnabled(ck) {
 		return false
 	}
-	if b.profile == nil || b.profile.Name != "glusterfs" {
-		// HMDFS keeps the historical plannable == model contract.
+	if b.profile == nil {
 		return true
 	}
-	return profileCallListContains(b.profile.DirectedRootCalls(), ck.Root)
+	if b.directedRoots == nil {
+		// A board built without InitCoverageBoard keeps the permissive legacy
+		// behavior; initialized boards always carry the snapshot.
+		return true
+	}
+	return b.directedRoots[ck.Root]
 }
 
 // computeProducibleLocked computes the model layer's per-temporal cell counts.
@@ -1551,6 +1565,7 @@ func (b *coverageBoard) reset() {
 	b.shapeEpoch = 0
 	b.shapeDrainCache = make(map[shapeDrainKey]shapeDrainEntry)
 	b.profile = nil
+	b.directedRoots = nil
 	b.persistDir = ""
 	b.persistBucket = 0
 	b.depths = [4]bool{}
