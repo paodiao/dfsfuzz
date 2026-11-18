@@ -104,9 +104,15 @@ func TestCellRolePlannableRelLinkpath(t *testing.T) {
 		if covBoard.cellInPlannable(ck) {
 			t.Fatalf("linkpath plannable relation %v accepted: %+v", rel, ck)
 		}
-		if !covBoard.cellInModel(ck) {
-			t.Fatalf("linkpath model relation %v missing: %+v", rel, ck)
-		}
+	}
+	same := cell(PathSame, cellRoleLinkPath)
+	if !covBoard.cellInModel(same) {
+		t.Fatalf("linkpath model Same cell missing: %+v", same)
+	}
+	childModel := cell(PathChild, cellRoleSymlinkLinkPath)
+	childModel.Root = "symlink"
+	if !covBoard.cellInModel(childModel) {
+		t.Fatalf("linkpath model Child cell missing: %+v", childModel)
 	}
 	readlink := glusterfsCoverageCell("symlink", "readlink", PathSame, TemporalHB,
 		RetSuccess, offsetBucketNA, false)
