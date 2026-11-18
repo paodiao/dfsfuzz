@@ -61,6 +61,21 @@ func TestCellRoleLinkRoot(t *testing.T) {
 	covBoard.mu.RUnlock()
 }
 
+func TestDefaultGlusterfsDualPathPlannable(t *testing.T) {
+	hmcfg := &Hmdfs_config{Profile: glusterfsProfile, DfsName: "glusterfs",
+		Node_num: 3, Cids: hmdfsSmokeCids(), FileTree: glusterfsPlanTree()}
+	ResetCoverageBoard()
+	InitCoverageBoard(hmcfg)
+	t.Cleanup(ResetCoverageBoard)
+	cell := glusterfsCoverageCell("write", "link", PathSibling, TemporalHB,
+		RetSuccess, offsetBucketNA, false)
+	covBoard.mu.RLock()
+	defer covBoard.mu.RUnlock()
+	if !covBoard.cellInPlannable(cell) {
+		t.Fatalf("default GlusterFS profile excluded dual-path variant: %+v", cell)
+	}
+}
+
 func TestCellRoleReadlinkSingle(t *testing.T) {
 	glusterfsCoverageConfig(t, true)
 	cell := glusterfsCoverageCell("symlink", "readlink", PathSame, TemporalHB,
