@@ -2721,7 +2721,9 @@ D1 同时发现并修复了两个真实问题：
   plannable 与 planner 同步排除 link 系。
 - `missing_r` 当前包含 root GETATTR 的无 path R 事件（D/S 有、R 无），
   后续可单独分类；不影响 LOOKUP mode 验证。
-- `dcMisses` 因 fresh-fresh race 构造上升是预期，需要与错误计划区分。
+- `dcMisses` 因 fresh-fresh race 构造上升是预期，需要与错误计划区分。诊断行
+  现在把它拆成 `dcMissFresh`（`FreshSame` pending）与 `dcMissOther`；拆分只
+  做归因，不改变 pending、命中/抑制或反馈口径。
 - `MaxDagCorpus` 默认 unlimited；长跑按规模配置并观察 `dag` saturation。
 - role-aware cell 会改变 `ObservedCells`、`PlannableTarget` 和
   `RootPlannableTarget` 的分母；D3 与旧日志对比时按新口径解释。
@@ -2847,13 +2849,18 @@ D2/D3 通过后再做：
 `directCell=plans/hits/misses/noPlan/insertFail` 里的 `noPlan` 是聚合计数，
 不能直接判定为 bug。至少要区分：
 
-| 类别 | 含义 | 是否通常需要改代码 |
-|---|---|---|
-| no live combo | `plannableTarget=0`、全部 discovered、combo unreachable | 否，饱和 |
-| no pickable cell | live combo 但 cell 全被 `cellUnreachable`/domain 过滤 | 否，先看抑制原因 |
-| enumeration empty | potential > 0，但 `planDirectedCells`/C2 没有任何 plan | 可能是，construction matrix/plannable 过宽 |
-| tree too small | batch 需要至少 2 个 client 或缺少可构造节点 | 否，环境/预算 |
-| cfgErr | 配置/前置条件异常 | 是/查配置，不算 noPlan |
+| 类别 | 诊断字段 | 含义 | 是否通常需要改代码 |
+|---|---|---|---|
+| no live combo | `noPlanCombo` | `plannableTarget=0`、全部 discovered、combo unreachable | 否，饱和 |
+| no pickable cell | `noPlanCell` | live combo，但候选 cell 全被饱和过滤（`cellUnreachable`/domain/covered/shape） | 否，先看抑制原因 |
+| enumeration empty | `noPlanEmpty` | potential > 0、tree 非空，但枚举没有产出可 admission 的候选；包括枚举出 plannable 层之外的 cell（`OutOfPlannable>0`） | 可能是，construction matrix/plannable 过宽 |
+| tree too small | `noPlanTree` | live combo 存在但 planning view 为空（缺可构造节点） | 否，环境/预算 |
+| cfgErr | `cfgErr` | 配置/前置条件异常 | 是/查配置，不算 noPlan |
+
+分类由 `planDirectedCellsScan` 的 `LiveCombos`/`BNodes`/`Filtered`/
+`OutOfPlannable` 和 pick 阶段的 `pickable` 状态决定，只写入诊断计数器，不改变
+planner 选择。`noPlan` 仍是四类原因之和；`NoteDirectedNoPlan()` 保留为无原因
+兼容入口。
 
 link/symlink root 的 role 已进入 `cellKey`：linkpath-role 只计 HB，linkpath CC
 不再进 plannable；plannable 还对 linkpath role 过滤掉不可构造的
@@ -2861,10 +2868,9 @@ link/symlink root 的 role 已进入 `cellKey`：linkpath-role 只计 HB，linkp
 relation 虚高。若 link/symlink root 的 noPlan 仍高，按 construction
 matrix/关系可行性排查，而不是 role 丢失。
 
-D2 先看 trace/DAG/coverage 是否健康；如果 `dcNoPlans` 高，再决定：
-
-- 加 `noPlanNoCombo`/`noPlanNoCell`/`noPlanEnumEmpty`/`noPlanTree` 计数器；
-- 或直接上 construction matrix。
+D2 先看 trace/DAG/coverage 是否健康；D3 直接用 `noPlanCombo`/`noPlanCell`/
+`noPlanEmpty`/`noPlanTree` 判断 `dcNoPlans` 卡在哪一层。只有 `noPlanEmpty`
+高且集中在 construction 不可达的 combo 时，才上 construction matrix。
 
 当前不写死 `dcNoPlans` 阈值；阈值应由 D2/D3 的实际执行率、树规模和
 batch 预算决定。
