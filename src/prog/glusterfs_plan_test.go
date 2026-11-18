@@ -243,6 +243,39 @@ func TestValidateCausalPlanLinkRootTargetOnly(t *testing.T) {
 	}
 }
 
+func TestValidateCausalPlanLinkpathRole(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	hmcfg := &Hmdfs_config{Profile: glusterfsProfile, DfsName: "glusterfs", Node_num: 3,
+		Cids: hmdfsSmokeCids(), FileTree: glusterfsPlanTree()}
+	lcs := NewLayeredChoiceStrategy(hmcfg, target)
+	const (
+		targetPath = "dirA/a"
+		linkPath   = "dirA/l1"
+	)
+	node := hmcfg.FileTree.FindNode(targetPath)
+	if node == nil {
+		t.Fatalf("target %q missing", targetPath)
+	}
+	plan := &directedPlan{
+		Cell: directedCell{
+			Combo:    comboKey{Root: "link", Variant: "stat", Rel: PathSibling},
+			RetB:     RetSuccess,
+			OffB:     offsetBucketNA,
+			PersistB: pathInDir(targetPath, hmcfg.Persistence_dir),
+			DepthB:   DepthBucketOf(targetPath),
+			TypeB:    node.Type != NodeTypeFile,
+		},
+		BaseA:            targetPath,
+		BaseB:            targetPath,
+		RootLinkPath:     linkPath,
+		RootRelationPath: linkPath,
+		Causal:           true,
+	}
+	if !validateCausalPlan(hmcfg, lcs, plan) {
+		t.Fatalf("linkpath-role plan rejected: %+v", plan)
+	}
+}
+
 func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
 	target := hmdfsSmokeTarget(t)
 	if _, ok := target.SyscallMap["symlink"]; !ok {
@@ -280,11 +313,15 @@ func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
 		if call == "link" && p.Cell.TypeB != false {
 			t.Fatalf("link target type = %v, want file", p.Cell.TypeB)
 		}
+		relationPath := p.RootRelationPath
+		if relationPath == "" {
+			relationPath = p.RootPath
+		}
 		wantRel, ok := causalPairRelation(p.Anchor.Source, p.Anchor.Path,
-			p.RootPath, p.RootPath)
+			relationPath, relationPath)
 		if !ok || p.Anchor.Relation != wantRel {
-			t.Fatalf("%s C1 relation = %v, target %q gives %v (ok=%v)",
-				call, p.Anchor.Relation, p.RootPath, wantRel, ok)
+			t.Fatalf("%s C1 relation = %v, relation path %q gives %v (ok=%v)",
+				call, p.Anchor.Relation, relationPath, wantRel, ok)
 		}
 	}
 }

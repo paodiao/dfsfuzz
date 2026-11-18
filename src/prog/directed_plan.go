@@ -102,6 +102,10 @@ type directedPlan struct {
 	// or the normal dual-root pass). It is the B side of a readlink C2 variant
 	// and is never a FileTree node. BaseA stays the existing target.
 	RootLinkPath string
+	// RootRelationPath is the A-side path used for relation/cell. Empty means
+	// BaseA (ordinary roots and target-role link/symlink plans); a linkpath-role
+	// plan sets it to RootLinkPath.
+	RootRelationPath string
 	// XattrName is the shared key for getxattr/setxattr variant construction.
 	XattrName string
 	// RenameReplace marks the E rename form (existing same-class same-parent
@@ -109,6 +113,18 @@ type directedPlan struct {
 	// false. Explicit because the live recheck must not infer the shape from
 	// destination existence (a materialized F name could race into existence).
 	RenameReplace bool
+}
+
+// relationRootPath returns the A-side path used for relation/cell. The empty
+// RootRelationPath is the historical target/ordinary-root behavior.
+func (p *directedPlan) relationRootPath() string {
+	if p != nil && p.RootRelationPath != "" {
+		return p.RootRelationPath
+	}
+	if p == nil {
+		return ""
+	}
+	return p.BaseA
 }
 
 // directedBatch is one Phase-2b insertion unit: a single root call on BaseA
@@ -574,6 +590,16 @@ func directedAShapeForPlan(plan *directedPlan, byPath map[string]directedAShape,
 			persist: pathInDir(host, persistDir),
 		}, true
 	default:
+		relPath := plan.relationRootPath()
+		if (plan.Cell.Combo.Root == "link" || plan.Cell.Combo.Root == "symlink") &&
+			relPath != "" && relPath != plan.BaseA {
+			// linkpath-role: a program-local file binding, not a FileTree node.
+			return directedAShape{
+				depth:   DepthBucketOf(relPath),
+				isDir:   false,
+				persist: pathInDir(relPath, persistDir),
+			}, true
+		}
 		in, ok := byPath[plan.BaseA]
 		return in, ok
 	}
@@ -1354,7 +1380,9 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 	// directory or the rename destination). RootLinkPath participates for
 	// link/symlink roots: a target may in principle have several planned
 	// linkpaths, but one batch executes exactly one root linkpath, so plans
-	// from another linkpath must never be mixed in.
+	// from another linkpath must never be mixed in. Target-role and
+	// linkpath-role relation plans may share a group; RootRelationPath is a
+	// per-plan relation choice, not a batch constraint.
 	var group []int
 	for i, ok := range flags {
 		if !ok {
@@ -2115,11 +2143,11 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	}
 	// Normal dual-path roots. link/symlink cannot be planned by the ordinary
 	// single-path passes: the root call needs both the existing target and a
-	// fresh program-local linkpath, while the cell/relation identity remains
-	// target-based. Reuse causal C2's fixed-root enumerator with
+	// fresh program-local linkpath. Reuse causal C2's fixed-root enumerator with
 	// causalRootNormal so relation, readlink and type semantics stay
-	// single-sourced. One linkpath is generated per (root, target) and is
-	// shared by every plan in the resulting batch group.
+	// single-sourced. One linkpath is generated per (root, target); both
+	// target-role and linkpath-role relation plans share that root call and can
+	// coexist in one batch group.
 	if profile.DualPathCausalEnabled() {
 		var dualRoots []string
 		for _, root := range rootCalls {
@@ -2137,12 +2165,14 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 				if linkPath == "" {
 					continue
 				}
-				dualPlans, dualCells := planCausalC2CellsWithParent(nil, lcs, hmcfg,
-					root, bn.path, "", AnchorPathUnknown, false, false,
-					bn.path, linkPath, false, causalRootNormal, r)
-				for _, ck := range dualCells {
-					if p := dualPlans[ck]; p != nil {
-						add(*p)
+				for _, relationPath := range []string{bn.path, linkPath} {
+					dualPlans, dualCells := planCausalC2CellsWithParent(nil, lcs, hmcfg,
+						root, bn.path, "", AnchorPathUnknown, false, false,
+						bn.path, linkPath, relationPath, false, causalRootNormal, r)
+					for _, ck := range dualCells {
+						if p := dualPlans[ck]; p != nil {
+							add(*p)
+						}
 					}
 				}
 			}

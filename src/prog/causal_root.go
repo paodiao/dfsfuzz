@@ -44,6 +44,7 @@ type causalRootPlan struct {
 	RootParentIsAnchor bool
 	RootSource         string
 	RootDest           string
+	RootRelationPath   string
 	RootRenameReplace  bool
 }
 
@@ -74,7 +75,7 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 	if c1.RootKind == causalRootFresh {
 		c1.RootPath = directedFreshName(c1.RootCall, c1.RootParent, r.Rand)
 	}
-	planByCell, cells := planCausalC2CellsWithParent(ps, lcs, hmcfg, c1.RootCall, c1.RootPath, c1.RootParent, c1.RootParentKind, c1.RootParentIsDir, c1.RootParentIsAnchor, c1.RootSource, c1.RootDest, c1.RootRenameReplace, c1.RootKind, r)
+	planByCell, cells := planCausalC2CellsWithParent(ps, lcs, hmcfg, c1.RootCall, c1.RootPath, c1.RootParent, c1.RootParentKind, c1.RootParentIsDir, c1.RootParentIsAnchor, c1.RootSource, c1.RootDest, c1.RootRelationPath, c1.RootRenameReplace, c1.RootKind, r)
 	if len(cells) == 0 {
 		return nil, false
 	}
@@ -93,7 +94,8 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 	var group []*directedPlan
 	for _, p := range picked {
 		if p.Cell.Combo.Root == seed.Cell.Combo.Root &&
-			p.BaseA == seed.BaseA && p.BaseA2 == seed.BaseA2 {
+			p.BaseA == seed.BaseA && p.BaseA2 == seed.BaseA2 &&
+			p.RootLinkPath == seed.RootLinkPath {
 			group = append(group, p)
 		}
 	}
@@ -194,21 +196,24 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 // causalRootRelPaths returns the root's pre/post paths for C2 relation
 // classification. A rename root is the HB A side and uses its destination
 // (post-state) for every relation; all other roots have one effective path.
-func causalRootRelPaths(rootKind causalRootKind, rootCall, rootPath, rootSource, rootDest string) (string, string) {
+func causalRootRelPaths(rootKind causalRootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath string) (string, string) {
 	if rootKind == causalRootRename {
 		// HB A uses the rename's post-state destination. Source/Dest remain
 		// available for materializing rename(src,dst).
 		return rootDest, rootDest
 	}
 	if rootCall == "link" || rootCall == "symlink" {
-		// Ordinary link/symlink variants classify through the target. The
-		// linkpath is a program-local binding and only the readlink variant
-		// (handled separately) observes it.
-		target := rootSource
-		if target == "" {
-			target = rootPath
+		// The relation uses the explicit role path. Empty preserves the
+		// historical target-role behavior; readlink sets rootRelationPath to
+		// the linkpath.
+		relationPath := rootRelationPath
+		if relationPath == "" {
+			relationPath = rootSource
+			if relationPath == "" {
+				relationPath = rootPath
+			}
 		}
-		return target, target
+		return relationPath, relationPath
 	}
 	return rootPath, rootPath
 }
@@ -281,12 +286,12 @@ func causalC2ComboLive(profile *DFSProfile, root string) (map[comboKey]bool, boo
 // It is a fixed-root enumeration, not a post-filter over the global A-witness
 // planner, so a cell is not lost merely because the normal planner sampled a
 // different valid A witness for it.
-func planCausalC2Cells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, rootCall, rootPath, rootParent, rootSource, rootDest string, rootRenameReplace bool, rootKind causalRootKind, r *randGen) (map[cellKey]*directedPlan, []cellKey) {
+func planCausalC2Cells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, rootCall, rootPath, rootParent, rootSource, rootDest, rootRelationPath string, rootRenameReplace bool, rootKind causalRootKind, r *randGen) (map[cellKey]*directedPlan, []cellKey) {
 	return planCausalC2CellsWithParent(ps, lcs, hmcfg, rootCall, rootPath, rootParent,
-		AnchorPathUnknown, false, false, rootSource, rootDest, rootRenameReplace, rootKind, r)
+		AnchorPathUnknown, false, false, rootSource, rootDest, rootRelationPath, rootRenameReplace, rootKind, r)
 }
 
-func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, rootCall, rootPath, rootParent string, rootParentKind AnchorPathKind, rootParentIsDir, rootParentIsAnchor bool, rootSource, rootDest string, rootRenameReplace bool, rootKind causalRootKind, r *randGen) (map[cellKey]*directedPlan, []cellKey) {
+func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, rootCall, rootPath, rootParent string, rootParentKind AnchorPathKind, rootParentIsDir, rootParentIsAnchor bool, rootSource, rootDest, rootRelationPath string, rootRenameReplace bool, rootKind causalRootKind, r *randGen) (map[cellKey]*directedPlan, []cellKey) {
 	planByCell := make(map[cellKey]*directedPlan)
 	var cells []cellKey
 	if lcs == nil || lcs.FileTree == nil || hmcfg == nil || r == nil {
@@ -386,7 +391,7 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		planA, planA2 = rootSource, rootDest
 		freshA2 = true
 	}
-	rootPre, rootPost := causalRootRelPaths(rootKind, rootCall, rootPath, rootSource, rootDest)
+	rootPre, rootPost := causalRootRelPaths(rootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath)
 	destructiveSame := func(varPre string, rel PathRelation) bool {
 		if rel != PathSame {
 			return false
@@ -438,6 +443,7 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			RootParentIsDir:    rootParentIsDir,
 			RootParentIsAnchor: rootParentIsAnchor,
 			RootLinkPath:       planRootLink,
+			RootRelationPath:   rootRelationPath,
 		}
 		cells = append(cells, ck)
 	}
@@ -613,6 +619,7 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			addC2(cell, rootDest, "", 0, 0, false, false, false)
 			if p := planByCell[cell.toKey()]; p != nil {
 				p.RootLinkPath = rootDest
+				p.RootRelationPath = rootDest
 			}
 		}
 	}
@@ -780,44 +787,48 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 							!causalRenameRootPathAllowed(anchor, linkPath) {
 							continue
 						}
-						// C1: link/symlink is the B side. The C1 cell and
-						// relation use the target only; linkpath is an
-						// auxiliary binding and must not form a second C1 pair.
-						actualRel, ok := causalPairRelation(anchorPre, anchorPost,
-							rootPath, rootPath)
-						if !ok {
-							continue
-						}
-						isDir := rootNode.Type != NodeTypeFile
-						ck := cellKey{
-							Root:     call.Meta.CallName,
-							Variant:  rootCall,
-							Rel:      actualRel,
-							Temporal: TemporalHB,
-							RetA:     RetSuccess,
-							RetB:     RetSuccess,
-							OffB:     offsetBucketNA,
-							PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
-							DepthB:   DepthBucketOf(rootPath),
-							TypeB:    isDir,
-						}
-						if !covBoard.cellUncovered(ck) {
-							continue
-						}
-						a := anchor
-						a.Relation = actualRel
-						plan := &causalRootPlan{
-							Anchor:     a,
-							Cell:       ck,
-							RootCall:   rootCall,
-							RootPath:   rootPath,
-							RootKind:   causalRootNormal,
-							RootParent: parentDirOrRoot(rootPath),
-							RootSource: rootPath,
-							RootDest:   linkPath,
-						}
-						if _, ok := byCell[ck]; !ok {
-							byCell[ck] = plan
+						// C1: link/symlink is the B side. The root has both
+						// target and linkpath roles; generate one plan per role.
+						// A cell collision keeps the first (target-role) plan,
+						// matching the role-free cell identity.
+						for _, relationPath := range []string{rootPath, linkPath} {
+							actualRel, ok := causalPairRelation(anchorPre, anchorPost,
+								relationPath, relationPath)
+							if !ok {
+								continue
+							}
+							isDir := relationPath == rootPath && rootNode.Type != NodeTypeFile
+							ck := cellKey{
+								Root:     call.Meta.CallName,
+								Variant:  rootCall,
+								Rel:      actualRel,
+								Temporal: TemporalHB,
+								RetA:     RetSuccess,
+								RetB:     RetSuccess,
+								OffB:     offsetBucketNA,
+								PersistB: pathInDir(relationPath, hmcfg.Persistence_dir),
+								DepthB:   DepthBucketOf(relationPath),
+								TypeB:    isDir,
+							}
+							if !covBoard.cellUncovered(ck) {
+								continue
+							}
+							a := anchor
+							a.Relation = actualRel
+							plan := &causalRootPlan{
+								Anchor:           a,
+								Cell:             ck,
+								RootCall:         rootCall,
+								RootPath:         rootPath,
+								RootKind:         causalRootNormal,
+								RootParent:       parentDirOrRoot(rootPath),
+								RootSource:       rootPath,
+								RootDest:         linkPath,
+								RootRelationPath: relationPath,
+							}
+							if _, ok := byCell[ck]; !ok {
+								byCell[ck] = plan
+							}
 						}
 						continue
 					}
@@ -1560,6 +1571,18 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 			return false
 		}
 	}
+	if plan.Cell.Combo.Root == "link" || plan.Cell.Combo.Root == "symlink" {
+		if plan.RootLinkPath == "" || ft.FindNode(plan.RootLinkPath) != nil {
+			return false
+		}
+		relationPath := plan.RootRelationPath
+		if relationPath == "" {
+			relationPath = plan.BaseA
+		}
+		if relationPath != plan.BaseA && relationPath != plan.RootLinkPath {
+			return false
+		}
+	}
 	// Variant side.
 	if plan.FreshSame {
 		if plan.BaseA == "" || plan.BaseA != plan.BaseB ||
@@ -1667,7 +1690,11 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 	if plan.FreshSame {
 		return pathRelBetween(plan.BaseA, plan.BaseB) == plan.Cell.Combo.Rel
 	}
-	rootPre, rootPost := plan.BaseA, plan.BaseA
+	rootRelationPath := plan.RootRelationPath
+	if rootRelationPath == "" {
+		rootRelationPath = plan.BaseA
+	}
+	rootPre, rootPost := rootRelationPath, rootRelationPath
 	if plan.FreshA2 {
 		// HB A of a rename root is the post-state destination.
 		rootPre, rootPost = plan.BaseA2, plan.BaseA2

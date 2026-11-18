@@ -1106,12 +1106,13 @@ PickDirectedBatch
 实现规则：
 
 - 普通 pass 的 root 列表排除 `link/symlink`；
-- dual pass 对每个 target/root 生成一个 fresh `RootLinkPath`，并调用
+- dual pass 对每个 target/root 生成一个 fresh `RootLinkPath`，并分别以
+  target/linkpath 作为 `RootRelationPath` 调用
   `planCausalC2CellsWithParent(..., rootKind=causalRootNormal, ...)`；
-- `BaseA` 是 target；cell/relation 用 target 计算；`RootLinkPath` 只出现在
-  plan/batch 和 readlink 的 B 侧，不进入 `cellKey/comboKey`；
-- `pickDirectedBatchNormal` 的 group 条件加入 `RootLinkPath`，保证一个 batch
-  只执行一个 root linkpath；
+- `BaseA` 是 target；`RootLinkPath` 是 linkpath；cell/relation 用
+  `RootRelationPath`（target 或 linkpath），它不进入 `cellKey/comboKey`；
+- target-role 和 linkpath-role plan 可以共享同一个 root execution 和 batch；
+  `pickDirectedBatchNormal` 仍按 `RootLinkPath` 分组，不按角色拆 group；
 - `insertDirectedBatch` 对 `Anchor==nil` 的 link/symlink root 用
   `causalRootCallsSeq` materialize target + linkpath；
 - normal dual plan 标记 `Causal=true` 只是为了复用 `validateCausalPlan` 对
@@ -1462,10 +1463,11 @@ readlink:    不做 C1 anchor
 - rename anchor 的 A 侧只用 post/dst，`src` 只作为 B/CC 候选，不把 src
   当成 A；
 - C1 root 增加 `causalRootDual`：
-  - `RootPath = target`（C1 cell 的 B 侧）
+  - `RootPath = target`（root materialization）
   - `RootSource = target`
   - `RootDest = linkpath`
-  - linkpath 只用于 root 生成和 readlink variant，不进 C1 cell。
+  - `RootRelationPath = target` 或 `linkpath`（C1 cell 的 B 侧/relation）
+  - target-role 和 linkpath-role 可以产生不同 cell；同 cellKey 只保留一个 plan。
 - C1 root 是 rename 时，B 侧 cell/relation 用 `RootSource`（src），
   `RootDest`（dst）只用于 materialize。
 
@@ -1545,8 +1547,11 @@ link:    link(target=rootPath, linkpath=fresh)
 symlink: symlink(target=rootPath, linkpath=fresh)
 ```
 
-C1 cell 的 `DepthB/TypeB/PersistB/Rel` 全用 target；linkpath 不进 cell。
+C1 cell 的 `DepthB/TypeB/PersistB/Rel` 用 `RootRelationPath`：target-role 用
+target（TypeB 按 target 类型），linkpath-role 用 linkpath（TypeB=false）。
+linkpath 只在 linkpath-role cell 中作为 B 侧路径出现，不进入 target-role cell。
 C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
+`DualPathCausalEnabled=false` 时 linkpath-role C1 不生成。
 
 #### 8.6.3 C2 variant 枚举
 
@@ -1562,9 +1567,11 @@ C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
 | `rmdir` | target | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | dir |
 | `rename` | src | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | file/dir |
 
-- C2 root 是 link/symlink 时，普通 variant 的 root A 用 target；唯一例外是
-  readlink：B 用 root `LinkPath`，root A 也用 linkpath，relation 只能是
-  `Same`；普通 variant 循环不生成 readlink；
+- C2 root 是 link/symlink 时，普通 variant 的 root A 用 `RootRelationPath`
+  （target 或 linkpath）；readlink 例外：B 用 root `LinkPath`，root A 也强制
+  linkpath，relation 只能是 `Same`；普通 variant 循环不生成 readlink；
+- target-role 和 linkpath-role plan 可以共享同一个 root execution，同 batch
+  只需 target/linkpath 相同；`cellKey` 不记录 role；
 - link/symlink 的 linkpath fresh，不进 `BaseB`/cell；
 - link/symlink 的 EEXIST 不进入 v1 cell 模型；
 - readlink 只允许 `root=symlink`，不规划 CC，不规划 EINVAL；
@@ -1736,10 +1743,11 @@ read(L1) + write(T)
 #### 8.6.6 Coverage cell
 
 - `cellKey`/`comboKey` 不加入 role/RelKind/HardlinkGroupKey；
-- C1 root=link/symlink：B 侧用 target，cell 不记录 linkpath；
-- C2 link/symlink variant：B 侧用 target，linkpath fresh 不进 cell；
-- C2 root 是 link/symlink 时，普通 variant 的 A 侧用 target；readlink 的
-  A 侧用 root `LinkPath`；
+- C1 root=link/symlink：B 侧用 `RootRelationPath`（target 或 linkpath）；
+  target-role 和 linkpath-role 若产生同一 cellKey，只保留一个 plan；
+- C2 link/symlink variant：B 侧用 target，linkpath fresh 不进 variant cell；
+- C2 root 是 link/symlink 时，普通 variant 的 A 侧用 `RootRelationPath`；
+  readlink 的 A 侧强制 root `LinkPath`；
 - C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，relation 只 Same，
   TypeB=false；
 - C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；
@@ -1810,7 +1818,7 @@ C1：
 - anchorNodes 同时枚举 target/linkpath；
 - root=link/symlink target 从测试根内已有文件/目录选（anchor 关系或 baseline），
   linkpath fresh；symlink payload 按 linkpath parent 物化；
-- C1 cell 使用 target，HB，RetB=Success；
+- C1 cell 使用 `RootRelationPath`（target 或 linkpath），HB，RetB=Success；
 - 禁止嵌套 link/symlink。
 
 C2：

@@ -1399,6 +1399,31 @@ func TestDirectedAShapeFreshA2Temporal(t *testing.T) {
 	}
 }
 
+// TestDirectedAShapeLinkpathRole pins the linkpath-role A shape: the linkpath
+// is a file binding, not a FileTree node, so its own depth/persist/type drive
+// the shape.
+func TestDirectedAShapeLinkpathRole(t *testing.T) {
+	byPath := map[string]directedAShape{
+		"merge_view/dirA/a": {depth: DepthBucketOf("merge_view/dirA/a"), isDir: true},
+	}
+	plan := &directedPlan{
+		Cell:             directedCell{Combo: comboKey{Root: "symlink"}},
+		BaseA:            "merge_view/dirA/a",
+		RootLinkPath:     "merge_view/dirB/nested/l1",
+		RootRelationPath: "merge_view/dirB/nested/l1",
+	}
+	shape, ok := directedAShapeForPlan(plan, byPath, "merge_view/dirB")
+	if !ok || shape.depth != DepthBucketOf(plan.RootRelationPath) ||
+		shape.isDir || !shape.persist {
+		t.Fatalf("linkpath-role shape = %+v (ok=%v)", shape, ok)
+	}
+	plan.RootRelationPath = ""
+	shape, ok = directedAShapeForPlan(plan, byPath, "")
+	if !ok || !shape.isDir || shape.depth != DepthBucketOf(plan.BaseA) {
+		t.Fatalf("target-role shape = %+v (ok=%v)", shape, ok)
+	}
+}
+
 // TestValidateRenamePlanLive pins the dual-path recheck: same-parent sources,
 // fresh destinations, non-empty directory destinations, the source/destination
 // A guard and the prePath-based Same relation.

@@ -227,7 +227,7 @@ func TestCausalRootFreshC2AndInsert(t *testing.T) {
 		t.Fatal("no fresh root plan")
 	}
 	fresh.RootPath = directedFreshName(fresh.RootCall, fresh.RootParent, r.Rand)
-	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, fresh.RootCall, fresh.RootPath, fresh.RootParent, "", "", false, fresh.RootKind, r)
+	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, fresh.RootCall, fresh.RootPath, fresh.RootParent, "", "", "", false, fresh.RootKind, r)
 	if len(cells) == 0 {
 		t.Fatal("fresh root produced no C2 plans")
 	}
@@ -314,7 +314,7 @@ func TestCausalRootRenameC2Candidates(t *testing.T) {
 			t.Fatalf("rename root not same-parent: %+v", p)
 		}
 		_, cells := planCausalC2Cells(ps, lcs, hmcfg, p.RootCall, p.RootPath,
-			p.RootParent, p.RootSource, p.RootDest, p.RootRenameReplace, p.RootKind, r)
+			p.RootParent, p.RootSource, p.RootDest, p.RootRelationPath, p.RootRenameReplace, p.RootKind, r)
 		if len(cells) == 0 {
 			t.Fatalf("rename root produced no C2 plans: %+v", p)
 		}
@@ -358,7 +358,7 @@ func TestCausalRootC2RenameAndFreshBPlans(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	ps := directedPlanBaseProgs(target)
 	r := newRand(target, rand.NewSource(12))
-	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, "stat", "merge_view/dirA/a", "", "", "", false, causalRootNormal, r)
+	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, "stat", "merge_view/dirA/a", "", "", "", "", false, causalRootNormal, r)
 	if len(cells) == 0 {
 		t.Fatal("no C2 plans")
 	}
@@ -423,7 +423,7 @@ func TestCausalRootC2VariantRenameSameUsesSource(t *testing.T) {
 	ps := directedPlanBaseProgs(target)
 	const root = "merge_view/dirA/a"
 	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, "stat", root, "",
-		"", "", false, causalRootNormal, newRand(target, rand.NewSource(13)))
+		"", "", "", false, causalRootNormal, newRand(target, rand.NewSource(13)))
 	sawSourceSame := false
 	for _, ck := range cells {
 		p := byCell[ck]
@@ -457,7 +457,7 @@ func TestCausalRootRenameC2Relations(t *testing.T) {
 			continue
 		}
 		byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, p.RootCall, p.RootPath,
-			p.RootParent, p.RootSource, p.RootDest, p.RootRenameReplace, p.RootKind, r)
+			p.RootParent, p.RootSource, p.RootDest, p.RootRelationPath, p.RootRenameReplace, p.RootKind, r)
 		for _, ck := range cells {
 			q := byCell[ck]
 			if q == nil {
@@ -665,7 +665,7 @@ func TestCausalRootC2SkipsRetiredCombo(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	ps := directedPlanBaseProgs(target)
 	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, "stat", "merge_view/dirA/a", "",
-		"", "", false, causalRootNormal, newRand(target, rand.NewSource(15)))
+		"", "", "", false, causalRootNormal, newRand(target, rand.NewSource(15)))
 	if len(cells) == 0 {
 		t.Fatal("causal C2 fixture produced no plans")
 	}
@@ -681,7 +681,7 @@ func TestCausalRootC2SkipsRetiredCombo(t *testing.T) {
 	covBoard.mu.Unlock()
 
 	byCell, cells = planCausalC2Cells(ps, lcs, hmcfg, "stat", "merge_view/dirA/a", "",
-		"", "", false, causalRootNormal, newRand(target, rand.NewSource(16)))
+		"", "", "", false, causalRootNormal, newRand(target, rand.NewSource(16)))
 	for _, ck := range cells {
 		if p := byCell[ck]; p != nil && p.Cell.Combo == retired {
 			t.Fatalf("retired combo still planned: %+v", p)
@@ -912,7 +912,7 @@ func TestPlanCausalC2RejectsTreeRootFreshParent(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	ps := directedPlanBaseProgs(target)
 	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, "mkdir",
-		"merge_view/freshRoot", "merge_view", "", "", false,
+		"merge_view/freshRoot", "merge_view", "", "", "", false,
 		causalRootFresh, newRand(target, rand.NewSource(25)))
 	if len(cells) != 0 || len(byCell) != 0 {
 		t.Fatalf("C2 accepted merge_view as fresh root parent: cells=%d plans=%d", len(cells), len(byCell))
@@ -925,7 +925,7 @@ func TestPlanCausalC2RejectsNestedFreshRootParent(t *testing.T) {
 	const nestedParent = "merge_view/dirA/newParent/newChild"
 	byCell, cells := planCausalC2CellsWithParent(ps, lcs, hmcfg, "mkdir",
 		nestedParent+"/root", nestedParent, AnchorPathFreshDir, true, true,
-		"", "", false, causalRootFresh, newRand(target, rand.NewSource(26)))
+		"", "", "", false, causalRootFresh, newRand(target, rand.NewSource(26)))
 	if len(cells) != 0 || len(byCell) != 0 {
 		t.Fatalf("C2 accepted nested fresh parent: cells=%d plans=%d", len(cells), len(byCell))
 	}
@@ -1013,11 +1013,24 @@ func TestCausalRootRelPathsLinkTargetOnly(t *testing.T) {
 		},
 	}
 	for _, tc := range cases {
-		pre, post := causalRootRelPaths(tc.kind, tc.call, tc.path, tc.source, tc.dest)
+		pre, post := causalRootRelPaths(tc.kind, tc.call, tc.path, tc.source, tc.dest, "")
 		if pre != tc.wantPre || post != tc.wantPost {
 			t.Fatalf("%s: paths = %q/%q, want %q/%q",
 				tc.name, pre, post, tc.wantPre, tc.wantPost)
 		}
+	}
+}
+
+func TestCausalRootRelPathsLinkRole(t *testing.T) {
+	pre, post := causalRootRelPaths(causalRootNormal, "symlink",
+		"dirA/a", "dirA/a", "dirB/l1", "dirB/l1")
+	if pre != "dirB/l1" || post != "dirB/l1" {
+		t.Fatalf("linkpath-role root paths = %q/%q, want dirB/l1", pre, post)
+	}
+	pre, post = causalRootRelPaths(causalRootNormal, "symlink",
+		"dirA/a", "dirA/a", "dirB/l1", "")
+	if pre != "dirA/a" || post != "dirA/a" {
+		t.Fatalf("default target-role root paths = %q/%q, want target", pre, post)
 	}
 }
 
