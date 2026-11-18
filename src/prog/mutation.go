@@ -4380,6 +4380,55 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 	return m
 }
 
+// freshPathCreatorBefore returns the latest successful creator of path before
+// end and the argument index that creates it. It mirrors freshPathKindsBefore:
+// a failed GlusterFS call is skipped, so it cannot shadow an earlier creator.
+func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfile) (GroupPosition, int, bool) {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
+	if p == nil || path == "" || end <= 0 {
+		return GroupPosition{}, 0, false
+	}
+	if end > len(p.Calls) {
+		end = len(p.Calls)
+	}
+	for i := end - 1; i >= 0; i-- {
+		c := p.Calls[i]
+		if c == nil || c.Meta == nil {
+			continue
+		}
+		if profile.Name == "glusterfs" && !callAssumedSucceeded(c) {
+			continue
+		}
+		switch c.Meta.CallName {
+		case "mkdir", "creat":
+			if extractPathFromCall(c) == path {
+				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
+			}
+		case "open":
+			if openPathCreatesFile(p.Target, c) && extractPathFromCall(c) == path {
+				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
+			}
+		case "rename":
+			_, dst := extractRenamePaths(c)
+			if dst == path {
+				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
+			}
+		case "link":
+			if extractPathFromCallByArgIdx(c, 1) == path {
+				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
+			}
+		case "symlink":
+			if extractPathFromCallByArgIdx(c, 1) == path {
+				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
+			}
+		}
+	}
+	return GroupPosition{}, 0, false
+}
+
 // dctBaseCandidates returns the HMDFS legacy candidate set.
 func dctBaseCandidates(p *Prog, insertPos int) []string {
 	return dctBaseCandidatesFor(hmdfsProfile, p, insertPos)

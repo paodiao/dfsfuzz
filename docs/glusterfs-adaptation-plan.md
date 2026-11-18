@@ -1914,6 +1914,10 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
   - target 可以是 baseline 已有路径，或同一 plan 中更早的 creator 产生的
     fresh 路径；fresh target 要求 baseline 节点不存在且 parent 有效；映射后
     必须仍是测试根内路径；
+  - fresh link/symlink target 在 `pathSpec` 中记录
+    `CreatorPos`/`CreatorArgIdx`；`buildPathPlan`/`buildTargetPathPlan`
+    映射后把 target 对齐到 creator 的 mapped path；`validatePathSetPlan`
+    拒绝 creator 缺失/分叉，以及目录类 creator 的 link target；
   - target 不能是 `freshLinkPathsBefore` 中的 linkpath（含 rename 后的
     linkpath），不能形成嵌套链接；
   - target != linkpath。

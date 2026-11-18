@@ -30,6 +30,12 @@ type pathSpec struct {
 	Role           pathRole
 	ArgIdx         int
 	TypeConstraint int
+	// CreatorPos/CreatorArgIdx bind a fresh consumer path (link/symlink
+	// target) to the earlier creator that will make it exist. HasCreator
+	// distinguishes the zero position from "no binding".
+	CreatorPos    GroupPosition
+	CreatorArgIdx int
+	HasCreator    bool
 }
 
 type pathMember struct {
@@ -334,6 +340,9 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				// earlier in the same program. In the latter case its type comes
 				// from the creator and it must not itself be a link binding.
 				kind := pathExisting
+				creatorPos := GroupPosition{}
+				creatorArg := 0
+				hasCreator := false
 				node := ft.FindNode(target)
 				if node != nil {
 					if !nodeMatchesConstraint(node, constraint) {
@@ -355,6 +364,14 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 					if info, ok := freshLinks[rawTarget]; ok && info.Kind != 0 {
 						continue
 					}
+					creatorPos, creatorArg, hasCreator = freshPathCreatorBefore(p, ci, target, profile)
+					if !hasCreator {
+						creatorPos, creatorArg, hasCreator = freshPathCreatorBefore(p, ci, rawTarget, profile)
+					}
+					if !hasCreator {
+						continue
+					}
+					creatorPos.ProgIdx = pi
 					kind = pathFresh
 				}
 				role := pathRoleLinkTarget
@@ -366,6 +383,9 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 					Paths: []pathSpec{{
 						Path: target, Kind: kind, Role: role, ArgIdx: 0,
 						TypeConstraint: constraint,
+						CreatorPos:     creatorPos,
+						CreatorArgIdx:  creatorArg,
+						HasCreator:     hasCreator,
 					}},
 					Constraint: constraint,
 				})
@@ -894,6 +914,61 @@ func pathSetSpecValidProvisional(ps []*Prog, pos GroupPosition, spec pathSpec, c
 	})
 }
 
+// pathSetPosBefore reports whether a runs before b in program/call order.
+func pathSetPosBefore(a, b GroupPosition) bool {
+	if a.ProgIdx != b.ProgIdx {
+		return a.ProgIdx < b.ProgIdx
+	}
+	return a.CallIdx < b.CallIdx
+}
+
+// pathSetCreatorSpec returns the member/spec index of the earlier creator bound
+// to a fresh consumer path.
+func pathSetCreatorSpec(set *pathSet, spec pathSpec) (int, int, bool) {
+	if set == nil || !spec.HasCreator {
+		return 0, 0, false
+	}
+	for i := range set.Members {
+		if set.Members[i].Pos != spec.CreatorPos {
+			continue
+		}
+		if spec.CreatorArgIdx < 0 || spec.CreatorArgIdx >= len(set.Members[i].Paths) {
+			return 0, 0, false
+		}
+		return i, spec.CreatorArgIdx, true
+	}
+	return 0, 0, false
+}
+
+// alignFreshLinkTargets makes a fresh link/symlink target follow the mapped
+// path of its creator. The creator may be the directed target member, whose
+// map uses a specially chosen memberPath; without this alignment the consumer
+// can land on a different fresh path and never resolve at execution.
+func alignFreshLinkTargets(set *pathSet, updates []pathUpdate) {
+	if set == nil || len(updates) != len(set.Members) {
+		return
+	}
+	for i := range set.Members {
+		m := &set.Members[i]
+		if len(updates[i].Specs) != len(m.Paths) {
+			continue
+		}
+		for j, spec := range m.Paths {
+			if spec.Kind != pathFresh || !spec.HasCreator ||
+				(spec.Role != pathRoleLinkTarget && spec.Role != pathRoleSymlinkTarget) {
+				continue
+			}
+			ci, cj, ok := pathSetCreatorSpec(set, spec)
+			if !ok || ci >= len(updates) || cj >= len(updates[ci].Specs) {
+				continue
+			}
+			if p := updates[ci].Specs[cj].Path; p != "" {
+				updates[i].Specs[j].Path = p
+			}
+		}
+	}
+}
+
 func pathSetFallbackPathWithParent(ps []*Prog, pos GroupPosition, desired, base string, spec pathSpec,
 	constraint int, ft *FileTree, r *randGen, parentValid func(string) bool) string {
 	candidates := []string{desired, base}
@@ -1179,6 +1254,7 @@ func buildTargetPathPlan(ps []*Prog, set *pathSet, target *pathTarget,
 		}
 		plan.Updates = append(plan.Updates, update)
 	}
+	alignFreshLinkTargets(set, plan.Updates)
 	if !pathSetConnected(set, plan) {
 		atomic.AddUint64(&pathSetStats.candidateConnectivityFail, 1)
 		return nil, 3, fallbacks, false
@@ -1305,6 +1381,7 @@ func buildPathPlan(ps []*Prog, set *pathSet, base, parent string, roots []string
 		}
 		plan.Updates = append(plan.Updates, update)
 	}
+	alignFreshLinkTargets(set, plan.Updates)
 	return plan, true
 }
 
@@ -1348,6 +1425,7 @@ func pathSetConnected(set *pathSet, plan *pathPlan) bool {
 
 type pathPlanMappedSpec struct {
 	pos  GroupPosition
+	orig pathSpec
 	spec pathSpec
 }
 
@@ -1411,8 +1489,8 @@ func validatePathSetPlan(ps []*Prog, set *pathSet, plan *pathPlan, ft *FileTree,
 		if update.Pos != member.Pos || len(update.Specs) != len(member.Paths) {
 			return quality, false
 		}
-		for _, spec := range update.Specs {
-			mapped = append(mapped, pathPlanMappedSpec{pos: member.Pos, spec: spec})
+		for j, spec := range update.Specs {
+			mapped = append(mapped, pathPlanMappedSpec{pos: member.Pos, orig: member.Paths[j], spec: spec})
 		}
 	}
 	freshPathPos := make(map[string]GroupPosition)
@@ -1439,6 +1517,40 @@ func validatePathSetPlan(ps []*Prog, set *pathSet, plan *pathPlan, ft *FileTree,
 				return pathSetPlanParentValid(ps, mapped, ft, tscoffs, member.Pos, parent, &quality)
 			}
 			if !pathSetSpecValidWithParent(ps, member.Pos, spec, member.Constraint, ft, parentValid) {
+				return quality, false
+			}
+		}
+	}
+	// A fresh link/symlink target is only as real as its earlier creator. The
+	// per-spec check above cannot see whether the creator was mapped to the same
+	// path (the directed target arm may map the creator member separately), so
+	// require the creator binding to survive the mapping.
+	for i := range plan.Updates {
+		member := set.Members[i]
+		for j, orig := range member.Paths {
+			if orig.Kind != pathFresh ||
+				(orig.Role != pathRoleLinkTarget && orig.Role != pathRoleSymlinkTarget) {
+				continue
+			}
+			if !orig.HasCreator || !pathSetPosBefore(orig.CreatorPos, member.Pos) {
+				return quality, false
+			}
+			ci, cj, ok := pathSetCreatorSpec(set, orig)
+			if !ok || ci >= len(plan.Updates) || cj >= len(plan.Updates[ci].Specs) {
+				return quality, false
+			}
+			creatorOrig := set.Members[ci].Paths[cj]
+			switch creatorOrig.Role {
+			case pathRoleMkdir, pathRoleCreat, pathRoleRenameDst, pathRoleDirect:
+			default:
+				return quality, false
+			}
+			creatorMapped := plan.Updates[ci].Specs[cj]
+			if creatorOrig.Kind != pathFresh ||
+				creatorMapped.Path != plan.Updates[i].Specs[j].Path {
+				return quality, false
+			}
+			if orig.Role == pathRoleLinkTarget && creatorOrig.TypeConstraint == relTargetDir {
 				return quality, false
 			}
 		}
