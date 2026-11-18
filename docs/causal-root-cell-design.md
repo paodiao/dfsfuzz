@@ -337,10 +337,14 @@ readlink: path = symlink 的 linkpath
   这两个 anchor 的 `SourceMoved=false`，因此 §2.6 的 source 子树过滤不适用。
 - C1 cell 的 B 侧只使用 target；C2 target-role 的 B 侧使用 target，
   linkpath-role 只在 HB 的 A 侧使用 linkpath；readlink 的 B 侧使用 linkpath。
+- C1 link/symlink anchor 按 A 侧 role 枚举：target role 用 target FileTree
+  node，linkpath role 用 `causalRootPathsByPath(linkpath)`；C1 cell 的
+  `Role` 与 anchor role 对齐。
 - C2 cell 的 `Role` 与 `RootRelationPath` 对齐：target/普通 cell 用
   `cellRoleNone`，linkpath-role 用显式 role 且只计 HB；readlink 用
   `cellRoleSymlinkLinkPath`。C1 link/symlink anchor 的 linkpath-role HB 与
-  C2 link/symlink root 的 linkpath-role HB 是同一个 cell。
+  C2 link/symlink root 的 linkpath-role HB 是同一个 cell。plannable 对
+  linkpath role 只保留 Parent/Sibling（readlink Same）。
 - link/symlink target 是 **anchor 关系派生** 的 canonical 路径，不是 fixed
   baseline；映射/迁移后必须仍在测试根内、存在且类型匹配。
 - `RootPaths`/`seedAnchor`/PathSet 只保存 canonical target；symlink payload

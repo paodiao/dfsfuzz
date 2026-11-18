@@ -1470,10 +1470,11 @@ symlink:     Path=linkpath, Source=target, Dest=linkpath
 readlink:    不做 C1 anchor
 ```
 
-- link/symlink anchor 的 `anchorNodes` 同时包含 target 和 linkpath；
-- link/symlink anchor 的 A 侧候选是 target/linkpath，
-  `causalPairRelation(anchor.Source, anchor.Path, ...)` 会看 `{pre, post}`
-  两个候选，target 不会丢；
+- link/symlink anchor 的 A 侧按 role 枚举：target role 用 target FileTree
+  node；linkpath role 用 `causalRootPathsByPath(linkpath)`，不把 linkpath
+  当 FileTree node；
+- 两个 role 分别用各自的 `{pre, post}` 调用 `causalPairRelation`，C1 cell
+  的 `Role` 与 anchor role 对齐，不再把 linkpath relation 压到 target cell；
 - rename anchor 的 A 侧只用 post/dst，`src` 只作为 B/CC 候选，不把 src
   当成 A；
 - C1 root 候选的 source 子树过滤只对成功 rename anchor 生效，由
@@ -1772,9 +1773,15 @@ read(L1) + write(T)
   都用 target，linkpath-role 只 HB 用 linkpath；readlink 的 A 侧强制 root
   `LinkPath`；
 - linkpath role 只计 HB：`computeProducibleLocked`/`computePlannableLocked`
-  按 `cellRolesForCombo` 求和，linkpath CC 不进入 model/plannable 势能；
+  按 role 存 `roleCellCounts`，linkpath CC 不进入 model/plannable 势能；
+- plannable 额外做 role/relation 过滤：linkpath 是 fresh file/symlink entry，
+  非 readlink 只允许 `Parent`/`Sibling`，readlink 只允许 `Same`；model 保留
+  自然可达上界，不应用这个过滤；
 - target-role 与 linkpath-role 共享 `comboKey`，但 `cellKey.Role` 不同；
   `directedCell.Role` 与 `RootRelationPath` 对齐，pending 按 role 匹配；
+- C1 link/symlink anchor 也按 role 枚举：target role 用 target node，
+  linkpath role 用 `causalRootPathsByPath(linkpath)`；C1 cell 的 `Role` 与
+  anchor role 一致；
 - C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，relation 只 Same，
   TypeB=false；
 - C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；
@@ -1847,10 +1854,14 @@ C1：
 
 - anchor 可以是 link/symlink/setxattr；readlink/getxattr 不做 anchor；
 - anchor link/symlink 的 Path=linkpath、Source=target、Dest=linkpath；
-- anchorNodes 同时枚举 target/linkpath；
+- anchorNodes 按 role 枚举：target role 用 target FileTree node；linkpath role
+  用 `causalRootPathsByPath(linkpath)` 的 Parent/Sibling，不把 linkpath 当
+  FileTree node；
 - root=link/symlink target 从测试根内已有文件/目录选（anchor 关系或 baseline），
   linkpath fresh；symlink payload 按 linkpath parent 物化；
-- C1 cell 使用 target，HB，RetB=Success；linkpath-role 只存在于 C2 HB；
+- C1 link/symlink root 的 B 侧只用 target；C1 link/symlink anchor 的 A 侧按
+  target/linkpath role 生成独立 cell，`Cell.Role` 与 anchor role 对齐；
+  linkpath-role 只 HB，且 plannable 只允许 Parent/Sibling（readlink Same）；
 - 禁止嵌套 link/symlink。
 
 C2：
@@ -1877,11 +1888,14 @@ Coverage：
   （none/linkpath/symlink-linkpath）。role 是 cell 身份，不是 DCT combo 维度；
 - link/symlink root 的 target role 用 `cellRoleNone`，linkpath role 用显式
   role；target role 计 CC+HB，linkpath role 只计 HB；
-- C1 link/symlink anchor 的 linkpath-role HB 与 C2 link/symlink root 的
-  linkpath-role HB 是同一个 cell，C2 linkpath plan 可以覆盖；
+- C1 link/symlink anchor 也按 target/linkpath role 枚举；linkpath-role HB 与
+  C2 link/symlink root 的 linkpath-role HB 是同一个 cell，二者 plan 可共享；
 - readlink 是单 role，用 `cellRoleSymlinkLinkPath`，只产生 HB self cell；
-- `computeProducibleLocked`/`computePlannableLocked` 按 role 求和；
-  linkpath CC 不进入 model/plannable 势能；
+- `producible`/`plannable`/`found`/`plannableFound` 都是
+  `map[comboKey]roleCellCounts`，按 role 存计数；linkpath CC 不进入
+  model/plannable 势能；
+- plannable 对 linkpath role 做 relation 过滤：非 readlink 只允许
+  `Parent`/`Sibling`，readlink 只允许 `Same`；model 保持自然可达上界；
 - producibleRets/Types/OffBuckets 按上表；creation-root Same combo 另加
   `freshSameForms` 的 race 形态（含 model race ENOENT 扩展）；
 - `DagPairToVariant` 不改。
@@ -2706,6 +2720,8 @@ D1 同时发现并修复了两个真实问题：
   后续可单独分类；不影响 LOOKUP mode 验证。
 - `dcMisses` 因 fresh-fresh race 构造上升是预期，需要与错误计划区分。
 - `MaxDagCorpus` 默认 unlimited；长跑按规模配置并观察 `dag` saturation。
+- role-aware cell 会改变 `ObservedCells`、`PlannableTarget` 和
+  `RootPlannableTarget` 的分母；D3 与旧日志对比时按新口径解释。
 
 ### 13.2 D 验证阶段
 
@@ -2837,8 +2853,10 @@ D2/D3 通过后再做：
 | cfgErr | 配置/前置条件异常 | 是/查配置，不算 noPlan |
 
 link/symlink root 的 role 已进入 `cellKey`：linkpath-role 只计 HB，linkpath CC
-不再进 plannable，因此 `dcNoPlans` 不再被 role-free CC 抬高。若 link/symlink
-root 的 noPlan 仍高，按 construction matrix/关系可行性排查，而不是 role 丢失。
+不再进 plannable；plannable 还对 linkpath role 过滤掉不可构造的
+`Child`/非 readlink `Same`。因此 `dcNoPlans` 不再被 role-free CC 或这些
+relation 虚高。若 link/symlink root 的 noPlan 仍高，按 construction
+matrix/关系可行性排查，而不是 role 丢失。
 
 D2 先看 trace/DAG/coverage 是否健康；如果 `dcNoPlans` 高，再决定：
 
