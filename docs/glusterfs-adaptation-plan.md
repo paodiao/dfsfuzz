@@ -1,9 +1,10 @@
 # GlusterFS 适配总计划（v1）
 
 > 状态：设计定稿（P1 已收敛）；核心实现已落；P2 review #7–#11 已收口；
-> D1 BPF standalone smoke 已通过，D2/D3/D4 待执行
+> GlusterFS dual-path causal 与 role-aware coverage 已启用；D1 BPF standalone
+> smoke 已通过，D2/D3/D4 待执行
 > 日期：2026-11-15（2026-11-18 更新 P2 收口、PathSet current state /
-> creator binding / rename prefix remap、coverage cell 与 FileTree fallback）
+> creator binding / rename prefix remap、role-aware coverage、dual-path gate）
 > 范围：GlusterFS 3 server + 3 client、replica 3；HMDFS 行为保持不变；NFS 暂不实现
 > 权威关系：本文是 GlusterFS 适配的总入口。tracer 的 BPF 原始细节参考
 > `docs/glusterfs-tracer-implementation-spec.md`；两者冲突时以本文为准。
@@ -911,13 +912,14 @@ const (
 ### 6.3 数据模型
 
 - `DAGVertex` 保留 `Path`，增加角色化备选路径；`OldPath` 只做 rename 兼容。
-- `DAGPair` 增加 `RoleA/RoleB`；`PathRel` 仍只有一个。
+- `DAGPair` 用 role-selected `APath/BPath` + `APathType/BPathType` 记录 role；
+  `PathRel` 仍只有一个。
 - `CallVariant` 不加 role；DCT 表仍是 root/variant/relation。双路径生成和
-  planner 使用 §8.5.6 的 `DualPathKind`/`RootPaths`，不进入 `CallVariant`
-  或 coverage key。
-- **`cellKey`/`comboKey` 不增加 `RoleA/RoleB`/`RelKind`**。role 只存在于
-  DAGPair 和 plan bindings，避免同一个 link 事件因 role 产生重复 cell；
-  legacy 键保持 `(Root, Variant, Rel, ...)`。
+  planner 使用 §8.5.6 的 `DualPathKind`/`RootPaths`，不进入 `CallVariant`。
+- **`comboKey` 不增加 role/RelKind**；`cellKey` 增加 `Role`，只区分
+  link/symlink A 侧的 target/linkpath role。target/普通 cell 用零值，
+  linkpath 用显式 role；legacy 键保持 `(Root, Variant, Rel, ...)` 的零 role
+  行为。`cellKey` 不增加 `RelKind`/HardlinkGroupKey。
 - `directedPlan` 保存 `ABindings/BBindings`；`BaseA/BaseA2/BaseB/BaseB2`
   只做兼容投影。
 - `planStateEffect` 返回多路径 effect；authority 按路径 + `HardlinkGroupKey`。
@@ -1051,7 +1053,7 @@ GlusterFS 规则：
 - `readlink` 只作为 variant，跟在 symlink root 后；不能做 root。
 - `link/symlink` 先做 seed root；derived DCT 共用 §8.5.6 的 `RootPaths`；
   causal C1 和 normal directed dual root 的 link/symlink 插入都由
-  `DualPathCausalEnabled` 控制，trace 稳定后一起开启；v1 保持 false。
+  `DualPathCausalEnabled` 控制；GlusterFS 默认开启，HMDFS 保持 false。
 - GlusterFS 允许跨目录 rename；HMDFS 保持 same-parent。
 - **GlusterFS v1 不做 `PathSameInode`**：DAG 只按路径相等/几何关系；
   HMDFS 无 hardlink，保留现有分类并继续折叠。
@@ -1127,8 +1129,9 @@ PickDirectedBatch
   `causalRootCallsSeq` materialize target + linkpath；
 - normal dual plan 标记 `Causal=true` 只是为了复用 `validateCausalPlan` 对
   `RootLinkPath`/readlink 的校验，不表示它来自 C1；
-- 由 `DualPathCausalEnabled` gate。v1 保持 false，所以代码存在但运行时惰性；
-  gate 打开后 causal C1 和 normal dual root 都可用。
+- 由 `DualPathCausalEnabled` gate。GlusterFS 默认 true，causal C1 和 normal
+  dual root 都可用；gate=false 只保留为 A/B 对照，此时 plannable 与 planner
+  同步排除 link 系。
 
 ### 8.2.3 FreshSame 竞赛矩阵与 combo-aware plannable
 
@@ -1183,8 +1186,9 @@ ENOENT`）只在对应 creation-root Same combo 的 model/plannable 中扩展，
 
 `planDirectedCells.add()` 的 plannable 检查是最后一道不变量：任何 normal plan
 进入 batch 前都必须落在 combo-aware plannable 内。HMDFS 的 plannable 恒等于
-model，保持旧行为；`link/symlink/readlink` 在 `DualPathCausalEnabled=false`
-时对 GlusterFS 不进 plannable，DCT 仍可自然生成并记录。
+model，保持旧行为；GlusterFS 默认 `DualPathCausalEnabled=true`，
+`link/symlink/readlink` 进入 plannable。gate=false 的 A/B 配置下两者同步排除，
+不会出现 plannable 有、planner 无的错配。
 
 ### 8.2.4 DAG feedback
 
@@ -1406,7 +1410,7 @@ HB 取 `Dest`（rename=dst）；非 rename root 取 `EntryPath`
 payload 只在构造 `symlink` 调用时由 `dirname(linkpath)` 到 canonical target
 计算，不能存进 `RootPaths`/DCT/PathSet key。
 causal root 的 link/symlink 插入由 profile gate（如
-`DualPathCausalEnabled`）控制，trace 稳定后开启。
+`DualPathCausalEnabled`）控制；GlusterFS 默认开启，HMDFS 保持 false。
 
 #### 8.5.7 实现落点
 
@@ -1450,7 +1454,7 @@ normal directed planner 的 link/symlink root 同样复用该抽象：
 `planDirectedCells` 的 dual pass 调 `planCausalC2CellsWithParent`，由
 `causalRootNormal` 固定 target/linkpath；`RootLinkPath` 只进 plan/batch，
 再经 `insertDirectedBatch` → `causalRootCallsSeq` materialize。该 pass 与
-C1 共用 `DualPathCausalEnabled` gate，v1 保持 false；详见 §8.2.2。
+C1 共用 `DualPathCausalEnabled` gate；GlusterFS 默认 true，HMDFS false；详见 §8.2.2。
 
 ### 8.6 Causal Root / Directed（GlusterFS v1）
 
@@ -1535,7 +1539,7 @@ getdents 的配套调用。文件 close 的 RELEASE 事件仍可作 DAG B/CC；�
 - readlink 只读一跳，返回 payload；DAG/checker 用 linkpath + payload 还原
   canonical target。
 
-`DualPathCausalEnabled=false` 时，link/symlink 的 C1/C2 插入不生成；
+`DualPathCausalEnabled=false` 的 A/B 配置下，link/symlink 的 C1/C2 插入不生成；
 trace 稳定后打开。
 
 #### 8.6.2 C1 root 路径候选
@@ -1565,7 +1569,7 @@ symlink: symlink(target=rootPath, linkpath=fresh)
 C1 cell 的 `DepthB/TypeB/PersistB/Rel` 全用 target；linkpath 只用于 root
 物化和 readlink，不进入 C1 cell。
 C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
-`DualPathCausalEnabled=false` 时 C1 link/symlink 不生成。
+`DualPathCausalEnabled=false` 的 A/B 配置下 C1 link/symlink 不生成。
 
 #### 8.6.3 C2 variant 枚举
 
@@ -1588,7 +1592,7 @@ C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
   readlink 例外：B 用 root `LinkPath`，root A 也强制 linkpath，relation
   只能是 `Same`；普通 variant 循环不生成 readlink；
 - target-role 和 linkpath-role plan 可以共享同一个 root execution，同 batch
-  只需 target/linkpath 相同；`cellKey` 不记录 role；
+  只需 target/linkpath 相同；`cellKey` 用 `Role` 区分 target/linkpath cell；
 - link/symlink 的 linkpath fresh，不进 `BaseB`/cell；
 - link/symlink 的 EEXIST 不进入 v1 cell 模型；
 - readlink 只允许 `root=symlink`，不规划 CC，不规划 EINVAL；
@@ -1755,16 +1759,22 @@ read(L1) + write(T)
 - destructive Same root 下，link/symlink/getxattr/setxattr 的 HB Success
   不规划；CC 仍按竞态保留 Success；不生成 ENOENT failure cell。readlink
   只有 HB，若 root destructive same LinkPath 则该组合不规划。
-- `DualPathCausalEnabled=false` 时 link/symlink/readlink 的 causal 插入不生成。
+- `DualPathCausalEnabled=false` 的 A/B 配置下 link/symlink/readlink 的 causal
+  插入不生成；GlusterFS 默认 true。
 
 #### 8.6.6 Coverage cell
 
-- `cellKey`/`comboKey` 不加入 role/RelKind/HardlinkGroupKey；
+- `comboKey` 不加入 role/RelKind/HardlinkGroupKey；`cellKey` 加入 `Role`
+  （target/普通 cell 用零值，linkpath 用显式 role）；
 - C1 root=link/symlink：B 侧只用 target；linkpath 不进 C1 cell；
 - C2 link/symlink variant：B 侧用 target，linkpath fresh 不进 variant cell；
 - C2 root 是 link/symlink 时，普通 variant 的 A 侧：target-role 的 CC/HB
   都用 target，linkpath-role 只 HB 用 linkpath；readlink 的 A 侧强制 root
   `LinkPath`；
+- linkpath role 只计 HB：`computeProducibleLocked`/`computePlannableLocked`
+  按 `cellRolesForCombo` 求和，linkpath CC 不进入 model/plannable 势能；
+- target-role 与 linkpath-role 共享 `comboKey`，但 `cellKey.Role` 不同；
+  `directedCell.Role` 与 `RootRelationPath` 对齐，pending 按 role 匹配；
 - C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，relation 只 Same，
   TypeB=false；
 - C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；
@@ -1825,10 +1835,11 @@ ENOENT` 等 race cell 在这些 combo 内是 model/plannable；普通已有对�
 
 - coverage board 初始化不能再用全局 `FsopsSubCalls`；必须用 profile 的
   root/variant 列表；
-- `computeProducibleLocked` 对 `variant=readlink` 必须设置 `hb=total, cc=0`，
-  否则 directed 会看到不可构造的 readlink CC cell；
+- `computeProducibleLocked`/`computePlannableLocked` 对 linkpath role 只计
+  HB；readlink 是单 role，也只计 HB。target role 仍计 CC+HB，否则 directed
+  会把 linkpath CC 当成可构造 cell；
 - `directedVariantCalls`/`causalC2ComboLive`/`DirectedPairPotential` 共用同一
-  temporal 规则。
+  role-aware temporal 规则。
 
 #### 8.6.7 Causal 验收清单
 
@@ -1857,14 +1868,20 @@ C2：
   `freshSameForms` 的 Failure/EEXIST/ENOENT 形态；这是独立通道，不受上面的
   单操作失败限制；
 - HardlinkGroupKey 只影响 size/offset 预测；
-- `DualPathCausalEnabled=false` 时 causal C1 和 normal dual root 的
-  link/symlink 插入都不生成。
+- `DualPathCausalEnabled=false` 的 A/B 配置下 causal C1 和 normal dual root 的
+  link/symlink 插入都不生成；GlusterFS 默认 true。
 
 Coverage：
 
-- cellKey 不含 role/group/RelKind；
-- link/symlink 双 role pair 由 cellKey 去重；
-- readlink 只产生 HB self cell；
+- `comboKey` 不含 role/group/RelKind；`cellKey` 含 `Role`
+  （none/linkpath/symlink-linkpath）。role 是 cell 身份，不是 DCT combo 维度；
+- link/symlink root 的 target role 用 `cellRoleNone`，linkpath role 用显式
+  role；target role 计 CC+HB，linkpath role 只计 HB；
+- C1 link/symlink anchor 的 linkpath-role HB 与 C2 link/symlink root 的
+  linkpath-role HB 是同一个 cell，C2 linkpath plan 可以覆盖；
+- readlink 是单 role，用 `cellRoleSymlinkLinkPath`，只产生 HB self cell；
+- `computeProducibleLocked`/`computePlannableLocked` 按 role 求和；
+  linkpath CC 不进入 model/plannable 势能；
 - producibleRets/Types/OffBuckets 按上表；creation-root Same combo 另加
   `freshSameForms` 的 race 形态（含 model race ENOENT 扩展）；
 - `DagPairToVariant` 不改。
@@ -2476,8 +2493,9 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   GlusterFS LOOKUP 直接用事件 `Path`；所有匹配事件建顶点，不做同调用过滤。
 - 不引入 `entry_ino`/canonicalization；hardlink 的 inode_path 任意 alias
   只影响事件 path，不影响 DAG 顶点路径。
-- 状态（2026-11-17）：coverage 三层（observed/model/plannable）、
-  combo-aware FreshSame race、GlusterFS 完整 DAG feedback 已实现。
+- 状态（2026-11-18）：coverage 三层（observed/model/plannable）、
+  combo-aware FreshSame race、role-aware linkpath cell、GlusterFS 完整 DAG
+  feedback 已实现。
 
 ### Phase 4：DCT/定向/restore
 
@@ -2488,7 +2506,7 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
 - DCT mutation：已执行 link/symlink 的 target/linkpath 随机，variants 跟随 base；
   rename 已执行用 dst、未执行用 src；readlink 只用 linkpath。
 - derived DCT 与 causal root 共用 `DualPathKind`/`RootPaths`；causal 的
-  link/symlink 由 `DualPathCausalEnabled` gate 控制。
+  link/symlink 由 `DualPathCausalEnabled` gate 控制，GlusterFS 默认 true。
 - C1：link/symlink/setxattr anchor/root；C1 root link/symlink 用 target 做
   cell、linkpath 只生成；读路径不做嵌套链接。
 - C2：link/symlink/readlink/getxattr/setxattr；readlink 只挂 symlink root，
@@ -2500,11 +2518,13 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   完整 `freshSameForms`；这些 Failure/EEXIST/ENOENT race 形态进 plannable，
   并在 model 中为对应 combo 补充单操作表未列出的 race 形态。
 - normal dual root 已实现：`planDirectedCells` dual pass +
-  `causalRootNormal`；`DualPathCausalEnabled=false` 时 v1 不生成。
+  `causalRootNormal`；GlusterFS 默认 `DualPathCausalEnabled=true`，正常生成；
+  gate=false 只作为 A/B 对照。
 - `HardlinkGroupKey` 只做 directed/C2 authority；`planStateEffect` 中
   link/symlink/setxattr 为 observer。
-- coverage：cellKey 不含 role/group；readlink CC=0；coverage board 使用
-  profile root/variant 列表，不再用全局 `FsopsSubCalls`。
+- coverage：`comboKey` 不含 role/group；`cellKey` 含 role，linkpath CC=0；
+  readlink 单 role；coverage board 使用 profile root/variant 列表，不再用
+  全局 `FsopsSubCalls`。
 - 跨目录 rename；link/symlink A/HB 随机 role。
 - PathSet broad：link/symlink 只迁移 canonical target，linkpath 保持
   program-local binding；readlink 不独立迁移；rename src/dst 都迁移，dst 按
@@ -2529,9 +2549,10 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
 
 - 3-3 验证；HMDFS 回归；文档更新。
 - 状态（2026-11-18）：P2 review #7–#11 已收口，PathSet current state /
-  creator binding / rename prefix remap 文档已同步；D1 BPF standalone
-  smoke 已通过。Ubuntu `go test ./prog ./syz-fuzzer`、`make executor`、
-  D2/D3/D4 仍待执行。
+  creator binding / rename prefix remap 文档已同步；GlusterFS dual-path causal
+  默认开启，coverage 增加 role 维度（comboKey 保持 role-free）；D1 BPF
+  standalone smoke 已通过。Ubuntu `go test ./prog ./syz-fuzzer`、
+  `make executor`、D2/D3/D4 仍待执行。
 
 ## 13. 验收
 
@@ -2561,7 +2582,7 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   - DCT mutation：已执行 link/symlink 的 target/linkpath 随机，variants 跟随
     base；rename 已执行用 dst、未执行用 src；readlink 只用 linkpath。
   - derived DCT 与 causal root 共用 `RootPaths`；causal 的 link/symlink 插入
-    由 `DualPathCausalEnabled` gate 控制。
+    由 `DualPathCausalEnabled` gate 控制，GlusterFS 默认 true。
   - C1：link/symlink/setxattr 可做 anchor/root；link/symlink root 的
     RootPath=target、RootDest=linkpath；readlink/getxattr 不做 anchor/root。
   - C2：link/symlink/readlink/getxattr/setxattr 可做 variant；readlink 只挂
@@ -2572,12 +2593,13 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
     getxattr ENODATA、setxattr EEXIST；其他失败不进 directed/producible。
   - HardlinkGroupKey 只影响 directed/C2 的 size/offset authority；C1/C2
     link/symlink/setxattr 在 `planStateEffect` 中是 observer。
-  - coverage：cellKey 不含 role/group/RelKind；link/symlink 双 role pair
-    由 cellKey 去重；readlink 只产生 HB self cell，CC=0；coverage board
-    使用 profile root/variant 列表。
+  - coverage：`comboKey` 不含 role/group/RelKind；`cellKey` 含 `Role`。
+    link/symlink target/linkpath 是不同 cell，linkpath role 只产生 HB；
+    readlink 单 role，只产生 HB self cell，CC=0；coverage board 使用
+    profile root/variant 列表。
   - 不生成嵌套 link/symlink；`readlink` 只读一跳。
-  - `CallVariant`/`Weights`/`comboKey`/`cellKey` 不引入 role/RelKind；
-    link/symlink 双 role pair 仍由现有 cellKey 去重。
+  - `CallVariant`/`Weights`/`comboKey` 不引入 role/RelKind；`cellKey` 只加
+    `Role`，不加 RelKind/group。target/linkpath 共享 combo，但 cell 身份分开。
   - link/symlink 事件 `Path/Path2` 分别等于 linkpath/target；symlink 的 Path2
     是 payload，DAG/checker 能按 linkpath 还原 canonical target。
   - symlink follow 的 FUSE GETATTR 事件 path 是 target `T`，但 DAG `stat`
@@ -2640,11 +2662,13 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
 ```text
 coverage 三层                        已实现
 FreshSame combo-aware plannable      已实现
-normal dual root                     已实现，v1 DualPathCausalEnabled=false
+normal dual root                     已实现，GlusterFS DualPathCausalEnabled=true
 GlusterFS DAG feedback               已启用
 GlusterFS executor cwd/restore/metadata 已实现
 MetadataDelayMs profile default      已实现（HMDFS 30000 / GlusterFS 10000）
 GlusterFS CSAN/symsc A/B             已实现
+GlusterFS dual-path causal          默认启用（DualPathCausalEnabled=true）
+role-aware coverage                 已实现，runtime 待验证
 P2 review #7–#11                     已修复，cross-compile/vet 通过
 PathSet current state/rename remap   已实现，runtime 待验证
 D1 BPF standalone smoke              已通过
@@ -2676,7 +2700,8 @@ D1 同时发现并修复了两个真实问题：
 - 非 creation-root 的上下文矛盾仍可能保留在 plannable envelope 中，例如
   `open/mkdir Same Success`、`open/rmdir Same Success`；后续 construction
   matrix 再收，当前不作为阻塞项。
-- normal dual root 在 v1 不实际生成；gate 打开后才进入 plannable/planner。
+- normal dual root 默认进入 plannable/planner；gate=false 的 A/B 配置下
+  plannable 与 planner 同步排除 link 系。
 - `missing_r` 当前包含 root GETATTR 的无 path R 事件（D/S 有、R 无），
   后续可单独分类；不影响 LOOKUP mode 验证。
 - `dcMisses` 因 fresh-fresh race 构造上升是预期，需要与错误计划区分。
@@ -2810,6 +2835,10 @@ D2/D3 通过后再做：
 | enumeration empty | potential > 0，但 `planDirectedCells`/C2 没有任何 plan | 可能是，construction matrix/plannable 过宽 |
 | tree too small | batch 需要至少 2 个 client 或缺少可构造节点 | 否，环境/预算 |
 | cfgErr | 配置/前置条件异常 | 是/查配置，不算 noPlan |
+
+link/symlink root 的 role 已进入 `cellKey`：linkpath-role 只计 HB，linkpath CC
+不再进 plannable，因此 `dcNoPlans` 不再被 role-free CC 抬高。若 link/symlink
+root 的 noPlan 仍高，按 construction matrix/关系可行性排查，而不是 role 丢失。
 
 D2 先看 trace/DAG/coverage 是否健康；如果 `dcNoPlans` 高，再决定：
 

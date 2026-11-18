@@ -1,14 +1,15 @@
 # 因果根与 root→variant 两层种子构造设计
 
-> 状态：设计定稿（2026-10-27）；普通/fd/fresh/rename root、FreshB、C2 combo filter、完整 pre/post relation 已实现；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-10-28 补充 C1 anchor PathKind、fresh anchor 关系矩阵、C2 fresh-parent 与 `open(O_CREAT)` 支持；已实现，Ubuntu runtime 待验证。2026-11-09 设计复核：补充 rename anchor 的 source 子树 root path 约束、1 层 fresh/nested fresh parent 边界、C2 FreshA normal parent 的 `aEligible` 防御，并把 anchor success 偏好文档与当前实现对齐；复核项代码已落，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 的 link/symlink target/linkpath、canonical/payload、readlink follower 与 PathSet 双路径边界。2026-11-18 复核：#7 rename source 子树过滤改为显式 `SourceMoved`，link/symlink target 不再被误过滤；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。
+> 状态：设计定稿（2026-10-27）；普通/fd/fresh/rename root、FreshB、C2 combo filter、完整 pre/post relation 已实现；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-10-28 补充 C1 anchor PathKind、fresh anchor 关系矩阵、C2 fresh-parent 与 `open(O_CREAT)` 支持；已实现，Ubuntu runtime 待验证。2026-11-09 设计复核：补充 rename anchor 的 source 子树 root path 约束、1 层 fresh/nested fresh parent 边界、C2 FreshA normal parent 的 `aEligible` 防御，并把 anchor success 偏好文档与当前实现对齐；复核项代码已落，Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。2026-11-15 补充 GlusterFS v1 的 link/symlink target/linkpath、canonical/payload、readlink follower 与 PathSet 双路径边界。2026-11-18 复核：#7 rename source 子树过滤改为显式 `SourceMoved`，link/symlink target 不再被误过滤；同批启用 GlusterFS dual-path causal 与 role-aware coverage（`comboKey` role-free，`cellKey` 增加 linkpath role）；Linux 交叉编译/vet 通过，Ubuntu runtime 待验证。
 > 范围：`PickDirectedBatch` 的根节点因果锚定、固定 root 的 variant 规划、rename 支持。
 > 术语：本文的 C1/C2 指 causal 两层（anchor→root、root→variant），不是论文中的 C1/C2 两个挑战。
 > 关联：Seed 纯派生设计见 `docs/seed-derivation-design.md`；PathSet/数据/删除部分见 `docs/seed-construction-causal-chain-notes.md`；本文不修改论文或 PPT。
 >
 > 2026-11-17 GlusterFS：normal directed planner 的 link/symlink root 复用
 > `planCausalC2CellsWithParent(..., causalRootNormal, ...)`，`RootLinkPath`
-> 只进 plan/batch；该 pass 与 causal C1 共用 `DualPathCausalEnabled` gate。
-> 语义见 `docs/glusterfs-adaptation-plan.md` §8.2.2。
+> 只进 plan/batch；该 pass 与 causal C1 共用 `DualPathCausalEnabled` gate，
+> GlusterFS 默认 true、HMDFS false。语义见
+> `docs/glusterfs-adaptation-plan.md` §8.2.2。
 
 ---
 
@@ -336,6 +337,10 @@ readlink: path = symlink 的 linkpath
   这两个 anchor 的 `SourceMoved=false`，因此 §2.6 的 source 子树过滤不适用。
 - C1 cell 的 B 侧只使用 target；C2 target-role 的 B 侧使用 target，
   linkpath-role 只在 HB 的 A 侧使用 linkpath；readlink 的 B 侧使用 linkpath。
+- C2 cell 的 `Role` 与 `RootRelationPath` 对齐：target/普通 cell 用
+  `cellRoleNone`，linkpath-role 用显式 role 且只计 HB；readlink 用
+  `cellRoleSymlinkLinkPath`。C1 link/symlink anchor 的 linkpath-role HB 与
+  C2 link/symlink root 的 linkpath-role HB 是同一个 cell。
 - link/symlink target 是 **anchor 关系派生** 的 canonical 路径，不是 fixed
   baseline；映射/迁移后必须仍在测试根内、存在且类型匹配。
 - `RootPaths`/`seedAnchor`/PathSet 只保存 canonical target；symlink payload
