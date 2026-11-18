@@ -1856,15 +1856,15 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
 | 调用 | PathSet broad | PathSet directed target arm |
 |---|---|---|
 | `rename(src,dst)` | 支持；src/dst 都迁移，走 `RenamePolicy` | 不参与；双路径成员整体排除 |
-| `link(target,linkpath)` | 支持；v1 只迁移 target；linkpath 保持 fresh binding | 不参与；`len(Paths)!=1` |
-| `symlink(target,linkpath)` | 支持；v1 只迁移 canonical target；linkpath 保持 fresh binding，物化时重算 payload | 不参与；`len(Paths)!=1` |
+| `link(target,linkpath)` | 支持；v1 只迁移 target；linkpath 保持 fresh binding | 不参与；call-name gate |
+| `symlink(target,linkpath)` | 支持；v1 只迁移 canonical target；linkpath 保持 fresh binding，物化时重算 payload | 不参与；call-name gate |
 | `readlink(linkpath,...)` | 跟随 symlink linkpath，不独立迁移 | 不参与；call-name gate 显式排除 |
 | `open(O_CREAT)` | 单路径，补 `pathRoleCreat` | 可单路径 target |
 
-- PathSet directed target arm v1 的判定是 **整个成员 `len(Paths)==1`**，不是“从双路径成员里选一个 spec”。`pickPathSetTarget`/`pathSetSinglePath` 保持这个语义；`readlink` 虽单路径，也必须由 call-name gate 排除。
+- PathSet directed target arm v1 的判定是 **整个成员 `len(Paths)==1`**，不是“从双路径成员里选一个 spec”。`pickPathSetTarget`/`pathSetSinglePath` 保持这个语义；target-only 后 link/symlink 也是单路径，因此另加 call-name gate，link/symlink/readlink 一律不参与 directed target arm。`readlink` 同样由 call-name gate 排除。
 - `PathSet` 内部只保存 canonical 路径（相对测试根）；不保存 symlink payload。
 - `link/symlink` 的 target **不是 fixed baseline**：它和 `rename` source 一样属于
-  路径分量，按 anchor 关系派生并参与映射；target 可以是 baseline existing，也可以是同一程序/plan 中更早 creator 产生、执行时存在的 fresh 路径；映射后必须重新校验存在性/类型。
+  路径分量，按 anchor 关系派生并参与映射；target 可以是 baseline existing，也可以是同一程序/plan 中更早 creator 产生、执行时存在的 fresh 路径；映射后必须重新校验存在性/类型。fresh target 用 `freshPathKindsBefore` 判定类型，用 `freshLinkPathsBefore` 排除更早 link/symlink 的 linkpath（包括 rename 后的 linkpath），继续禁止嵌套链接。
 - `linkpath` 可以在任意已有父目录下；fresh 且不得与 target 相同。v1 只把
   linkpath 作为调用参数/readlink follower 使用，不把它加入 PathSet 迁移。
 - `symlink` 的 target 必须是测试根内文件/目录；payload 由
@@ -1899,7 +1899,10 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
   - link target 必须是普通文件；
   - symlink target 必须是文件/目录；
   - target 可以是 baseline 已有路径，或同一 plan 中更早的 creator 产生的
-    fresh 路径；映射后必须仍是测试根内路径；
+    fresh 路径；fresh target 要求 baseline 节点不存在且 parent 有效；映射后
+    必须仍是测试根内路径；
+  - target 不能是 `freshLinkPathsBefore` 中的 linkpath（含 rename 后的
+    linkpath），不能形成嵌套链接；
   - target != linkpath。
 - 后续 linkpath 迁移 feature 才需要：
   - `pathSetTargetValid`/`freshKinds`/`freshLinks` 的完整 target 校验；

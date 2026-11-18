@@ -321,30 +321,54 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				// program-local fresh binding and is intentionally not a
 				// pathSpec; adding it requires the deferred linkpath migration
 				// feature (role/validation/two-stage symlink payload).
-				target := extractPathFromCallByArgIdx(call, 0)
+				rawTarget := extractPathFromCallByArgIdx(call, 0)
 				if name == "symlink" {
 					linkPath := extractPathFromCallByArgIdx(call, 1)
-					target = symlinkCanonicalTarget(linkPath, target)
+					rawTarget = symlinkCanonicalTarget(linkPath, rawTarget)
 				}
-				target = normalizePathSetPath(ft, target)
-				if target != "" {
-					node := ft.FindNode(target)
-					if node == nil || !nodeMatchesConstraint(node, constraint) {
+				target := normalizePathSetPath(ft, rawTarget)
+				if target == "" || ft == nil {
+					continue
+				}
+				// The target may be a baseline node or a fresh path created
+				// earlier in the same program. In the latter case its type comes
+				// from the creator and it must not itself be a link binding.
+				kind := pathExisting
+				node := ft.FindNode(target)
+				if node != nil {
+					if !nodeMatchesConstraint(node, constraint) {
 						continue
 					}
-					role := pathRoleLinkTarget
-					if name == "symlink" {
-						role = pathRoleSymlinkTarget
+				} else {
+					freshKinds := freshPathKindsBefore(p, ft, ci, profile)
+					freshKind, ok := freshKinds[target]
+					if !ok {
+						freshKind, ok = freshKinds[rawTarget]
 					}
-					members = append(members, pathMember{
-						Pos: pos,
-						Paths: []pathSpec{{
-							Path: target, Kind: pathExisting, Role: role, ArgIdx: 0,
-							TypeConstraint: constraint,
-						}},
-						Constraint: constraint,
-					})
+					if !ok || !pathSetFreshTargetTypeAllowed(name, freshKind) {
+						continue
+					}
+					freshLinks := freshLinkPathsBefore(p, ft, ci)
+					if info, ok := freshLinks[target]; ok && info.Kind != 0 {
+						continue
+					}
+					if info, ok := freshLinks[rawTarget]; ok && info.Kind != 0 {
+						continue
+					}
+					kind = pathFresh
 				}
+				role := pathRoleLinkTarget
+				if name == "symlink" {
+					role = pathRoleSymlinkTarget
+				}
+				members = append(members, pathMember{
+					Pos: pos,
+					Paths: []pathSpec{{
+						Path: target, Kind: kind, Role: role, ArgIdx: 0,
+						TypeConstraint: constraint,
+					}},
+					Constraint: constraint,
+				})
 				continue
 			}
 			if strings.Contains(name, "rename") {
@@ -483,6 +507,30 @@ func pathSetSinglePath(m *pathMember) (pathSpec, bool) {
 	return m.Paths[0], true
 }
 
+// pathSetFreshTargetTypeAllowed applies the link/symlink target type rule to
+// a fresh path's creator hint. link requires a regular file; symlink accepts
+// a file or directory.
+func pathSetFreshTargetTypeAllowed(call string, kind int) bool {
+	if kind != relTargetFile && kind != relTargetDir {
+		return false
+	}
+	if call == "link" {
+		return kind == relTargetFile
+	}
+	return true
+}
+
+// pathSetDirectedTargetCall reports whether a link/symlink/readlink member may
+// participate in the PathSet directed target arm. Broad relocation still
+// accepts these calls; only the target arm excludes them.
+func pathSetDirectedTargetCall(call string) bool {
+	switch call {
+	case "link", "symlink", "readlink":
+		return false
+	}
+	return true
+}
+
 func pathSetCallName(ps []*Prog, pos GroupPosition) string {
 	if pos.ProgIdx < 0 || pos.ProgIdx >= len(ps) {
 		return ""
@@ -510,7 +558,7 @@ func pickPathSetTarget(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *
 		return nil, false
 	}
 	anchorName := pathSetCallName(ps, anchor.Pos)
-	if anchorName == "" {
+	if anchorName == "" || !pathSetDirectedTargetCall(anchorName) {
 		return nil, false
 	}
 	anchorKind := lcs.profileOrDefault().TargetConstraint(anchorName)
@@ -527,7 +575,7 @@ func pickPathSetTarget(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *
 			continue
 		}
 		name := pathSetCallName(ps, m.Pos)
-		if name == "" {
+		if name == "" || !pathSetDirectedTargetCall(name) {
 			continue
 		}
 		kind := lcs.profileOrDefault().TargetConstraint(name)
@@ -822,6 +870,11 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 				return nodeMatchesConstraint(node, typeConstraint)
 			}
 			return parentValid(GetParentDir(spec.Path))
+		}
+		return node != nil && nodeMatchesConstraint(node, typeConstraint)
+	case pathRoleLinkTarget, pathRoleSymlinkTarget:
+		if spec.Kind == pathFresh {
+			return node == nil && parentValid(GetParentDir(spec.Path))
 		}
 		return node != nil && nodeMatchesConstraint(node, typeConstraint)
 	default:

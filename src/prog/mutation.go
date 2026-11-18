@@ -4487,11 +4487,21 @@ func freshLinkPathsBefore(p *Prog, ft *FileTree, end int) map[string]linkPathInf
 					Kind: linkPathSymlink, FollowIsDir: isDir, Target: target, CreatorIdx: i,
 				}
 			}
-		case "unlink", "rmdir", "rename":
-			// Removal invalidates a local binding; rename moves it.
-			paths := dctCallPaths(c)
-			for _, path := range paths {
+		case "unlink", "rmdir":
+			// Removal invalidates a local binding.
+			for _, path := range dctCallPaths(c) {
 				delete(m, path)
+			}
+		case "rename":
+			// Rename moves a source binding to dst and overwrites any
+			// binding that previously occupied dst. Both cases matter for
+			// nested-link rejection.
+			src, dst := extractRenamePaths(c)
+			info, moved := m[src]
+			delete(m, src)
+			delete(m, dst)
+			if moved && dst != "" {
+				m[dst] = info
 			}
 		}
 	}

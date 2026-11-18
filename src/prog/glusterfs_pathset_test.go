@@ -154,6 +154,224 @@ func TestFreshLinkPathsBefore(t *testing.T) {
 	}
 }
 
+func TestFreshLinkPathsRenameMovesBinding(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["rename"]; !ok {
+		t.Skip("target has no rename")
+	}
+	ft := glusterfsPlanTree()
+	link := mkLinkCall(t, target, "dirA/a", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	rn := mkRenameCall(t, target, "dirA/l1", "dirA/l2", 210, 260)
+	rn.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{link, rn}}
+
+	links := freshLinkPathsBefore(p, ft, 2)
+	if _, ok := links["dirA/l1"]; ok {
+		t.Fatal("renamed linkpath still present at the old name")
+	}
+	info := links["dirA/l2"]
+	if info.Kind != linkPathHardlink || info.Target != "dirA/a" {
+		t.Fatalf("renamed linkpath = %+v, want hardlink binding moved to l2", info)
+	}
+}
+
+func TestFreshLinkPathsRenameOverwritesDestination(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["rename"]; !ok {
+		t.Skip("target has no rename")
+	}
+	ft := glusterfsPlanTree()
+	link := mkLinkCall(t, target, "dirA/a", "dirA/l2")
+	link.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	rn := mkRenameCall(t, target, "dirA/b", "dirA/l2", 210, 260)
+	rn.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{link, rn}}
+
+	links := freshLinkPathsBefore(p, ft, 2)
+	if _, ok := links["dirA/l2"]; ok {
+		t.Fatal("rename-overwritten linkpath still recorded as a binding")
+	}
+	if kind := freshPathKindsBefore(p, ft, 2, glusterfsProfile)["dirA/l2"]; kind != relTargetFile {
+		t.Fatalf("rename destination type = %d, want file", kind)
+	}
+}
+
+func TestBuildPathMembersLinkFreshTarget(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["creat"]; !ok {
+		t.Skip("target has no creat")
+	}
+	ft := glusterfsPlanTree()
+	creator := mkCreat(target, "dirA/fresh.txt")
+	creator.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	link := mkLinkCall(t, target, "dirA/fresh.txt", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{creator, link}}
+
+	members := buildPathMembers([]*Prog{p}, ft, glusterfsProfile)
+	var linkSpec *pathSpec
+	for i := range members {
+		if members[i].Pos == (GroupPosition{ProgIdx: 0, CallIdx: 1}) {
+			linkSpec = &members[i].Paths[0]
+		}
+	}
+	if linkSpec == nil || linkSpec.Kind != pathFresh ||
+		linkSpec.Role != pathRoleLinkTarget || linkSpec.Path != "dirA/fresh.txt" {
+		t.Fatalf("fresh link target spec = %+v", linkSpec)
+	}
+	if !pathSetSpecValid(nil, GroupPosition{}, *linkSpec, relTargetFile, ft) {
+		t.Fatal("fresh link target rejected by pathSetSpecValid")
+	}
+}
+
+func TestBuildPathMembersSymlinkFreshDirTarget(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["symlink"]; !ok {
+		t.Skip("target has no symlink")
+	}
+	ft := glusterfsPlanTree()
+	creator := mkMkdir(target, "dirA/freshDir")
+	creator.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	sym := mkSymlinkCall(t, target, "freshDir", "dirA/l2")
+	sym.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{creator, sym}}
+
+	members := buildPathMembers([]*Prog{p}, ft, glusterfsProfile)
+	var symSpec *pathSpec
+	for i := range members {
+		if members[i].Pos == (GroupPosition{ProgIdx: 0, CallIdx: 1}) {
+			symSpec = &members[i].Paths[0]
+		}
+	}
+	if symSpec == nil || symSpec.Kind != pathFresh ||
+		symSpec.Role != pathRoleSymlinkTarget || symSpec.Path != "dirA/freshDir" {
+		t.Fatalf("fresh symlink target spec = %+v", symSpec)
+	}
+}
+
+func TestBuildPathMembersRejectsNestedLinkTarget(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	ft := glusterfsPlanTree()
+	first := mkLinkCall(t, target, "dirA/a", "dirA/l1")
+	first.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	second := mkLinkCall(t, target, "dirA/l1", "dirA/l2")
+	second.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{first, second}}
+
+	for _, m := range buildPathMembers([]*Prog{p}, ft, glusterfsProfile) {
+		if m.Pos == (GroupPosition{ProgIdx: 0, CallIdx: 1}) {
+			t.Fatalf("nested linkpath target produced a member: %+v", m)
+		}
+	}
+}
+
+func TestBuildPathMembersAllowsRegularOverwrittenLinkpath(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["rename"]; !ok {
+		t.Skip("target has no rename")
+	}
+	ft := glusterfsPlanTree()
+	link := mkLinkCall(t, target, "dirA/a", "dirA/l2")
+	link.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	rn := mkRenameCall(t, target, "dirA/b", "dirA/l2", 210, 260)
+	rn.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 0}
+	relink := mkLinkCall(t, target, "dirA/l2", "dirA/l3")
+	relink.CheckInfo = &FileMetadata{Stime: 270, Etime: 320, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{link, rn, relink}}
+
+	var spec *pathSpec
+	for _, m := range buildPathMembers([]*Prog{p}, ft, glusterfsProfile) {
+		if m.Pos == (GroupPosition{ProgIdx: 0, CallIdx: 2}) {
+			spec = &m.Paths[0]
+		}
+	}
+	if spec == nil || spec.Kind != pathFresh || spec.Path != "dirA/l2" {
+		t.Fatalf("regular-overwritten linkpath target spec = %+v", spec)
+	}
+}
+
+func TestApplyPathSetFreshLinkTarget(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["creat"]; !ok {
+		t.Skip("target has no creat")
+	}
+	creator := mkCreat(target, "dirA/fresh.txt")
+	link := mkLinkCall(t, target, "dirA/fresh.txt", "dirA/l1")
+	p := &Prog{Target: target, Calls: []*Call{creator, link}}
+	plan := &pathPlan{Updates: []pathUpdate{
+		{Pos: GroupPosition{ProgIdx: 0, CallIdx: 0}, Specs: []pathSpec{{
+			Path: "dirB/fresh.txt", Kind: pathFresh, Role: pathRoleCreat,
+			ArgIdx: 0, TypeConstraint: relTargetFile,
+		}}},
+		{Pos: GroupPosition{ProgIdx: 0, CallIdx: 1}, Specs: []pathSpec{{
+			Path: "dirB/fresh.txt", Kind: pathFresh, Role: pathRoleLinkTarget,
+			ArgIdx: 0, TypeConstraint: relTargetFile,
+		}}},
+	}}
+	if !applyPathSetPlan([]*Prog{p}, plan, newRand(target, rand.NewSource(71))) {
+		t.Fatal("applyPathSetPlan failed")
+	}
+	if got := extractPathFromCall(p.Calls[0]); got != "dirB/fresh.txt" {
+		t.Fatalf("creator path = %q, want dirB/fresh.txt", got)
+	}
+	if got := extractPathFromCallByArgIdx(p.Calls[1], 0); got != "dirB/fresh.txt" {
+		t.Fatalf("link target = %q, want dirB/fresh.txt", got)
+	}
+}
+
+func TestPathSetSpecValidFreshLinkTarget(t *testing.T) {
+	ft := glusterfsPlanTree()
+	spec := pathSpec{
+		Path: "dirA/fresh.txt", Kind: pathFresh, Role: pathRoleLinkTarget,
+		ArgIdx: 0, TypeConstraint: relTargetFile,
+	}
+	if !pathSetSpecValid(nil, GroupPosition{}, spec, relTargetFile, ft) {
+		t.Fatal("fresh link target with valid parent rejected")
+	}
+	badParent := spec
+	badParent.Path = "missing/fresh.txt"
+	if pathSetSpecValid(nil, GroupPosition{}, badParent, relTargetFile, ft) {
+		t.Fatal("fresh link target with missing parent accepted")
+	}
+	existing := spec
+	existing.Path = "dirA/a"
+	if pathSetSpecValid(nil, GroupPosition{}, existing, relTargetFile, ft) {
+		t.Fatal("fresh link target that already exists accepted")
+	}
+}
+
+func TestPathSetDirectedTargetCall(t *testing.T) {
+	for _, name := range []string{"link", "symlink", "readlink"} {
+		if pathSetDirectedTargetCall(name) {
+			t.Fatalf("%s must not participate in the directed target arm", name)
+		}
+	}
+	for _, name := range []string{"stat", "open", "creat"} {
+		if !pathSetDirectedTargetCall(name) {
+			t.Fatalf("%s should remain eligible for the directed target arm", name)
+		}
+	}
+}
+
 func TestFreshBoundaryPrefix(t *testing.T) {
 	ft := glusterfsPlanTree()
 	if !freshParentNodeEligible(ft, "Eris_link_top") {
