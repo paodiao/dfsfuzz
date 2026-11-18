@@ -274,6 +274,66 @@ func TestValidateCausalPlanLinkpathRole(t *testing.T) {
 	if !validateCausalPlan(hmcfg, lcs, plan) {
 		t.Fatalf("linkpath-role plan rejected: %+v", plan)
 	}
+	ccPlan := *plan
+	ccPlan.Cell.Temporal = TemporalConcurrent
+	if validateCausalPlan(hmcfg, lcs, &ccPlan) {
+		t.Fatalf("linkpath-role CC plan accepted: %+v", ccPlan)
+	}
+}
+
+// TestCausalC2LinkpathRoleHBOnly pins the observation rule: a link/symlink
+// root is observable at the program-local linkpath only in HB pairs. The C2
+// planner must not enqueue linkpath-role CC cells that pair extraction can
+// never report.
+func TestCausalC2LinkpathRoleHBOnly(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["symlink"]; !ok {
+		t.Skip("target has no symlink")
+	}
+	hmcfg := glusterfsCoverageConfig(t, true)
+	lcs := NewLayeredChoiceStrategy(hmcfg, target)
+	const (
+		targetPath = "dirA"
+		linkPath   = "dirB/l1"
+	)
+	r := newRand(target, rand.NewSource(97))
+	r.hmcfg = hmcfg
+	byCell, cells := planCausalC2CellsWithParent(nil, lcs, hmcfg,
+		"symlink", targetPath, "", AnchorPathUnknown, false, false,
+		targetPath, linkPath, linkPath, false, causalRootNormal, r)
+	if len(cells) == 0 {
+		t.Fatal("linkpath-role C2 enumeration produced no plans")
+	}
+	for _, ck := range cells {
+		p := byCell[ck]
+		if p == nil {
+			continue
+		}
+		if p.RootRelationPath != linkPath {
+			t.Fatalf("linkpath-role plan relation path = %q, want %q",
+				p.RootRelationPath, linkPath)
+		}
+		if p.Cell.Temporal != TemporalHB {
+			t.Fatalf("linkpath-role plan has non-HB temporal: %+v", p)
+		}
+	}
+
+	r = newRand(target, rand.NewSource(98))
+	r.hmcfg = hmcfg
+	byCell, cells = planCausalC2CellsWithParent(nil, lcs, hmcfg,
+		"symlink", targetPath, "", AnchorPathUnknown, false, false,
+		targetPath, linkPath, targetPath, false, causalRootNormal, r)
+	sawCC := false
+	for _, ck := range cells {
+		p := byCell[ck]
+		if p != nil && p.Cell.Temporal == TemporalConcurrent {
+			sawCC = true
+			break
+		}
+	}
+	if !sawCC {
+		t.Fatal("target-role C2 enumeration produced no CC plan")
+	}
 }
 
 func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
@@ -295,6 +355,14 @@ func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
 	anchor.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
 	p0 := &Prog{Target: target, Calls: []*Call{anchor}}
 	plans := collectCausalRootPlans(p0, lcs, hmcfg, newRand(target, rand.NewSource(51)))
+	for _, p := range plans {
+		if p.RootCall != "link" && p.RootCall != "symlink" {
+			continue
+		}
+		if p.RootRelationPath != "" && p.RootRelationPath != p.RootPath {
+			t.Fatalf("C1 %s linkpath-role plan generated: %+v", p.RootCall, p)
+		}
+	}
 	seen := map[string]*causalRootPlan{}
 	for _, p := range plans {
 		if p.RootCall == "link" || p.RootCall == "symlink" {

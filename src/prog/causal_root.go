@@ -75,7 +75,29 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 	if c1.RootKind == causalRootFresh {
 		c1.RootPath = directedFreshName(c1.RootCall, c1.RootParent, r.Rand)
 	}
-	planByCell, cells := planCausalC2CellsWithParent(ps, lcs, hmcfg, c1.RootCall, c1.RootPath, c1.RootParent, c1.RootParentKind, c1.RootParentIsDir, c1.RootParentIsAnchor, c1.RootSource, c1.RootDest, c1.RootRelationPath, c1.RootRenameReplace, c1.RootKind, r)
+	// The C1 cell choice is target-based, but it must not restrict the C2
+	// roles: a link/symlink root can serve target-role CC+HB plans and
+	// linkpath-role HB plans from the same execution. Enumerate the target
+	// role first so a cell produced by both roles keeps the target plan.
+	relationPaths := []string{c1.RootPath}
+	if (c1.RootCall == "link" || c1.RootCall == "symlink") &&
+		c1.RootDest != "" && c1.RootDest != c1.RootPath {
+		relationPaths = append(relationPaths, c1.RootDest)
+	}
+	planByCell := make(map[cellKey]*directedPlan)
+	var cells []cellKey
+	for _, relationPath := range relationPaths {
+		rolePlans, roleCells := planCausalC2CellsWithParent(ps, lcs, hmcfg, c1.RootCall, c1.RootPath, c1.RootParent, c1.RootParentKind, c1.RootParentIsDir, c1.RootParentIsAnchor, c1.RootSource, c1.RootDest, relationPath, c1.RootRenameReplace, c1.RootKind, r)
+		for _, ck := range roleCells {
+			if _, exists := planByCell[ck]; exists {
+				continue
+			}
+			if p := rolePlans[ck]; p != nil {
+				planByCell[ck] = p
+				cells = append(cells, ck)
+			}
+		}
+	}
 	if len(cells) == 0 {
 		return nil, false
 	}
@@ -392,6 +414,12 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		freshA2 = true
 	}
 	rootPre, rootPost := causalRootRelPaths(rootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath)
+	// A link/symlink root is observable at the program-local linkpath only in
+	// the HB form: pair extraction enumerates the linkpath role for a
+	// link/symlink A vertex only when it is HB. A CC linkpath-role plan could
+	// never be observed, so it must not enter the pending ledger.
+	linkPathRole := (rootCall == "link" || rootCall == "symlink") &&
+		rootRelationPath != "" && rootRelationPath != rootPath
 	destructiveSame := func(varPre string, rel PathRelation) bool {
 		if rel != PathSame {
 			return false
@@ -409,6 +437,9 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 				cell.RetB != RetSuccess {
 				return
 			}
+		}
+		if linkPathRole && cell.Temporal != TemporalHB {
+			return
 		}
 		ck := cell.toKey()
 		if filterCombos && !liveCombos[cell.Combo] {
@@ -787,48 +818,47 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 							!causalRenameRootPathAllowed(anchor, linkPath) {
 							continue
 						}
-						// C1: link/symlink is the B side. The root has both
-						// target and linkpath roles; generate one plan per role.
-						// A cell collision keeps the first (target-role) plan,
-						// matching the role-free cell identity.
-						for _, relationPath := range []string{rootPath, linkPath} {
-							actualRel, ok := causalPairRelation(anchorPre, anchorPost,
-								relationPath, relationPath)
-							if !ok {
-								continue
-							}
-							isDir := relationPath == rootPath && rootNode.Type != NodeTypeFile
-							ck := cellKey{
-								Root:     call.Meta.CallName,
-								Variant:  rootCall,
-								Rel:      actualRel,
-								Temporal: TemporalHB,
-								RetA:     RetSuccess,
-								RetB:     RetSuccess,
-								OffB:     offsetBucketNA,
-								PersistB: pathInDir(relationPath, hmcfg.Persistence_dir),
-								DepthB:   DepthBucketOf(relationPath),
-								TypeB:    isDir,
-							}
-							if !covBoard.cellUncovered(ck) {
-								continue
-							}
-							a := anchor
-							a.Relation = actualRel
-							plan := &causalRootPlan{
-								Anchor:           a,
-								Cell:             ck,
-								RootCall:         rootCall,
-								RootPath:         rootPath,
-								RootKind:         causalRootNormal,
-								RootParent:       parentDirOrRoot(rootPath),
-								RootSource:       rootPath,
-								RootDest:         linkPath,
-								RootRelationPath: relationPath,
-							}
-							if _, ok := byCell[ck]; !ok {
-								byCell[ck] = plan
-							}
+						// C1: link/symlink is the B side. The pair extractor
+						// reports a link/symlink B vertex through its target
+						// only; the linkpath role is A-side/HB-only. The root
+						// call still materializes the fresh linkpath, but a
+						// linkpath-role C1 cell could never be observed, so the
+						// C1 cell is target-only.
+						actualRel, ok := causalPairRelation(anchorPre, anchorPost,
+							rootPath, rootPath)
+						if !ok {
+							continue
+						}
+						ck := cellKey{
+							Root:     call.Meta.CallName,
+							Variant:  rootCall,
+							Rel:      actualRel,
+							Temporal: TemporalHB,
+							RetA:     RetSuccess,
+							RetB:     RetSuccess,
+							OffB:     offsetBucketNA,
+							PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
+							DepthB:   DepthBucketOf(rootPath),
+							TypeB:    rootNode.Type != NodeTypeFile,
+						}
+						if !covBoard.cellUncovered(ck) {
+							continue
+						}
+						a := anchor
+						a.Relation = actualRel
+						plan := &causalRootPlan{
+							Anchor:           a,
+							Cell:             ck,
+							RootCall:         rootCall,
+							RootPath:         rootPath,
+							RootKind:         causalRootNormal,
+							RootParent:       parentDirOrRoot(rootPath),
+							RootSource:       rootPath,
+							RootDest:         linkPath,
+							RootRelationPath: rootPath,
+						}
+						if _, ok := byCell[ck]; !ok {
+							byCell[ck] = plan
 						}
 						continue
 					}
@@ -1580,6 +1610,10 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 			relationPath = plan.BaseA
 		}
 		if relationPath != plan.BaseA && relationPath != plan.RootLinkPath {
+			return false
+		}
+		if plan.RootRelationPath != "" && plan.RootRelationPath == plan.RootLinkPath &&
+			plan.RootRelationPath != plan.BaseA && plan.Cell.Temporal != TemporalHB {
 			return false
 		}
 	}

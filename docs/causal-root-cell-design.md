@@ -332,7 +332,8 @@ readlink: path = symlink 的 linkpath
   symlink: Path=linkpath, Source=target, Dest=linkpath
   readlink: 不做 C1 anchor
   ```
-- C1/C2 cell 的 B 侧使用 target；linkpath 只用于生成/readlink，不进 cell。
+- C1 cell 的 B 侧只使用 target；C2 target-role 的 B 侧使用 target，
+  linkpath-role 只在 HB 的 A 侧使用 linkpath；readlink 的 B 侧使用 linkpath。
 - link/symlink target 是 **anchor 关系派生** 的 canonical 路径，不是 fixed
   baseline；映射/迁移后必须仍在测试根内、存在且类型匹配。
 - `RootPaths`/`seedAnchor`/PathSet 只保存 canonical target；symlink payload

@@ -503,6 +503,10 @@ func TestGlusterfsNormalDualRootPlans(t *testing.T) {
 		if !p.Causal || p.BaseA == "" || p.RootLinkPath == "" {
 			t.Fatalf("malformed normal dual plan: %+v", p)
 		}
+		if p.RootRelationPath == p.RootLinkPath && p.RootRelationPath != p.BaseA &&
+			p.Cell.Temporal != TemporalHB {
+			t.Fatalf("normal dual linkpath-role plan is not HB: %+v", p)
+		}
 		if GetParentDir(p.BaseA) != GetParentDir(p.RootLinkPath) {
 			t.Fatalf("linkpath %q is not next to target %q", p.RootLinkPath, p.BaseA)
 		}

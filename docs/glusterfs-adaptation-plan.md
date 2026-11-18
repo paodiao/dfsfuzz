@@ -1109,6 +1109,8 @@ PickDirectedBatch
 - dual pass 对每个 target/root 生成一个 fresh `RootLinkPath`，并分别以
   target/linkpath 作为 `RootRelationPath` 调用
   `planCausalC2CellsWithParent(..., rootKind=causalRootNormal, ...)`；
+  target-role 生成 CC+HB，linkpath-role 只生成 HB（pair extractor 只在
+  link/symlink 是 HB A 侧时枚举 linkpath）；
 - `BaseA` 是 target；`RootLinkPath` 是 linkpath；cell/relation 用
   `RootRelationPath`（target 或 linkpath），它不进入 `cellKey/comboKey`；
 - target-role 和 linkpath-role plan 可以共享同一个 root execution 和 batch；
@@ -1466,8 +1468,9 @@ readlink:    不做 C1 anchor
   - `RootPath = target`（root materialization）
   - `RootSource = target`
   - `RootDest = linkpath`
-  - `RootRelationPath = target` 或 `linkpath`（C1 cell 的 B 侧/relation）
-  - target-role 和 linkpath-role 可以产生不同 cell；同 cellKey 只保留一个 plan。
+  - `RootRelationPath = target`（C1 cell 的 B 侧/relation）
+  - C1 link/symlink 是 pair 的 B 侧，DAG 只按 target 报 B 侧；不生成
+    linkpath-role C1 cell。
 - C1 root 是 rename 时，B 侧 cell/relation 用 `RootSource`（src），
   `RootDest`（dst）只用于 materialize。
 
@@ -1547,11 +1550,10 @@ link:    link(target=rootPath, linkpath=fresh)
 symlink: symlink(target=rootPath, linkpath=fresh)
 ```
 
-C1 cell 的 `DepthB/TypeB/PersistB/Rel` 用 `RootRelationPath`：target-role 用
-target（TypeB 按 target 类型），linkpath-role 用 linkpath（TypeB=false）。
-linkpath 只在 linkpath-role cell 中作为 B 侧路径出现，不进入 target-role cell。
+C1 cell 的 `DepthB/TypeB/PersistB/Rel` 全用 target；linkpath 只用于 root
+物化和 readlink，不进入 C1 cell。
 C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
-`DualPathCausalEnabled=false` 时 linkpath-role C1 不生成。
+`DualPathCausalEnabled=false` 时 C1 link/symlink 不生成。
 
 #### 8.6.3 C2 variant 枚举
 
@@ -1567,9 +1569,12 @@ C1 root link/symlink 的 `RetB` 只规划 Success；不规划 EEXIST/ENOENT。
 | `rmdir` | target | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | dir |
 | `rename` | src | Success / RetFailure（ENOTEMPTY） | root 是 modifier 时 CC+HB | file/dir |
 
-- C2 root 是 link/symlink 时，普通 variant 的 root A 用 `RootRelationPath`
-  （target 或 linkpath）；readlink 例外：B 用 root `LinkPath`，root A 也强制
-  linkpath，relation 只能是 `Same`；普通 variant 循环不生成 readlink；
+- C2 root 是 link/symlink 时，普通 variant 的 root A：
+  - target-role：CC+HB 都用 target；
+  - linkpath-role：只 HB 用 linkpath；CC 不生成（pair extractor 只在
+    link/symlink 是 HB A 侧时枚举 linkpath）；
+  readlink 例外：B 用 root `LinkPath`，root A 也强制 linkpath，relation
+  只能是 `Same`；普通 variant 循环不生成 readlink；
 - target-role 和 linkpath-role plan 可以共享同一个 root execution，同 batch
   只需 target/linkpath 相同；`cellKey` 不记录 role；
 - link/symlink 的 linkpath fresh，不进 `BaseB`/cell；
@@ -1728,8 +1733,8 @@ read(L1) + write(T)
 
 - C1：anchor → root HB；root 插在 anchor 之后，`refTime=anchor.Etime`；
   link/symlink/setxattr root 只规划 RetB=Success。
-- C2：root 是 modifier 时 CC+HB，否则只 CC；link/symlink 的 target 是
-  baseline 路径，不依赖 linkpath 可见性。
+- C2：root 是 modifier 时 CC+HB，否则只 CC；link/symlink root 的 target-role
+  走 CC+HB，linkpath-role 只走 HB（CC pair 的 A 侧只看 target）。
 - readlink：directed 只规划 HB Success，不规划 CC/ENOENT；路径为 root
   `LinkPath`；跨节点实际不可见时 ENOENT 只作为自然观测，不做 failure cell。
 - getxattr/setxattr：setxattr modifier，getxattr observer；HB/CC 按 root
@@ -1743,11 +1748,11 @@ read(L1) + write(T)
 #### 8.6.6 Coverage cell
 
 - `cellKey`/`comboKey` 不加入 role/RelKind/HardlinkGroupKey；
-- C1 root=link/symlink：B 侧用 `RootRelationPath`（target 或 linkpath）；
-  target-role 和 linkpath-role 若产生同一 cellKey，只保留一个 plan；
+- C1 root=link/symlink：B 侧只用 target；linkpath 不进 C1 cell；
 - C2 link/symlink variant：B 侧用 target，linkpath fresh 不进 variant cell；
-- C2 root 是 link/symlink 时，普通 variant 的 A 侧用 `RootRelationPath`；
-  readlink 的 A 侧强制 root `LinkPath`；
+- C2 root 是 link/symlink 时，普通 variant 的 A 侧：target-role 的 CC/HB
+  都用 target，linkpath-role 只 HB 用 linkpath；readlink 的 A 侧强制 root
+  `LinkPath`；
 - C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，relation 只 Same，
   TypeB=false；
 - C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；
@@ -1818,7 +1823,7 @@ C1：
 - anchorNodes 同时枚举 target/linkpath；
 - root=link/symlink target 从测试根内已有文件/目录选（anchor 关系或 baseline），
   linkpath fresh；symlink payload 按 linkpath parent 物化；
-- C1 cell 使用 `RootRelationPath`（target 或 linkpath），HB，RetB=Success；
+- C1 cell 使用 target，HB，RetB=Success；linkpath-role 只存在于 C2 HB；
 - 禁止嵌套 link/symlink。
 
 C2：
