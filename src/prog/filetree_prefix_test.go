@@ -27,6 +27,38 @@ func TestFileTreeEmptyPrefix(t *testing.T) {
 	}
 }
 
+func TestNewLayeredChoiceStrategyFileTreePrefix(t *testing.T) {
+	cids := []string{"c1"}
+	gl := &Hmdfs_config{
+		Profile: glusterfsProfile, Cids: cids, Node_num: 1,
+		Init_dir:  map[string][]string{"c1": {"dirA"}},
+		Init_file: map[string][]string{"c1": {"dirA/a"}},
+	}
+	glcs := NewLayeredChoiceStrategy(gl, nil)
+	if glcs.FileTree == nil || glcs.FileTree.Prefix != "" {
+		t.Fatalf("glusterfs tree prefix = %+v, want empty", glcs.FileTree)
+	}
+	if glcs.FileTree.FindNode("dirA/a") == nil {
+		t.Fatal("glusterfs tree missing dirA/a")
+	}
+	if glcs.FileTree.FindNode("merge_view/dirA/a") != nil {
+		t.Fatal("glusterfs tree was built with the merge_view prefix")
+	}
+
+	hm := &Hmdfs_config{
+		Profile: hmdfsProfile, Cids: cids, Node_num: 1,
+		Init_dir:  map[string][]string{"c1": {"merge_view/dirA"}},
+		Init_file: map[string][]string{"c1": {"merge_view/dirA/a"}},
+	}
+	hlcs := NewLayeredChoiceStrategy(hm, nil)
+	if hlcs.FileTree == nil || hlcs.FileTree.Prefix != MergeViewPrefix {
+		t.Fatalf("hmdfs tree prefix = %+v, want %q", hlcs.FileTree, MergeViewPrefix)
+	}
+	if hlcs.FileTree.FindNode("merge_view/dirA/a") == nil {
+		t.Fatal("hmdfs tree missing merge_view/dirA/a")
+	}
+}
+
 func TestFileTreeDefaultPrefix(t *testing.T) {
 	ft := NewFileTree()
 	if got := ft.RootPath(); got != "merge_view" {

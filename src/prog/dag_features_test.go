@@ -5,6 +5,26 @@ import (
 	"testing"
 )
 
+// TestCellKeyHonorsBPathType pins the B-side role type override: a linkpath
+// role is a file even when its target inode is a directory.
+func TestCellKeyHonorsBPathType(t *testing.T) {
+	pair := DAGPair{
+		A:     &DAGVertex{CallName: "open", RetBucket: RetSuccess},
+		B:     &DAGVertex{CallName: "stat", RetBucket: RetSuccess, IsDir: true},
+		BPath: "dirA/a", BPathType: pairPathTypeFile,
+		Temporal: TemporalHB, PathRel: PathSamePath,
+	}
+	ck, ok := cellKeyOf(&pair, "")
+	if !ok || ck.TypeB {
+		t.Fatalf("file BPathType cell = %+v (ok=%v), want TypeB=false", ck, ok)
+	}
+	pair.BPathType = pairPathTypeDefault
+	ck, ok = cellKeyOf(&pair, "")
+	if !ok || !ck.TypeB {
+		t.Fatalf("default BPathType cell = %+v (ok=%v), want TypeB=true", ck, ok)
+	}
+}
+
 // TestEventIsDir covers the event-time type decision: i_mode wins, then
 // the function's unambiguous entry type, then the post-execution fallback.
 func TestEventIsDir(t *testing.T) {

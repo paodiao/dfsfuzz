@@ -9,15 +9,19 @@ import (
 // directed root. It is deliberately not a directed cell: the C2 batch still
 // owns coverage/pending accounting.
 type causalAnchor struct {
-	Pos       GroupPosition
-	Path      string
-	Source    string
-	Dest      string
-	PathKind  AnchorPathKind
-	IsDir     bool
-	InsertPos int
-	RefTime   int64
-	Relation  PathRelation
+	Pos      GroupPosition
+	Path     string
+	Source   string
+	Dest     string
+	PathKind AnchorPathKind
+	IsDir    bool
+	// SourceMoved marks a successful rename anchor: Source is the entry-state
+	// source that moved away. link/symlink anchors keep Source as the existing
+	// target, so the source-subtree filter must not apply to them.
+	SourceMoved bool
+	InsertPos   int
+	RefTime     int64
+	Relation    PathRelation
 }
 
 // causalRootPlan is the first-layer (anchor -> root) plan. Its Cell is the C1
@@ -691,13 +695,14 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 			continue
 		}
 		anchor := causalAnchor{
-			Pos:       pos,
-			Path:      path,
-			Source:    source,
-			Dest:      dest,
-			InsertPos: ci + 1,
-			RefTime:   int64(ciInfo.Etime) - lcs.tscoffFor(0),
-			Relation:  PathNoRel,
+			Pos:         pos,
+			Path:        path,
+			Source:      source,
+			Dest:        dest,
+			SourceMoved: strings.Contains(call.Meta.Name, "rename"),
+			InsertPos:   ci + 1,
+			RefTime:     int64(ciInfo.Etime) - lcs.tscoffFor(0),
+			Relation:    PathNoRel,
 		}
 		if !validateCausalAnchor(p0, &anchor, lcs) {
 			continue
@@ -1280,7 +1285,7 @@ func causalRootPathsByPath(ft *FileTree, path string, info anchorPathInfo, rel P
 // the source path and its descendants have moved by then. Source parent and
 // sibling paths remain valid and must still pass the normal node constraints.
 func causalRenameRootPathAllowed(a causalAnchor, rootPath string) bool {
-	if a.Source == "" || a.Source == a.Path {
+	if !a.SourceMoved || a.Source == "" || a.Source == a.Path {
 		return true
 	}
 	return !pathUnderRoot(rootPath, a.Source)

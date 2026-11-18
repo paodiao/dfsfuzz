@@ -2078,7 +2078,7 @@ func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoic
 	if hmcfg != nil && hmcfg.FileTree != nil {
 		lcs.FileTree = hmcfg.FileTree
 	} else if hmcfg != nil {
-		lcs.FileTree = NewFileTree()
+		lcs.FileTree = NewFileTreeForConfig(hmcfg)
 		lcs.FileTree.InitFromHmdfsConfig(hmcfg)
 	}
 

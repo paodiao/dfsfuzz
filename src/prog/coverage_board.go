@@ -630,7 +630,7 @@ func (b *coverageBoard) rootDirectedComboEnabled(ck comboKey) bool {
 	if b.profile == nil {
 		return true
 	}
-	return profileCallListContains(b.profile.DirectedRootCalls(), ck.Root)
+	return profileExactListContains(b.profile.DirectedRootCalls(), ck.Root)
 }
 
 // computeProducibleLocked computes the model layer's per-temporal cell counts.
@@ -752,7 +752,7 @@ func cellKeyOf(p *DAGPair, persistDir string) (cellKey, bool) {
 		RetB:     p.B.RetBucket,
 		OffB:     offB,
 		DepthB:   DepthBucketOf(bPath),
-		TypeB:    p.B.IsDir,
+		TypeB:    pairPathIsDir(p.B, p.BPathType),
 		PersistB: pathInDir(bPath, persistDir),
 	}
 	return ck, true

@@ -52,6 +52,21 @@ func TestGlusterfsRootCallPartition(t *testing.T) {
 	}
 }
 
+func TestRootDirectedComboEnabledExactRoot(t *testing.T) {
+	b := &coverageBoard{profile: &DFSProfile{
+		Name: "futuredfs",
+		Plan: PlanProfile{DirectedRootCalls: []string{"stat"}},
+	}}
+	if !b.rootDirectedComboEnabled(comboKey{Root: "stat"}) {
+		t.Fatal("exact root stat rejected")
+	}
+	for _, root := range []string{"fstatat", "openat", "pwritev"} {
+		if b.rootDirectedComboEnabled(comboKey{Root: root}) {
+			t.Fatalf("root %q matched by substring", root)
+		}
+	}
+}
+
 func TestCoverageBoardCallListsUseProfile(t *testing.T) {
 	roots, variants := coverageBoardCallLists(glusterfsProfile)
 	if len(roots) != len(GlusterfsRootCalls) {

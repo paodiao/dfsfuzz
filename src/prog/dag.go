@@ -114,6 +114,20 @@ func pairPathTypeOf(isDir bool) pairPathType {
 	return pairPathTypeFile
 }
 
+// pairPathIsDir applies a role path's type override to the vertex type.
+func pairPathIsDir(v *DAGVertex, typ pairPathType) bool {
+	if v == nil {
+		return false
+	}
+	switch typ {
+	case pairPathTypeFile:
+		return false
+	case pairPathTypeDir:
+		return true
+	}
+	return v.IsDir
+}
+
 // DAGPair is an ordered pair of vertices with temporal and path relations.
 //
 // APath/BPath carry the role-selected paths that produced PathRel and feed
@@ -1700,13 +1714,7 @@ func featuresOfPairPath(v *DAGVertex, path, persistDir string, typ pairPathType)
 	if v == nil {
 		return 0
 	}
-	isDir := v.IsDir
-	switch typ {
-	case pairPathTypeFile:
-		isDir = false
-	case pairPathTypeDir:
-		isDir = true
-	}
+	isDir := pairPathIsDir(v, typ)
 	persist := pathInDir(path, persistDir)
 	return packFeatures(v.FuncID, v.RetBucket, DepthBucketOf(path), isDir, persist, offsetBucketOf(v))
 }
