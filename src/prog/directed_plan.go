@@ -65,9 +65,14 @@ func (dc directedCell) toKey() cellKey {
 // DirectedPending records one exact cell target of the most recent directed
 // batch; the batch is resolved by ResolveDirectedPending after the following
 // execution (each hit clears the cell baseline, each executed miss increments
-// it).
+// it). FreshSame is a diagnostic label only: it splits the aggregate dcMisses
+// into fresh-fresh race misses and ordinary misses without changing pending or
+// planner behavior. Role is retained for future role-level miss attribution;
+// it is not counted yet.
 type DirectedPending struct {
-	Cell directedCell
+	Cell      directedCell
+	FreshSame bool
+	Role      cellRole
 }
 
 // directedPlan is a constructible plan: the base paths, the target node for
@@ -1100,12 +1105,57 @@ const (
 	// directedPlanFound: a plan was returned.
 	directedPlanFound directedPlanStatus = iota
 	// directedPlanNone: nothing to target (enumeration space saturated, tree
-	// too small/immature, or all candidate combos filtered).
+	// too small/immature, or all candidate combos filtered). The specific
+	// directedPlanNone* values below refine this aggregate for diagnostics.
 	directedPlanNone
+	// directedPlanNoneNoCombo: no live combo was left (all discovered,
+	// combo-suppressed, or outside the plannable grid).
+	directedPlanNoneNoCombo
+	// directedPlanNoneNoCell: plans existed, but every candidate cell was
+	// already covered or cell-suppressed at pick time.
+	directedPlanNoneNoCell
+	// directedPlanNoneEnumEmpty: live combos and a non-empty view existed, but
+	// the enumerator produced no cell (construction/enumeration gap).
+	directedPlanNoneEnumEmpty
+	// directedPlanNoneTree: live combos existed but the planning view was
+	// empty (tree too small/immature).
+	directedPlanNoneTree
 	// directedPlanCfgErr: a precondition/config anomaly that should never
 	// occur in a healthy run (e.g. an empty or mismatched hmcfg.Cids).
 	directedPlanCfgErr
 )
+
+// directedPlanScan captures the enumeration state needed to classify an empty
+// plan result. It is diagnostic only and never feeds planner decisions.
+type directedPlanScan struct {
+	LiveCombos int
+	BNodes     int
+	// Filtered counts candidate plans rejected because they are legitimately
+	// saturated (covered, cell-suppressed, outside the depth domain, or their
+	// event shape is already known). If every candidate was filtered, the
+	// empty result is "no pickable cell", not an enumeration gap.
+	Filtered int
+	// OutOfPlannable counts candidates the plannable layer does not contain.
+	// They are an enumeration/plannable mismatch, so an empty result with any
+	// of them must surface as enumEmpty rather than saturation.
+	OutOfPlannable int
+}
+
+// directedEmptyPlanStatus classifies an enumeration that produced no cells.
+func directedEmptyPlanStatus(scan directedPlanScan) directedPlanStatus {
+	switch {
+	case scan.LiveCombos == 0:
+		return directedPlanNoneNoCombo
+	case scan.BNodes == 0:
+		return directedPlanNoneTree
+	case scan.OutOfPlannable > 0:
+		return directedPlanNoneEnumEmpty
+	case scan.Filtered > 0:
+		return directedPlanNoneNoCell
+	default:
+		return directedPlanNoneEnumEmpty
+	}
+}
 
 // pickRenameReplaceDst returns an existing same-class non-TmpDir sibling of
 // srcPath usable as the E overwrite destination (directories must still be
@@ -1339,8 +1389,9 @@ func batchBaseBAuthorityOK(plans []directedPlan) bool {
 // samples one cell uniformly, and returns a batch of up to len(ps)-1 plans
 // sharing that cell's root call and root base path (sampled without
 // replacement when the group is larger than the node budget). The status tells
-// the caller how to account for a nil batch: nothing to target
-// (directedPlanNone) or a precondition/config anomaly (directedPlanCfgErr).
+// the caller how to account for a nil batch: nothing to target (directedPlanNone
+// or one of its diagnostic refinements) or a precondition/config anomaly
+// (directedPlanCfgErr).
 func PickDirectedBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, r *randGen) (*directedBatch, directedPlanStatus) {
 	if batch, ok := pickCausalRootBatch(ps, lcs, hmcfg, r); ok {
 		return batch, directedPlanFound
@@ -1361,9 +1412,9 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 	if len(hmcfg.Cids) == 0 || len(hmcfg.Cids) != len(ps) {
 		return nil, directedPlanCfgErr
 	}
-	planByCell, cells := planDirectedCells(ps, lcs, hmcfg, r)
+	planByCell, cells, scan := planDirectedCellsScan(ps, lcs, hmcfg, r)
 	if len(cells) == 0 {
-		return nil, directedPlanNone
+		return nil, directedEmptyPlanStatus(scan)
 	}
 	flags := covBoard.uncoveredCellFlags(cells)
 	var pickable []int
@@ -1373,7 +1424,7 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 		}
 	}
 	if len(pickable) == 0 {
-		return nil, directedPlanNone
+		return nil, directedPlanNoneNoCell
 	}
 	seed := planByCell[cells[pickable[r.Intn(len(pickable))]]]
 	// Group: every still-pickable cell whose representative shares the seed's
@@ -1421,7 +1472,7 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 		m = len(group)
 	}
 	if m <= 0 {
-		return nil, directedPlanNone
+		return nil, directedPlanNoneNoCell
 	}
 	seedKey := seed.Cell.toKey()
 	seedCI := -1
@@ -1707,25 +1758,20 @@ func rootOffsetBuckets(root string, freshFD bool) []uint64 {
 // window biases the pick. The returned cells slice is in deterministic
 // plan-insertion order.
 func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, r *randGen) (map[cellKey]*directedPlan, []cellKey) {
+	planByCell, cells, _ := planDirectedCellsScan(ps, lcs, hmcfg, r)
+	return planByCell, cells
+}
+
+// planDirectedCellsScan is planDirectedCells plus the diagnostic scan state
+// used to classify an empty enumeration. Planner behavior is identical.
+func planDirectedCellsScan(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, r *randGen) (map[cellKey]*directedPlan, []cellKey, directedPlanScan) {
 	planByCell := make(map[cellKey]*directedPlan)
 	var cells []cellKey
 	profile := hmcfg.ProfileOrDefault()
 	rootCalls := profile.DirectedRootCalls()
 	variantCalls := profile.DirectedVariantCalls()
-	// link/symlink roots need a target and a program-local linkpath. They are
-	// enumerated by the dedicated dual pass below (which reuses causal C2);
-	// the ordinary passes keep their single-path root assumption.
-	primaryRoots := make([]string, 0, len(rootCalls))
-	for _, root := range rootCalls {
-		if root == "link" || root == "symlink" {
-			continue
-		}
-		primaryRoots = append(primaryRoots, root)
-	}
 	view := buildDirectedView(lcs.FileTree, hmcfg.Persistence_dir)
-	if len(view.bNodes) == 0 {
-		return planByCell, cells
-	}
+	scan := directedPlanScan{BNodes: len(view.bNodes)}
 	// A-side dims of every ordinary node (the witnesses): the event-shape
 	// guard needs the depth/persist/type of the root call's observed path, and
 	// looking it up in the view avoids a tree lock per plan.
@@ -1783,13 +1829,22 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	filterPlannable := profile.Name == "glusterfs" && covBoard.isReady()
 	add := func(plan directedPlan) {
 		ck := plan.Cell.toKey()
-		if filterPlannable && !covBoard.cellUncovered(ck) {
-			return
+		if filterPlannable {
+			uncovered, saturated := covBoard.cellAdmission(ck)
+			if !uncovered {
+				if saturated {
+					scan.Filtered++
+				} else {
+					scan.OutOfPlannable++
+				}
+				return
+			}
 		}
 		if _, ok := planByCell[ck]; ok {
 			return
 		}
 		if shapeCovered(&plan) {
+			scan.Filtered++
 			return
 		}
 		p := plan
@@ -1804,7 +1859,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 	// optimization.
 	rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
 	var combos []comboKey
-	for _, root := range primaryRoots {
+	for _, root := range rootCalls {
 		for _, variant := range variantCalls {
 			if !directedVariantAllowed(profile, root, variant) {
 				continue
@@ -1823,6 +1878,13 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 			continue
 		}
 		comboLive[ck] = true
+		// link/symlink roots need a target and a program-local linkpath. They
+		// are enumerated by the dedicated dual pass below (which reuses causal
+		// C2); the ordinary passes keep their single-path root assumption.
+		// They still count as live combos for the empty-enumeration scan.
+		if ck.Root == "link" || ck.Root == "symlink" {
+			continue
+		}
 		m := rootsByVariantRel[ck.Variant]
 		if m == nil {
 			m = make(map[PathRelation][]string)
@@ -1830,8 +1892,16 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 		}
 		m[ck.Rel] = append(m[ck.Rel], ck.Root)
 	}
+	scan.LiveCombos = len(comboLive)
+	if len(view.bNodes) == 0 {
+		return planByCell, cells, scan
+	}
 	if len(rootsByVariantRel) == 0 {
-		return planByCell, cells
+		// The dual link/symlink pass below is intentionally not reached here.
+		// If only link/symlink combos are live, scan.LiveCombos > 0 still
+		// classifies the empty result as enumEmpty (not noCombo), so D3 can
+		// see the enumeration gap instead of misreading it as saturation.
+		return planByCell, cells, scan
 	}
 	// NodeX stays unassigned here (0): batch assembly assigns 1..M so that
 	// every plan in a batch gets its own node.
@@ -2180,7 +2250,7 @@ func planDirectedCells(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_conf
 			}
 		}
 	}
-	return planByCell, cells
+	return planByCell, cells, scan
 }
 
 // ResolveDirectedPending settles the pending batch after an execution: every
@@ -2205,7 +2275,7 @@ func (lcs *LayeredChoiceStrategy) ResolveDirectedPending(pairs []DAGPair, persis
 		case observed[ck]:
 			covBoard.noteDirectedHit(ck)
 		case executed:
-			covBoard.noteDirectedMiss(ck)
+			covBoard.noteDirectedMissKind(ck, pending[i].FreshSame)
 		}
 	}
 }
@@ -2946,7 +3016,11 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 	}
 	pending := make([]DirectedPending, len(batch.Plans))
 	for i := range batch.Plans {
-		pending[i] = DirectedPending{Cell: batch.Plans[i].Cell}
+		pending[i] = DirectedPending{
+			Cell:      batch.Plans[i].Cell,
+			FreshSame: batch.Plans[i].FreshSame,
+			Role:      batch.Plans[i].Cell.Role,
+		}
 	}
 	lcs.PendingDirected = pending
 	covBoard.noteDirectedPlans(len(batch.Plans))

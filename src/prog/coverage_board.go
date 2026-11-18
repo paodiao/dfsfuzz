@@ -254,6 +254,16 @@ type coverageBoard struct {
 	cellNoPlans     uint64
 	cellInsertFails uint64
 	cellCfgErrs     uint64
+	// Diagnostic splits of cellMisses and cellNoPlans. They never feed
+	// planner decisions; they only make the aggregate counters attributable
+	// during D3/D4. cellMissFreshSame counts executed fresh-fresh race plans
+	// whose paired form was not observed; cellMissOther is every other miss.
+	cellMissFreshSame   uint64
+	cellMissOther       uint64
+	cellNoPlanNoCombo   uint64
+	cellNoPlanNoCell    uint64
+	cellNoPlanEnumEmpty uint64
+	cellNoPlanTree      uint64
 }
 
 var covBoard = &coverageBoard{
@@ -538,6 +548,25 @@ func DirectedCellStats() (plans, hits, misses, noPlans, insertFails uint64) {
 	return covBoard.cellStats()
 }
 
+// DirectedCellBreakdown is the diagnostic split of the aggregate directCell
+// counters. It is observational only and never feeds planner or pending
+// decisions.
+type DirectedCellBreakdown struct {
+	MissFreshSame   uint64
+	MissOther       uint64
+	NoPlanNoCombo   uint64
+	NoPlanNoCell    uint64
+	NoPlanEnumEmpty uint64
+	NoPlanTree      uint64
+}
+
+// DirectedCellBreakdownStats returns the reason splits behind
+// DirectedCellStats: fresh-fresh race misses vs other misses, and the noPlan
+// causes (no live combo, no pickable cell, empty enumeration, empty tree).
+func DirectedCellBreakdownStats() DirectedCellBreakdown {
+	return covBoard.cellBreakdown()
+}
+
 // DirectedBatchStats returns the number of directed batches that entered
 // execution; with DirectedCellStats().plans it gives the average batch fill.
 func DirectedBatchStats() uint64 {
@@ -568,6 +597,12 @@ func NoteDirectedInsertFail() {
 // (enumeration space saturated, tree too small, or every combo filtered).
 func NoteDirectedNoPlan() {
 	covBoard.noteDirectedNoPlan()
+}
+
+// NoteDirectedNoPlanReason records a directed attempt with no targetable plan
+// and attributes it to the specific status returned by PickDirectedBatch.
+func NoteDirectedNoPlanReason(status directedPlanStatus) {
+	covBoard.noteDirectedNoPlanReason(status)
 }
 
 // NoteDirectedCfgErr records a directed attempt aborted by a precondition or
@@ -1523,11 +1558,18 @@ func (b *coverageBoard) noteDirectedPick(ck comboKey, pot int) {
 }
 
 // noteDirectedMiss records one planned execution of cell ck that produced no
-// matching pair. Consecutive misses suppress the cell from 2b enumeration. A
-// cell already discovered before this pending resolved (a cross-proc race)
-// is not charged: the miss would only add noise, and the cell is out of the
-// 2b pool anyway.
+// matching pair, charging the generic (non-FreshSame) miss bucket. Kept as the
+// compatibility wrapper for tests and any non-pending caller.
 func (b *coverageBoard) noteDirectedMiss(ck cellKey) {
+	b.noteDirectedMissKind(ck, false)
+}
+
+// noteDirectedMissKind is the single miss-accounting point. Consecutive misses
+// suppress the cell from 2b enumeration. A cell already discovered before this
+// pending resolved (a cross-proc race) is not charged: the miss would only add
+// noise, and the cell is out of the 2b pool anyway. freshSame only splits the
+// diagnostic bucket; suppression behavior is identical.
+func (b *coverageBoard) noteDirectedMissKind(ck cellKey, freshSame bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.discovered[ck] != 0 {
@@ -1535,6 +1577,11 @@ func (b *coverageBoard) noteDirectedMiss(ck cellKey) {
 		return
 	}
 	b.cellMisses++
+	if freshSame {
+		b.cellMissFreshSame++
+	} else {
+		b.cellMissOther++
+	}
 	n := b.cellAttempts[ck] + 1
 	b.cellAttempts[ck] = n
 	if n >= cellMissThreshold && !b.cellUnreachable[ck] {
@@ -1585,11 +1632,32 @@ func (b *coverageBoard) noteDirectedInsertFail() {
 	b.cellInsertFails++
 }
 
-// noteDirectedNoPlan records a directed attempt with no targetable plan.
+// noteDirectedNoPlan records a directed attempt with no targetable plan,
+// without a specific reason (compatibility wrapper).
 func (b *coverageBoard) noteDirectedNoPlan() {
+	b.noteDirectedNoPlanReason(directedPlanNone)
+}
+
+// noteDirectedNoPlanReason is the single noPlan-accounting point. The reason
+// split is diagnostic only: it never changes planner behavior. cfgErr/found
+// statuses are not noPlan events and are ignored here.
+func (b *coverageBoard) noteDirectedNoPlanReason(status directedPlanStatus) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if status == directedPlanFound || status == directedPlanCfgErr {
+		return
+	}
 	b.cellNoPlans++
+	switch status {
+	case directedPlanNoneNoCombo:
+		b.cellNoPlanNoCombo++
+	case directedPlanNoneNoCell:
+		b.cellNoPlanNoCell++
+	case directedPlanNoneEnumEmpty:
+		b.cellNoPlanEnumEmpty++
+	case directedPlanNoneTree:
+		b.cellNoPlanTree++
+	}
 }
 
 // noteDirectedCfgErr records a directed attempt aborted by a config anomaly.
@@ -1609,6 +1677,28 @@ func (b *coverageBoard) cellUncovered(ck cellKey) bool {
 		return false
 	}
 	return b.discovered[ck] == 0 && !b.cellUnreachable[ck]
+}
+
+// cellAdmission splits a failed cellUncovered into a legitimate saturation
+// (covered, cell-suppressed, or outside the depth domain) and an
+// enumeration/plannable mismatch (outside the plannable layer). The split is
+// diagnostic only: admission behavior is exactly cellUncovered.
+func (b *coverageBoard) cellAdmission(ck cellKey) (uncovered, saturated bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if !b.ready || ck.RetA != RetSuccess {
+		return false, false
+	}
+	if !b.cellInDomain(ck) {
+		return false, true
+	}
+	if !b.cellInPlannable(ck) {
+		return false, false
+	}
+	if b.discovered[ck] != 0 || b.cellUnreachable[ck] {
+		return false, true
+	}
+	return true, false
 }
 
 // uncoveredCellFlags evaluates the given cell candidates under one read lock
@@ -1632,6 +1722,19 @@ func (b *coverageBoard) cellStats() (plans, hits, misses, noPlans, insertFails u
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	return b.cellPlans, b.cellHits, b.cellMisses, b.cellNoPlans, b.cellInsertFails
+}
+
+func (b *coverageBoard) cellBreakdown() DirectedCellBreakdown {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return DirectedCellBreakdown{
+		MissFreshSame:   b.cellMissFreshSame,
+		MissOther:       b.cellMissOther,
+		NoPlanNoCombo:   b.cellNoPlanNoCombo,
+		NoPlanNoCell:    b.cellNoPlanNoCell,
+		NoPlanEnumEmpty: b.cellNoPlanEnumEmpty,
+		NoPlanTree:      b.cellNoPlanTree,
+	}
 }
 
 func (b *coverageBoard) batchStats() uint64 {
@@ -1805,6 +1908,12 @@ func (b *coverageBoard) reset() {
 	b.cellNoPlans = 0
 	b.cellInsertFails = 0
 	b.cellCfgErrs = 0
+	b.cellMissFreshSame = 0
+	b.cellMissOther = 0
+	b.cellNoPlanNoCombo = 0
+	b.cellNoPlanNoCell = 0
+	b.cellNoPlanEnumEmpty = 0
+	b.cellNoPlanTree = 0
 }
 
 // producibleRets is the Phase-1 static reachability table (Doc A.4): which

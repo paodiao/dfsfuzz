@@ -3791,7 +3791,7 @@ func MutateFsopsWithDCT(ps []*Prog, rs rand.Source, sCalls *SpecialCalls, hmcfg 
 			case status == directedPlanCfgErr:
 				NoteDirectedCfgErr()
 			default:
-				NoteDirectedNoPlan()
+				NoteDirectedNoPlanReason(status)
 			}
 		}
 		return insertDerivedCallFromDCT(ps, r, sCalls, hmcfg, lcs, false, false)
