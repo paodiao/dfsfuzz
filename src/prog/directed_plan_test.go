@@ -41,6 +41,54 @@ func directedCellCounts() (hits, misses uint64) {
 	return h, m
 }
 
+// TestDirectedEmptyPlanStatus pins the diagnostic classification of an empty
+// enumeration. It is a pure mapping and does not change planner behavior.
+func TestDirectedEmptyPlanStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		scan directedPlanScan
+		want directedPlanStatus
+	}{
+		{"no live combo", directedPlanScan{LiveCombos: 0, BNodes: 0}, directedPlanNoneNoCombo},
+		{"empty tree", directedPlanScan{LiveCombos: 2, BNodes: 0}, directedPlanNoneTree},
+		{"all candidates filtered", directedPlanScan{LiveCombos: 2, BNodes: 4, Filtered: 3}, directedPlanNoneNoCell},
+		{"out-of-plannable candidate", directedPlanScan{LiveCombos: 2, BNodes: 4, OutOfPlannable: 1}, directedPlanNoneEnumEmpty},
+		{"out-of-plannable wins over saturation", directedPlanScan{LiveCombos: 2, BNodes: 4, Filtered: 1, OutOfPlannable: 1}, directedPlanNoneEnumEmpty},
+		{"enumeration empty", directedPlanScan{LiveCombos: 2, BNodes: 4}, directedPlanNoneEnumEmpty},
+	}
+	for _, tc := range cases {
+		if got := directedEmptyPlanStatus(tc.scan); got != tc.want {
+			t.Errorf("%s: status = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestResolveDirectedPendingFreshSameMiss pins the dcMisses split: an executed
+// FreshSame pending charges the fresh-fresh race bucket, an ordinary pending
+// charges the other bucket, and both still count toward the aggregate misses.
+func TestResolveDirectedPendingFreshSameMiss(t *testing.T) {
+	ResetCoverageBoard()
+	t.Cleanup(ResetCoverageBoard)
+	lcs := &LayeredChoiceStrategy{PendingDirected: []DirectedPending{
+		{
+			Cell:      directedCell{Combo: comboKey{Root: "creat", Variant: "stat", Rel: PathSame}},
+			FreshSame: true,
+		},
+		{
+			Cell: directedCell{Combo: comboKey{Root: "write", Variant: "truncate", Rel: PathSame}},
+		},
+	}}
+	lcs.ResolveDirectedPending(nil, "", true)
+	if _, _, misses, _, _ := DirectedCellStats(); misses != 2 {
+		t.Fatalf("misses = %d, want 2", misses)
+	}
+	bd := DirectedCellBreakdownStats()
+	if bd.MissFreshSame != 1 || bd.MissOther != 1 {
+		t.Fatalf("miss breakdown = fresh:%d other:%d, want 1/1",
+			bd.MissFreshSame, bd.MissOther)
+	}
+}
+
 // TestDirectedTemplateScope pins the planned template boundaries.
 func TestDirectedTemplateScope(t *testing.T) {
 	if _, ok := directedVariantKinds("mkdir"); !ok {

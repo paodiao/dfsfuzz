@@ -287,6 +287,73 @@ func TestDirectedCellMissAccounting(t *testing.T) {
 	}
 }
 
+// TestDirectedCellBreakdownCounters pins the diagnostic splits: noPlan reasons
+// are attributed once per attempt, cfgErr/found are not noPlan events, and
+// FreshSame misses are separated from ordinary misses without changing the
+// aggregate counters or the suppression ledger.
+func TestDirectedCellBreakdownCounters(t *testing.T) {
+	newTestCoverageBoard(t)
+	NoteDirectedNoPlanReason(directedPlanNoneNoCombo)
+	NoteDirectedNoPlanReason(directedPlanNoneNoCell)
+	NoteDirectedNoPlanReason(directedPlanNoneEnumEmpty)
+	NoteDirectedNoPlanReason(directedPlanNoneTree)
+	NoteDirectedNoPlan() // generic: aggregate only
+	NoteDirectedNoPlanReason(directedPlanFound)
+	NoteDirectedNoPlanReason(directedPlanCfgErr)
+	ck := cellKey{
+		Root: "write", Variant: "truncate", Rel: PathSame, Temporal: TemporalHB,
+		RetA: RetSuccess, RetB: RetENOENT,
+	}
+	covBoard.noteDirectedMissKind(ck, true)
+	covBoard.noteDirectedMissKind(ck, false)
+	_, _, misses, noPlans, _ := DirectedCellStats()
+	if misses != 2 {
+		t.Fatalf("misses = %d, want 2", misses)
+	}
+	if noPlans != 5 {
+		t.Fatalf("noPlans = %d, want 5", noPlans)
+	}
+	bd := DirectedCellBreakdownStats()
+	if bd.NoPlanNoCombo != 1 || bd.NoPlanNoCell != 1 ||
+		bd.NoPlanEnumEmpty != 1 || bd.NoPlanTree != 1 {
+		t.Fatalf("noPlan breakdown = %+v, want 1/1/1/1", bd)
+	}
+	if bd.MissFreshSame != 1 || bd.MissOther != 1 {
+		t.Fatalf("miss breakdown = fresh:%d other:%d, want 1/1",
+			bd.MissFreshSame, bd.MissOther)
+	}
+	if covBoard.cellUnreachable[ck] {
+		t.Fatal("diagnostic misses must not suppress the cell below threshold")
+	}
+}
+
+// TestCellAdmissionSplitsSaturationFromMismatch pins the noPlan classification
+// input: a covered/suppressed cell is saturated, while a cell outside the
+// plannable layer is an enumeration/plannable mismatch (neither uncovered nor
+// saturated).
+func TestCellAdmissionSplitsSaturationFromMismatch(t *testing.T) {
+	glusterfsCoverageConfig(t, true)
+	ck := glusterfsCoverageCell("symlink", "readlink", PathSame, TemporalHB,
+		RetSuccess, offsetBucketNA, false)
+	if uncovered, saturated := covBoard.cellAdmission(ck); !uncovered || saturated {
+		t.Fatalf("plannable fresh cell: uncovered=%v saturated=%v, want true/false",
+			uncovered, saturated)
+	}
+	covBoard.mu.Lock()
+	covBoard.discovered[ck] = 1
+	covBoard.mu.Unlock()
+	if uncovered, saturated := covBoard.cellAdmission(ck); uncovered || !saturated {
+		t.Fatalf("covered cell: uncovered=%v saturated=%v, want false/true",
+			uncovered, saturated)
+	}
+	bad := glusterfsCoverageCell("symlink", "readlink", PathSibling, TemporalHB,
+		RetSuccess, offsetBucketNA, false)
+	if uncovered, saturated := covBoard.cellAdmission(bad); uncovered || saturated {
+		t.Fatalf("out-of-plannable cell: uncovered=%v saturated=%v, want false/false",
+			uncovered, saturated)
+	}
+}
+
 // TestCoverageUnreachableRebaseline checks that a combo producing a new cell
 // within every window shorter than the threshold is never marked unreachable:
 // recordPairs re-baselines the window immediately at production, so the
