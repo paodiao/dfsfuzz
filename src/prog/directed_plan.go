@@ -136,9 +136,12 @@ type directedBatch struct {
 	Anchor            *causalAnchor
 }
 
-// directedRootCalls is the planned root set. mkdir/creat/rename roots are the
-// 2b2 fresh-path forms (synthesized A paths, see the fresh passes); rmdir stays
-// out of the root set.
+// directedRootCalls is the HMDFS legacy/effective directed-root list and the
+// fallback for profiles that do not set Plan.DirectedRootCalls. GlusterFS must
+// use its own GlusterfsCausalRootCalls override; changing this array is an
+// HMDFS behavior change and must be covered by HMDFS tests. mkdir/creat/rename
+// roots are the 2b2 fresh-path forms (synthesized A paths, see the fresh
+// passes); rmdir stays out of the root set.
 var directedRootCalls = []string{
 	"open", "read", "pread64", "write", "pwrite64", "truncate",
 	"stat", "chmod", "fsync", "fdatasync", "getdents64",

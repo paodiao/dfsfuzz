@@ -1486,6 +1486,11 @@ rmdir:
   C1/normal directed root 不支持（Success 空目录 / ENOTEMPTY 非空目录
   两种 root 形态尚未同时进入 fixed-root planner）。
 
+`directedRootCalls` 是 HMDFS 的 legacy/effective root 列表，也是未设置
+`Plan.DirectedRootCalls` 的 profile 的兜底；GlusterFS 使用
+`GlusterfsCausalRootCalls` 覆盖。不要为了 GlusterFS 改全局
+`directedRootCalls`：改全局等同改 HMDFS，必须同步 HMDFS 测试。
+
 C2 variant:
   open, stat, chmod, fsync, fdatasync, getdents64, read, write,
   pread64, pwrite64, truncate, rmdir, rename, unlink, mkdir, creat,

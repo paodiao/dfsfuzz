@@ -5,6 +5,30 @@ import (
 	"testing"
 )
 
+// TestHmdfsDirectedRootCallsLegacy pins the global directedRootCalls list that
+// HMDFS uses as its effective root set. GlusterFS owns a separate override;
+// editing the global list is an HMDFS behavior change and must fail here first.
+func TestHmdfsDirectedRootCallsLegacy(t *testing.T) {
+	want := []string{
+		"open", "read", "pread64", "write", "pwrite64", "truncate",
+		"stat", "chmod", "fsync", "fdatasync", "getdents64",
+		"unlink", "mkdir", "creat", "rename",
+	}
+	got := hmdfsProfile.DirectedRootCalls()
+	if len(got) != len(want) {
+		t.Fatalf("HMDFS directed roots = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("HMDFS directed roots[%d] = %q, want %q (all=%v)",
+				i, got[i], want[i], got)
+		}
+	}
+	if profileCallListContains(got, "rmdir") {
+		t.Fatal("rmdir must remain absent from the HMDFS directed-root list")
+	}
+}
+
 // TestGlusterfsRootCallPartition pins the model-root vs directed-root split:
 // every directed root must exist in the model/DCT root list, and the only
 // current model-only root is rmdir. Adding a directed root later must update
