@@ -1,7 +1,8 @@
 # Executor 文件树恢复设计
 
-> 状态：HMDFS 代码已写入，待 Linux 编译与实测；GlusterFS 恢复/角色细节见总计划
-> 日期：2026-11-08（2026-11-15 补充 GlusterFS runtime/initial loading/role 决策）
+> 状态：HMDFS/GlusterFS restore 路径已实现；D1 BPF standalone smoke 已通过，
+> D2 executor integration 待执行；GlusterFS 恢复/角色细节见总计划
+> 日期：2026-11-08（2026-11-18 更新实现状态与 D1 结果）
 > 范围：executor 每次执行前的文件树恢复；triage/minimize 简化；corpus 时间线保留  
 > 相关：`docs/glusterfs-adaptation-plan.md`、`docs/glusterfs-config-and-scripts.md`、`docs/glusterfs-tracer-implementation-spec.md`、`docs/seed-optimization-plan.md`
 >

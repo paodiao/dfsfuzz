@@ -1,9 +1,9 @@
 # Rename Policy 抽象记录
 
-> 状态：设计记录（2026-10-28；2026-11-09 对齐 A+ rename anchor role 边界；2026-11-15 定 GlusterFS v1 policy/PathSet 迁移，代码待实现）。
+> 状态：设计记录（2026-10-28；2026-11-09 对齐 A+ rename anchor role 边界；2026-11-18 RenamePolicy v1 已实现，rename 保持 role-free；runtime 待验证）。
 > 范围：rename 的 source/destination 路径规则如何跨文件系统复用。
 > 关联：`docs/seed-derivation-design.md`、`docs/causal-root-cell-design.md`、`docs/cross-node-fresh-path-notes.md`。
-> 本文只记录抽象方向和接口草案，不修改代码。
+> 本文只记录抽象方向和接口草案；当前实现以 `docs/glusterfs-adaptation-plan.md` 为准。
 
 ---
 

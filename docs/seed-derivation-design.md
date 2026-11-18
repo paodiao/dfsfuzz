@@ -570,7 +570,7 @@ GlusterFS v1 的派生规则：
   linkpath = fresh，可在任意已有父目录
   actual call = symlink(relpath(target, dirname(linkpath)), linkpath)
   ```
-- `symlink` 调用参数中的 arg0 是 payload；`collectSeedAnchors`/`baseCandidate`
+- `symlink` 调用参数中的 arg0 是 payload；`collectSeedAnchors`/DCT base 选择
   必须用共享 `symlinkCanonicalTarget(linkpath, payload)` 还原 canonical target，
   不能把 payload 当 FileTree 路径。
 - target 是 anchor-relative，不是 fixed baseline；生成后必须仍在测试根内且类型
@@ -1073,7 +1073,7 @@ append-only：仅作为 initial group / fallback 的简化策略，不作为主�
   - `deriveSeedRootPath` 增加 link/symlink target 派生；canonical target 不存
     symlink payload
   - 共享 `symlinkCanonicalTarget(linkpath, payload)`：`collectSeedAnchors`、
-    `baseCandidate`、DAG/checker 都使用；不能把 payload 当 FileTree 路径
+    DCT base 选择、DAG/checker 都使用；不能把 payload 当 FileTree 路径
   - 第一版 fresh parent 限制：`collectSeedAnchors` 使用 `freshParentNodeEligible`；nested fresh parent 不进入 anchor 池
   - `deriveSeedRootPath` 只支持 1 层 fresh；不把 `freshKinds` 作为 fresh-parent 放行输入
   - `freshPathParentEligible` 标注为 future nested fresh helper；当前 C1 / seed derivation 生产路径统一使用 `freshParentNodeEligible`，不重新引入 nested fresh 前不得作为生产 gate

@@ -98,13 +98,13 @@ unsupported/ignored，不能静默保留（尤其避免 `readv/writev` 这类“
 | 跨目录 rename | GlusterFS 支持文件和目录跨目录 rename，destination 支持 fresh 与 existing replace；HMDFS 保持 same-parent。`renameat2` 不支持。详见 §6.5。 |
 | readv/writev alias | 不做 alias；config 不启用 `readv/writev/preadv/pwritev`，只用 `read/pread64/write/pwrite64`。配置校验报告 unsupported。 |
 | Call → Event matcher | 22-call 表；`creat` 和 `open(O_CREAT)` 只映射 `CREATE`，不映射 `FILE_OPEN`；`open` 按 flags 区分 CREATE/DIR_OPEN/FILE_OPEN；`getdents64` → ITERATE。详见 §5.3。 |
-| PathSameInode / hardlink identity | **GlusterFS v1 不做 `PathSameInode`**，不增加 `RelKind`，不改 `cellKey/comboKey`，也不加 `entry_ino`。保留 link/symlink 的 `Path/Path2`、program-local bindings、`HardlinkGroupKey` 和 authority；HMDFS 保持现有分类并折叠为 `PathSame`。源码已确认 LINK/SYMLINK/UNLINK/RMDIR/RENAME 的 `loc.inode` 可用，但 v1 的 DAG 路径改用调用参数/fd provenance，不依赖它（见 §4.3、§5.2）。 |
+| PathSameInode / hardlink identity | **GlusterFS v1 不做 `PathSameInode`**，不增加 `RelKind`，不增加 `entry_ino`；`comboKey` 保持 role-free，`cellKey` 只增加 `Role`（target/普通 cell 用 `cellRoleNone`，linkpath 用显式 role）。保留 link/symlink 的 `Path/Path2`、program-local `RootLinkPath`/`freshLinks`、`HardlinkGroupKey` 和 authority；HMDFS 保持现有分类并折叠为 `PathSame`。源码已确认 LINK/SYMLINK/UNLINK/RMDIR/RENAME 的 `loc.inode` 可用，但 v1 的 DAG 路径改用调用参数/fd provenance，不依赖它（见 §4.3、§5.2）。 |
 | PathSet 双路径 | broad 支持 `link/symlink/readlink/rename`；v1 只迁移 link/symlink 的 target，linkpath 是 program-local fresh binding 不随 PathSet 迁移；rename src/dst 都迁移，dst 由 `RenamePolicy` 在迁移阶段选，existing 优先、fresh 兜底。详见 §8.7。 |
 
 补充：
 
 - DCT seed 没有显式 Success/Ret 规划；`readlink` 不能做 root，只能作为
-  `symlink` root 的 variant（`PathSame`/`PathSelf`），实际 Success/ENOENT
+  `symlink` root 的 variant（`PathSame`），实际 Success/ENOENT
   都是合法结果。
 - DCT mutation 有 `refTime`/`ChooseTemporal`，可把 symlink 放在 readlink 前形成
   HB；仍没有显式 RetB 目标，CC 按竞态处理。Directed 才显式规划 RetB。
@@ -157,7 +157,7 @@ type DFSProfile struct {
   state effect、`PathStateTracking`（in-program current state；HMDFS=false，
   GlusterFS=true）。
 - `TreeProfile`：FileTree 前缀、节点类型；v1 不在 FileTree 建模
-  symlink/hardlink（链接路径走 program-local bindings）。
+  symlink/hardlink（链接路径走 program-local `RootLinkPath`/`freshLinks`）。
 - `GenProfile`：生成器与取值模型、参数策略。
 - `CheckerProfile`：A/B 字段、supported/ignored calls、restore。
 - `TraceProfile`：parser、executor init/start/stop、wire 布局。
@@ -712,8 +712,8 @@ events[count]
   `isModifierFunc`、`isOffsetFunc` 改为 profile 方法或表。
 - HMDFS 保留现有 `PathSameInode` 分类，`dagRelToDctRel` 继续把它折成
   `PathSame`。GlusterFS v1 设 `SupportsSameInode=false`：`determinePathRel`
-  不比较 `Ino`，只做路径相等、父子、同父和 `PathNone`；不新增 `RelKind`，
-  不改 `cellKey`/`comboKey`。
+  不比较 `Ino`，只做路径相等、父子、同父和 `PathNone`；不新增 `RelKind`；
+  `comboKey` 不变，`cellKey` 只增加 `Role`（见 §6.3、§8.6.6）。
 - GlusterFS parser 固定 `Ino=0`，`NodeID` 单独保存；不要把 `nodeid` 填进
   `Ino`，否则 `determinePathRel` 的 same-inode 分支和 delete timeline 会误用
   inode 指针。`isEntryInoFunc` 不为 link/symlink/unlink/rmdir/rename 新增
@@ -858,18 +858,21 @@ DAG 和定向构建不引入完整 role-pair 矩阵。每个**生成的 pair** �
   - DAG 两条路径各生成一个 pair，都统计；GlusterFS v1 不区分
     `PathSameInode`，两个 pair 只按路径相等/父子/同父/None 分类；
   - 同一事件对的两个 role pair 若落到同一 cell，由覆盖板的 `cellKey` 去重；
-  - 定向随机选 target 或 linkpath。
+  - C1 anchor 和 normal dual 都分别枚举 target/linkpath 两个 role，不是二选一
+    丢弃；target-role 计 CC+HB，linkpath-role 只计 HB。
 - link/symlink 作为 HB B/CC：用 target；linkpath 自由。
 - readlink：
   - 定向只允许 HB B；
   - DAG 若出现 CC，用 linkpath 记录反馈，但不去向；
   - A 必须是同一 linkpath 上的 modifier（实际成功形态主要是 symlink）。
-- 自由路径由 `ResolveFreeRole` 解析，必须满足 profile：
+- 自由路径由 `RootPaths`/`RenamePolicy`/`freshLinkPathsBefore` 解析，必须满足
+  profile：
   - HMDFS rename same-parent；
   - GlusterFS rename 可跨目录；
   - link/symlink 的 fresh/existing、类型、父目录存在；
   - linkpath follow/nofollow；
-  - **不能对 linkpath 调 `FileTree.FindNode`**；linkpath 只来自 bindings。
+  - **不能对 linkpath 调 `FileTree.FindNode`**；linkpath 只来自 program-local
+    `RootLinkPath`/`freshLinks`。
 
 ### 6.2 linkpath 访问
 
@@ -920,8 +923,10 @@ const (
   link/symlink A 侧的 target/linkpath role。target/普通 cell 用零值，
   linkpath 用显式 role；legacy 键保持 `(Root, Variant, Rel, ...)` 的零 role
   行为。`cellKey` 不增加 `RelKind`/HardlinkGroupKey。
-- `directedPlan` 保存 `ABindings/BBindings`；`BaseA/BaseA2/BaseB/BaseB2`
-  只做兼容投影。
+- `directedPlan` 用 `BaseA/BaseA2/BaseB/BaseB2` 保存构造路径；link/symlink
+  root 的 program-local linkpath 用 `RootLinkPath`，cell/relation 用的 A 侧
+  路径用 `RootRelationPath`（空值表示 `BaseA`）。`FreshA/FreshA2/FreshB/
+  FreshSame` 标记 batch 物化时生成的 fresh 路径。
 - `planStateEffect` 返回多路径 effect；authority 按路径 + `HardlinkGroupKey`。
 - **GlusterFS v1 不做 `PathSameInode`**；HMDFS 保留现有分类并折叠为
   `PathSame`。GlusterFS 的 `Ino` 不进入 path relation。
@@ -942,12 +947,15 @@ const (
 ### 6.4 定向生成
 
 - 先按 §6.1 选 root/variant 的关系角色。
-- link/symlink 作为 HB A 时，随机选 target 或 linkpath；另一条由 `ResolveFreeRole` 解析。
+- link/symlink 作为 HB A 时，target/linkpath 两个 role 都枚举；C1 在所有
+  C1 cell 里随机选一个，C2/normal dual 分别生成 target-role 和 linkpath-role
+  plan。
 - readlink 只做 HB B self 形态；A 选 linkpath role。
-- `resolveBindings` 按角色拓扑解析路径，替代 `GetPathsForRenameVariant`、
-  `pickRenameDst`、`freshRenameDst` 的 rename 专用逻辑。
-- `insertCallFromDCT`/`insertDerivedCallFromDCT` 使用 bindings 和 `ArgIdx`，
-  不使用 `basePath2` 特判。
+- 路径解析使用 `RootPaths`/`DualPathKind`；rename destination 走
+  `RenamePolicy`，fresh rename destination 仍由 `freshRenameDst` 物化。
+- `insertCallFromDCT`/`insertDerivedCallFromDCT` 使用 `dctBaseCandidatesFor`、
+  `freshLinkPathsBefore` 和 `RootPaths`；link/symlink 的 linkpath 是
+  program-local fresh binding，不进入 FileTree。
 
 ### 6.5 RenamePolicy（v1）
 
@@ -1075,6 +1083,9 @@ GlusterFS 规则：
   构造层：FailurePolicy 和 directed pair（root 或 anchor）主动构造的形态；
   Direction-3（2a variant 偏置、2b exact plan、mutation offset/depth 偏置）
   只消费这一层。`comboKey.Root` 是 A 侧 call 名，不区分 root/anchor。
+  注意：plannable 是 variant-form 静态上界，不等同于当前 planner 的精确
+  构造能力；非 creation-root 的 context-dependent 形态仍可能有 phantom cell，
+  见 §13.1 已知边界。
 - **root-directed**：`rootDirected*` 从 plannable 里按
   `profile.DirectedRootCalls()` 快照再过滤一层；过滤是精确 call-name 匹配
   （`profileExactListContains`），不是子串/前缀匹配，`open$dir` 等变体不会
@@ -1107,9 +1118,11 @@ producer，也不是 C1 的降级实现。调用链：
 PickDirectedBatch
   ├─ pickCausalRootBatch              // C1/C2；能产出则直接返回
   └─ pickDirectedBatchNormal
-       └─ planDirectedCells
-            ├─ 普通 existing-node pass
-            ├─ FreshA / FreshA2 / FreshB / FreshSame pass
+       └─ planDirectedCellsScan
+            ├─ main loop（含 synthesized FreshB B nodes）
+            ├─ FreshA
+            ├─ FreshA2
+            ├─ FreshSame
             └─ normal dual-root pass
 ```
 
@@ -1184,11 +1197,12 @@ plannable；普通已有目录上的 `mkdir EEXIST` 仍不主动构造。race �
 ENOENT`）只在对应 creation-root Same combo 的 model/plannable 中扩展，不污染
 其它 combo，从而保持 `plannable ⊆ model`。
 
-`planDirectedCells.add()` 的 plannable 检查是最后一道不变量：任何 normal plan
+`planDirectedCellsScan` 的 `add` 检查是最后一道不变量：任何 normal plan
 进入 batch 前都必须落在 combo-aware plannable 内。HMDFS 的 plannable 恒等于
 model，保持旧行为；GlusterFS 默认 `DualPathCausalEnabled=true`，
-`link/symlink/readlink` 进入 plannable。gate=false 的 A/B 配置下两者同步排除，
-不会出现 plannable 有、planner 无的错配。
+`link/symlink/readlink` 进入 plannable。gate=false 的 A/B 配置下 link 系在
+plannable 与 planner 中同步排除；非 link 的 context-dependent 形态仍按
+§13.1 已知边界处理，不能据此认为不存在 plannable/planner 错配。
 
 ### 8.2.4 DAG feedback
 
@@ -1220,7 +1234,7 @@ saturation 和 smash 执行预算。
 - DCT seed 的 `readlink`：
   - 不能作为 root（baseline 没有 symlink）；
   - 只允许作为 `symlink` root 的 variant；
-  - relation 只取 `PathSame`/`PathSelf`；
+  - relation 只取 `PathSame`；
   - 实际 `Success` 和 `ENOENT` 都是自然结果，DCT 不预设。
 - DCT mutation 有 `refTime`/`ChooseTemporal`：
   - HB 可以把 symlink 排在 readlink 前，形成可证明的可见性；
@@ -1257,8 +1271,8 @@ type CallVariant struct {
 ```
 
 - 不给 `CallVariant` 加 role、rename destination 形态或 `RelKind`；
-- 不改 `Weights` key、`CallVariant.String()`、`SortCallVariants`、
-  `comboKey`、`cellKey`；
+- 不改 `Weights` key、`CallVariant.String()`、`SortCallVariants`、`comboKey`；
+  `cellKey` 只增加 `Role`（见 §8.6.6），其余维度不变；
 - 新增 profile-specific `BuildDefaultDCT(profile)`；
 - HMDFS 保持现有 DCT 表和行为不变。
 
@@ -1278,7 +1292,7 @@ coverage board 的 root/variant 网格用 19/21 列表，不用 22 个 SubCalls�
 不可生产的 close-root cell。
 
 GlusterFS variant（21）：上述 root 集合加 `getxattr/readlink`；其中 `readlink`
-只挂在 `root=symlink` 下，relation 只取 `PathSame`/`PathSelf`，不能做 root。
+只挂在 `root=symlink` 下，relation 只取 `PathSame`，不能做 root。
 `getxattr` 只做 variant/observer，不做 root。
 
 #### 8.5.3 类型与权重
@@ -1414,36 +1428,35 @@ causal root 的 link/symlink 插入由 profile gate（如
 
 #### 8.5.7 实现落点
 
-1. `BasePathInfo`：
-   - 保留 HMDFS 的 `basePathIsFile` / `freshKinds map[string]int`；
-   - GlusterFS 新增 `freshLinks map[string]linkPathInfo`
+1. DCT base 选择：
+   - `dctBaseCandidatesFor(profile, p0, insertPos)` 收集 p0 中可作为新 root
+     base 的路径；GlusterFS 对 rename/link/symlink/readlink 按 before/success
+     规则过滤；
+   - `freshPathKindsBefore` 记录 p0 中更早的 mkdir/creat 产生的 fresh path
+     类型；
+   - `freshLinkPathsBefore` 记录更早 link/symlink 的 program-local linkpath
      （`linkPathHardlink`/`linkPathSymlink`、`FollowIsDir`、`Target`、
      `CreatorIdx`）；
-   - `freshLinkPathsBefore` 扫描 link/symlink；`basePathInfo` 优先级：
-     `freshLinks` -> `freshKinds` -> FileTree。
-2. `baseCandidate`：
-   - GlusterFS 的 `insertCallFromDCT` 收集 `Path/Role/CallIdx/CallName/
-     Target/LinkPath/LinkInfo`；
-   - HMDFS 保持现有 `pathCandidates` 逻辑；
-   - link/symlink 的 arg1 linkpath 进入候选，readlink 只进 linkpath。
-3. derived/causal：
+   - `rootBaseConstraintFor` 按 root call 的类型约束过滤候选；link/symlink
+     target 不能是另一个 linkpath。
+2. derived/causal：
    - `AnchorPathKind` 增加 `AnchorPathFreshSymlink`；
    - `anchorPathInfo`/`seedAnchor` 增加 `FollowIsDir`；
    - `collectSeedAnchors` 收集 target/linkpath 两个 role；
    - `deriveSeedRootPath` 增加 link/symlink 分支；
-   - `insertDerivedCallFromDCT` 使用 `RootSource/RootDest`、freshLinks 和
-     readlink 特例。
-4. `RenamePolicy`：
-   - profile hook `PickDst(ft, src, rel, r)`；
-   - HMDFS 包装现有 `pickRenameDst`，行为不变；
-   - GlusterFS 负责 same/cross-parent、fresh/replace、类型/非空检查；
-   - DCT seed/mutation/derived 的 rename dst 都走该 hook；directed 以后复用。
-5. coverage：
-   - `DagPairToVariant`/`cellKey`/`comboKey` 不改；
+   - `insertDerivedCallFromDCT` 使用 `seedDerivation`、`RootPaths`、
+     freshLinks 和 readlink 特例。
+3. RenamePolicy：
+   - profile hook `pickRenameDstPolicy` 已落地（`pickRenameDstFor` 调用）；
+     HMDFS 保持 same-parent，GlusterFS 负责 same/cross-parent、fresh/replace、
+     类型/非空检查；
+   - DCT seed/mutation/derived 的 rename dst 都走该 hook；directed 复用。
+4. coverage：
+   - `DagPairToVariant` 不变；`comboKey` 不变；`cellKey` 只增加 `Role`；
    - link/symlink 两个 role pair 仍只产出 `CallVariant{CallName, PathRelation}`；
    - 同 relation 落同一 cell 时由 cellKey 去重，不同 relation 按现有逻辑记录；
    - readlink 非 symlink root 组合由 DCT producible/cellInModel 过滤；
-   - 不把 role/RelKind 写进 coverage。
+   - 不把 role/RelKind 写进 comboKey。
 
 #### 8.5.8 与 causal 的衔接
 
@@ -1451,7 +1464,7 @@ DCT 表/生成规则到此冻结。causal root/directed 的 C1/C2 规则见 §8.
 两者共享 §8.5.6 的 `DualPathKind`/`RootPaths`，不另写双路径逻辑。
 
 normal directed planner 的 link/symlink root 同样复用该抽象：
-`planDirectedCells` 的 dual pass 调 `planCausalC2CellsWithParent`，由
+`planDirectedCellsScan` 的 dual pass 调 `planCausalC2CellsWithParent`，由
 `causalRootNormal` 固定 target/linkpath；`RootLinkPath` 只进 plan/batch，
 再经 `insertDirectedBatch` → `causalRootCallsSeq` materialize。该 pass 与
 C1 共用 `DualPathCausalEnabled` gate；GlusterFS 默认 true，HMDFS false；详见 §8.2.2。
@@ -1481,7 +1494,7 @@ readlink:    不做 C1 anchor
   `causalAnchor.SourceMoved` 显式标记；不能用 `Source != Path` 推断，
   因为 link/symlink anchor 的 `Source=target` 也满足该条件。link/symlink
   target 及其后代不能被当成“被移走的 source 子树”；
-- C1 root 增加 `causalRootDual`：
+- C1 link/symlink root 复用 `causalRootNormal`：
   - `RootPath = target`（root materialization）
   - `RootSource = target`
   - `RootDest = linkpath`
@@ -1541,7 +1554,7 @@ getdents 的配套调用。文件 close 的 RELEASE 事件仍可作 DAG B/CC；�
   canonical target。
 
 `DualPathCausalEnabled=false` 的 A/B 配置下，link/symlink 的 C1/C2 插入不生成；
-trace 稳定后打开。
+GlusterFS 默认 true，gate=false 只用于对照实验。
 
 #### 8.6.2 C1 root 路径候选
 
@@ -1622,16 +1635,29 @@ rename:             Success, RetFailure
 ```
 
 `variantKindsFor` 对 GlusterFS 不补 ENOENT；HMDFS 保持原行为。
-`variantKindAllowed`：
+
+`variantKindAllowed` 是 **上下文门**，不是 form 表；它决定某个 form 在具体
+root/B/relation 下能不能构造：
 
 ```text
-link:     target 非目录；Success
-symlink:  target 任意；Success
-readlink: root=="symlink"；Success
-getxattr: 任意；Success/RetFailure
-setxattr: 任意；Success/RetEEXIST
-rmdir:    目录；Success（空）/RetFailure（非空）
-rename:   Success（合法目标）/RetFailure（非空目录目标）
+existing B:
+  mkdir:    RetEEXIST only when B is dir
+            （GlusterFS form 表只有 Success，所以普通已有 B 实际不会 plan；
+             Success 只由 FreshSame/freshB 构造）
+  creat:    RetSuccess only when B is file（truncate）；fresh B 只由 fresh 通道
+  rmdir:    RetFailure only when B is dir && nonEmpty；Success 只由 FreshSame
+  unlink:   RetSuccess when B is file；RetENOENT 只在 root=unlink && rel=Same
+  rename:   false（rename variant 只用 synthesized rename B）
+  link:     RetSuccess when B is file
+  symlink:  RetSuccess
+  readlink: RetSuccess when B is non-dir
+            （root=symlink 由 combo/plannable 层约束）
+  getxattr: RetSuccess only when root=setxattr && rel=Same；否则 RetFailure
+  setxattr: RetSuccess any；RetEEXIST only when root=setxattr && rel=Same
+freshB:
+  only the named call (mkdir/creat) with RetSuccess
+synthesized rename B:
+  rename with renameKindRet(bn)，或 root=unlink && rel=Same 的 RetENOENT
 ```
 
 ##### FailurePolicy（GlusterFS v1）
@@ -1660,7 +1686,7 @@ setxattr EPERM/EINVAL
 ```
 
 这些限制只针对单操作/已有对象上的失败构造：路径缺失只作为 LOOKUP 自然观测，
-不进入普通 GlusterFS directed/producible 失败 cell。
+不进入普通 GlusterFS directed/plannable 失败 cell；model 仍保留自然可达上界。
 
 fresh-fresh 竞赛是独立通道，使用完整 `freshSameForms` 矩阵：
 
@@ -1808,7 +1834,7 @@ read(L1) + write(T)
   `rootDirectedComboEnabled` 根据 `DirectedRootCalls` 精确匹配排除它，但不把
   `DirectedPairPotential`/`DirectedPairDepthPots` 等 anchor 视图一起清零。
 
-producible 表：
+model（`producible`）表：
 
 ```text
 producibleRets:
@@ -1816,30 +1842,43 @@ producibleRets:
   getxattr              -> Success, RetFailure（ENODATA）
   setxattr              -> Success, RetEEXIST（XATTR_CREATE）
   rmdir/rename          -> Success, RetFailure（ENOTEMPTY）
+  unlink                -> Success
+  mkdir                 -> Success, RetEEXIST
+  creat                 -> Success, RetFailure
+  chmod/stat/truncate/open -> Success, RetENOENT
+  write/pwrite64        -> Success, RetFailure
+  getdents64            -> Success, RetENOENT
+  read/pread64/fsync/fdatasync -> Success
 
 producibleTypes:
   link     -> {file}
   symlink  -> {file, dir}
   readlink -> {false}
   getxattr/setxattr -> {file, dir}
-  rmdir/rename -> {file, dir}（按 source/dest 类型约束）
+  rmdir    -> {dir}
+  rename   -> {file, dir}
+  mkdir    -> {dir}
+  creat/read/write/pread64/pwrite64/fsync/fdatasync/truncate/unlink -> {file}
+  open/stat/chmod -> {file, dir}
+  getdents64 -> {dir}
 
 producibleOffBuckets:
-  全部 NA
+  offset calls: zero/mid/tail/beyond；RetENOENT -> NA
+  其他: NA
 ```
 
-GlusterFS 不把其他**单操作/已有对象**失败形态放进 `producible`：
-`mkdir EEXIST`（已有目录）、`unlink/open/stat/... ENOENT`、
-`link/symlink/readlink` 失败、`readlink EINVAL`、`link EMLINK`、
-`getxattr ERANGE`、`setxattr EPERM/EINVAL` 都不进入 directed/producible。
-自然 DAG 观测可以记录为 out-of-model，不压低未覆盖势能。
+`producible` 是**自然可达上界**，所以包含 `mkdir EEXIST`、`open/stat/truncate
+ENOENT`、`write/pwrite64 Failure` 等自然失败形态。`plannable` 只保留
+`directedVariantKinds` + fresh-fresh race forms；FailurePolicy 只主动构造
+`rmdir/rename ENOTEMPTY`、`getxattr ENODATA`、`setxattr EEXIST`。因此
+`ModelOnly = ModelFound - PlannableFound` 是预期结果，不是 planner 漏规划。
 
-例外是 fresh-fresh 竞赛：对 `Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo，
+fresh-fresh 竞赛例外：对 `Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo，
 model/plannable 额外采用完整 `freshSameForms` 的 (root, variant, ret, type)
 形态。因此 `mkdir/creat Same Failure`、`creat/mkdir Same EEXIST`、
 `mkdir/mkdir Same EEXIST`、`mkdir/rmdir Same ENOENT`、`creat/unlink Same
 ENOENT` 等 race cell 在这些 combo 内是 model/plannable；普通已有对象上的
-同名返回仍被排除。HMDFS 的 producible 表不变。
+同名返回仍不进入 plannable。HMDFS 的 producible 表不变。
 
 实现约束：
 
@@ -1877,7 +1916,8 @@ C2：
 - setxattr RetB=Success/RetEEXIST（XATTR_CREATE）；
 - 其他单操作失败（已有对象的 mkdir EEXIST、unlink/open/stat/... ENOENT、
   link/symlink/readlink 失败、readlink EINVAL、link EMLINK、getxattr ERANGE、
-  setxattr EPERM/EINVAL）不进入 directed/producible；
+  setxattr EPERM/EINVAL）不进入 directed/plannable；model 保留自然可达上界，
+  因此它们可能出现在 `ModelOnly`；
 - fresh-fresh 竞赛在 `Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo 内使用
   `freshSameForms` 的 Failure/EEXIST/ENOENT 形态；这是独立通道，不受上面的
   单操作失败限制；
@@ -1953,7 +1993,7 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
   以下位置使用：
   - `path_set.go::buildPathMembers` 的 symlink target spec；
   - `seed_derivation.go::collectSeedAnchors` 的 symlink target anchor；
-  - `distributed_choice.go`/`baseCandidate` 的 DCT mutation target；
+  - `mutation.go`/`dctBaseCandidatesFor` 的 DCT mutation target；
   - `dag.go::BuildVertices`/`determinePathRel` 的事件 `Path2`；
   - `applyPathSetToCall` 的 payload 重算；
   - checker 的 `SymlinkPath` 归一化。
@@ -2379,7 +2419,8 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   `Node_idx_of_persistence=-1`。
 - `FileTree` 使用 `PathOwnerCid="shared"`；`Cids` 重复 shared 仅用于长度兼容。
 - `FileTree` 只加载普通文件/目录/空目录/TmpDir，不加载也不建模
-  symlink/hardlink；`link/symlink` 的 linkpath 只在 program-local bindings。
+  symlink/hardlink；`link/symlink` 的 linkpath 只在 program-local
+  `RootLinkPath`/`freshLinks`。
 - `generate_test_files.py` 用唯一 `shared` 作为 node id；
   `--num-large-files 0` 时跳过整个 large-dir 块，不生成 `large_dir.info`。
 - 可选 `--shared` 校验，防止多个 cid。
@@ -2486,7 +2527,7 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
 
 ### Phase 2：双路径角色模型
 
-- `CallSignature`/`Bindings`/`RelationRole`/`ResolveFreeRole`。
+- `DualPathKind`/`RootPaths`/`RenamePolicy`/`symlinkCanonicalTarget`。
 - rename 特判迁移到 profile；HMDFS same-parent 保持不变。
 - link/symlink 的 target/linkpath 用 canonical 测试根路径；symlink payload 只在
   调用物化时生成；readlink 作为 linkpath follower；共享
@@ -2503,8 +2544,9 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
 - `link/symlink` target 保存 canonical 测试根路径；symlink payload 按
   linkpath parent 物化；readlink 按 linkpath + payload 还原 canonical target。
 - client-only generation + empty server wrap。
-- **不做 FileTree 链接建模**；link/symlink 路径走 bindings，
-  authority 走 `HardlinkGroupKey`（仅 directed/C2 batch，见 §8.6.4）。
+- **不做 FileTree 链接建模**；link/symlink 路径走 program-local
+  `RootLinkPath`/`freshLinks`，authority 走 `HardlinkGroupKey`（仅
+  directed/C2 batch，见 §8.6.4）。
 - DAG 双路径、linkpath access/type、A 类 checker；不新增 SameInode/RelKind。
 - DAG 路径规则：非 LOOKUP 顶点用调用参数/fd provenance，`ev.Path` fallback；
   GlusterFS LOOKUP 直接用事件 `Path`；所有匹配事件建顶点，不做同调用过滤。
@@ -2530,11 +2572,12 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   只 HB Success；link/symlink RetB=Success；getxattr RetFailure（ENODATA）；
   setxattr RetEEXIST（XATTR_CREATE）；rmdir/rename RetFailure（ENOTEMPTY）。
 - FailurePolicy 只主动构造 rmdir ENOTEMPTY、rename ENOTEMPTY、getxattr
-  ENODATA、setxattr EEXIST；其他单操作失败不进 directed/producible。
+  ENODATA、setxattr EEXIST；其他单操作失败不进 directed/plannable，model
+  仍保留自然可达上界。
 - fresh-fresh 竞赛例外：`Rel=Same` 且 root 是 `mkdir`/`creat` 的 combo 使用
   完整 `freshSameForms`；这些 Failure/EEXIST/ENOENT race 形态进 plannable，
   并在 model 中为对应 combo 补充单操作表未列出的 race 形态。
-- normal dual root 已实现：`planDirectedCells` dual pass +
+- normal dual root 已实现：`planDirectedCellsScan` dual pass +
   `causalRootNormal`；GlusterFS 默认 `DualPathCausalEnabled=true`，正常生成；
   gate=false 只作为 A/B 对照。
 - `HardlinkGroupKey` 只做 directed/C2 authority；`planStateEffect` 中
@@ -2607,7 +2650,8 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
     getxattr RetFailure（ENODATA）；setxattr RetEEXIST（XATTR_CREATE）；
     rmdir/rename RetFailure（ENOTEMPTY）。
   - FailurePolicy 主动构造只有 rmdir ENOTEMPTY、rename ENOTEMPTY、
-    getxattr ENODATA、setxattr EEXIST；其他失败不进 directed/producible。
+    getxattr ENODATA、setxattr EEXIST；其他失败不进 directed/plannable，
+    model 仍保留自然可达上界。
   - HardlinkGroupKey 只影响 directed/C2 的 size/offset authority；C1/C2
     link/symlink/setxattr 在 `planStateEffect` 中是 observer。
   - coverage：`comboKey` 不含 role/group/RelKind；`cellKey` 含 `Role`。
@@ -2686,6 +2730,7 @@ MetadataDelayMs profile default      已实现（HMDFS 30000 / GlusterFS 10000�
 GlusterFS CSAN/symsc A/B             已实现
 GlusterFS dual-path causal          默认启用（DualPathCausalEnabled=true）
 role-aware coverage                 已实现，runtime 待验证
+directed diagnostics (noPlan/dcMiss split) 已实现，runtime 待验证
 P2 review #7–#11                     已修复，cross-compile/vet 通过
 PathSet current state/rename remap   已实现，runtime 待验证
 D1 BPF standalone smoke              已通过
@@ -2715,10 +2760,23 @@ D1 同时发现并修复了两个真实问题：
 已知边界：
 
 - 非 creation-root 的上下文矛盾仍可能保留在 plannable envelope 中，例如
-  `open/mkdir Same Success`、`open/rmdir Same Success`；后续 construction
-  matrix 再收，当前不作为阻塞项。
+  `open/mkdir Same Success`、`open/rmdir Same Success`、`open/rename Same
+  Success`、`open/getxattr Same Success`、`open/setxattr Same EEXIST`，以及
+  readlink 默认 role。这些是 plannable（variant-form 静态上界）和 planner
+  构造能力的差异；后续 construction matrix 再收，当前不作为阻塞项。
+- potential 目前仍读 plannable：`directedPairPotential` 不减
+  `cellSuppressed`，`rootDirectedPotentials` 减；Direction 3 和 2b 的势能
+  口径不完全一致。当前不修，D3 用 `noPlan`/`dcMiss` 指标量化。
+- normal 2b 和 causal 2b 的 admission 不完全一致：causal `addC2` 不做
+  `shapeCovered`；C1 只选 root，不进 pending；DCT/2a 可产生 model-only cell。
+  当前作为实现细节保留。
+- 只有 link/symlink combo live 时，`planDirectedCellsScan` 在
+  `rootsByVariantRel==0` 处提前返回，normal dual pass 不执行；D3 会看到
+  `noPlanEmpty`，不再被误报成 `noPlanCombo`。
+- `noPlan*` 只归因 normal 2b picker；causal C1/C2 失败和 DCT 不算进去。
+  `dcMiss*` 只归因 C2 pending；C1 和 DCT 不产生 `dcMiss`。
 - normal dual root 默认进入 plannable/planner；gate=false 的 A/B 配置下
-  plannable 与 planner 同步排除 link 系。
+  link 系在 plannable 与 planner 同步排除。
 - `missing_r` 当前包含 root GETATTR 的无 path R 事件（D/S 有、R 无），
   后续可单独分类；不影响 LOOKUP mode 验证。
 - `dcMisses` 因 fresh-fresh race 构造上升是预期，需要与错误计划区分。诊断行
@@ -2823,17 +2881,27 @@ MaxDagCorpus/saturatedCalls 未失控
 
 D3 先看指标，不预设阈值：
 
-- `dcNoPlans`、`dcMisses`、`dcBatches`；
-- `obs/outModel/modelOnly/model/plan`；
+- `dcNoPlans`、`dcMisses`、`dcMissFresh`、`dcMissOther`、`dcBatches`；
+- `noPlanCombo` / `noPlanCell` / `noPlanEmpty` / `noPlanTree`；
+- `obs/outModel/modelOnly/model/plan`、`cellUnreach`/`unreach`；
 - `dagCorpusEntries`、`MaxDagCorpus`、`dag` saturation；
 - `cfgErr`、`insertFail`、fallback 频率。
 
-只有在 D2/D3 数据表明 plannable 与 planner 枚举不一致时，才进入代码修复：
+`noPlan` 原因计数器已经实现，D3 直接看四类：
 
-- 加 `noPlan` 原因计数器；
-- construction matrix / `plannableComboStaticallyUnreachableFor`；
-- 收紧 `plannableFormsForCombo`；
-- 调整 FreshSame race/model 表。
+- `noPlanCombo` 高：饱和；
+- `noPlanCell` 高：covered/suppressed/domain/shape 饱和；
+- `noPlanEmpty` 高且集中在非 creation-root combo：plannable/planner 构造缺口，
+  考虑 construction matrix；
+- `noPlanTree` 高：tree 太小。
+
+`dcMissFresh` 高是 fresh-fresh race 预期；`dcMissOther` 高才重点看错误计划。
+只有数据表明 plannable 与 planner 枚举不一致时，才进入代码修复：
+
+- construction matrix / `comboStaticallyUnreachableFor`；
+- 收紧 `plannableFormsFor` / `computePlannableLocked`；
+- 调整 FreshSame race/model 表；
+- 若需要，再拆 `plannerAvailable`/`PlannerPotential`（见 §13.1 已知边界）。
 
 #### D4：长跑与对照实验
 
@@ -2862,6 +2930,12 @@ D2/D3 通过后再做：
 planner 选择。`noPlan` 仍是四类原因之和；`NoteDirectedNoPlan()` 保留为无原因
 兼容入口。
 
+归因边界：
+
+- `noPlan*` 只归因 normal 2b picker；causal C1/C2 失败和 DCT/2a 不算进去；
+- `dcMiss*` 只归因 C2 pending；C1 只选 root，DCT/2a 不产生 `dcMiss`；
+- 计数器是累计值，D3 判断趋势时用相邻日志的 delta，不看绝对值。
+
 link/symlink root 的 role 已进入 `cellKey`：linkpath-role 只计 HB，linkpath CC
 不再进 plannable；plannable 还对 linkpath role 过滤掉不可构造的
 `Child`/非 readlink `Same`。因此 `dcNoPlans` 不再被 role-free CC 或这些
@@ -2888,16 +2962,22 @@ batch 预算决定。
   不进入 legacy fallback。
 - `src/prog/path_set.go`：link/symlink target-only broad、prefix-aware、
   rename policy、symlink canonical/payload 映射。
-- `src/prog/coverage_board.go`：observed/model/plannable 三层、combo-aware
-  fresh-fresh race forms、Direction-3 potential/enumeration。
-- `src/prog/glusterfs_coverage_test.go`：三层口径、race plannable、normal
-  dual root/insert 的回归测试。
+- `src/prog/coverage_board.go`：observed/model/plannable 三层、role-aware
+  `roleCellCounts`、combo-aware fresh-fresh race forms、Direction-3 potential/
+  enumeration、`cellAdmission`、noPlan/dcMiss breakdown。
+- `src/prog/directed_plan.go`：`planDirectedCellsScan`、FreshA/FreshA2/
+  FreshSame/normal dual、`variantKindAllowed`、pending 与 batch materialize。
+- `src/prog/glusterfs_coverage_test.go`、`glusterfs_plan_test.go`：三层口径、
+  race plannable、normal dual root/insert、causal C1/C2 回归测试。
+- `src/prog/coverage_role_test.go`、`rename_role_test.go`：role-aware cell/
+  plannable relation、rename role-free 与跨路径回归测试。
 - `src/prog/causal_root.go`、`seed_derivation.go`、`anchor_path.go`：
   profile planner、`RootPaths`、AnchorPathKind/creator 分类。
 - `src/pkg/ipc/ipc.go`：GlusterFS parser、server/client parse split。
 - `src/checker/conc-fs.go`、`src/checker/symsc`：A 类检查、profile 过滤。
 - `src/syz-fuzzer/proc.go`、`fuzzer.go`：角色 view、seed/corpus 校验；
-  GlusterFS DAG feedback（board + corpus/triage）与三层 coverage 日志。
+  GlusterFS DAG feedback（board + corpus/triage）与三层 coverage 日志；
+  `dcMissFresh/dcMissOther`、`noPlanCombo/Cell/Empty/Tree` 诊断字段。
 - `src/prog/rand.go`、`generation.go`、`mutation.go`：`RootPath()`/`JoinRoot()`、
   `filenameImpl` 空前缀、client-only generators/mutators。
 - `src/executor/executor.cc`、`common_linux.h`、`glusterfs_trace.*`、

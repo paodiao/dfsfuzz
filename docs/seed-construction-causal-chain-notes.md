@@ -217,7 +217,7 @@ rename:   src/dst 都映射，但 dst 由 RenamePolicy 选，不做 generic suff
   已有文件/目录，或由同一 plan 中更早的 creator 产生；target 不得逃出测试根。
 - `symlink` 的 arg0 是 payload，不是 canonical target。`buildPathMembers` 必须用
   共享 `symlinkCanonicalTarget(linkpath, payload)` 还原 canonical target；
-  同一 helper 也用于 `collectSeedAnchors`、DCT baseCandidate、DAG/checker。
+  同一 helper 也用于 `collectSeedAnchors`、DCT base 选择、DAG/checker。
 - `symlink` 的 target 不保存 payload；迁移后按原 linkpath 到
   `newCanonicalTarget` 重算 payload。
 - `linkpath` 是 program-local binding：可以在任意已有父目录，fresh 且不得等于

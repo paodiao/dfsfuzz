@@ -56,8 +56,8 @@
   checker 需要时用 `linkpath + Path2` 解析回测试根内 canonical target；
   `RootPaths`/DCT/PathSet 只保存 canonical target。
 - link/symlink/readlink 使用双路径关系规则；**GlusterFS v1 不做
-  `PathSameInode`，不新增 `RelKind`，不改 `cellKey`/`comboKey`**；HMDFS
-  保留现有分类并继续折叠为 `PathSame`。
+  `PathSameInode`，不新增 `RelKind`；`comboKey` 不变，`cellKey` 只增加
+  `Role`（见总计划 §6.3/§8.6.6）**；HMDFS 保留现有分类并继续折叠为 `PathSame`。
 - `entry_ino` 不进入 v1 wire event。源码已确认 LINK/SYMLINK/UNLINK/RMDIR/
   RENAME 的 `loc.inode` 在 `fuse_fop_resume` 可用，但 v1 不需要它：
   hardlink 的 inode/fd 事件 path 由 `inode_path` 选任意 dentry，DAG 非
@@ -1184,7 +1184,7 @@ file 是 depth 1
 a/b 是 depth 2
 不出现前导 /
 PathSet 在空前缀下可构建、可迁移
-FileTree 不包含 link/symlink；linkpath 只存在于 bindings
+FileTree 不包含 link/symlink；linkpath 只存在于 program-local RootLinkPath/freshLinks
 ```
 
 GlusterFS InitialDir 只加载 `shared.file/.dir/.tmpdir` 和 `empty_dirs.info`，

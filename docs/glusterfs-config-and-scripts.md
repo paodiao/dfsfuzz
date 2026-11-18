@@ -1,7 +1,8 @@
 # GlusterFS 配置、初始树与脚本
 
-> 状态：设计定稿（P1 已收敛），代码/脚本未实施
-> 日期：2026-11-15
+> 状态：config/scripts/restore 已实现；D1 BPF standalone smoke 已通过，
+> D2 executor integration 待执行
+> 日期：2026-11-15（2026-11-18 更新实现状态与 D1 结果）
 > 范围：GlusterFS 3-3 replica 3 的 config、InitialDir 加载、generate_test_files、
 > prefill/restore、node-up/node-down、mount 选项
 > 相关：`docs/glusterfs-adaptation-plan.md`、`docs/executor-file-tree-restore.md`
@@ -497,8 +498,8 @@ timing 由 profile 解析，HMDFS 现有值不变：
   - `mount` 选项包含 `attribute-timeout=0,entry-timeout=0`；
   - `InitialDir` 只加载 shared 清单；
   - FileTree 中没有 server cid，也没有 link/symlink 节点；linkpath 只在
-    program-local bindings；所有调用路径是相对测试根 canonical 路径，
-    symlink target 在调用物化时转 payload 且不逃出测试根；
+    program-local `RootLinkPath`/`freshLinks`；所有调用路径是相对测试根
+    canonical 路径，symlink target 在调用物化时转 payload 且不逃出测试根；
   - `large_dir.info` 未被读取；
   - 镜像预建 `/root/glusterfs-client`（空挂载点）、`/root/glusterfs-server`、
     `/root/dfs-fuzzing/libucov.so`；`eifuzz_root` 由首轮 restore 创建；
