@@ -1782,6 +1782,9 @@ read(L1) + write(T)
 - C1 link/symlink anchor 也按 role 枚举：target role 用 target node，
   linkpath role 用 `causalRootPathsByPath(linkpath)`；C1 cell 的 `Role` 与
   anchor role 一致；
+- rename 不受 `DualPathCausalEnabled` 影响；C1/C2、normal directed 和 PathSet
+  的 rename 仍按 source/destination 处理，rename cell 的 `Role` 始终为
+  `cellRoleNone`；只有 link/symlink A 侧 anchor/root 才产生 linkpath role；
 - C2 readlink：B 侧用 root `LinkPath`，Temporal 只 HB，relation 只 Same，
   TypeB=false；
 - C2 rename variant：B 侧用 src，dst 只用于 materialize/RetB；

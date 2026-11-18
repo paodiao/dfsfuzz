@@ -345,6 +345,9 @@ readlink: path = symlink 的 linkpath
   `cellRoleSymlinkLinkPath`。C1 link/symlink anchor 的 linkpath-role HB 与
   C2 link/symlink root 的 linkpath-role HB 是同一个 cell。plannable 对
   linkpath role 只保留 Parent/Sibling（readlink Same）。
+- rename 不受 `DualPathCausalEnabled` 影响；C1/C2/normal directed/PathSet 的
+  rename 继续按 source/destination 和 `SourceMoved` 处理，cell `Role` 始终为
+  `cellRoleNone`。
 - link/symlink target 是 **anchor 关系派生** 的 canonical 路径，不是 fixed
   baseline；映射/迁移后必须仍在测试根内、存在且类型匹配。
 - `RootPaths`/`seedAnchor`/PathSet 只保存 canonical target；symlink payload
