@@ -2523,6 +2523,37 @@ func pathOfCall(ps []*Prog, pos GroupPosition) string {
 	return getFdFilePathForCall(ps, pos)
 }
 
+// legacyPathMutableCall reports whether the legacy path fallback may rewrite
+// this call's path argument. link/symlink/readlink carry a target/linkpath
+// (or a symlink payload) whose two roles must stay synchronized; only
+// PathSet/DCT/directed planners may move them.
+func legacyPathMutableCall(name string) bool {
+	switch name {
+	case "link", "symlink", "readlink":
+		return false
+	}
+	return true
+}
+
+// filterLegacyPathCalls drops dual-path calls from a concurrent group before
+// the legacy path mutators run. The group is shared with the data/remove
+// mutators, so this filter is applied only on the path-mutation entry points.
+func filterLegacyPathCalls(ps []*Prog, calls []ConcurrentCall) []ConcurrentCall {
+	out := calls[:0]
+	for _, cc := range calls {
+		if cc.Pos.ProgIdx < 0 || cc.Pos.ProgIdx >= len(ps) ||
+			cc.Pos.CallIdx < 0 || cc.Pos.CallIdx >= len(ps[cc.Pos.ProgIdx].Calls) {
+			continue
+		}
+		call := ps[cc.Pos.ProgIdx].Calls[cc.Pos.CallIdx]
+		if call == nil || call.Meta == nil || !legacyPathMutableCall(call.Meta.CallName) {
+			continue
+		}
+		out = append(out, cc)
+	}
+	return out
+}
+
 // pickAnchor selects a random call in ps[0] that has a resolvable path and
 // execution timing; wantData restricts the anchor to data-carrying calls
 // (write/read/truncate), whose whole point is sharing offsets and lengths.
@@ -2533,10 +2564,16 @@ func pickAnchor(ps []*Prog, r *randGen, wantData bool) (GroupPosition, string, b
 	for attempt := 0; attempt < 8; attempt++ {
 		idx := r.Intn(len(ps[0].Calls))
 		call := ps[0].Calls[idx]
+		if call == nil || call.Meta == nil {
+			continue
+		}
 		if wantData && !isWriteCall(call) && !isReadCall(call) && !isTruncateCall(call) {
 			continue
 		}
 		pos := GroupPosition{ProgIdx: 0, CallIdx: idx}
+		if !legacyPathMutableCall(call.Meta.CallName) {
+			continue
+		}
 		path := pathOfCall(ps, pos)
 		if path == "" || call.CheckInfo == nil {
 			continue
@@ -2797,7 +2834,7 @@ func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 			return true
 		}
 	}
-	conc := findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs)
+	conc := filterLegacyPathCalls(ps, findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs))
 	if len(conc) == 0 {
 		return false
 	}
@@ -2865,7 +2902,7 @@ func MutateGroupPathDynamic(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) 
 	}
 	applied := false
 	for _, u := range updates {
-		if updateCallPathInProg(ps[u.pos.ProgIdx], u.pos.CallIdx, u.newPath, r) {
+		if updateCallPathInProg(ps[u.pos.ProgIdx], u.pos.CallIdx, u.newPath, r, lcs) {
 			applied = true
 		}
 	}
@@ -2922,7 +2959,7 @@ func mutateGroupPathDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 	if !ok {
 		return false
 	}
-	conc := findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs)
+	conc := filterLegacyPathCalls(ps, findGroupCalls(ps, anchor, anchorPath, lcs.tscoffs))
 	if len(conc) == 0 {
 		return false
 	}
@@ -3067,13 +3104,13 @@ func mutateGroupPathDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 			!pathSatisfiesType(lcs.FileTree, memberPath, mKind) {
 			continue
 		}
-		if !updateCallPathInProg(ps[anchorPos.ProgIdx], anchorPos.CallIdx, newBase, r) {
+		if !updateCallPathInProg(ps[anchorPos.ProgIdx], anchorPos.CallIdx, newBase, r, lcs) {
 			return false
 		}
 		// The anchor rewrite above is already a real edit; the member and the
 		// owners stay best-effort (their derivation gates above skip
 		// unrealizable ones).
-		updateCallPathInProg(ps[member.pos.ProgIdx], member.pos.CallIdx, memberPath, r)
+		updateCallPathInProg(ps[member.pos.ProgIdx], member.pos.CallIdx, memberPath, r, lcs)
 		for i := range owners {
 			rp := owners[i].pos
 			if rp == anchorPos || rp == member.pos || !ownerOK[i] {
@@ -3087,7 +3124,7 @@ func mutateGroupPathDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen)
 				}
 				p = newBase
 			}
-			updateCallPathInProg(ps[rp.ProgIdx], rp.CallIdx, p, r)
+			updateCallPathInProg(ps[rp.ProgIdx], rp.CallIdx, p, r, lcs)
 		}
 		recordLastMutation("MutateGroupPathDirected")
 		return true
@@ -4024,20 +4061,34 @@ func calculateNodeWeight(node *FileNode) float64 {
 // updateCallPathInProg rewrites the path-carrying argument of callIdx to
 // newPath. Returns true when the source path was actually rewritten; the
 // rename destination follow-up stays best-effort.
-func updateCallPathInProg(p *Prog, callIdx int, newPath string, r *randGen) bool {
-	if callIdx < 0 || callIdx >= len(p.Calls) {
+func updateCallPathInProg(p *Prog, callIdx int, newPath string, r *randGen, lcs *LayeredChoiceStrategy) bool {
+	if p == nil || callIdx < 0 || callIdx >= len(p.Calls) {
 		return false
 	}
 	call := p.Calls[callIdx]
+	if call == nil || call.Meta == nil || !legacyPathMutableCall(call.Meta.Name) {
+		return false
+	}
+	// rename 的目标路径跟随源迁移：目标基于新源派生。GlusterFS 走 profile 的
+	// RenamePolicy（允许 cross-parent/fresh/replace）；HMDFS 保持历史 fresh
+	// same-parent suffix 行为，不改变 HMDFS 的 legacy mutation。
+	renameDst := ""
+	if strings.Contains(call.Meta.Name, "rename") {
+		if lcs != nil && lcs.profileOrDefault().Name == "glusterfs" {
+			renameDst = lcs.pickRenameDstFor(newPath, PathNoRel, r.Rand)
+		} else {
+			renameDst = newPath + "._renamed_" + randomSuffix(r.Rand)
+		}
+		if renameDst == "" || renameDst == newPath {
+			return false
+		}
+	}
 	if !reassignDataArgAt(p, call, 0, r, []byte(newPath+"\x00")) {
 		return false
 	}
 	r.target.assignSizesCall(call)
-
-	// rename 的目标路径跟随源迁移（L25）：目标基于旧源派生
-	// （源._renamed_xxx）——源迁移后目标同步重新派生（对齐 L9 的 rename 处理）。
-	if strings.Contains(call.Meta.Name, "rename") {
-		updateCallPathByArgIdx(p, call, 1, newPath+"._renamed_"+randomSuffix(r.Rand), r)
+	if renameDst != "" {
+		updateCallPathByArgIdx(p, call, 1, renameDst, r)
 	}
 	return true
 }

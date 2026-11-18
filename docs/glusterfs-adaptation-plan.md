@@ -1985,6 +1985,9 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
   再写 source/dst，policy 失败则不修改调用。
 - PathSet target arm 仍然不选 rename；legacy fallback 的 rename 是 path mutation，
   不是 target arm。
+- 2026-11-18 已落地：`pickAnchor` 和两个 path-mutation 入口按
+  `legacyPathMutableCall` 过滤；`updateCallPathInProg` 再防御一次，并接收
+  `lcs` 走 RenamePolicy。HMDFS 仍保持 fresh same-parent `._renamed_` suffix。
 
 ### 8.8 Fresh / 跨节点边界（GlusterFS v1）
 
