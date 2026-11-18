@@ -1919,6 +1919,9 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
     creator 重建的 baseline 路径上（仍受 creator binding 约束）。
     HMDFS 保持 `false`，继续 baseline-first；GlusterFS 和未来支持 link 的
     DFS 设 `true`；
+  - `PathStateTracking=true` 时目录 rename 对 fresh kind、link binding、
+    tombstone 和 creator 路径做 prefix remap；HMDFS `false` 保持 exact
+    src/dst 行为；
   - fresh link/symlink target 在 `pathSpec` 中记录
     `CreatorPos`/`CreatorArgIdx` 和 `CurrentKind`；`buildPathPlan`/
     `buildTargetPathPlan` 映射后把 target 对齐到 creator 的 mapped path；

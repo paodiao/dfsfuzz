@@ -4369,15 +4369,146 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 			}
 		case "rename":
 			src, dst := extractRenamePaths(c)
-			if k, ok := kindOf(src); ok {
-				set(dst, k)
-			}
 			if profile.TracksPathState() {
-				delete(m, src)
+				renameFreshKindPrefix(m, src, dst, kindOf)
+			} else if k, ok := kindOf(src); ok {
+				set(dst, k)
 			}
 		}
 	}
 	return m
+}
+
+// renameLinkPathPrefix moves a link/symlink binding subtree from src to dst and
+// drops any bindings previously occupying dst.
+func renameLinkPathPrefix(m map[string]linkPathInfo, src, dst string) {
+	if m == nil || src == "" || dst == "" || src == dst {
+		return
+	}
+	for path := range m {
+		if path == dst || strings.HasPrefix(path, dst+"/") {
+			delete(m, path)
+		}
+	}
+	moved := make(map[string]linkPathInfo)
+	for path, info := range m {
+		if path == src || strings.HasPrefix(path, src+"/") {
+			moved[dst+strings.TrimPrefix(path, src)] = info
+			delete(m, path)
+		}
+	}
+	for path, info := range moved {
+		m[path] = info
+	}
+	// A directory rename also moves link/symlink targets that live under the
+	// renamed subtree, even when the binding itself is outside it.
+	for path, info := range m {
+		if info.Target == src {
+			info.Target = dst
+			m[path] = info
+		} else if strings.HasPrefix(info.Target, src+"/") {
+			info.Target = dst + strings.TrimPrefix(info.Target, src)
+			m[path] = info
+		}
+	}
+}
+
+// renameFreshKindPrefix moves a fresh-kind subtree from src to dst. The dst
+// root inherits the source kind; descendants keep their own kind.
+func renameFreshKindPrefix(m map[string]int, src, dst string, kindOf func(string) (int, bool)) {
+	if m == nil || src == "" || dst == "" || src == dst {
+		return
+	}
+	srcKind, srcOK := kindOf(src)
+	moved := make(map[string]int)
+	for path, kind := range m {
+		if path == src || strings.HasPrefix(path, src+"/") {
+			moved[dst+strings.TrimPrefix(path, src)] = kind
+			delete(m, path)
+		}
+	}
+	for path := range m {
+		if path == dst || strings.HasPrefix(path, dst+"/") {
+			delete(m, path)
+		}
+	}
+	if srcOK {
+		m[dst] = srcKind
+	}
+	for path, kind := range moved {
+		m[path] = kind
+	}
+}
+
+// renameAbsentPrefix moves known tombstones below src to dst, marks the old
+// src root absent, and clears tombstones below the replacement dst.
+func renameAbsentPrefix(m map[string]bool, src, dst string) {
+	if m == nil || src == "" || dst == "" || src == dst {
+		return
+	}
+	moved := make(map[string]bool)
+	for path := range m {
+		if strings.HasPrefix(path, src+"/") {
+			moved[dst+strings.TrimPrefix(path, src)] = true
+			delete(m, path)
+		}
+	}
+	for path := range m {
+		if path == dst || strings.HasPrefix(path, dst+"/") {
+			delete(m, path)
+		}
+	}
+	m[src] = true
+	for path := range moved {
+		m[path] = true
+	}
+}
+
+type freshRenameEvent struct {
+	idx int
+	src string
+	dst string
+}
+
+// freshRenameEventsBefore returns successful rename events for path-state
+// profiles. Legacy profiles keep exact-path creator matching.
+func freshRenameEventsBefore(p *Prog, end int, profile *DFSProfile) []freshRenameEvent {
+	if p == nil || profile == nil || !profile.TracksPathState() {
+		return nil
+	}
+	if end > len(p.Calls) {
+		end = len(p.Calls)
+	}
+	var out []freshRenameEvent
+	for i := 0; i < end; i++ {
+		c := p.Calls[i]
+		if c == nil || c.Meta == nil || !callAssumedSucceeded(c) ||
+			!strings.Contains(c.Meta.CallName, "rename") {
+			continue
+		}
+		src, dst := extractRenamePaths(c)
+		if src != "" && dst != "" && src != dst {
+			out = append(out, freshRenameEvent{idx: i, src: src, dst: dst})
+		}
+	}
+	return out
+}
+
+// renamePathThroughEvents applies renames that happen after afterIdx.
+func renamePathThroughEvents(path string, events []freshRenameEvent, afterIdx int) string {
+	for _, ev := range events {
+		if ev.idx <= afterIdx {
+			continue
+		}
+		if path == ev.src {
+			path = ev.dst
+			continue
+		}
+		if strings.HasPrefix(path, ev.src+"/") {
+			path = ev.dst + strings.TrimPrefix(path, ev.src)
+		}
+	}
+	return path
 }
 
 // freshPathCreatorBefore returns the latest successful creator of path before
@@ -4395,6 +4526,7 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 	if end > len(p.Calls) {
 		end = len(p.Calls)
 	}
+	events := freshRenameEventsBefore(p, end, profile)
 	for i := end - 1; i >= 0; i-- {
 		c := p.Calls[i]
 		if c == nil || c.Meta == nil {
@@ -4405,24 +4537,25 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 		}
 		switch c.Meta.CallName {
 		case "mkdir", "creat":
-			if extractPathFromCall(c) == path {
+			if renamePathThroughEvents(extractPathFromCall(c), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
 			}
 		case "open":
-			if openPathCreatesFile(p.Target, c) && extractPathFromCall(c) == path {
+			if openPathCreatesFile(p.Target, c) &&
+				renamePathThroughEvents(extractPathFromCall(c), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
 			}
 		case "rename":
 			_, dst := extractRenamePaths(c)
-			if dst == path {
+			if renamePathThroughEvents(dst, events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		case "link":
-			if extractPathFromCallByArgIdx(c, 1) == path {
+			if renamePathThroughEvents(extractPathFromCallByArgIdx(c, 1), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		case "symlink":
-			if extractPathFromCallByArgIdx(c, 1) == path {
+			if renamePathThroughEvents(extractPathFromCallByArgIdx(c, 1), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		}
@@ -4458,12 +4591,7 @@ func freshPathAbsentBefore(p *Prog, end int, profiles ...*DFSProfile) map[string
 			}
 		case "rename":
 			src, dst := extractRenamePaths(c)
-			if src != "" {
-				m[src] = true
-			}
-			if dst != "" {
-				delete(m, dst)
-			}
+			renameAbsentPrefix(m, src, dst)
 		case "mkdir", "creat":
 			if path := extractPathFromCall(c); path != "" {
 				delete(m, path)
@@ -4597,7 +4725,11 @@ type linkPathInfo struct {
 // freshLinkPathsBefore scans link/symlink calls before end and records their
 // program-local linkpaths. A linkpath is not a FileTree node; a later
 // link/symlink target must not be one (v1 forbids nested links).
-func freshLinkPathsBefore(p *Prog, ft *FileTree, end int) map[string]linkPathInfo {
+func freshLinkPathsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfile) map[string]linkPathInfo {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
 	if p == nil {
 		return nil
 	}
@@ -4651,6 +4783,10 @@ func freshLinkPathsBefore(p *Prog, ft *FileTree, end int) map[string]linkPathInf
 			// binding that previously occupied dst. Both cases matter for
 			// nested-link rejection.
 			src, dst := extractRenamePaths(c)
+			if profile.TracksPathState() {
+				renameLinkPathPrefix(m, src, dst)
+				continue
+			}
 			info, moved := m[src]
 			delete(m, src)
 			delete(m, dst)
@@ -4721,7 +4857,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	// its intent as a local hint: a hinted mismatch is treated like a tree
 	// mismatch below, without writing the tree.
 	freshKinds := freshPathKindsBefore(p0, lcs.FileTree, insertPos, lcs.profileOrDefault())
-	freshLinks := freshLinkPathsBefore(p0, lcs.FileTree, insertPos)
+	freshLinks := freshLinkPathsBefore(p0, lcs.FileTree, insertPos, lcs.profileOrDefault())
 
 	// The candidate-derived basePath was chosen before the root was known, so
 	// a file-only/dir-only root may land on a mismatched type (EISDIR/ENOTDIR

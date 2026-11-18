@@ -360,7 +360,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				if profile.TracksPathState() {
 					// Exact current state: an in-program creator/deletion may
 					// override the baseline node (or make it absent).
-					freshLinks := freshLinkPathsBefore(p, ft, ci)
+					freshLinks := freshLinkPathsBefore(p, ft, ci, profile)
 					if info, ok := freshLinks[target]; ok && info.Kind != 0 {
 						continue
 					}
@@ -380,7 +380,8 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 								// a fresh-target creator unless the path was
 								// deleted before it runs.
 								absentBeforeCreator := freshPathAbsentBefore(p, creatorPos.CallIdx, profile)
-								freshNow = absentBeforeCreator[target] || absentBeforeCreator[rawTarget]
+								freshNow = pathSetAbsentIn(absentBeforeCreator, target) ||
+									pathSetAbsentIn(absentBeforeCreator, rawTarget)
 							}
 						}
 					}
@@ -393,7 +394,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 						currentKind = freshKind
 					} else if node != nil {
 						absent := freshPathAbsentBefore(p, ci, profile)
-						if absent[target] || absent[rawTarget] {
+						if pathSetAbsentIn(absent, target) || pathSetAbsentIn(absent, rawTarget) {
 							continue
 						}
 						if !nodeMatchesConstraint(node, constraint) {
@@ -416,7 +417,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 					if !freshOK || !pathSetFreshTargetTypeAllowed(name, freshKind) {
 						continue
 					}
-					freshLinks := freshLinkPathsBefore(p, ft, ci)
+					freshLinks := freshLinkPathsBefore(p, ft, ci, profile)
 					if info, ok := freshLinks[target]; ok && info.Kind != 0 {
 						continue
 					}
@@ -945,6 +946,23 @@ func pathKindMatchesConstraint(kind, constraint int) bool {
 	return true
 }
 
+// pathSetAbsentIn reports whether path is covered by an exact tombstone or a
+// renamed/deleted directory prefix.
+func pathSetAbsentIn(absent map[string]bool, path string) bool {
+	if absent == nil || path == "" {
+		return false
+	}
+	if absent[path] {
+		return true
+	}
+	for prefix := range absent {
+		if prefix != "" && pathUnderRoot(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // pathSetCreatorState returns whether the creator at ci creates a fresh path
 // and, for tracked profiles, whether it recreates a baseline path after an
 // in-program deletion/rename.
@@ -953,7 +971,7 @@ func pathSetCreatorState(p *Prog, ft *FileTree, ci int, path string, profile *DF
 		return pathFresh, false
 	}
 	if profile != nil && profile.TracksPathState() {
-		if absent := freshPathAbsentBefore(p, ci, profile); absent[path] {
+		if absent := freshPathAbsentBefore(p, ci, profile); pathSetAbsentIn(absent, path) {
 			return pathFresh, true
 		}
 	}
