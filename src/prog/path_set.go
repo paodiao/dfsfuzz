@@ -36,6 +36,13 @@ type pathSpec struct {
 	CreatorPos    GroupPosition
 	CreatorArgIdx int
 	HasCreator    bool
+	// CurrentKind is the creator's file/dir class for a fresh consumer or
+	// recreated path. It can differ from the baseline node when the program
+	// deletes/recreates the path before the call runs.
+	CurrentKind int
+	// Recreated marks a fresh creator that runs after an in-program deletion
+	// of a baseline path.
+	Recreated bool
 }
 
 type pathMember struct {
@@ -340,21 +347,73 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				// earlier in the same program. In the latter case its type comes
 				// from the creator and it must not itself be a link binding.
 				kind := pathExisting
+				currentKind := 0
 				creatorPos := GroupPosition{}
 				creatorArg := 0
 				hasCreator := false
 				node := ft.FindNode(target)
-				if node != nil {
+				freshKinds := freshPathKindsBefore(p, ft, ci, profile)
+				freshKind, freshOK := freshKinds[target]
+				if !freshOK {
+					freshKind, freshOK = freshKinds[rawTarget]
+				}
+				if profile.TracksPathState() {
+					// Exact current state: an in-program creator/deletion may
+					// override the baseline node (or make it absent).
+					freshLinks := freshLinkPathsBefore(p, ft, ci)
+					if info, ok := freshLinks[target]; ok && info.Kind != 0 {
+						continue
+					}
+					if info, ok := freshLinks[rawTarget]; ok && info.Kind != 0 {
+						continue
+					}
+					freshNow := false
+					if freshOK {
+						creatorPos, creatorArg, hasCreator = freshPathCreatorBefore(p, ci, target, profile)
+						if !hasCreator {
+							creatorPos, creatorArg, hasCreator = freshPathCreatorBefore(p, ci, rawTarget, profile)
+						}
+						if hasCreator {
+							freshNow = node == nil
+							if !freshNow {
+								// A creator that replaces an existing path is not
+								// a fresh-target creator unless the path was
+								// deleted before it runs.
+								absentBeforeCreator := freshPathAbsentBefore(p, creatorPos.CallIdx, profile)
+								freshNow = absentBeforeCreator[target] || absentBeforeCreator[rawTarget]
+							}
+						}
+					}
+					if freshNow {
+						if !pathSetFreshTargetTypeAllowed(name, freshKind) {
+							continue
+						}
+						creatorPos.ProgIdx = pi
+						kind = pathFresh
+						currentKind = freshKind
+					} else if node != nil {
+						absent := freshPathAbsentBefore(p, ci, profile)
+						if absent[target] || absent[rawTarget] {
+							continue
+						}
+						if !nodeMatchesConstraint(node, constraint) {
+							continue
+						}
+						// The creator only replaced/truncated an existing path
+						// here; keep the target as a baseline consumer.
+						creatorPos = GroupPosition{}
+						creatorArg = 0
+						hasCreator = false
+					} else {
+						continue
+					}
+				} else if node != nil {
+					// Legacy profiles keep the baseline-first approximation.
 					if !nodeMatchesConstraint(node, constraint) {
 						continue
 					}
 				} else {
-					freshKinds := freshPathKindsBefore(p, ft, ci, profile)
-					freshKind, ok := freshKinds[target]
-					if !ok {
-						freshKind, ok = freshKinds[rawTarget]
-					}
-					if !ok || !pathSetFreshTargetTypeAllowed(name, freshKind) {
+					if !freshOK || !pathSetFreshTargetTypeAllowed(name, freshKind) {
 						continue
 					}
 					freshLinks := freshLinkPathsBefore(p, ft, ci)
@@ -373,6 +432,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 					}
 					creatorPos.ProgIdx = pi
 					kind = pathFresh
+					currentKind = freshKind
 				}
 				role := pathRoleLinkTarget
 				if name == "symlink" {
@@ -386,6 +446,7 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 						CreatorPos:     creatorPos,
 						CreatorArgIdx:  creatorArg,
 						HasCreator:     hasCreator,
+						CurrentKind:    currentKind,
 					}},
 					Constraint: constraint,
 				})
@@ -396,6 +457,10 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				src = normalizePathSetPath(ft, src)
 				dst = normalizePathSetPath(ft, dst)
 				sourceType := pathSetNodeConstraint(ft, src)
+				freshKinds := freshPathKindsBefore(p, ft, ci, profile)
+				if k, ok := freshKinds[src]; ok {
+					sourceType = k
+				}
 				var specs []pathSpec
 				if src != "" {
 					specs = append(specs, pathSpec{
@@ -404,13 +469,18 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 					})
 				}
 				if dst != "" {
-					kind := pathFresh
-					if ft != nil && ft.FindNode(dst) != nil {
-						kind = pathExisting
+					kind, recreated := pathSetCreatorState(p, ft, ci, dst, profile)
+					currentKind := 0
+					if kind == pathFresh {
+						currentKind = sourceType
+						if k, ok := freshKinds[dst]; ok {
+							currentKind = k
+						}
 					}
 					specs = append(specs, pathSpec{
 						Path: dst, Kind: kind, Role: pathRoleRenameDst,
 						ArgIdx: 1, TypeConstraint: sourceType,
+						CurrentKind: currentKind, Recreated: recreated,
 					})
 				}
 				if len(specs) > 0 {
@@ -428,22 +498,27 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 			}
 			kind := pathExisting
 			role := pathRoleDirect
+			currentKind := 0
+			recreated := false
 			switch {
 			case strings.Contains(name, "mkdir"):
 				role = pathRoleMkdir
-				if ft == nil || ft.FindNode(path) == nil {
-					kind = pathFresh
+				kind, recreated = pathSetCreatorState(p, ft, ci, path, profile)
+				if kind == pathFresh {
+					currentKind = relTargetDir
 				}
 			case strings.Contains(name, "creat"):
 				role = pathRoleCreat
-				if ft == nil || ft.FindNode(path) == nil {
-					kind = pathFresh
+				kind, recreated = pathSetCreatorState(p, ft, ci, path, profile)
+				if kind == pathFresh {
+					currentKind = relTargetFile
 				}
 			case strings.Contains(name, "open"):
-				if profile.Name == "glusterfs" && openPathCreatesFile(p.Target, call) {
+				if profile.TracksPathState() && openPathCreatesFile(p.Target, call) {
 					role = pathRoleCreat
-					if ft == nil || ft.FindNode(path) == nil {
-						kind = pathFresh
+					kind, recreated = pathSetCreatorState(p, ft, ci, path, profile)
+					if kind == pathFresh {
+						currentKind = relTargetFile
 					}
 				}
 			}
@@ -452,6 +527,8 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				Paths: []pathSpec{{
 					Path: path, Kind: kind, Role: role, ArgIdx: 0,
 					TypeConstraint: constraint,
+					CurrentKind:    currentKind,
+					Recreated:      recreated,
 				}},
 				Constraint: constraint,
 			})
@@ -858,6 +935,31 @@ func pathSetProvisionalParentValid(ft *FileTree, parent string) bool {
 	return nodeIsDir(node)
 }
 
+func pathKindMatchesConstraint(kind, constraint int) bool {
+	switch constraint {
+	case relTargetFile:
+		return kind == relTargetFile
+	case relTargetDir:
+		return kind == relTargetDir
+	}
+	return true
+}
+
+// pathSetCreatorState returns whether the creator at ci creates a fresh path
+// and, for tracked profiles, whether it recreates a baseline path after an
+// in-program deletion/rename.
+func pathSetCreatorState(p *Prog, ft *FileTree, ci int, path string, profile *DFSProfile) (pathKind, bool) {
+	if ft == nil || ft.FindNode(path) == nil {
+		return pathFresh, false
+	}
+	if profile != nil && profile.TracksPathState() {
+		if absent := freshPathAbsentBefore(p, ci, profile); absent[path] {
+			return pathFresh, true
+		}
+	}
+	return pathExisting, false
+}
+
 func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, constraint int, ft *FileTree,
 	parentValid func(string) bool) bool {
 	if ft == nil || spec.Path == "" {
@@ -871,12 +973,16 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 	switch spec.Role {
 	case pathRoleMkdir:
 		if spec.Kind == pathFresh {
-			return node == nil && parentValid(GetParentDir(spec.Path))
+			if node != nil {
+				return spec.Recreated && spec.CurrentKind == relTargetDir
+			}
+			return parentValid(GetParentDir(spec.Path))
 		}
 		return node != nil && nodeIsDir(node)
 	case pathRoleCreat:
 		if spec.Kind == pathFresh {
-			if node != nil && node.Type != NodeTypeFile {
+			if node != nil && node.Type != NodeTypeFile &&
+				!(spec.Recreated && spec.CurrentKind == relTargetFile) {
 				return false
 			}
 			return parentValid(GetParentDir(spec.Path))
@@ -887,6 +993,9 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 	case pathRoleRenameDst:
 		if spec.Kind == pathFresh {
 			if node != nil {
+				if spec.Recreated && spec.CurrentKind != 0 {
+					return pathKindMatchesConstraint(spec.CurrentKind, typeConstraint)
+				}
 				return nodeMatchesConstraint(node, typeConstraint)
 			}
 			return parentValid(GetParentDir(spec.Path))
@@ -894,7 +1003,15 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 		return node != nil && nodeMatchesConstraint(node, typeConstraint)
 	case pathRoleLinkTarget, pathRoleSymlinkTarget:
 		if spec.Kind == pathFresh {
-			return node == nil && parentValid(GetParentDir(spec.Path))
+			if spec.CurrentKind != 0 && !pathKindMatchesConstraint(spec.CurrentKind, typeConstraint) {
+				return false
+			}
+			if node != nil {
+				// A tracked creator may recreate a baseline path; the plan-level
+				// creator binding proves the creator maps to this path.
+				return spec.HasCreator && spec.CurrentKind != 0
+			}
+			return parentValid(GetParentDir(spec.Path))
 		}
 		return node != nil && nodeMatchesConstraint(node, typeConstraint)
 	default:

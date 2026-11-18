@@ -1912,12 +1912,18 @@ target；linkpath 是 program-local fresh binding，不进入 PathSet。
   - link target 必须是普通文件；
   - symlink target 必须是文件/目录；
   - target 可以是 baseline 已有路径，或同一 plan 中更早的 creator 产生的
-    fresh 路径；fresh target 要求 baseline 节点不存在且 parent 有效；映射后
-    必须仍是测试根内路径；
+    fresh 路径；fresh target 要求 parent 有效；映射后必须仍是测试根内路径；
+  - `PlanProfile.PathStateTracking=true` 时按 in-program
+    unlink/rmdir/rename 的 current state 判定：成功删除/改名的路径有
+    tombstone，fresh creator kind 优先于 baseline；fresh target 允许落在被
+    creator 重建的 baseline 路径上（仍受 creator binding 约束）。
+    HMDFS 保持 `false`，继续 baseline-first；GlusterFS 和未来支持 link 的
+    DFS 设 `true`；
   - fresh link/symlink target 在 `pathSpec` 中记录
-    `CreatorPos`/`CreatorArgIdx`；`buildPathPlan`/`buildTargetPathPlan`
-    映射后把 target 对齐到 creator 的 mapped path；`validatePathSetPlan`
-    拒绝 creator 缺失/分叉，以及目录类 creator 的 link target；
+    `CreatorPos`/`CreatorArgIdx` 和 `CurrentKind`；`buildPathPlan`/
+    `buildTargetPathPlan` 映射后把 target 对齐到 creator 的 mapped path；
+    `validatePathSetPlan` 拒绝 creator 缺失/分叉，以及目录类 creator 的
+    link target；
   - target 不能是 `freshLinkPathsBefore` 中的 linkpath（含 rename 后的
     linkpath），不能形成嵌套链接；
   - target != linkpath。

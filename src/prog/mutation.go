@@ -4343,7 +4343,7 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 		if c == nil || c.Meta == nil {
 			continue
 		}
-		if profile.Name == "glusterfs" && !callAssumedSucceeded(c) {
+		if profile.TracksPathState() && !callAssumedSucceeded(c) {
 			continue
 		}
 		switch c.Meta.CallName {
@@ -4364,7 +4364,7 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 				set(linkPath, k)
 			}
 		case "unlink", "rmdir":
-			if profile.Name == "glusterfs" {
+			if profile.TracksPathState() {
 				delete(m, extractPathFromCall(c))
 			}
 		case "rename":
@@ -4372,7 +4372,7 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 			if k, ok := kindOf(src); ok {
 				set(dst, k)
 			}
-			if profile.Name == "glusterfs" {
+			if profile.TracksPathState() {
 				delete(m, src)
 			}
 		}
@@ -4382,7 +4382,8 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 
 // freshPathCreatorBefore returns the latest successful creator of path before
 // end and the argument index that creates it. It mirrors freshPathKindsBefore:
-// a failed GlusterFS call is skipped, so it cannot shadow an earlier creator.
+// when the profile tracks path state, a failed call is skipped so it cannot
+// shadow an earlier creator.
 func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfile) (GroupPosition, int, bool) {
 	profile := hmdfsProfile
 	if len(profiles) > 0 && profiles[0] != nil {
@@ -4399,7 +4400,7 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 		if c == nil || c.Meta == nil {
 			continue
 		}
-		if profile.Name == "glusterfs" && !callAssumedSucceeded(c) {
+		if profile.TracksPathState() && !callAssumedSucceeded(c) {
 			continue
 		}
 		switch c.Meta.CallName {
@@ -4427,6 +4428,59 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 		}
 	}
 	return GroupPosition{}, 0, false
+}
+
+// freshPathAbsentBefore records exact paths removed by successful in-program
+// unlink/rmdir/rename before end. It is only meaningful for profiles that track
+// path state; legacy profiles keep their historical baseline-only behavior and
+// receive nil.
+func freshPathAbsentBefore(p *Prog, end int, profiles ...*DFSProfile) map[string]bool {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
+	if p == nil || end <= 0 || !profile.TracksPathState() {
+		return nil
+	}
+	if end > len(p.Calls) {
+		end = len(p.Calls)
+	}
+	m := make(map[string]bool)
+	for i := 0; i < end; i++ {
+		c := p.Calls[i]
+		if c == nil || c.Meta == nil || !callAssumedSucceeded(c) {
+			continue
+		}
+		switch c.Meta.CallName {
+		case "unlink", "rmdir":
+			if path := extractPathFromCall(c); path != "" {
+				m[path] = true
+			}
+		case "rename":
+			src, dst := extractRenamePaths(c)
+			if src != "" {
+				m[src] = true
+			}
+			if dst != "" {
+				delete(m, dst)
+			}
+		case "mkdir", "creat":
+			if path := extractPathFromCall(c); path != "" {
+				delete(m, path)
+			}
+		case "open":
+			if openPathCreatesFile(p.Target, c) {
+				if path := extractPathFromCall(c); path != "" {
+					delete(m, path)
+				}
+			}
+		case "link", "symlink":
+			if path := extractPathFromCallByArgIdx(c, 1); path != "" {
+				delete(m, path)
+			}
+		}
+	}
+	return m
 }
 
 // dctBaseCandidates returns the HMDFS legacy candidate set.

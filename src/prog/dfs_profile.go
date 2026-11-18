@@ -63,6 +63,10 @@ type PlanProfile struct {
 	DirectedRootCalls     []string
 	DirectedVariantCalls  []string
 	DualPathCausalEnabled bool
+	// PathStateTracking models successful in-program unlink/rmdir/rename and
+	// only successful creators in fresh-path helpers. HMDFS keeps the legacy
+	// approximation; GlusterFS and future link-capable profiles set true.
+	PathStateTracking bool
 }
 
 type TreeProfile struct {
@@ -162,6 +166,7 @@ var hmdfsProfile = &DFSProfile{
 		CausalRootCalls:   causalRootCalls,
 		DirectedRootCalls: directedRootCalls, DirectedVariantCalls: directedVariantCalls,
 		DualPathCausalEnabled: false,
+		PathStateTracking:     false,
 	},
 	Tree:  TreeProfile{Prefix: MergeViewPrefix},
 	Gen:   GenProfile{Stash: true, Dcache: true, Fsops: true, ClientOnly: false},
@@ -199,6 +204,7 @@ var glusterfsProfile = &DFSProfile{
 		DirectedRootCalls:     GlusterfsCausalRootCalls,
 		DirectedVariantCalls:  GlusterfsDirectedVariantCalls,
 		DualPathCausalEnabled: false,
+		PathStateTracking:     true,
 	},
 	Tree:  TreeProfile{Prefix: ""},
 	Gen:   GenProfile{Stash: false, Dcache: false, Fsops: true, ClientOnly: true},
@@ -372,4 +378,10 @@ func (p *DFSProfile) DirectedVariantCalls() []string {
 // leaves it false until the FUSE trace is stable.
 func (p *DFSProfile) DualPathCausalEnabled() bool {
 	return p != nil && p.Plan.DualPathCausalEnabled
+}
+
+// TracksPathState reports whether fresh-path helpers model successful
+// in-program deletions/renames and skip failed creators.
+func (p *DFSProfile) TracksPathState() bool {
+	return p != nil && p.Plan.PathStateTracking
 }
