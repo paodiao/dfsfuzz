@@ -24,6 +24,78 @@ type causalAnchor struct {
 	Relation    PathRelation
 }
 
+// causalAnchorRole is one A-side role of a C1 anchor. Link/symlink anchors have
+// a target role and a program-local linkpath role; ordinary and rename anchors
+// have a single default role. Paths for a linkpath role come from
+// causalRootPathsByPath because the linkpath is not a FileTree node.
+type causalAnchorRole struct {
+	Pre, Post string
+	Role      cellRole
+	Nodes     []*FileNode
+	Path      string
+	ByPath    bool
+}
+
+func causalAnchorRoles(anchor causalAnchor, call *Call, ft *FileTree) []causalAnchorRole {
+	if call == nil || call.Meta == nil {
+		return nil
+	}
+	switch call.Meta.CallName {
+	case "link", "symlink":
+		var targetNodes []*FileNode
+		if ft != nil {
+			if n := ft.FindNode(anchor.Source); n != nil {
+				targetNodes = append(targetNodes, n)
+			}
+		}
+		return []causalAnchorRole{
+			{
+				Pre: anchor.Source, Post: anchor.Source,
+				Role: cellRoleNone, Nodes: targetNodes,
+			},
+			{
+				Pre: anchor.Path, Post: anchor.Path,
+				Role: linkPathCellRole(call.Meta.CallName),
+				Path: anchor.Path, ByPath: true,
+			},
+		}
+	default:
+		pre, post := anchor.Source, anchor.Path
+		if strings.Contains(call.Meta.Name, "rename") {
+			pre, post = anchor.Path, anchor.Path
+		}
+		var nodes []*FileNode
+		if ft != nil {
+			if n := ft.FindNode(anchor.Path); n != nil {
+				nodes = append(nodes, n)
+			}
+			if n := ft.FindNode(anchor.Source); n != nil &&
+				(len(nodes) == 0 || n != nodes[0]) {
+				nodes = append(nodes, n)
+			}
+		}
+		return []causalAnchorRole{{
+			Pre: pre, Post: post, Role: cellRoleNone,
+			Nodes: nodes, Path: anchor.Path, ByPath: true,
+		}}
+	}
+}
+
+func causalPathsByRel(ft *FileTree, role causalAnchorRole, info anchorPathInfo, rels []PathRelation) map[PathRelation][]string {
+	out := make(map[PathRelation][]string, len(rels))
+	for _, node := range role.Nodes {
+		for _, rel := range rels {
+			out[rel] = append(out[rel], causalRootPaths(ft, node, rel)...)
+		}
+	}
+	if role.ByPath && info.Kind.IsFresh() {
+		for _, rel := range rels {
+			out[rel] = append(out[rel], causalRootPathsByPath(ft, role.Path, info, rel)...)
+		}
+	}
+	return out
+}
+
 // causalRootPlan is the first-layer (anchor -> root) plan. Its Cell is the C1
 // causal cell used to pick the root; it is not a C2 pending cell.
 type causalRootKind int
@@ -719,356 +791,276 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 		}
 		anchor.PathKind = info.Kind
 		anchor.IsDir = info.IsDir
-		// Rename anchor A is its post-state destination; link/symlink keep
-		// the target/linkpath role candidates, and ordinary anchors are the
-		// same path on both sides.
-		anchorPre, anchorPost := anchor.Source, anchor.Path
-		if strings.Contains(call.Meta.Name, "rename") {
-			anchorPre, anchorPost = anchor.Path, anchor.Path
-		}
-		var anchorNodes []*FileNode
-		if node := ft.FindNode(path); node != nil {
-			anchorNodes = append(anchorNodes, node)
-		}
-		if sourceNode := ft.FindNode(source); sourceNode != nil {
-			if len(anchorNodes) == 0 || sourceNode != anchorNodes[0] {
-				anchorNodes = append(anchorNodes, sourceNode)
-			}
-		}
 		rels := []PathRelation{PathSame, PathParent, PathChild, PathSibling}
-		pathsByRel := make(map[PathRelation][]string, len(rels))
-		for _, anchorNode := range anchorNodes {
-			for _, rel := range rels {
-				pathsByRel[rel] = append(pathsByRel[rel], causalRootPaths(ft, anchorNode, rel)...)
-			}
-		}
-		if info.Kind.IsFresh() {
-			for _, rel := range rels {
-				pathsByRel[rel] = append(pathsByRel[rel], causalRootPathsByPath(ft, path, info, rel)...)
-			}
-		}
-		addFreshPlan := func(rootCall string, rel PathRelation, parent string, parentKind AnchorPathKind, parentIsDir, parentIsAnchor bool) {
-			if parent == "" {
-				return
-			}
-			if !parentIsAnchor {
-				parentNode := ft.FindNode(parent)
-				if parentNode == nil || parentNode.Type == NodeTypeFile ||
-					!aEligible(parentNode, ft.Root) {
+		for _, role := range causalAnchorRoles(anchor, call, ft) {
+			anchorPre, anchorPost := role.Pre, role.Post
+			anchorNodes := role.Nodes
+			pathsByRel := causalPathsByRel(ft, role, info, rels)
+			addFreshPlan := func(rootCall string, rel PathRelation, parent string, parentKind AnchorPathKind, parentIsDir, parentIsAnchor bool) {
+				if parent == "" {
 					return
 				}
-			} else if !parentKind.IsFresh() || !parentIsDir ||
-				!freshParentNodeEligible(ft, parent) {
-				return
-			}
-			rootPath := directedFreshPlaceholder(rootCall, parent)
-			if !causalRenameRootPathAllowed(anchor, rootPath) {
-				return
-			}
-			actualRel, ok := causalPairRelation(anchorPre, anchorPost, "", rootPath)
-			if !ok {
-				return
-			}
-			isDir := rootCall == "mkdir"
-			ck := cellKey{
-				Root:     call.Meta.CallName,
-				Variant:  rootCall,
-				Rel:      actualRel,
-				Temporal: TemporalHB,
-				RetA:     RetSuccess,
-				RetB:     RetSuccess,
-				OffB:     offsetBucketNA,
-				PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
-				DepthB:   DepthBucketOf(rootPath),
-				TypeB:    isDir,
-			}
-			if !covBoard.cellUncovered(ck) {
-				return
-			}
-			a := anchor
-			a.Relation = actualRel
-			plan := &causalRootPlan{
-				Anchor:             a,
-				Cell:               ck,
-				RootCall:           rootCall,
-				RootPath:           rootPath,
-				RootKind:           causalRootFresh,
-				RootParent:         parent,
-				RootParentKind:     parentKind,
-				RootParentIsDir:    parentIsDir,
-				RootParentIsAnchor: parentIsAnchor,
-			}
-			if _, ok := byCell[ck]; !ok {
-				byCell[ck] = plan
-			}
-		}
-		for _, rootCall := range rootCalls {
-			if (rootCall == "link" || rootCall == "symlink") &&
-				!profile.DualPathCausalEnabled() {
-				continue
-			}
-			for _, rel := range rels {
-				paths := pathsByRel[rel]
-				for _, rootPath := range paths {
-					if !causalRenameRootPathAllowed(anchor, rootPath) {
-						continue
+				if !parentIsAnchor {
+					parentNode := ft.FindNode(parent)
+					if parentNode == nil || parentNode.Type == NodeTypeFile ||
+						!aEligible(parentNode, ft.Root) {
+						return
 					}
-					rootNode := ft.FindNode(rootPath)
-					if rootNode == nil || rootNode == ft.Root || !aEligible(rootNode, ft.Root) {
-						continue
-					}
-					if !causalRootFitsFor(profile, rootCall, rootNode) {
-						continue
-					}
-					if rootCall == "link" || rootCall == "symlink" {
-						linkPath := r.freshLinkPath(rootPath, rootCall)
-						if linkPath == "" || ft.FindNode(linkPath) != nil ||
-							!causalRenameRootPathAllowed(anchor, linkPath) {
-							continue
-						}
-						// C1: link/symlink is the B side. The pair extractor
-						// reports a link/symlink B vertex through its target
-						// only; the linkpath role is A-side/HB-only. The root
-						// call still materializes the fresh linkpath, but a
-						// linkpath-role C1 cell could never be observed, so the
-						// C1 cell is target-only.
-						actualRel, ok := causalPairRelation(anchorPre, anchorPost,
-							rootPath, rootPath)
-						if !ok {
-							continue
-						}
-						ck := cellKey{
-							Root:     call.Meta.CallName,
-							Variant:  rootCall,
-							Rel:      actualRel,
-							Temporal: TemporalHB,
-							RetA:     RetSuccess,
-							RetB:     RetSuccess,
-							OffB:     offsetBucketNA,
-							PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
-							DepthB:   DepthBucketOf(rootPath),
-							TypeB:    rootNode.Type != NodeTypeFile,
-						}
-						if !covBoard.cellUncovered(ck) {
-							continue
-						}
-						a := anchor
-						a.Relation = actualRel
-						plan := &causalRootPlan{
-							Anchor:           a,
-							Cell:             ck,
-							RootCall:         rootCall,
-							RootPath:         rootPath,
-							RootKind:         causalRootNormal,
-							RootParent:       parentDirOrRoot(rootPath),
-							RootSource:       rootPath,
-							RootDest:         linkPath,
-							RootRelationPath: rootPath,
-						}
-						if _, ok := byCell[ck]; !ok {
-							byCell[ck] = plan
-						}
-						continue
-					}
-					actualRel, ok := causalPairRelation(anchorPre, anchorPost, "", rootPath)
-					if !ok {
-						continue
-					}
-					dn := directedNode{
-						path:     rootPath,
-						isDir:    rootNode.Type != NodeTypeFile,
-						size:     rootNode.Size,
-						depth:    DepthBucketOf(rootPath),
-						persist:  pathInDir(rootPath, hmcfg.Persistence_dir),
-						nonEmpty: len(rootNode.Children) > 0,
-					}
-					if !nodeFitsConstraintFor(profile, dn, rootCall) {
-						continue
-					}
-					for _, args := range causalRootArgs(rootCall, dn, r) {
-						ck := cellKey{
-							Root:     call.Meta.CallName,
-							Variant:  rootCall,
-							Rel:      actualRel,
-							Temporal: TemporalHB,
-							RetA:     RetSuccess,
-							RetB:     RetSuccess,
-							OffB:     args.offB,
-							PersistB: dn.persist,
-							DepthB:   dn.depth,
-							TypeB:    dn.isDir,
-						}
-						if !covBoard.cellUncovered(ck) {
-							continue
-						}
-						a := anchor
-						a.Relation = actualRel
-						plan := &causalRootPlan{
-							Anchor:     a,
-							Cell:       ck,
-							RootCall:   rootCall,
-							RootPath:   rootPath,
-							RootOffset: args.offset,
-							RootLen:    args.length,
-						}
-						if _, ok := byCell[ck]; !ok {
-							byCell[ck] = plan
-						}
-					}
+				} else if !parentKind.IsFresh() || !parentIsDir ||
+					!freshParentNodeEligible(ft, parent) {
+					return
 				}
-				if (rootCall == "mkdir" || rootCall == "creat") &&
-					(rel == PathChild || rel == PathSibling) {
-					for _, anchorNode := range anchorNodes {
-						parent := ""
-						switch rel {
-						case PathChild:
-							if anchorNode.Type != NodeTypeFile {
-								parent = anchorNode.FullPath
-							}
-						case PathSibling:
-							parent = GetParentDir(anchorNode.FullPath)
-						}
-						if parent == "" {
-							continue
-						}
-						parentNode := ft.FindNode(parent)
-						if parentNode == nil || parentNode.Type == NodeTypeFile ||
-							!aEligible(parentNode, ft.Root) {
-							continue
-						}
-						rootPath := directedFreshPlaceholder(rootCall, parent)
+				rootPath := directedFreshPlaceholder(rootCall, parent)
+				if !causalRenameRootPathAllowed(anchor, rootPath) {
+					return
+				}
+				actualRel, ok := causalPairRelation(anchorPre, anchorPost, "", rootPath)
+				if !ok {
+					return
+				}
+				isDir := rootCall == "mkdir"
+				ck := cellKey{
+					Root:     call.Meta.CallName,
+					Variant:  rootCall,
+					Rel:      actualRel,
+					Temporal: TemporalHB,
+					RetA:     RetSuccess,
+					RetB:     RetSuccess,
+					OffB:     offsetBucketNA,
+					PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
+					DepthB:   DepthBucketOf(rootPath),
+					TypeB:    isDir,
+					Role:     role.Role,
+				}
+				if !covBoard.cellUncovered(ck) {
+					return
+				}
+				a := anchor
+				a.Relation = actualRel
+				plan := &causalRootPlan{
+					Anchor:             a,
+					Cell:               ck,
+					RootCall:           rootCall,
+					RootPath:           rootPath,
+					RootKind:           causalRootFresh,
+					RootParent:         parent,
+					RootParentKind:     parentKind,
+					RootParentIsDir:    parentIsDir,
+					RootParentIsAnchor: parentIsAnchor,
+				}
+				if _, ok := byCell[ck]; !ok {
+					byCell[ck] = plan
+				}
+			}
+			for _, rootCall := range rootCalls {
+				if (rootCall == "link" || rootCall == "symlink") &&
+					!profile.DualPathCausalEnabled() {
+					continue
+				}
+				for _, rel := range rels {
+					paths := pathsByRel[rel]
+					for _, rootPath := range paths {
 						if !causalRenameRootPathAllowed(anchor, rootPath) {
+							continue
+						}
+						rootNode := ft.FindNode(rootPath)
+						if rootNode == nil || rootNode == ft.Root || !aEligible(rootNode, ft.Root) {
+							continue
+						}
+						if !causalRootFitsFor(profile, rootCall, rootNode) {
+							continue
+						}
+						if rootCall == "link" || rootCall == "symlink" {
+							linkPath := r.freshLinkPath(rootPath, rootCall)
+							if linkPath == "" || ft.FindNode(linkPath) != nil ||
+								!causalRenameRootPathAllowed(anchor, linkPath) {
+								continue
+							}
+							// C1: link/symlink is the B side. The pair extractor
+							// reports a link/symlink B vertex through its target
+							// only; the linkpath role is A-side/HB-only. The root
+							// call still materializes the fresh linkpath, but a
+							// linkpath-role C1 cell could never be observed, so the
+							// C1 cell is target-only.
+							actualRel, ok := causalPairRelation(anchorPre, anchorPost,
+								rootPath, rootPath)
+							if !ok {
+								continue
+							}
+							ck := cellKey{
+								Root:     call.Meta.CallName,
+								Variant:  rootCall,
+								Rel:      actualRel,
+								Temporal: TemporalHB,
+								RetA:     RetSuccess,
+								RetB:     RetSuccess,
+								OffB:     offsetBucketNA,
+								PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
+								DepthB:   DepthBucketOf(rootPath),
+								TypeB:    rootNode.Type != NodeTypeFile,
+								Role:     role.Role,
+							}
+							if !covBoard.cellUncovered(ck) {
+								continue
+							}
+							a := anchor
+							a.Relation = actualRel
+							plan := &causalRootPlan{
+								Anchor:           a,
+								Cell:             ck,
+								RootCall:         rootCall,
+								RootPath:         rootPath,
+								RootKind:         causalRootNormal,
+								RootParent:       parentDirOrRoot(rootPath),
+								RootSource:       rootPath,
+								RootDest:         linkPath,
+								RootRelationPath: rootPath,
+							}
+							if _, ok := byCell[ck]; !ok {
+								byCell[ck] = plan
+							}
 							continue
 						}
 						actualRel, ok := causalPairRelation(anchorPre, anchorPost, "", rootPath)
 						if !ok {
 							continue
 						}
-						isDir := rootCall == "mkdir"
-						ck := cellKey{
-							Root:     call.Meta.CallName,
-							Variant:  rootCall,
-							Rel:      actualRel,
-							Temporal: TemporalHB,
-							RetA:     RetSuccess,
-							RetB:     RetSuccess,
-							OffB:     offsetBucketNA,
-							PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
-							DepthB:   DepthBucketOf(rootPath),
-							TypeB:    isDir,
+						dn := directedNode{
+							path:     rootPath,
+							isDir:    rootNode.Type != NodeTypeFile,
+							size:     rootNode.Size,
+							depth:    DepthBucketOf(rootPath),
+							persist:  pathInDir(rootPath, hmcfg.Persistence_dir),
+							nonEmpty: len(rootNode.Children) > 0,
 						}
-						if !covBoard.cellUncovered(ck) {
+						if !nodeFitsConstraintFor(profile, dn, rootCall) {
 							continue
 						}
-						a := anchor
-						a.Relation = actualRel
-						plan := &causalRootPlan{
-							Anchor:     a,
-							Cell:       ck,
-							RootCall:   rootCall,
-							RootPath:   rootPath,
-							RootKind:   causalRootFresh,
-							RootParent: parent,
-						}
-						if _, ok := byCell[ck]; !ok {
-							byCell[ck] = plan
+						for _, args := range causalRootArgs(rootCall, dn, r) {
+							ck := cellKey{
+								Root:     call.Meta.CallName,
+								Variant:  rootCall,
+								Rel:      actualRel,
+								Temporal: TemporalHB,
+								RetA:     RetSuccess,
+								RetB:     RetSuccess,
+								OffB:     args.offB,
+								PersistB: dn.persist,
+								DepthB:   dn.depth,
+								TypeB:    dn.isDir,
+								Role:     role.Role,
+							}
+							if !covBoard.cellUncovered(ck) {
+								continue
+							}
+							a := anchor
+							a.Relation = actualRel
+							plan := &causalRootPlan{
+								Anchor:     a,
+								Cell:       ck,
+								RootCall:   rootCall,
+								RootPath:   rootPath,
+								RootOffset: args.offset,
+								RootLen:    args.length,
+							}
+							if _, ok := byCell[ck]; !ok {
+								byCell[ck] = plan
+							}
 						}
 					}
-					if info.Kind.IsFresh() {
-						switch rel {
-						case PathChild:
-							addFreshPlan(rootCall, rel, path, info.Kind, info.IsDir, true)
-						case PathSibling:
-							addFreshPlan(rootCall, rel, GetParentDir(path), AnchorPathExisting, true, false)
-						}
-					}
-				}
-				if rootCall == "rename" {
-					for _, rootPath := range paths {
-						if !causalRenameRootPathAllowed(anchor, rootPath) {
-							continue
-						}
-						rootNode := ft.FindNode(rootPath)
-						if rootNode == nil || rootNode == ft.Root || !aEligible(rootNode, ft.Root) ||
-							rootNode.Type == NodeTypeTmpDir {
-							continue
-						}
-						if rootNode.Type != NodeTypeFile && len(rootNode.Children) > 0 {
-							continue // root E requires an empty directory
-						}
-						source := causalRenameSource(ft, rootPath)
-						if source == "" || !causalRenameRootPathAllowed(anchor, source) {
-							continue
-						}
-						sourceNode := ft.FindNode(source)
-						if sourceNode == nil {
-							continue
-						}
-						// C1 root rename is the B side: its relation and cell
-						// path are the source, not the destination.
-						actualRel, ok := causalPairRelation(anchorPre, anchorPost, source, source)
-						if !ok {
-							continue
-						}
-						ck := cellKey{
-							Root:     call.Meta.CallName,
-							Variant:  rootCall,
-							Rel:      actualRel,
-							Temporal: TemporalHB,
-							RetA:     RetSuccess,
-							RetB:     RetSuccess,
-							OffB:     offsetBucketNA,
-							PersistB: pathInDir(source, hmcfg.Persistence_dir),
-							DepthB:   DepthBucketOf(source),
-							TypeB:    sourceNode.Type != NodeTypeFile,
-						}
-						if !covBoard.cellUncovered(ck) {
-							continue
-						}
-						a := anchor
-						a.Relation = actualRel
-						plan := &causalRootPlan{
-							Anchor:            a,
-							Cell:              ck,
-							RootCall:          rootCall,
-							RootPath:          rootPath,
-							RootKind:          causalRootRename,
-							RootParent:        GetParentDir(rootPath),
-							RootSource:        source,
-							RootDest:          rootPath,
-							RootRenameReplace: true,
-						}
-						if _, ok := byCell[ck]; !ok {
-							byCell[ck] = plan
-						}
-					}
-					if rel == PathChild || rel == PathSibling {
+					if (rootCall == "mkdir" || rootCall == "creat") &&
+						(rel == PathChild || rel == PathSibling) {
 						for _, anchorNode := range anchorNodes {
 							parent := ""
-							if rel == PathChild && anchorNode.Type != NodeTypeFile {
-								parent = anchorNode.FullPath
-							} else if rel == PathSibling {
+							switch rel {
+							case PathChild:
+								if anchorNode.Type != NodeTypeFile {
+									parent = anchorNode.FullPath
+								}
+							case PathSibling:
 								parent = GetParentDir(anchorNode.FullPath)
 							}
 							if parent == "" {
 								continue
 							}
-							source := causalRenameSourceUnder(ft, parent)
-							if source == "" || !causalRenameRootPathAllowed(anchor, source) {
+							parentNode := ft.FindNode(parent)
+							if parentNode == nil || parentNode.Type == NodeTypeFile ||
+								!aEligible(parentNode, ft.Root) {
 								continue
 							}
-							dest := freshRenameDst(source, r.Rand)
-							if ft.FindNode(dest) != nil || !causalRenameRootPathAllowed(anchor, dest) {
+							rootPath := directedFreshPlaceholder(rootCall, parent)
+							if !causalRenameRootPathAllowed(anchor, rootPath) {
 								continue
 							}
-							// C1 root rename is the B side: relation/cell use
-							// the source; dest is only the materialized target.
-							actualRel, ok := causalPairRelation(anchorPre, anchorPost, source, source)
+							actualRel, ok := causalPairRelation(anchorPre, anchorPost, "", rootPath)
 							if !ok {
+								continue
+							}
+							isDir := rootCall == "mkdir"
+							ck := cellKey{
+								Root:     call.Meta.CallName,
+								Variant:  rootCall,
+								Rel:      actualRel,
+								Temporal: TemporalHB,
+								RetA:     RetSuccess,
+								RetB:     RetSuccess,
+								OffB:     offsetBucketNA,
+								PersistB: pathInDir(rootPath, hmcfg.Persistence_dir),
+								DepthB:   DepthBucketOf(rootPath),
+								TypeB:    isDir,
+								Role:     role.Role,
+							}
+							if !covBoard.cellUncovered(ck) {
+								continue
+							}
+							a := anchor
+							a.Relation = actualRel
+							plan := &causalRootPlan{
+								Anchor:     a,
+								Cell:       ck,
+								RootCall:   rootCall,
+								RootPath:   rootPath,
+								RootKind:   causalRootFresh,
+								RootParent: parent,
+							}
+							if _, ok := byCell[ck]; !ok {
+								byCell[ck] = plan
+							}
+						}
+						if role.ByPath && info.Kind.IsFresh() {
+							switch rel {
+							case PathChild:
+								addFreshPlan(rootCall, rel, path, info.Kind, info.IsDir, true)
+							case PathSibling:
+								addFreshPlan(rootCall, rel, GetParentDir(path), AnchorPathExisting, true, false)
+							}
+						}
+					}
+					if rootCall == "rename" {
+						for _, rootPath := range paths {
+							if !causalRenameRootPathAllowed(anchor, rootPath) {
+								continue
+							}
+							rootNode := ft.FindNode(rootPath)
+							if rootNode == nil || rootNode == ft.Root || !aEligible(rootNode, ft.Root) ||
+								rootNode.Type == NodeTypeTmpDir {
+								continue
+							}
+							if rootNode.Type != NodeTypeFile && len(rootNode.Children) > 0 {
+								continue // root E requires an empty directory
+							}
+							source := causalRenameSource(ft, rootPath)
+							if source == "" || !causalRenameRootPathAllowed(anchor, source) {
 								continue
 							}
 							sourceNode := ft.FindNode(source)
 							if sourceNode == nil {
+								continue
+							}
+							// C1 root rename is the B side: its relation and cell
+							// path are the source, not the destination.
+							actualRel, ok := causalPairRelation(anchorPre, anchorPost, source, source)
+							if !ok {
 								continue
 							}
 							ck := cellKey{
@@ -1082,6 +1074,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 								PersistB: pathInDir(source, hmcfg.Persistence_dir),
 								DepthB:   DepthBucketOf(source),
 								TypeB:    sourceNode.Type != NodeTypeFile,
+								Role:     role.Role,
 							}
 							if !covBoard.cellUncovered(ck) {
 								continue
@@ -1092,15 +1085,78 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 								Anchor:            a,
 								Cell:              ck,
 								RootCall:          rootCall,
-								RootPath:          dest,
+								RootPath:          rootPath,
 								RootKind:          causalRootRename,
-								RootParent:        parent,
+								RootParent:        GetParentDir(rootPath),
 								RootSource:        source,
-								RootDest:          dest,
-								RootRenameReplace: false,
+								RootDest:          rootPath,
+								RootRenameReplace: true,
 							}
 							if _, ok := byCell[ck]; !ok {
 								byCell[ck] = plan
+							}
+						}
+						if rel == PathChild || rel == PathSibling {
+							for _, anchorNode := range anchorNodes {
+								parent := ""
+								if rel == PathChild && anchorNode.Type != NodeTypeFile {
+									parent = anchorNode.FullPath
+								} else if rel == PathSibling {
+									parent = GetParentDir(anchorNode.FullPath)
+								}
+								if parent == "" {
+									continue
+								}
+								source := causalRenameSourceUnder(ft, parent)
+								if source == "" || !causalRenameRootPathAllowed(anchor, source) {
+									continue
+								}
+								dest := freshRenameDst(source, r.Rand)
+								if ft.FindNode(dest) != nil || !causalRenameRootPathAllowed(anchor, dest) {
+									continue
+								}
+								// C1 root rename is the B side: relation/cell use
+								// the source; dest is only the materialized target.
+								actualRel, ok := causalPairRelation(anchorPre, anchorPost, source, source)
+								if !ok {
+									continue
+								}
+								sourceNode := ft.FindNode(source)
+								if sourceNode == nil {
+									continue
+								}
+								ck := cellKey{
+									Root:     call.Meta.CallName,
+									Variant:  rootCall,
+									Rel:      actualRel,
+									Temporal: TemporalHB,
+									RetA:     RetSuccess,
+									RetB:     RetSuccess,
+									OffB:     offsetBucketNA,
+									PersistB: pathInDir(source, hmcfg.Persistence_dir),
+									DepthB:   DepthBucketOf(source),
+									TypeB:    sourceNode.Type != NodeTypeFile,
+									Role:     role.Role,
+								}
+								if !covBoard.cellUncovered(ck) {
+									continue
+								}
+								a := anchor
+								a.Relation = actualRel
+								plan := &causalRootPlan{
+									Anchor:            a,
+									Cell:              ck,
+									RootCall:          rootCall,
+									RootPath:          dest,
+									RootKind:          causalRootRename,
+									RootParent:        parent,
+									RootSource:        source,
+									RootDest:          dest,
+									RootRenameReplace: false,
+								}
+								if _, ok := byCell[ck]; !ok {
+									byCell[ck] = plan
+								}
 							}
 						}
 					}

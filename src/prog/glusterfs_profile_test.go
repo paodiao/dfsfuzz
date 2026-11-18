@@ -347,11 +347,12 @@ func TestGlusterfsReadlinkCoverageHBOnly(t *testing.T) {
 		Root: "symlink", Variant: "readlink", Rel: PathSame,
 	})
 	covBoard.mu.RUnlock()
-	if got[0] <= 0 {
-		t.Fatalf("readlink HB producible = %d, want > 0", got[0])
+	readlink := got[cellRoleSymlinkLinkPath]
+	if readlink[0] <= 0 {
+		t.Fatalf("readlink HB producible = %d, want > 0", readlink[0])
 	}
-	if got[1] != 0 {
-		t.Fatalf("readlink CC producible = %d, want 0", got[1])
+	if readlink[1] != 0 {
+		t.Fatalf("readlink CC producible = %d, want 0", readlink[1])
 	}
 }
 

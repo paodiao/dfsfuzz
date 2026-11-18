@@ -39,12 +39,12 @@ func coverBoardCellsExcept(t *testing.T, keep func(ck comboKey, c cellKey) bool)
 								}
 								if covBoard.discovered[c] == 0 {
 									f := covBoard.found[ck]
-									f[tm]++
+									f[c.Role][tm]++
 									covBoard.found[ck] = f
 									// HMDFS plannable == model; keep both ledgers in
 									// sync with what recordPairs would do.
 									pf := covBoard.plannableFound[ck]
-									pf[tm]++
+									pf[c.Role][tm]++
 									covBoard.plannableFound[ck] = pf
 								}
 								covBoard.discovered[c]++

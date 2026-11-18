@@ -215,7 +215,9 @@ func TestCoverageUnreachableRetirement(t *testing.T) {
 	f0 := covBoard.found[ck]
 	RecordCoveragePairs([]DAGPair{mkCoveragePair("write", "truncate", PathSamePath, TemporalHB,
 		RetSuccess, RetENOENT, "merge_view/d/f")})
-	if got := covBoard.found[ck][0] + covBoard.found[ck][1]; got != f0[0]+f0[1]+1 {
+	got := covBoard.found[ck].total()
+	want := f0.total()
+	if got[0]+got[1] != want[0]+want[1]+1 {
 		t.Fatal("found not incremented")
 	}
 	if covBoard.unreachable[ck] {
@@ -446,8 +448,10 @@ func TestCoverageDepthDomain(t *testing.T) {
 	pot0 := DirectedPairPotential(combo.Root, combo.Variant, combo.Rel)
 	f0 := covBoard.found[combo]
 	RecordCoveragePairs([]DAGPair{deep})
-	if f := covBoard.found[combo]; f[0]+f[1] != f0[0]+f0[1] {
-		t.Fatalf("unmodeled-depth discovery counted: found=%v, want %v", f, f0)
+	f := covBoard.found[combo].total()
+	base := f0.total()
+	if f[0]+f[1] != base[0]+base[1] {
+		t.Fatalf("unmodeled-depth discovery counted: found=%v, want %v", f, base)
 	}
 	if pot := DirectedPairPotential(combo.Root, combo.Variant, combo.Rel); pot != pot0 {
 		t.Fatalf("potential changed on unmodeled-depth discovery: %d, want %d", pot, pot0)
@@ -467,8 +471,9 @@ func TestCoverageDepthDomain(t *testing.T) {
 		t.Fatal("modeled-depth cell not usable as a directed target")
 	}
 	RecordCoveragePairs([]DAGPair{shallow})
-	if f := covBoard.found[combo]; f[0]+f[1] != f0[0]+f0[1]+1 {
-		t.Fatalf("modeled-depth discovery not counted: found=%v, want %v", f, f0[0]+f0[1]+1)
+	f = covBoard.found[combo].total()
+	if f[0]+f[1] != base[0]+base[1]+1 {
+		t.Fatalf("modeled-depth discovery not counted: found=%v, want %v", f, base[0]+base[1]+1)
 	}
 	if pot := DirectedPairPotential(combo.Root, combo.Variant, combo.Rel); pot != pot0-1 {
 		t.Fatalf("potential after modeled discovery = %d, want %d", pot, pot0-1)
@@ -943,7 +948,8 @@ func TestRecordCoveragePairsTwinCombos(t *testing.T) {
 	if shapes != 1 {
 		t.Fatalf("twin shapes = %d, want 1 (same abstract shape)", shapes)
 	}
-	if wf[0]+wf[1] == 0 || pf[0]+pf[1] == 0 {
+	wft, pft := wf.total(), pf.total()
+	if wft[0]+wft[1] == 0 || pft[0]+pft[1] == 0 {
 		t.Fatalf("twin combos not both found: write=%v pwrite64=%v", wf, pf)
 	}
 

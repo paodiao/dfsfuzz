@@ -28,7 +28,21 @@ const (
 	cellRoleNone cellRole = iota
 	cellRoleLinkPath
 	cellRoleSymlinkLinkPath
+	cellRoleCount
 )
+
+// roleCellCounts keeps per-role temporal counts. The fixed array avoids a map
+// allocation on the per-pair cellInModel/cellInPlannable path.
+type roleCellCounts [cellRoleCount][2]int
+
+func (rc roleCellCounts) total() [2]int {
+	var out [2]int
+	for role := cellRole(0); role < cellRoleCount; role++ {
+		out[0] += rc[role][0]
+		out[1] += rc[role][1]
+	}
+	return out
+}
 
 func linkPathCellRole(call string) cellRole {
 	switch call {
@@ -57,32 +71,52 @@ func isLinkPathCellRole(role cellRole) bool {
 	return role == cellRoleLinkPath || role == cellRoleSymlinkLinkPath
 }
 
+// cellRoleSet is a fixed-size role list: at most target/linkpath, so hot-path
+// callers never allocate.
+type cellRoleSet struct {
+	roles [2]cellRole
+	n     int
+}
+
 // cellRolesForCombo returns the A-side roles a combo can produce. Readlink is
 // a single linkpath-follower role; link/symlink roots can be observed at the
 // target (default) and at the program-local linkpath (HB only).
-func cellRolesForCombo(ck comboKey) []cellRole {
+func cellRolesForCombo(ck comboKey) cellRoleSet {
 	switch ck.Root {
 	case "link":
 		if ck.Variant == "readlink" {
 			// readlink only follows a symlink root.
-			return nil
+			return cellRoleSet{}
 		}
-		return []cellRole{cellRoleNone, cellRoleLinkPath}
+		return cellRoleSet{
+			roles: [2]cellRole{cellRoleNone, cellRoleLinkPath},
+			n:     2,
+		}
 	case "symlink":
 		if ck.Variant == "readlink" {
 			if ck.Rel != PathSame {
-				return nil
+				return cellRoleSet{}
 			}
-			return []cellRole{cellRoleSymlinkLinkPath}
+			return cellRoleSet{
+				roles: [2]cellRole{cellRoleSymlinkLinkPath},
+				n:     1,
+			}
 		}
-		return []cellRole{cellRoleNone, cellRoleSymlinkLinkPath}
+		return cellRoleSet{
+			roles: [2]cellRole{cellRoleNone, cellRoleSymlinkLinkPath},
+			n:     2,
+		}
 	}
-	return []cellRole{cellRoleNone}
+	return cellRoleSet{
+		roles: [2]cellRole{cellRoleNone},
+		n:     1,
+	}
 }
 
 func cellRoleAllowedForCombo(ck comboKey, role cellRole) bool {
-	for _, r := range cellRolesForCombo(ck) {
-		if r == role {
+	roles := cellRolesForCombo(ck)
+	for i := 0; i < roles.n; i++ {
+		if roles.roles[i] == role {
 			return true
 		}
 	}
@@ -168,11 +202,11 @@ type shapeDrainEntry struct {
 type coverageBoard struct {
 	mu             sync.RWMutex
 	discovered     map[cellKey]int
-	producible     map[comboKey][2]int // model: producible cells per temporal form
-	found          map[comboKey][2]int // model: discovered cells per temporal form
-	plannable      map[comboKey][2]int // directed pair: constructible cells per temporal form
-	plannableFound map[comboKey][2]int // directed pair: discovered cells per temporal form
-	knownShapes    map[uint64]bool     // observed event shapes (call-name agnostic)
+	producible     map[comboKey]roleCellCounts // model: producible cells per role/temporal
+	found          map[comboKey]roleCellCounts // model: discovered cells per role/temporal
+	plannable      map[comboKey]roleCellCounts // directed pair: constructible cells per role/temporal
+	plannableFound map[comboKey]roleCellCounts // directed pair: discovered cells per role/temporal
+	knownShapes    map[uint64]bool             // observed event shapes (call-name agnostic)
 	// shapeEpoch increments on every newly observed shape; shapeDrainCache
 	// entries are valid only at the epoch they were written, since shapes
 	// never disappear within a board generation. The cache is replaced
@@ -224,10 +258,10 @@ type coverageBoard struct {
 
 var covBoard = &coverageBoard{
 	discovered:       make(map[cellKey]int),
-	producible:       make(map[comboKey][2]int),
-	found:            make(map[comboKey][2]int),
-	plannable:        make(map[comboKey][2]int),
-	plannableFound:   make(map[comboKey][2]int),
+	producible:       make(map[comboKey]roleCellCounts),
+	found:            make(map[comboKey]roleCellCounts),
+	plannable:        make(map[comboKey]roleCellCounts),
+	plannableFound:   make(map[comboKey]roleCellCounts),
 	knownShapes:      make(map[uint64]bool),
 	shapeDrainCache:  make(map[shapeDrainKey]shapeDrainEntry),
 	directedAttempts: make(map[comboKey]int),
@@ -724,44 +758,68 @@ func (b *coverageBoard) rootDirectedComboEnabled(ck comboKey) bool {
 	return profileExactListContains(b.profile.DirectedRootCalls(), ck.Root)
 }
 
-// computeProducibleLocked computes the model layer's per-temporal cell counts.
-// The count is the sum over the combo's A-side roles; linkpath roles are HB-only
-// so they never contribute a role-free CC cell.
-func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
+// computeProducibleLocked computes the model layer's per-role temporal counts.
+// The model keeps the natural-reachability upper bound; plannable applies the
+// additional role/relation construction filter below.
+func (b *coverageBoard) computeProducibleLocked(ck comboKey) roleCellCounts {
 	forms, types := modelFormsForCombo(b.profile, ck)
-	return b.roleCellCountsLocked(ck, forms, types)
+	return b.roleCellCountsLocked(ck, forms, types, false)
 }
 
-// computePlannableLocked computes the planner layer's per-temporal cell counts.
-func (b *coverageBoard) computePlannableLocked(ck comboKey) [2]int {
+// computePlannableLocked computes the planner layer's per-role temporal counts.
+func (b *coverageBoard) computePlannableLocked(ck comboKey) roleCellCounts {
 	if !b.directedPairComboEnabled(ck) {
-		return [2]int{}
+		return roleCellCounts{}
 	}
 	if ck.Variant == "readlink" {
 		// Directed readlink follows the symlink root's linkpath, so it is
 		// constructible only under a symlink root and only as Same.
 		if ck.Root != "symlink" || ck.Rel != PathSame {
-			return [2]int{}
+			return roleCellCounts{}
 		}
 	}
 	if forms, ok := plannableFreshSameFormsFor(b.profile, ck); ok {
-		return b.roleCellCountsLocked(ck, forms, nil)
+		return b.roleCellCountsLocked(ck, forms, nil, true)
 	}
 	return b.roleCellCountsLocked(ck,
 		plannableFormsFor(b.profile, ck.Variant),
-		producibleTypesFor(b.profile, ck.Variant))
+		producibleTypesFor(b.profile, ck.Variant), true)
 }
 
-// roleCellCountsLocked sums a combo's per-role temporal counts. The comboKey is
+// cellRolePlannableRelAllowed filters linkpath-role relations the directed
+// planner can actually construct. The model keeps the full natural-reachability
+// upper bound; this filter is plannable-only.
+//
+// A fresh linkpath is a file/symlink entry:
+//   - Parent: B can be the linkpath's parent directory;
+//   - Sibling: B can share the linkpath's parent;
+//   - Child: a fresh linkpath cannot act as a parent directory, and the planner
+//     has no child B node for it;
+//   - Same: a non-readlink B is an existing path, which cannot equal a fresh
+//     linkpath. readlink is the one exception: its B is the root LinkPath.
+func cellRolePlannableRelAllowed(ck comboKey, role cellRole) bool {
+	if !isLinkPathCellRole(role) {
+		return true
+	}
+	if ck.Variant == "readlink" {
+		return ck.Rel == PathSame
+	}
+	return ck.Rel == PathParent || ck.Rel == PathSibling
+}
+
+// roleCellCountsLocked fills a combo's per-role temporal counts. The comboKey is
 // deliberately role-free; role is a cell dimension, so target/linkpath roles
 // still share one DCT combo and one root execution.
-func (b *coverageBoard) roleCellCountsLocked(ck comboKey, forms []cellForm, typeList []bool) [2]int {
+func (b *coverageBoard) roleCellCountsLocked(ck comboKey, forms []cellForm, typeList []bool, plannable bool) roleCellCounts {
 	total := b.computeCellTotalLocked(forms, typeList)
-	var out [2]int
-	for _, role := range cellRolesForCombo(ck) {
-		counts := temporalCellCountsForRole(ck, total, role)
-		out[0] += counts[0]
-		out[1] += counts[1]
+	var out roleCellCounts
+	roles := cellRolesForCombo(ck)
+	for i := 0; i < roles.n; i++ {
+		role := roles.roles[i]
+		if plannable && !cellRolePlannableRelAllowed(ck, role) {
+			continue
+		}
+		out[role] = temporalCellCountsForRole(ck, total, role)
 	}
 	return out
 }
@@ -951,12 +1009,12 @@ func (b *coverageBoard) markDiscoveredLocked(ck cellKey) {
 			fk := comboKey{Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel}
 			if b.cellInModel(ck) {
 				f := b.found[fk]
-				f[int(ck.Temporal)]++
+				f[ck.Role][int(ck.Temporal)]++
 				b.found[fk] = f
 			}
 			if b.cellInPlannable(ck) {
 				f := b.plannableFound[fk]
-				f[int(ck.Temporal)]++
+				f[ck.Role][int(ck.Temporal)]++
 				b.plannableFound[fk] = f
 				// F1: a productive combo lifts its directed-failure
 				// suppression and re-baselines its window, so it can re-enter
@@ -966,7 +1024,8 @@ func (b *coverageBoard) markDiscoveredLocked(ck cellKey) {
 				delete(b.unreachable, fk)
 				b.directedAttempts[fk] = 0
 				b.resolveMark[fk] = 0
-				b.foundSnapshot[fk] = f[0] + f[1]
+				tot := f.total()
+				b.foundSnapshot[fk] = tot[0] + tot[1]
 			}
 		}
 	}
@@ -993,7 +1052,7 @@ func (b *coverageBoard) cellInModel(ck cellKey) bool {
 	if !ok {
 		return false
 	}
-	if prod[int(ck.Temporal)] == 0 {
+	if prod[ck.Role][int(ck.Temporal)] == 0 {
 		return false
 	}
 	forms, types := modelFormsForCombo(b.profile, ckm)
@@ -1018,11 +1077,14 @@ func (b *coverageBoard) cellInPlannable(ck cellKey) bool {
 	if !cellRoleAllowedForCombo(ckm, ck.Role) {
 		return false
 	}
+	if !cellRolePlannableRelAllowed(ckm, ck.Role) {
+		return false
+	}
 	if isLinkPathCellRole(ck.Role) && ck.Temporal != TemporalHB {
 		return false
 	}
 	prod, ok := b.plannable[ckm]
-	if !ok || prod[int(ck.Temporal)] == 0 {
+	if !ok || prod[ck.Role][int(ck.Temporal)] == 0 {
 		return false
 	}
 	if freshForms, ok := plannableFreshSameFormsFor(b.profile, ckm); ok {
@@ -1121,7 +1183,11 @@ func (b *coverageBoard) shapeDrainedLocked(ck comboKey, aFunc uint32, aDepth uin
 		return false
 	}
 	prod, ok := b.plannable[ck]
-	if !ok || (prod[0] == 0 && prod[1] == 0) {
+	if !ok {
+		return false
+	}
+	tot := prod.total()
+	if tot[0] == 0 && tot[1] == 0 {
 		return false
 	}
 	key := shapeDrainKey{Combo: ck, AFunc: aFunc, ADepth: aDepth, AIsDir: aIsDir, APersist: aPersist}
@@ -1195,9 +1261,11 @@ func (b *coverageBoard) directedPairPotentials(root string, cands []CallVariant)
 			continue
 		}
 		found := b.plannableFound[ck]
-		for t := 0; t < 2; t++ {
-			if d := prod[t] - found[t]; d > 0 {
-				res[i] += d
+		for role := cellRole(0); role < cellRoleCount; role++ {
+			for t := 0; t < 2; t++ {
+				if d := prod[role][t] - found[role][t]; d > 0 {
+					res[i] += d
+				}
 			}
 		}
 	}
@@ -1265,9 +1333,11 @@ func (b *coverageBoard) directedPairPotential(root, variant string, rel PathRela
 	}
 	found := b.plannableFound[ck]
 	pot := 0
-	for t := 0; t < 2; t++ {
-		if d := prod[t] - found[t]; d > 0 {
-			pot += d
+	for role := cellRole(0); role < cellRoleCount; role++ {
+		for t := 0; t < 2; t++ {
+			if d := prod[role][t] - found[role][t]; d > 0 {
+				pot += d
+			}
 		}
 	}
 	return pot
@@ -1300,7 +1370,7 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 	if nd == 0 {
 		return
 	}
-	emit := func(role cellRole, ret RetBucket, off uint64, isDir bool) {
+	emit := func(role cellRole, counts [2]int, ret RetBucket, off uint64, isDir bool) {
 		for i := 0; i < nd; i++ {
 			depth := depthList[i]
 			persists := [2]bool{false}
@@ -1311,7 +1381,7 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 			}
 			for pi := 0; pi < np; pi++ {
 				for t := 0; t < 2; t++ {
-					if prod[t] == 0 {
+					if counts[t] == 0 {
 						continue
 					}
 					if isLinkPathCellRole(role) && TemporalRel(t) != TemporalHB {
@@ -1331,18 +1401,29 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 			}
 		}
 	}
+	roles := cellRolesForCombo(ck)
 	if freshForms, ok := plannableFreshSameFormsFor(b.profile, ck); ok {
-		for _, role := range cellRolesForCombo(ck) {
+		for ri := 0; ri < roles.n; ri++ {
+			role := roles.roles[ri]
+			if !cellRolePlannableRelAllowed(ck, role) {
+				continue
+			}
+			counts := prod[role]
 			for _, fp := range freshForms {
-				emit(role, fp.ret, fp.off, fp.isDir)
+				emit(role, counts, fp.ret, fp.off, fp.isDir)
 			}
 		}
 		return
 	}
-	for _, role := range cellRolesForCombo(ck) {
+	for ri := 0; ri < roles.n; ri++ {
+		role := roles.roles[ri]
+		if !cellRolePlannableRelAllowed(ck, role) {
+			continue
+		}
+		counts := prod[role]
 		for _, form := range plannableFormsFor(b.profile, ck.Variant) {
 			for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
-				emit(role, form.ret, form.off, isDir)
+				emit(role, counts, form.ret, form.off, isDir)
 			}
 		}
 	}
@@ -1429,7 +1510,8 @@ func (b *coverageBoard) noteDirectedPick(ck comboKey, pot int) {
 	if a-b.resolveMark[ck] >= unreachableThreshold {
 		f := 0
 		if fc, ok := b.plannableFound[ck]; ok {
-			f = fc[0] + fc[1]
+			tot := fc.total()
+			f = tot[0] + tot[1]
 		}
 		if f == b.foundSnapshot[ck] {
 			b.unreachable[ck] = true
@@ -1618,9 +1700,11 @@ func (b *coverageBoard) rootDirectedPotentials(cks []comboKey) []int {
 		}
 		found := b.plannableFound[ck]
 		pot := 0
-		for t := 0; t < 2; t++ {
-			if d := prod[t] - found[t]; d > 0 {
-				pot += d
+		for role := cellRole(0); role < cellRoleCount; role++ {
+			for t := 0; t < 2; t++ {
+				if d := prod[role][t] - found[role][t]; d > 0 {
+					pot += d
+				}
 			}
 		}
 		pot -= b.cellSuppressed[ck]
@@ -1635,10 +1719,12 @@ func (b *coverageBoard) coverStats() (found, target int) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	for _, f := range b.found {
-		found += f[0] + f[1]
+		tot := f.total()
+		found += tot[0] + tot[1]
 	}
 	for _, p := range b.producible {
-		target += p[0] + p[1]
+		tot := p.total()
+		target += tot[0] + tot[1]
 	}
 	return found, target
 }
@@ -1651,18 +1737,22 @@ func (b *coverageBoard) layerStats() CoverageSnapshot {
 		ObservedShapes: len(b.knownShapes),
 	}
 	for _, f := range b.found {
-		s.ModelFound += f[0] + f[1]
+		tot := f.total()
+		s.ModelFound += tot[0] + tot[1]
 	}
 	for _, p := range b.producible {
-		s.ModelTarget += p[0] + p[1]
+		tot := p.total()
+		s.ModelTarget += tot[0] + tot[1]
 	}
 	for _, f := range b.plannableFound {
-		s.PlannableFound += f[0] + f[1]
+		tot := f.total()
+		s.PlannableFound += tot[0] + tot[1]
 	}
 	for ck, p := range b.plannable {
-		s.PlannableTarget += p[0] + p[1]
+		tot := p.total()
+		s.PlannableTarget += tot[0] + tot[1]
 		if b.rootDirectedComboEnabled(ck) {
-			s.RootPlannableTarget += p[0] + p[1]
+			s.RootPlannableTarget += tot[0] + tot[1]
 		}
 	}
 	s.OutOfModel = s.ObservedCells - s.ModelFound
@@ -1686,10 +1776,10 @@ func (b *coverageBoard) reset() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.discovered = make(map[cellKey]int)
-	b.producible = make(map[comboKey][2]int)
-	b.found = make(map[comboKey][2]int)
-	b.plannable = make(map[comboKey][2]int)
-	b.plannableFound = make(map[comboKey][2]int)
+	b.producible = make(map[comboKey]roleCellCounts)
+	b.found = make(map[comboKey]roleCellCounts)
+	b.plannable = make(map[comboKey]roleCellCounts)
+	b.plannableFound = make(map[comboKey]roleCellCounts)
 	b.knownShapes = make(map[uint64]bool)
 	b.shapeEpoch = 0
 	b.shapeDrainCache = make(map[shapeDrainKey]shapeDrainEntry)

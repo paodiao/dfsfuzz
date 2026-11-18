@@ -1,6 +1,9 @@
 package prog
 
-import "testing"
+import (
+	"math/rand"
+	"testing"
+)
 
 func linkRolePair(target, linkPath, rel string, temporal TemporalRel) DAGPair {
 	a := &DAGVertex{
@@ -55,8 +58,12 @@ func TestCellRoleLinkRoot(t *testing.T) {
 	hb := cc
 	hb.Temporal = TemporalHB
 	hb.Role = cellRoleLinkPath
+	if covBoard.cellInPlannable(hb) {
+		t.Fatalf("linkpath Same cell accepted: %+v", hb)
+	}
+	hb.Rel = PathSibling
 	if !covBoard.cellInPlannable(hb) {
-		t.Fatalf("linkpath HB cell rejected: %+v", hb)
+		t.Fatalf("linkpath Sibling cell rejected: %+v", hb)
 	}
 	covBoard.mu.RUnlock()
 }
@@ -73,6 +80,80 @@ func TestDefaultGlusterfsDualPathPlannable(t *testing.T) {
 	defer covBoard.mu.RUnlock()
 	if !covBoard.cellInPlannable(cell) {
 		t.Fatalf("default GlusterFS profile excluded dual-path variant: %+v", cell)
+	}
+}
+
+func TestCellRolePlannableRelLinkpath(t *testing.T) {
+	glusterfsCoverageConfig(t, true)
+	cell := func(rel PathRelation, role cellRole) cellKey {
+		return cellKey{
+			Root: "link", Variant: "stat", Rel: rel, Temporal: TemporalHB,
+			RetA: RetSuccess, RetB: RetSuccess, OffB: offsetBucketNA,
+			DepthB: 1, Role: role,
+		}
+	}
+	covBoard.mu.RLock()
+	for _, rel := range []PathRelation{PathParent, PathSibling} {
+		ck := cell(rel, cellRoleLinkPath)
+		if !covBoard.cellInPlannable(ck) {
+			t.Fatalf("linkpath plannable relation %v rejected: %+v", rel, ck)
+		}
+	}
+	for _, rel := range []PathRelation{PathChild, PathSame} {
+		ck := cell(rel, cellRoleLinkPath)
+		if covBoard.cellInPlannable(ck) {
+			t.Fatalf("linkpath plannable relation %v accepted: %+v", rel, ck)
+		}
+		if !covBoard.cellInModel(ck) {
+			t.Fatalf("linkpath model relation %v missing: %+v", rel, ck)
+		}
+	}
+	readlink := glusterfsCoverageCell("symlink", "readlink", PathSame, TemporalHB,
+		RetSuccess, offsetBucketNA, false)
+	if !covBoard.cellInPlannable(readlink) {
+		t.Fatalf("readlink Same cell rejected: %+v", readlink)
+	}
+	badReadlink := readlink
+	badReadlink.Rel = PathParent
+	if covBoard.cellInPlannable(badReadlink) {
+		t.Fatalf("readlink non-Same cell accepted: %+v", badReadlink)
+	}
+	covBoard.mu.RUnlock()
+}
+
+func TestCausalLinkAnchorRoleEnumeration(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	hmcfg := glusterfsCoverageConfig(t, true)
+	lcs := NewLayeredChoiceStrategy(hmcfg, target)
+	r := newRand(target, rand.NewSource(131))
+	r.hmcfg = hmcfg
+	link := mkLinkCall(t, target, "dirA/a", "dirB/l1")
+	link.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 0}
+	p0 := &Prog{Target: target, Calls: []*Call{link}}
+	plans := collectCausalRootPlans(p0, lcs, hmcfg, r)
+	var targetRole, linkPathRole bool
+	for _, p := range plans {
+		if p.Cell.Root != "link" || p.RootCall != "stat" {
+			continue
+		}
+		switch p.Cell.Role {
+		case cellRoleNone:
+			targetRole = true
+		case cellRoleLinkPath:
+			linkPathRole = true
+			if p.Cell.Rel == PathChild || p.Cell.Rel == PathSame {
+				t.Fatalf("C1 linkpath role planned impossible relation: %+v", p)
+			}
+		}
+	}
+	if !targetRole {
+		t.Fatal("C1 link anchor produced no target-role plan")
+	}
+	if !linkPathRole {
+		t.Fatal("C1 link anchor produced no linkpath-role plan")
 	}
 }
 

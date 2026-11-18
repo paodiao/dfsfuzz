@@ -181,9 +181,9 @@ func TestGlusterfsPlannableFreshSameRaces(t *testing.T) {
 	}
 }
 
-// TestGlusterfsPlannableDualPathGate pins the v1 gate: link/symlink/readlink
-// are observed/model-visible but not actively plannable until the dual-path
-// gate is enabled.
+// TestGlusterfsPlannableDualPathGate pins the gate-off/on A/B behavior:
+// link/symlink/readlink are observed/model-visible but not actively plannable
+// when the dual-path gate is disabled; the default profile enables it.
 func TestGlusterfsPlannableDualPathGate(t *testing.T) {
 	glusterfsCoverageConfig(t, false)
 
@@ -279,10 +279,12 @@ func TestGlusterfsPlannableSubsetOfModel(t *testing.T) {
 		if !ok {
 			t.Fatalf("plannable combo %+v missing from model", ck)
 		}
-		for tm := 0; tm < 2; tm++ {
-			if pp[tm] > mp[tm] {
-				t.Fatalf("combo %+v temporal %d: plannable %d > model %d",
-					ck, tm, pp[tm], mp[tm])
+		for role := cellRole(0); role < cellRoleCount; role++ {
+			for tm := 0; tm < 2; tm++ {
+				if pp[role][tm] > mp[role][tm] {
+					t.Fatalf("combo %+v role %d temporal %d: plannable %d > model %d",
+						ck, role, tm, pp[role][tm], mp[role][tm])
+				}
 			}
 		}
 	}
