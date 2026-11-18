@@ -442,8 +442,11 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 				return
 			}
 		}
-		if linkPathRole && cell.Temporal != TemporalHB {
-			return
+		if linkPathRole {
+			if cell.Temporal != TemporalHB {
+				return
+			}
+			cell.Role = linkPathCellRole(rootCall)
 		}
 		ck := cell.toKey()
 		if filterCombos && !liveCombos[cell.Combo] {
@@ -1619,6 +1622,15 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 		}
 		if plan.RootRelationPath != "" && plan.RootRelationPath == plan.RootLinkPath &&
 			plan.RootRelationPath != plan.BaseA && plan.Cell.Temporal != TemporalHB {
+			return false
+		}
+		wantRole := cellRoleNone
+		if plan.Cell.Combo.Variant == "readlink" {
+			wantRole = cellRoleSymlinkLinkPath
+		} else if plan.RootRelationPath != "" && plan.RootRelationPath != plan.BaseA {
+			wantRole = linkPathCellRole(plan.Cell.Combo.Root)
+		}
+		if plan.Cell.Role != wantRole {
 			return false
 		}
 	}

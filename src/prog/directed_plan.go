@@ -50,6 +50,7 @@ type directedCell struct {
 	PersistB bool
 	DepthB   uint64
 	TypeB    bool
+	Role     cellRole
 }
 
 func (dc directedCell) toKey() cellKey {
@@ -57,6 +58,7 @@ func (dc directedCell) toKey() cellKey {
 		Root: dc.Combo.Root, Variant: dc.Combo.Variant, Rel: dc.Combo.Rel,
 		Temporal: dc.Temporal, RetA: RetSuccess, RetB: dc.RetB,
 		OffB: dc.OffB, PersistB: dc.PersistB, DepthB: dc.DepthB, TypeB: dc.TypeB,
+		Role: dc.Role,
 	}
 }
 

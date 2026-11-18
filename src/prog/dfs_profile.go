@@ -58,8 +58,9 @@ type PlanProfile struct {
 	DCTVariantCalls []string
 	CausalRootCalls []string
 	// Directed-plan call lists and dual-path gate. HMDFS keeps the old global
-	// lists; GlusterFS v1 enables link/symlink only after trace stability, so
-	// DualPathCausalEnabled stays false for v1.
+	// lists and leaves the gate false; GlusterFS enables link/symlink/readlink
+	// causal planning. The coverage board reads the same gate, so plannable and
+	// the planner cannot diverge on whether dual-path cells are constructible.
 	DirectedRootCalls     []string
 	DirectedVariantCalls  []string
 	DualPathCausalEnabled bool
@@ -203,7 +204,7 @@ var glusterfsProfile = &DFSProfile{
 		CausalRootCalls:       GlusterfsCausalRootCalls,
 		DirectedRootCalls:     GlusterfsCausalRootCalls,
 		DirectedVariantCalls:  GlusterfsDirectedVariantCalls,
-		DualPathCausalEnabled: false,
+		DualPathCausalEnabled: true,
 		PathStateTracking:     true,
 	},
 	Tree:  TreeProfile{Prefix: ""},

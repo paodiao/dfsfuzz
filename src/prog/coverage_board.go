@@ -18,6 +18,96 @@ import (
 // from-scratch generation shares the same discovery state. It starts empty on
 // every fresh run and is filled by novel pairs only.
 
+// cellRole is the A-side role of a link/symlink cell. The zero value covers
+// ordinary cells and the link/symlink target role; only the program-local
+// linkpath role needs an explicit value because it is HB-only and would
+// otherwise share the role-free CC cell with the target role.
+type cellRole uint8
+
+const (
+	cellRoleNone cellRole = iota
+	cellRoleLinkPath
+	cellRoleSymlinkLinkPath
+)
+
+func linkPathCellRole(call string) cellRole {
+	switch call {
+	case "link":
+		return cellRoleLinkPath
+	case "symlink":
+		return cellRoleSymlinkLinkPath
+	}
+	return cellRoleNone
+}
+
+func linkPathCellRoleForVertex(v *DAGVertex) cellRole {
+	if v == nil {
+		return cellRoleNone
+	}
+	switch v.FuncID {
+	case FuncLink:
+		return cellRoleLinkPath
+	case FuncSymlink:
+		return cellRoleSymlinkLinkPath
+	}
+	return linkPathCellRole(v.CallName)
+}
+
+func isLinkPathCellRole(role cellRole) bool {
+	return role == cellRoleLinkPath || role == cellRoleSymlinkLinkPath
+}
+
+// cellRolesForCombo returns the A-side roles a combo can produce. Readlink is
+// a single linkpath-follower role; link/symlink roots can be observed at the
+// target (default) and at the program-local linkpath (HB only).
+func cellRolesForCombo(ck comboKey) []cellRole {
+	switch ck.Root {
+	case "link":
+		if ck.Variant == "readlink" {
+			// readlink only follows a symlink root.
+			return nil
+		}
+		return []cellRole{cellRoleNone, cellRoleLinkPath}
+	case "symlink":
+		if ck.Variant == "readlink" {
+			if ck.Rel != PathSame {
+				return nil
+			}
+			return []cellRole{cellRoleSymlinkLinkPath}
+		}
+		return []cellRole{cellRoleNone, cellRoleSymlinkLinkPath}
+	}
+	return []cellRole{cellRoleNone}
+}
+
+func cellRoleAllowedForCombo(ck comboKey, role cellRole) bool {
+	for _, r := range cellRolesForCombo(ck) {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}
+
+// pairCellRole derives the A-side role from the role paths already selected by
+// ExtractPairs. A link/symlink HB A pair at the target is the default role; the
+// linkpath role is the explicit one. C1 anchor and C2 root pairs share this
+// identity, so the same cell can be covered by either planner layer.
+func pairCellRole(p *DAGPair) cellRole {
+	if p == nil || p.A == nil || !isLinkSymlinkVertex(p.A) ||
+		p.Temporal != TemporalHB {
+		return cellRoleNone
+	}
+	target := prePath(p.A)
+	if target == "" {
+		target = p.A.Path
+	}
+	if target != "" && pairAPath(p) != target {
+		return linkPathCellRoleForVertex(p.A)
+	}
+	return cellRoleNone
+}
+
 // cellKey is the structured identity of one feedback cell of a DAG pair.
 type cellKey struct {
 	Root     string
@@ -30,6 +120,7 @@ type cellKey struct {
 	PersistB bool
 	DepthB   uint64
 	TypeB    bool // true: B is a directory
+	Role     cellRole
 }
 
 // comboKey identifies a DCT (root, variant, relation) combination.
@@ -634,10 +725,11 @@ func (b *coverageBoard) rootDirectedComboEnabled(ck comboKey) bool {
 }
 
 // computeProducibleLocked computes the model layer's per-temporal cell counts.
-// See computeCellCountLocked for the shared dimension rules.
+// The count is the sum over the combo's A-side roles; linkpath roles are HB-only
+// so they never contribute a role-free CC cell.
 func (b *coverageBoard) computeProducibleLocked(ck comboKey) [2]int {
 	forms, types := modelFormsForCombo(b.profile, ck)
-	return b.computeCellCountLocked(ck, forms, types)
+	return b.roleCellCountsLocked(ck, forms, types)
 }
 
 // computePlannableLocked computes the planner layer's per-temporal cell counts.
@@ -653,11 +745,25 @@ func (b *coverageBoard) computePlannableLocked(ck comboKey) [2]int {
 		}
 	}
 	if forms, ok := plannableFreshSameFormsFor(b.profile, ck); ok {
-		return b.computeCellCountLocked(ck, forms, nil)
+		return b.roleCellCountsLocked(ck, forms, nil)
 	}
-	return b.computeCellCountLocked(ck,
+	return b.roleCellCountsLocked(ck,
 		plannableFormsFor(b.profile, ck.Variant),
 		producibleTypesFor(b.profile, ck.Variant))
+}
+
+// roleCellCountsLocked sums a combo's per-role temporal counts. The comboKey is
+// deliberately role-free; role is a cell dimension, so target/linkpath roles
+// still share one DCT combo and one root execution.
+func (b *coverageBoard) roleCellCountsLocked(ck comboKey, forms []cellForm, typeList []bool) [2]int {
+	total := b.computeCellTotalLocked(forms, typeList)
+	var out [2]int
+	for _, role := range cellRolesForCombo(ck) {
+		counts := temporalCellCountsForRole(ck, total, role)
+		out[0] += counts[0]
+		out[1] += counts[1]
+	}
+	return out
 }
 
 // depthMultiplierLocked returns the number of depth/persist combinations in
@@ -711,10 +817,22 @@ func temporalCellCounts(ck comboKey, total int) [2]int {
 	return [2]int{hb, cc}
 }
 
-// computeCellCountLocked computes per-temporal cell counts arithmetically (no
-// cell enumeration). Open forms (hasType=false) expand over typeList; pinned
-// fresh-fresh forms contribute exactly one type each. The caller must hold mu.
-func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, typeList []bool) [2]int {
+// temporalCellCountsForRole applies the linkpath role's HB-only rule on top of
+// the shared temporal gate. The target/default role keeps the existing CC+HB
+// form; the linkpath role can only be observed when link/symlink is the HB A
+// side, so its CC cell must never enter the model or plannable potential.
+func temporalCellCountsForRole(ck comboKey, total int, role cellRole) [2]int {
+	if isLinkPathCellRole(role) {
+		return [2]int{total, 0}
+	}
+	return temporalCellCounts(ck, total)
+}
+
+// computeCellTotalLocked computes the number of B-side cells before the
+// temporal modifier gate. Open forms (hasType=false) expand over typeList;
+// pinned fresh-fresh forms contribute exactly one type each. The caller must
+// hold mu.
+func (b *coverageBoard) computeCellTotalLocked(forms []cellForm, typeList []bool) int {
 	typeCount := 0
 	for _, f := range forms {
 		if f.hasType {
@@ -723,8 +841,13 @@ func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, ty
 			typeCount += len(typeList)
 		}
 	}
-	total := typeCount * b.depthMultiplierLocked()
-	return temporalCellCounts(ck, total)
+	return typeCount * b.depthMultiplierLocked()
+}
+
+// computeCellCountLocked computes per-temporal cell counts arithmetically (no
+// cell enumeration) for role-free callers.
+func (b *coverageBoard) computeCellCountLocked(ck comboKey, forms []cellForm, typeList []bool) [2]int {
+	return temporalCellCounts(ck, b.computeCellTotalLocked(forms, typeList))
 }
 
 // cellKeyOf maps a pair onto its coverage cell. persistDir is the run's
@@ -754,6 +877,7 @@ func cellKeyOf(p *DAGPair, persistDir string) (cellKey, bool) {
 		DepthB:   DepthBucketOf(bPath),
 		TypeB:    pairPathIsDir(p.B, p.BPathType),
 		PersistB: pathInDir(bPath, persistDir),
+		Role:     pairCellRole(p),
 	}
 	return ck, true
 }
@@ -859,6 +983,12 @@ func (b *coverageBoard) markDiscoveredLocked(ck cellKey) {
 // b.mu.
 func (b *coverageBoard) cellInModel(ck cellKey) bool {
 	ckm := comboKey{Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel}
+	if !cellRoleAllowedForCombo(ckm, ck.Role) {
+		return false
+	}
+	if isLinkPathCellRole(ck.Role) && ck.Temporal != TemporalHB {
+		return false
+	}
 	prod, ok := b.producible[ckm]
 	if !ok {
 		return false
@@ -883,6 +1013,12 @@ func (b *coverageBoard) cellInPlannable(ck cellKey) bool {
 	}
 	ckm := comboKey{Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel}
 	if !b.directedPairComboEnabled(ckm) {
+		return false
+	}
+	if !cellRoleAllowedForCombo(ckm, ck.Role) {
+		return false
+	}
+	if isLinkPathCellRole(ck.Role) && ck.Temporal != TemporalHB {
 		return false
 	}
 	prod, ok := b.plannable[ckm]
@@ -1164,7 +1300,7 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 	if nd == 0 {
 		return
 	}
-	emit := func(ret RetBucket, off uint64, isDir bool) {
+	emit := func(role cellRole, ret RetBucket, off uint64, isDir bool) {
 		for i := 0; i < nd; i++ {
 			depth := depthList[i]
 			persists := [2]bool{false}
@@ -1178,10 +1314,14 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 					if prod[t] == 0 {
 						continue
 					}
+					if isLinkPathCellRole(role) && TemporalRel(t) != TemporalHB {
+						continue
+					}
 					cell := cellKey{
 						Root: ck.Root, Variant: ck.Variant, Rel: ck.Rel,
 						Temporal: TemporalRel(t), RetA: RetSuccess, RetB: ret,
 						OffB: off, PersistB: persists[pi], DepthB: depth, TypeB: isDir,
+						Role: role,
 					}
 					if b.discovered[cell] != 0 || b.cellUnreachable[cell] {
 						continue
@@ -1192,14 +1332,18 @@ func (b *coverageBoard) forEachUncoveredCellKey(ck comboKey, fn func(cell cellKe
 		}
 	}
 	if freshForms, ok := plannableFreshSameFormsFor(b.profile, ck); ok {
-		for _, fp := range freshForms {
-			emit(fp.ret, fp.off, fp.isDir)
+		for _, role := range cellRolesForCombo(ck) {
+			for _, fp := range freshForms {
+				emit(role, fp.ret, fp.off, fp.isDir)
+			}
 		}
 		return
 	}
-	for _, form := range plannableFormsFor(b.profile, ck.Variant) {
-		for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
-			emit(form.ret, form.off, isDir)
+	for _, role := range cellRolesForCombo(ck) {
+		for _, form := range plannableFormsFor(b.profile, ck.Variant) {
+			for _, isDir := range producibleTypesFor(b.profile, ck.Variant) {
+				emit(role, form.ret, form.off, isDir)
+			}
 		}
 	}
 }

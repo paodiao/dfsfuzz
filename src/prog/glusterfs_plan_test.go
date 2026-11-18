@@ -36,8 +36,8 @@ func TestGlusterfsPlanProfileLists(t *testing.T) {
 			t.Fatalf("directed variants missing %q", want)
 		}
 	}
-	if profile.DualPathCausalEnabled() {
-		t.Fatal("GlusterFS v1 must keep causal dual-path insertion disabled")
+	if !profile.DualPathCausalEnabled() {
+		t.Fatal("GlusterFS must enable causal dual-path insertion")
 	}
 }
 
@@ -189,11 +189,13 @@ func TestValidateCausalPlanReadlink(t *testing.T) {
 			PersistB: false,
 			DepthB:   DepthBucketOf(linkPath),
 			TypeB:    false,
+			Role:     cellRoleSymlinkLinkPath,
 		},
-		BaseA:        "dirA/a",
-		BaseB:        linkPath,
-		RootLinkPath: linkPath,
-		Causal:       true,
+		BaseA:            "dirA/a",
+		BaseB:            linkPath,
+		RootLinkPath:     linkPath,
+		RootRelationPath: linkPath,
+		Causal:           true,
 	}
 	if !validateCausalPlan(hmcfg, lcs, plan) {
 		t.Fatal("valid readlink C2 plan rejected")
@@ -264,6 +266,7 @@ func TestValidateCausalPlanLinkpathRole(t *testing.T) {
 			PersistB: pathInDir(targetPath, hmcfg.Persistence_dir),
 			DepthB:   DepthBucketOf(targetPath),
 			TypeB:    node.Type != NodeTypeFile,
+			Role:     cellRoleLinkPath,
 		},
 		BaseA:            targetPath,
 		BaseB:            targetPath,
@@ -315,6 +318,10 @@ func TestCausalC2LinkpathRoleHBOnly(t *testing.T) {
 		}
 		if p.Cell.Temporal != TemporalHB {
 			t.Fatalf("linkpath-role plan has non-HB temporal: %+v", p)
+		}
+		if p.Cell.Role != cellRoleSymlinkLinkPath {
+			t.Fatalf("linkpath-role plan cell role = %v, want symlink-linkpath: %+v",
+				p.Cell.Role, p)
 		}
 	}
 
@@ -395,16 +402,19 @@ func TestGlusterfsCollectCausalDualRoots(t *testing.T) {
 }
 
 func TestGlusterfsDirectedDualRootGate(t *testing.T) {
-	if directedVariantAllowed(glusterfsProfile, "link", "open") {
-		t.Fatal("GlusterFS v1 must not plan a link root while dual-path causal is disabled")
+	if !directedVariantAllowed(glusterfsProfile, "link", "open") {
+		t.Fatal("GlusterFS must plan a link root with dual-path causal enabled")
 	}
-	if directedVariantAllowed(glusterfsProfile, "symlink", "open") {
-		t.Fatal("GlusterFS v1 must not plan a symlink root while dual-path causal is disabled")
+	if !directedVariantAllowed(glusterfsProfile, "symlink", "open") {
+		t.Fatal("GlusterFS must plan a symlink root with dual-path causal enabled")
 	}
 	gp := *glusterfsProfile
-	gp.Plan.DualPathCausalEnabled = true
-	if !directedVariantAllowed(&gp, "link", "open") {
-		t.Fatal("enabled dual-path profile should allow a link root")
+	gp.Plan.DualPathCausalEnabled = false
+	if directedVariantAllowed(&gp, "link", "open") {
+		t.Fatal("disabled dual-path profile must not plan a link root")
+	}
+	if directedVariantAllowed(&gp, "symlink", "open") {
+		t.Fatal("disabled dual-path profile must not plan a symlink root")
 	}
 	if directedVariantAllowed(&gp, "open", "readlink") {
 		t.Fatal("readlink must only follow a symlink root")

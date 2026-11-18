@@ -36,10 +36,14 @@ func glusterfsCoverageBaseProgs(target *Target) []*Prog {
 
 func glusterfsCoverageCell(root, variant string, rel PathRelation, temporal TemporalRel,
 	ret RetBucket, off uint64, isDir bool) cellKey {
+	role := cellRoleNone
+	if root == "symlink" && variant == "readlink" {
+		role = cellRoleSymlinkLinkPath
+	}
 	return cellKey{
 		Root: root, Variant: variant, Rel: rel, Temporal: temporal,
 		RetA: RetSuccess, RetB: ret, OffB: off, PersistB: false,
-		DepthB: 1, TypeB: isDir,
+		DepthB: 1, TypeB: isDir, Role: role,
 	}
 }
 
@@ -503,9 +507,19 @@ func TestGlusterfsNormalDualRootPlans(t *testing.T) {
 		if !p.Causal || p.BaseA == "" || p.RootLinkPath == "" {
 			t.Fatalf("malformed normal dual plan: %+v", p)
 		}
-		if p.RootRelationPath == p.RootLinkPath && p.RootRelationPath != p.BaseA &&
-			p.Cell.Temporal != TemporalHB {
+		linkPathRole := p.RootRelationPath == p.RootLinkPath && p.RootRelationPath != p.BaseA
+		if linkPathRole && p.Cell.Temporal != TemporalHB {
 			t.Fatalf("normal dual linkpath-role plan is not HB: %+v", p)
+		}
+		wantRole := cellRoleNone
+		if p.Cell.Combo.Variant == "readlink" {
+			wantRole = cellRoleSymlinkLinkPath
+		} else if linkPathRole {
+			wantRole = linkPathCellRole(root)
+		}
+		if p.Cell.Role != wantRole {
+			t.Fatalf("normal dual %s role = %v, want %v: %+v",
+				root, p.Cell.Role, wantRole, p)
 		}
 		if GetParentDir(p.BaseA) != GetParentDir(p.RootLinkPath) {
 			t.Fatalf("linkpath %q is not next to target %q", p.RootLinkPath, p.BaseA)
