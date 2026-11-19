@@ -82,13 +82,13 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P1-B6 | fixed | `GetParentDir` 对顶层路径产生 `"./..."`；`joinTestPath(".", name)`/`freshChildPath(".",...)` 生成 `"./mut_dir_x"`，DAG/coverage/freshKinds 字符串不一致 | `distributed_choice.go:2318,2375-2380`；`mutation.go:5121,5365`；`rand.go:2889`；`seed_derivation.go:291-292` | `joinTestPath` 把 `.` 当 root；生成点用 `parentDirOrRoot`；`pickRenameSrcDir` 支持 GlusterFS 顶层；fresh map key 归一；`GetParentDir` 本身不改 |
 | P1-B7 | deferred | PathSet 可生成 `rename(src, src)` no-op | `path_set.go:1107-1140,1011-1021` | `pathRoleRenameDst` 拒绝 dst==src；fallback 排除 source |
 | P1-B8 | deferred | derived readlink variant 允许 CC；root symlink 是 modifier，50% CC，readlink 在 root 前执行 → ENOENT | `mutation.go:5314,5322-5340,5350-5355`；`distributed_choice.go:1975-1983` | readlink variant 强制 `TemporalHB`/`rootEnd` |
-| P1-B9 | test-only | `dctBaseCandidatesFor` 包含 insertPos 之后的 creator / 已删除路径；当前仅测试调用 `insertCallFromDCT` | `mutation.go:4622-4682` | 只收 `before` 或现有节点；跳过成功删除；或删除死函数 |
-| P1-B10 | latent | FailurePolicy rename ENOTEMPTY 硬编码 same-parent；GlusterFS cross-parent ENOTEMPTY 不构造 | `mutation.go:3688-3695,3728-3751` | 走 RenamePolicy 或允许 cross-parent source |
-| P1-B11 | latent | `NewLayeredChoiceStrategy` choice table 用 `hmcfg.Profile` 而非 `profileOrDefault()`；`Profile=nil` 的 GlusterFS config 得到 HMDFS ChoiceCalls | `distributed_choice.go:2085-2090` | 用已计算的 profile |
-| P1-B12 | confirmed | `IsFdRequiredCall("readlink")` 被 `"read"` 子串命中；readlink 被当 fd call，timing 回退 index 对齐 | `distributed_choice.go:108-115`；`hmdfs_values.go:489-490` | 精确匹配/profile `FdRequiredCalls` |
-| P1-B13 | latent | PathSet generic member 不排除 linkpath；`stat/open/chmod` 若路径是 symlink linkpath，PathSet 可迁移 consumer | `path_set.go:492-535` vs `332-455` | tracked profile 下检查 `freshLinkPathsBefore` |
-| P1-B14 | latent | cross-program fresh parent 不要求 mkdir 成功；失败 mkdir 被当 soft parent | `path_set.go:1595-1608` | 要求 `mkdir.CheckInfo.Retv==0` |
-| P1-B15 | confirmed | PathSet rename source 是 fresh path 时永远 `pathExisting`；fresh rename source 无 tree node，plan 被拒 | `path_set.go:466-470,1009-1010` | 绑定 creator，允许 fresh src |
+| P1-B9 | fixed | `dctBaseCandidatesFor` 包含 insertPos 之后的 creator / 已删除路径；当前仅测试调用 `insertCallFromDCT` | `mutation.go:4622-4682` | 保留函数并修 filter：用 tracking copy 的 `freshPathKindsBefore`/`freshPathAbsentBefore`/`freshLinkPathsBefore` 做存在性过滤；签名加 `ft`；去重 |
+| P1-B10 | fixed | FailurePolicy rename ENOTEMPTY 硬编码 same-parent；GlusterFS cross-parent ENOTEMPTY 不构造 | `mutation.go:3688-3695,3728-3751` | `pickRenameSrcDir` 加 profile：HMDFS same-parent，GlusterFS 允许 cross-parent（排除 dst 自身/子树/祖先）；`applyFailureShape` 传 profile |
+| P1-B11 | fixed | `NewLayeredChoiceStrategy` choice table 用 `hmcfg.Profile` 而非 `profileOrDefault()`；`Profile=nil` 的 GlusterFS config 得到 HMDFS ChoiceCalls | `distributed_choice.go:2085-2090` | 用已计算的 `profile.Calls.ChoiceCalls` |
+| P1-B12 | fixed | `IsFdRequiredCall("readlink")` 被 `"read"` 子串命中；readlink 被当 fd call，timing 回退 index 对齐 | `distributed_choice.go:108-115`；`hmdfs_values.go:489-490` | 改精确匹配；回归测试覆盖 readlink/read/pread64 |
+| P1-B13 | fixed | PathSet generic member 不排除 linkpath；`stat/open/chmod` 若路径是 symlink linkpath，PathSet 可迁移 consumer | `path_set.go:492-535` vs `332-455` | tracked profile 下 generic branch 先查 `freshLinkPathsBefore`，linkpath 不进 PathSet |
+| P1-B14 | fixed | cross-program fresh parent 不要求 mkdir 成功；失败 mkdir 被当 soft parent | `path_set.go:1595-1608` | `callReturnedSuccess(mkdir)`；同程序 nil CheckInfo 保留 assume-success，跨程序 nil CheckInfo 保持拒绝；`pathSetFreshParentCreated` 同步补成功检查 |
+| P1-B15 | fixed | PathSet rename source 是 fresh path 时永远 `pathExisting`；fresh rename source 无 tree node，plan 被拒 | `path_set.go:466-470,1009-1010` | source 绑定 creator：`Kind: pathFresh`、`CurrentKind`、`HasCreator`/`CreatorPos`；validator 允许 fresh src；plan creator-binding 纳入 `pathRoleRenameSrc` |
 
 2026-11-19 修复记录：P1-B1/B2/B3/B4/B5/B6 已落地（B5a 已在前一轮修复）。
 
@@ -100,6 +100,18 @@ out-of-scope              不属于本轮 GlusterFS 适配
 - B5 hardening（review follow-up）：`findAnchorCreator` 的扫描方向按 `TracksPathState()` 分流（HMDFS first-wins，GlusterFS latest-wins）；`anchorCreatorKind` 跳过 `Retv<0` 的失败 creator（即使 `requireSuccess=false`）；hardlink anchor 要求 target 存在且为普通文件；`freshPathAbsentBefore`/`freshRenameEventsBefore`/`freshPathCreatorBefore` 改用 `profile.Tree.Prefix` 归一。
 - B6：`joinTestPath(".")` 归一为 root；mkdir sibling 生成点用 `parentDirOrRoot`；`pickRenameSrcDir` 支持 GlusterFS 顶层；`freshPathKindsBefore`/`freshLinkPathsBefore`/`freshPathAbsentBefore`/`freshRenameEventsBefore`/`freshPathCreatorBefore` 的 key 归一；`GetParentDir` 本身不改，避免影响 DAG SameParent。
 - 回归测试：`TestDepthBucketOfRelative`、`TestGlusterfsTopLevelBucketSelection`、`TestGlusterfsCoverageDepths`、`TestPathSetTargetLevelGlusterfsTopLevel`、`TestDerivedRootCallPathsDualNone`、`TestGetPathsForRenameVariantUsesProfilePolicy`、`TestMapPathSetBasePath`、`TestPathSetBaseCandidateOK`、`TestPathPlanChangesPaths`、`TestBuildPathPlanBroadMapping`、`TestClassifyAnchorPathRejectsDeletedPath`、`TestClassifyAnchorPathAcceptsCreatorAnchor`、`TestClassifyAnchorPathRecreatedType`、`TestBuildPathMembersSkipsDeletedRenameSource`、`TestJoinTestPathRoot`、`TestFreshPathKindsCanonical`、`TestFreshPathAbsentCanonical`、`TestFindAnchorCreatorLegacyFirstCreator`、`TestFindAnchorCreatorSkipsFailedLatestCreator`、`TestClassifyAnchorPathRejectsDeletedLinkTarget`、`TestClassifyAnchorPathRejectsDirLinkTarget`、`TestClassifyAnchorPathAcceptsFileLinkTarget`、`TestFreshPathAbsentPrefixedProfile`。
+- 验证：`gofmt`、`GOOS=linux GOARCH=amd64 go test -c ./prog`、`go test -c ./syz-fuzzer`、`go vet ./prog ./syz-fuzzer` 通过；Linux 3-3 运行时待跑。
+
+2026-11-19 修复记录：P1-B9/B10/B11/B12/B13/B14/B15 已落地。
+
+- B9：保留 `dctBaseCandidatesFor` 并修 filter；用 tracking copy 的 `freshPathKindsBefore`/`freshPathAbsentBefore`/`freshLinkPathsBefore` 只收 insertPos 时刻存在的路径（baseline、in-program creator、linkpath），排除已删除/已 rename 走/尚未创建的路径；签名加 `ft`，去重。
+- B10：`pickRenameSrcDir` 加 profile；HMDFS 仍 same-parent，GlusterFS 允许 cross-parent，排除 dst 自身/子树/祖先（这些形状 EINVAL，到不了 ENOTEMPTY）。
+- B11：`NewLayeredChoiceStrategy` 的 choice table 改用已计算的 `profile.Calls.ChoiceCalls`，`Profile=nil` 的 GlusterFS config 不再回退到 HMDFS ChoiceCalls。
+- B12：`IsFdRequiredCall` 改精确匹配，`readlink` 不再被 `"read"` 子串命中。
+- B13：tracked profile 的 generic PathSet member 先查 `freshLinkPathsBefore`，symlink/hardlink linkpath 不再进入 PathSet。
+- B14：`pathSetPlanParentValid`/`pathSetFreshParentCreated` 要求 mkdir 成功（`callReturnedSuccess`）；同程序 nil CheckInfo 保留 assume-success，跨程序 nil CheckInfo 保持拒绝。
+- B15：`buildPathMembers` 的 rename source 绑定 creator（`Kind: pathFresh`、`CurrentKind`、`HasCreator`/`CreatorPos`）；`pathSetSpecValidWithParent` 允许 fresh src；plan creator-binding 循环纳入 `pathRoleRenameSrc`，creator 与 source 必须映射到同一路径。
+- 回归测试：`TestDctBaseCandidatesRenameProfile`（HMDFS 期望改为 dst）、`TestDctBaseCandidatesLinkRoles`、`TestDctBaseCandidatesExistenceFilter`、`TestPickRenameSrcDirProfilePolicy`、`TestLayeredChoiceStrategyProfileNilGlusterfsChoice`、`TestIsFdRequiredCallExactMatch`、`TestBuildPathMembersSkipsLinkPath`、`TestPathSetFreshParentCreatedSuccess`、`TestPathSetPlanParentMkdirSuccess`、`TestPathSetPlanParentCrossProgramMkdirSuccess`、`TestBuildPathMembersFreshRenameSource`、`TestValidatePathSetPlanFreshRenameSource`。
 - 验证：`gofmt`、`GOOS=linux GOARCH=amd64 go test -c ./prog`、`go test -c ./syz-fuzzer`、`go vet ./prog ./syz-fuzzer` 通过；Linux 3-3 运行时待跑。
 
 ### P1-C Tracer / parser
@@ -267,6 +279,29 @@ P1-B5:
 
 P1-B6:
   TestJoinTestPathRoot / TestFreshPathKindsCanonical / TestFreshPathAbsentCanonical
+
+P1-B9:
+  TestDctBaseCandidatesExistenceFilter / TestDctBaseCandidatesRenameProfile /
+  TestDctBaseCandidatesLinkRoles
+
+P1-B10:
+  TestPickRenameSrcDirProfilePolicy
+
+P1-B11:
+  TestLayeredChoiceStrategyProfileNilGlusterfsChoice
+
+P1-B12:
+  TestIsFdRequiredCallExactMatch
+
+P1-B13:
+  TestBuildPathMembersSkipsLinkPath
+
+P1-B14:
+  TestPathSetFreshParentCreatedSuccess / TestPathSetPlanParentMkdirSuccess /
+  TestPathSetPlanParentCrossProgramMkdirSuccess
+
+P1-B15:
+  TestBuildPathMembersFreshRenameSource / TestValidatePathSetPlanFreshRenameSource
 
 P1-C1:
   truncate/pread/pwrite bucket 与观测一致
