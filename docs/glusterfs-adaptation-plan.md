@@ -6,6 +6,8 @@
 > 日期：2026-11-15（2026-11-18 更新 P2 收口、PathSet current state /
 > creator binding / rename prefix remap、role-aware coverage、dual-path gate）
 > 范围：GlusterFS 3 server + 3 client、replica 3；HMDFS 行为保持不变；NFS 暂不实现
+> `fuzz-config/all-config/glusterfs` 下的 2-1/3-1/3-2/6-1/6-2 是原版 Monarch 矩阵，
+> 不是本计划 v1 的目标配置；v1 使用单独的 3-3 config。
 > 权威关系：本文是 GlusterFS 适配的总入口。tracer 的 BPF 原始细节参考
 > `docs/glusterfs-tracer-implementation-spec.md`；两者冲突时以本文为准。
 > 相关：`docs/glusterfs-config-and-scripts.md`、`docs/executor-file-tree-restore.md`、

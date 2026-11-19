@@ -7,6 +7,11 @@
 > prefill/restore、node-up/node-down、mount 选项
 > 相关：`docs/glusterfs-adaptation-plan.md`、`docs/executor-file-tree-restore.md`
 
+> 配置来源：`fuzz-config/all-config/glusterfs` 是原版 Monarch 的多拓扑矩阵
+> （2-1/3-1/3-2/6-1/6-2；distributed/disperse/replica），不是本计划 v1 的目标。
+> v1 使用单独的新 config（§1），固定 `server_num=3`、`fuzzing_vms=6`、
+> `dfs_setup_params="3 3 'replica 3'"`。
+
 ## 0. 结论摘要
 
 - `enable_syscalls` 固定为 22 个（见 §1）；不启用
@@ -38,12 +43,16 @@
 [ ] /root/.ssh/authorized_keys      focal.id_rsa.pub
 [ ] ssh -i focal.id_rsa root@VM     可登录
 [ ] eifuzz_root                     不预置，由首轮 restore 创建
+[ ] 不要直接复用 fuzz-config/all-config/glusterfs 下的原版矩阵配置
+[ ] 复用 VM 时确认 test-volume 是 replica 3；旧 mode 先 gluster volume stop/delete test-volume
 ```
 
 当前没有独立 `prefill.sh`；首轮 `receive_execute` 的 `restore_initial_file_tree()`
 由 reset client 执行，等价于 prefill。不再依赖 manager 复制 prefill 脚本。
 
 ## 1. 3-3 config
+
+下面的 3-3 config 是我们自己的 v1 模板；`all-config/glusterfs` 下的配置仅作原版 Monarch 参考。
 
 新增 GlusterFS 3-3 normal 配置，例如：
 

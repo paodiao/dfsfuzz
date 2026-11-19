@@ -155,6 +155,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 - E1：executor 的 node-up 调用按 DFS 分支；HMDFS 保留 params quote，GlusterFS/NFS 恢复原版 unquoted 5 参数契约；`glusterfs-node-up.sh` 的 5 参数接口不变。
 - E2：新增 `pkg/glusterfsconfig` canonical 校验；`mgrconfig.Complete` 和 `loadGlusterfsConfig` 都要求 3 server / 3 client / 6 VMs / `3 3 'replica 3'`；config 脚本 volume create/start 检查退出码并做幂等保护。
+- E2 范围：`fuzz-config/all-config/glusterfs` 是原版 Monarch 的 2-1/3-1/3-2/6-1/6-2 矩阵，不是 v1 目标；v1 使用单独的 3-3 config，E2 校验只针对该配置。
 - E4：`DfsRuntimeOps::init_trace` 返回 bool；`init_glusterfs_trace` 失败返回 0；executor fail-fast；HMDFS wrapper 保持 true。
 - E5：config/node-up 脚本检查 mount/volume 退出码；client mount 逐个 wait；executor 检查 popen/pclose。正常 restore 不加 statfs；startup 后 mount 消失仍按原版风险接受。
 - 回归测试：`TestValidateV1`、`TestLoadGlusterfsConfigRequiresThreeClients`；C++ `make executor` / `make glusterfs-trace-test` 待 3-3；mount 失败和 trace init 失败需 3-3 注入验证。
