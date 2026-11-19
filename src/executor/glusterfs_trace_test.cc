@@ -15,6 +15,9 @@
  * Commands:
  *   Enter / c : drain rings, print raw events (with --raw) and final events
  *   q / quit  : exit
+ *
+ * Options:
+ *   --self-test : run the LOOKUP path/event checks and exit
  */
 
 #include <algorithm>
@@ -240,10 +243,151 @@ static void collect(bool raw)
 	g_final_events.clear();
 }
 
+static int run_lookup_path_tests(void)
+{
+	int failures = 0;
+	auto expect = [&](const char *path, bool out_of_root, uint32_t truncated,
+			  bool want) {
+		bool ok = lookup_event_path_ok(path, out_of_root, truncated);
+		if (ok != want) {
+			fprintf(stderr,
+				"lookup_event_path_ok(%s,out=%d,trunc=%u) = %d, want %d\n",
+				path, out_of_root, truncated, ok, want);
+			failures++;
+		}
+	};
+	expect("dirA/a", false, 0, true);   // resolved child path
+	expect("a", false, 0, true);        // top-level child
+	expect("", false, 0, false);        // missing R path
+	expect("dirA/a", true, 0, false);   // out-of-root
+	expect("dirA/a", false, 1, false);  // path truncated
+	expect("dirA/a", false, 2, true);   // path2 bit is irrelevant to LOOKUP
+	expect("dirA/a", false, 4, true);   // xattr bit is irrelevant to LOOKUP
+	return failures;
+}
+
+/* run_event_tests drives process_merged_events with synthetic D/R/S rings.
+ * The LOOKUP cases pin the C2 rule: loc.path is the child path and a missing
+ * path must never fall back to the parent nodeid map. */
+static int run_event_tests(void)
+{
+	int failures = 0;
+	auto reset = []() {
+		ctl_read_buf.clear();
+		path_read_buf.clear();
+		g_pending.clear();
+		g_nodeid_path.clear();
+		g_final_events.clear();
+		g_missing_d = 0;
+		g_missing_r = 0;
+		g_missing_s = 0;
+		g_drop_xattr = 0;
+		g_drop_lookup = 0;
+		g_out_of_root = 0;
+		g_path2_out_of_root = 0;
+		g_unmapped_opcode = 0;
+		g_dropped_events = 0;
+	};
+	auto add_ctl = [](uint64_t ts, uint64_t unique, uint32_t phase,
+			  uint32_t opcode, uint64_t nodeid) {
+		struct glusterfs_ctl_event e = {};
+		e.ts = ts;
+		e.unique = unique;
+		e.phase = phase;
+		e.opcode = opcode;
+		e.nodeid = nodeid;
+		ctl_read_buf.push_back(e);
+	};
+	auto add_path = [](uint64_t ts, uint64_t unique, const char *path,
+			   uint32_t truncated) {
+		struct glusterfs_path_event e = {};
+		e.ts = ts;
+		e.unique = unique;
+		e.truncated = truncated;
+		if (path != nullptr) {
+			e.path_len = (uint32_t)strlen(path);
+			memcpy(e.path, path, e.path_len);
+		}
+		path_read_buf.push_back(e);
+	};
+	auto check = [&](const char *name, bool cond) {
+		if (!cond) {
+			fprintf(stderr, "event self-test %s failed\n", name);
+			failures++;
+		}
+	};
+	auto final_path = [](size_t i) {
+		return field_text(g_final_events[i].path,
+				  g_final_events[i].path_len,
+				  GLUSTERFS_TRACE_PATH_MAX);
+	};
+
+	// Valid LOOKUP: loc.path is used as-is, no extra name append.
+	reset();
+	add_ctl(100, 1, 0, GF_OP_LOOKUP, 0x100);
+	add_path(150, 1, "dirA/a", 0);
+	add_ctl(200, 1, 1, GF_OP_LOOKUP, 0x100);
+	process_merged_events();
+	check("lookup valid count", g_final_events.size() == 1);
+	check("lookup valid path", g_final_events.size() == 1 &&
+	      final_path(0) == "dirA/a");
+	check("lookup valid no drop", g_drop_lookup == 0);
+
+	// Missing LOOKUP path: the nodeid map holds the parent and must not be
+	// used as the child path.
+	reset();
+	g_nodeid_path[0x100] = "dirA";
+	add_ctl(100, 2, 0, GF_OP_LOOKUP, 0x100);
+	add_ctl(200, 2, 1, GF_OP_LOOKUP, 0x100);
+	process_merged_events();
+	check("lookup missing path count", g_final_events.empty());
+	check("lookup missing path drop", g_drop_lookup == 1);
+
+	// Non-LOOKUP target-inode opcode keeps the nodeid fallback.
+	reset();
+	g_nodeid_path[0x100] = "dirA";
+	add_ctl(100, 3, 0, GF_OP_GETATTR, 0x100);
+	add_ctl(200, 3, 1, GF_OP_GETATTR, 0x100);
+	process_merged_events();
+	check("getattr fallback count", g_final_events.size() == 1);
+	check("getattr fallback path", g_final_events.size() == 1 &&
+	      final_path(0) == "dirA");
+
+	// Out-of-root LOOKUP path is dropped.
+	reset();
+	add_ctl(100, 4, 0, GF_OP_LOOKUP, 0x100);
+	add_path(150, 4, ".glusterfs/x", 0);
+	add_ctl(200, 4, 1, GF_OP_LOOKUP, 0x100);
+	process_merged_events();
+	check("lookup out-of-root count", g_final_events.empty());
+	check("lookup out-of-root drop", g_drop_lookup == 1);
+
+	// Truncated LOOKUP path is dropped.
+	reset();
+	add_ctl(100, 5, 0, GF_OP_LOOKUP, 0x100);
+	add_path(150, 5, "dirA/a", 1);
+	add_ctl(200, 5, 1, GF_OP_LOOKUP, 0x100);
+	process_merged_events();
+	check("lookup truncated count", g_final_events.empty());
+	check("lookup truncated drop", g_drop_lookup == 1);
+
+	return failures;
+}
+
+static int run_self_tests(void)
+{
+	int failures = run_lookup_path_tests() + run_event_tests();
+	if (failures == 0)
+		printf("glusterfs-trace self-test: PASS\n");
+	else
+		printf("glusterfs-trace self-test: FAIL (%d)\n", failures);
+	return failures == 0 ? 0 : 1;
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s [--fuse-so PATH] [--trace-root PATH] [--raw]\n"
+		"usage: %s [--fuse-so PATH] [--trace-root PATH] [--raw] [--self-test]\n"
 		"  default fuse.so: "
 		"/usr/local/lib/glusterfs/11dev/xlator/mount/fuse.so\n"
 		"  default trace-root: eifuzz_root (relative to mount root)\n",
@@ -266,6 +410,8 @@ int main(int argc, char **argv)
 			trace_root = argv[++i];
 		} else if (!strcmp(argv[i], "--raw")) {
 			raw = true;
+		} else if (!strcmp(argv[i], "--self-test")) {
+			return run_self_tests();
 		} else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
 			usage(argv[0]);
 			return 0;
