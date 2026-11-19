@@ -73,13 +73,13 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 | ID | 状态 | 问题 | 位置 | 处理方向 |
 |---|---|---|---|---|
-| P1-B1 | confirmed | depth bucket 用全局 `DepthBucketOf`，GlusterFS 顶层节点 bucket 0 被 `pickByBucket` 丢掉；DCT seed/pattern base 退化，coverage/directed depth-0 也被 `depths[0]=0` 排除 | `distributed_choice.go:872,914,252-258`；`coverage_board.go` depth 初始化；`path_set.go:712`；`mutation.go:3079` | 用 `ft.DepthBucketOf`；空 prefix 下不要强制清零 bucket 0；`countDagDepthBucket` 支持 bucket 0 |
-| P1-B2 | confirmed | derived setxattr root 把文件路径当 xattr name；`RootPaths.Dest()` 对 DualNone 返回 `PostPath=path` | `mutation.go:5220-5222,5271-5284`；`dual_path.go:46-55`；`seed_derivation.go:92,362-363`；`rand.go:3352-3357` | `rp.Kind==DualNone` 时 `basePath2=""`，让 `randomXattrName` 生效；或 setxattr 特判 shared key |
-| P1-B3 | confirmed | rename variant 绕过 profile RenamePolicy；`GetPathsForRenameVariant` → `pickRenameDst` → `pickRenameDstPolicy(hmdfsProfile,...)`，GlusterFS 永远 same-parent | `distributed_choice.go:2239-2248,2280-2282`；`mutation.go:5129,5372`；`rand.go:2897` | 改成 `lcs.pickRenameDstFor(src, rel, r)`；HMDFS 保持 wrapper |
-| P1-B4 | confirmed | PathSet broad relocation 用 newBase 当 oldBase 映射；`choosePathSetBase` 丢掉 oldBase，`mapPathSetPath` 得到 `newBase+path` 或 no-op | `path_set.go:811-841,1494-1502,872-875` | 返回 `oldBase/newBase`，用 `oldBase+suffix→newBase+suffix`；拒绝 ancestor newBase，要求至少一个路径变化 |
-| P1-B5 | confirmed | anchor/rename source 不跟踪 in-program unlink/rmdir/rename；FileTree 只保留 baseline，derived root 落在已删除路径；fresh rename source 永远 `pathExisting` | `anchor_path.go:31-38,53-104`；`seed_derivation.go:115-192`；`mutation.go:4570-4612`；`path_set.go:466-470,1009-1010` | anchor/creator 查询加 `freshPathAbsentBefore`/`freshRenameEventsBefore`；rename src 用 `pathSetCreatorState`；至少拒绝 anchor 自身成功删除的路径 |
+| P1-B1 | fixed | depth bucket 用全局 `DepthBucketOf`，GlusterFS 顶层节点 bucket 0 被 `pickByBucket` 丢掉；DCT seed/pattern base 退化，coverage/directed depth-0 也被 `depths[0]=0` 排除 | `distributed_choice.go:872,914,252-258`；`coverage_board.go` depth 初始化；`path_set.go:712`；`mutation.go:3079` | `DepthBucketOf` 统一走 `DepthBucketOfWithPrefix(path, MergeViewPrefix)`；GlusterFS 顶层 = bucket 1，selector/coverage/DAG 同步；`merge_view` 保留为 HMDFS 根别名 |
+| P1-B2 | fixed | derived setxattr root 把文件路径当 xattr name；`RootPaths.Dest()` 对 DualNone 返回 `PostPath=path` | `mutation.go:5220-5222,5271-5284`；`dual_path.go:46-55`；`seed_derivation.go:92,362-363`；`rand.go:3352-3357` | `derivedRootCallPaths` 对 `DualNone` 返回空 `path2`，让 `randomXattrName` 生效 |
+| P1-B3 | fixed | rename variant 绕过 profile RenamePolicy；`GetPathsForRenameVariant` → `pickRenameDst` → `pickRenameDstPolicy(hmdfsProfile,...)`，GlusterFS 永远 same-parent | `distributed_choice.go:2239-2248,2280-2282`；`mutation.go:5129,5372`；`rand.go:2897` | `GetPathsForRenameVariant` 改用 `lcs.pickRenameDstFor(src, rel, r)`；`pickRenameDstPolicy` 用 `parentDirOrRoot`，空 root 不再被当 unset；HMDFS 保持 wrapper |
+| P1-B4 | fixed | PathSet broad relocation 用 newBase 当 oldBase 映射；`choosePathSetBase` 丢掉 oldBase，`mapPathSetPath` 得到 `newBase+path` 或 no-op | `path_set.go:811-841,1494-1502,872-875` | 返回 `oldBase/newBase`，新增 `mapPathSetBasePath`；允许 ancestor newBase，拒绝 descendant/no-op；`pathPlanChangesPaths` 要求至少一个路径变化 |
+| P1-B5 | fixed | anchor/rename source 不跟踪 in-program unlink/rmdir/rename；FileTree 只保留 baseline，derived root 落在已删除路径（fresh rename source 属 P1-B15） | `anchor_path.go:31-38,53-104`；`seed_derivation.go:115-192`；`mutation.go:4570-4612`；`path_set.go:466-470,1009-1010` | anchor/creator 查询加 `freshPathAbsentBefore`/profile；anchor 自身 creator 豁免，latest creator 优先；PathSet rename src absent 时跳过；HMDFS 行为不变 |
 | P1-B5a | fixed | `findAnchorCreator` 的 `requireSuccess` 用 `callSucceeded`（`Retv==0`），成功 `open(O_CREAT)` 返回 fd>0 会被当成失败跳过；`classifyAnchorPath` 看不到这个 fresh anchor | `anchor_path.go:58,122-124` | 改用 `callReturnedSuccess`（`Retv>=0`）；补 `TestFindAnchorCreatorAcceptsOpenCreate` |
-| P1-B6 | confirmed | `GetParentDir` 对顶层路径产生 `"./..."`；`joinTestPath(".", name)`/`freshChildPath(".",...)` 生成 `"./mut_dir_x"`，DAG/coverage/freshKinds 字符串不一致 | `distributed_choice.go:2318,2375-2380`；`mutation.go:5121,5365`；`rand.go:2889`；`seed_derivation.go:291-292` | 统一 `parentDirOrRoot`/canonical join；normalize freshKinds/freshLinks 键 |
+| P1-B6 | fixed | `GetParentDir` 对顶层路径产生 `"./..."`；`joinTestPath(".", name)`/`freshChildPath(".",...)` 生成 `"./mut_dir_x"`，DAG/coverage/freshKinds 字符串不一致 | `distributed_choice.go:2318,2375-2380`；`mutation.go:5121,5365`；`rand.go:2889`；`seed_derivation.go:291-292` | `joinTestPath` 把 `.` 当 root；生成点用 `parentDirOrRoot`；`pickRenameSrcDir` 支持 GlusterFS 顶层；fresh map key 归一；`GetParentDir` 本身不改 |
 | P1-B7 | deferred | PathSet 可生成 `rename(src, src)` no-op | `path_set.go:1107-1140,1011-1021` | `pathRoleRenameDst` 拒绝 dst==src；fallback 排除 source |
 | P1-B8 | deferred | derived readlink variant 允许 CC；root symlink 是 modifier，50% CC，readlink 在 root 前执行 → ENOENT | `mutation.go:5314,5322-5340,5350-5355`；`distributed_choice.go:1975-1983` | readlink variant 强制 `TemporalHB`/`rootEnd` |
 | P1-B9 | test-only | `dctBaseCandidatesFor` 包含 insertPos 之后的 creator / 已删除路径；当前仅测试调用 `insertCallFromDCT` | `mutation.go:4622-4682` | 只收 `before` 或现有节点；跳过成功删除；或删除死函数 |
@@ -89,6 +89,17 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P1-B13 | latent | PathSet generic member 不排除 linkpath；`stat/open/chmod` 若路径是 symlink linkpath，PathSet 可迁移 consumer | `path_set.go:492-535` vs `332-455` | tracked profile 下检查 `freshLinkPathsBefore` |
 | P1-B14 | latent | cross-program fresh parent 不要求 mkdir 成功；失败 mkdir 被当 soft parent | `path_set.go:1595-1608` | 要求 `mkdir.CheckInfo.Retv==0` |
 | P1-B15 | confirmed | PathSet rename source 是 fresh path 时永远 `pathExisting`；fresh rename source 无 tree node，plan 被拒 | `path_set.go:466-470,1009-1010` | 绑定 creator，允许 fresh src |
+
+2026-11-19 修复记录：P1-B1/B2/B3/B4/B5/B6 已落地（B5a 已在前一轮修复）。
+
+- B1：`DepthBucketOf` 统一走 `DepthBucketOfWithPrefix(path, MergeViewPrefix)`，GlusterFS 顶层从 bucket 0 移到 1；selector、coverage `depths`、DAG `featuresOfPairPath`、PathSet/directed target 同步。`merge_view` 保留为 HMDFS 根别名；`ft.DepthBucketOf` 是 collision-free 变体。
+- B2：新增 `derivedRootCallPaths`，`DualNone` 的 `path2` 置空；derived setxattr 使用 `randomXattrName()` 的 `user.*` 名字。
+- B3：`GetPathsForRenameVariant` 改走 `pickRenameDstFor`；`pickRenameDstPolicy` 的 `parent` 用 `parentDirOrRoot`，并移除空 root 的 `targetParent` 回退（`""` 是合法 GlusterFS root）。
+- B4：`choosePathSetBase` 返回 `oldBase/newBase`；新增 `mapPathSetBasePath`、`pathSetBaseCandidateOK`、`pathPlanChangesPaths`；允许 ancestor newBase（上提一层），拒绝 descendant/no-op/root；`buildPathPlan` 用 `oldBase+suffix → newBase+suffix`。
+- B5：`classifyAnchorPath`/`findAnchorCreator`/`anchorSourceIsDir`/`collectSeedAnchors` 增加 profile 参数；GlusterFS 下拒绝 anchor 前已删除的路径，anchor 自身 creator 豁免，latest creator 优先；PathSet rename src 在 absent 时跳过 member。HMDFS `PathStateTracking=false`，保持 baseline-only 行为。
+- B6：`joinTestPath(".")` 归一为 root；mkdir sibling 生成点用 `parentDirOrRoot`；`pickRenameSrcDir` 支持 GlusterFS 顶层；`freshPathKindsBefore`/`freshLinkPathsBefore`/`freshPathAbsentBefore`/`freshRenameEventsBefore`/`freshPathCreatorBefore` 的 key 归一；`GetParentDir` 本身不改，避免影响 DAG SameParent。
+- 回归测试：`TestDepthBucketOfRelative`、`TestGlusterfsTopLevelBucketSelection`、`TestGlusterfsCoverageDepths`、`TestPathSetTargetLevelGlusterfsTopLevel`、`TestDerivedRootCallPathsDualNone`、`TestGetPathsForRenameVariantUsesProfilePolicy`、`TestMapPathSetBasePath`、`TestPathSetBaseCandidateOK`、`TestPathPlanChangesPaths`、`TestBuildPathPlanBroadMapping`、`TestClassifyAnchorPathRejectsDeletedPath`、`TestClassifyAnchorPathAcceptsCreatorAnchor`、`TestClassifyAnchorPathRecreatedType`、`TestBuildPathMembersSkipsDeletedRenameSource`、`TestJoinTestPathRoot`、`TestFreshPathKindsCanonical`、`TestFreshPathAbsentCanonical`。
+- 验证：`gofmt`、`GOOS=linux GOARCH=amd64 go test -c ./prog`、`go test -c ./syz-fuzzer`、`go vet ./prog ./syz-fuzzer` 通过；Linux 3-3 运行时待跑。
 
 ### P1-C Tracer / parser
 
@@ -233,19 +244,25 @@ P1-A4:
   top-level fresh mkdir/creat/link/symlink C1/C2/PathSet 测试
 
 P1-B1:
-  顶层节点 SelectFile/SelectDir + coverage depth 0 + PathSet/directed depth 0
+  TestDepthBucketOfRelative / TestGlusterfsTopLevelBucketSelection /
+  TestGlusterfsCoverageDepths / TestPathSetTargetLevelGlusterfsTopLevel
 
 P1-B2:
-  derived setxattr name 以 user. 开头
+  TestDerivedRootCallPathsDualNone + TestGenerateSpecialCallByName
 
 P1-B3:
-  GlusterFS rename variant cross-parent
+  TestGetPathsForRenameVariantUsesProfilePolicy
 
 P1-B4:
-  broad PathSet oldBase→newBase + 至少一个路径变化
+  TestMapPathSetBasePath / TestPathSetBaseCandidateOK /
+  TestPathPlanChangesPaths / TestBuildPathPlanBroadMapping
 
 P1-B5:
-  unlink/rmdir anchor + fresh rename source
+  TestClassifyAnchorPathRejectsDeletedPath / TestClassifyAnchorPathAcceptsCreatorAnchor /
+  TestClassifyAnchorPathRecreatedType / TestBuildPathMembersSkipsDeletedRenameSource
+
+P1-B6:
+  TestJoinTestPathRoot / TestFreshPathKindsCanonical / TestFreshPathAbsentCanonical
 
 P1-C1:
   truncate/pread/pwrite bucket 与观测一致
