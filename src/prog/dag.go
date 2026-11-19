@@ -156,6 +156,7 @@ type DagDiag struct {
 	MatchFailed     int   // events dropped because no call window matched
 	ProgIdxBad      int   // events dropped because ProgIdx is out of range
 	PathEmpty       int   // events dropped because the path could not be resolved
+	PathTruncated   int   // GlusterFS events dropped because path/path2 was truncated
 	PerNodeVertices []int // vertices per ProgIdx (node)
 	// Function-level breakdown (indexed by FuncID 0..20).
 	PerFuncVertices [FuncCount]int // matched vertices per FuncID
@@ -334,6 +335,14 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		if glusterfs && hmcfg.Serv_num > 0 && ev.ProgIdx < hmcfg.Serv_num {
 			// GlusterFS server programs do not attach uprobes; any server
 			// ProgIdx in a malformed event is not a client observation.
+			continue
+		}
+		if ev.Truncated&3 != 0 {
+			// The tracer records the bitmap in the final GlusterFS wire event.
+			// bit0 is the path and bit1 is path2; either one makes the vertex
+			// path unsafe. bit2 only truncates the xattr name, which is not a
+			// DAG path, so it does not drop the event.
+			diag.PathTruncated++
 			continue
 		}
 		p := ps[ev.ProgIdx]
