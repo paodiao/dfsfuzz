@@ -96,3 +96,31 @@ func TestC2VariantAllowedAfterEffect(t *testing.T) {
 		t.Fatal("fresh-B under the move destination parent rejected")
 	}
 }
+
+func TestPathEffectNormalizesDotPaths(t *testing.T) {
+	ft := NewFileTreeWithPrefix("")
+	ft.AddNode("dirA/a", NodeTypeFile, "")
+	e := plannedPathEffect(ft, "unlink", "./dirA/a", "./dirA/a", "./dirA/a")
+	if e.src != "dirA/a" {
+		t.Fatalf("effect src = %q, want dirA/a", e.src)
+	}
+	for _, path := range []string{"dirA/a", "./dirA/a"} {
+		if e.allows(path) {
+			t.Fatalf("dot-prefixed unlink source %q not filtered", path)
+		}
+	}
+	if !e.allows("dirA/b") {
+		t.Fatal("safe path rejected after dot-path normalization")
+	}
+
+	rename := plannedPathEffect(ft, "rename", "./dirA/dst", "./dirA/src", "./dirA/dst")
+	if rename.src != "dirA/src" || rename.dst != "dirA/dst" {
+		t.Fatalf("rename effect = %+v, want normalized src/dst", rename)
+	}
+	if rename.allows("dirA/src") || rename.allows("./dirA/src") {
+		t.Fatal("dot-prefixed rename source not filtered")
+	}
+	if !rename.allows("dirA/dst") {
+		t.Fatal("rename destination rejected")
+	}
+}

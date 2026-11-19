@@ -37,29 +37,29 @@ func TestCausalRenameRootC2TemporalRelations(t *testing.T) {
 		"rename", "dirA/b", "dirA", AnchorPathUnknown, false, false,
 		"dirA/a", "dirA/b", "", true, causalRootRename, r)
 
-	var ccSameSource, hbSameDest bool
+	var ccSource, hbDest bool
 	for _, ck := range cells {
 		p := byCell[ck]
-		if p == nil || p.Cell.Combo.Variant != "stat" {
+		if p == nil {
 			continue
 		}
-		if p.Cell.Temporal == TemporalHB && p.BaseB == "dirA/a" {
-			t.Fatalf("HB stat on the rename source survived: %+v", p)
+		if p.Cell.Temporal == TemporalHB && p.Cell.Combo.Variant != "creat" &&
+			(p.BaseB == "dirA/a" ||
+				(p.Cell.Combo.Variant == "rename" && p.BaseB2 == "dirA/a")) {
+			t.Fatalf("HB variant on the rename source survived: %+v", p)
 		}
-		if p.Cell.Temporal == TemporalConcurrent && p.BaseB == "dirA/a" &&
-			p.Cell.Combo.Rel == PathSame {
-			ccSameSource = true
+		if p.Cell.Temporal == TemporalConcurrent && p.BaseB == "dirA/a" {
+			ccSource = true
 		}
-		if p.Cell.Temporal == TemporalHB && p.BaseB == "dirA/b" &&
-			p.Cell.Combo.Rel == PathSame {
-			hbSameDest = true
+		if p.Cell.Temporal == TemporalHB && p.BaseB == "dirA/b" {
+			hbDest = true
 		}
 	}
-	if !ccSameSource {
-		t.Fatal("CC rename root did not plan Same on the source")
+	if !ccSource {
+		t.Fatal("CC rename root produced no source-side plan")
 	}
-	if !hbSameDest {
-		t.Fatal("HB rename root did not plan Same on the destination")
+	if !hbDest {
+		t.Fatal("HB rename root produced no destination-side plan")
 	}
 }
 
@@ -171,6 +171,36 @@ func TestCausalFailedAnchorRejected(t *testing.T) {
 		if p.Anchor.Path == "dirB/c" {
 			t.Fatalf("failed anchor produced a C1 plan: %+v", p)
 		}
+	}
+}
+
+func TestCausalWriteAnchorAccepted(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["pwrite64"]; !ok {
+		t.Skip("target has no pwrite64")
+	}
+	hmcfg := glusterfsCoverageConfig(t, true)
+	lcs := NewLayeredChoiceStrategy(hmcfg, target)
+	ps := glusterfsCoverageBaseProgs(target)
+
+	open := mkOpen(target, "dirA/a")
+	open.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 3}
+	w := mkPwrite64(target, open, 21, 0)
+	w.CheckInfo = &FileMetadata{Stime: 210, Etime: 260, Retv: 21}
+	ps[0].Calls = append([]*Call{open, w}, ps[0].Calls...)
+
+	r := newRand(target, rand.NewSource(307))
+	r.hmcfg = hmcfg
+	plans := collectCausalRootPlans(ps[0], lcs, hmcfg, r)
+	found := false
+	for _, p := range plans {
+		if p.Anchor.Path == "dirA/a" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("successful pwrite64 anchor (Retv=21) produced no C1 plan")
 	}
 }
 

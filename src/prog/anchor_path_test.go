@@ -40,6 +40,37 @@ func TestClassifyAnchorPathCreator(t *testing.T) {
 	}
 }
 
+func TestFindAnchorCreatorAcceptsOpenCreate(t *testing.T) {
+	target, _, _, lcs := seedOptLCS(t)
+	if _, ok := target.SyscallMap["open"]; !ok {
+		t.Skip("target has no open")
+	}
+	oCreate, ok := target.LookupConst("O_CREAT")
+	if !ok {
+		t.Skip("target has no O_CREAT")
+	}
+	const path = "merge_view/dirA/fresh"
+
+	open := mkOpen(target, path)
+	flags, ok := open.Args[1].(*ConstArg)
+	if !ok {
+		t.Fatalf("open flags arg = %T, want *ConstArg", open.Args[1])
+	}
+	flags.Val |= oCreate
+	open.CheckInfo = &FileMetadata{Stime: 100, Etime: 200, Retv: 3}
+	p := &Prog{Target: target, Calls: []*Call{open}}
+	kind, isDir, idx, ok := findAnchorCreator(p, lcs.FileTree, path, 0, true)
+	if !ok || kind != AnchorPathFreshFile || isDir || idx != 0 {
+		t.Fatalf("open(O_CREAT) creator = kind %v isDir %v idx %d ok %v",
+			kind, isDir, idx, ok)
+	}
+
+	open.CheckInfo.Retv = -1
+	if _, _, _, ok := findAnchorCreator(p, lcs.FileTree, path, 0, true); ok {
+		t.Fatal("failed open(O_CREAT) accepted as a creator")
+	}
+}
+
 func TestSeedDerivationTableAndPath(t *testing.T) {
 	target, _, _, lcs := seedOptLCS(t)
 	table := newCausalDerivationTable()
