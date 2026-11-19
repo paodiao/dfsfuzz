@@ -5581,22 +5581,25 @@ func timeAlignedInRange(p *Prog, refTime int64, tscoff int64, start, end int) in
 }
 
 // ProgTimings extracts the per-call execution timeline of every prog as
-// flattened [Stime, Etime] pairs (0/0 for calls without CheckInfo) for RPC
-// transfer. CheckInfo is runtime-only and not part of the prog serialization,
-// so this is how corpus seeds keep their timeline across fuzzer restarts.
+// flattened [Stime, Etime, Retv] triples (0/0/0 for calls without CheckInfo)
+// for RPC transfer. CheckInfo is runtime-only and not part of the prog
+// serialization, so this is how corpus seeds keep their timeline across fuzzer
+// restarts. Retv must travel with the timeline: a restored failed creator or
+// anchor must not look successful to callSucceeded/callReturnedSuccess.
 func ProgTimings(ps []*Prog) [][]uint64 {
 	timings := make([][]uint64, len(ps))
 	for i, p := range ps {
 		if p == nil {
 			continue
 		}
-		t := make([]uint64, 2*len(p.Calls))
+		t := make([]uint64, 3*len(p.Calls))
 		for j, call := range p.Calls {
 			if call == nil || call.CheckInfo == nil {
 				continue
 			}
-			t[2*j] = call.CheckInfo.Stime
-			t[2*j+1] = call.CheckInfo.Etime
+			t[3*j] = call.CheckInfo.Stime
+			t[3*j+1] = call.CheckInfo.Etime
+			t[3*j+2] = uint64(call.CheckInfo.Retv)
 		}
 		timings[i] = t
 	}
@@ -5606,10 +5609,10 @@ func ProgTimings(ps []*Prog) [][]uint64 {
 // ApplyProgTimings restores the per-call CheckInfo timeline of progs from a
 // ProgTimings payload (e.g. a corpus seed re-delivered after a fuzzer
 // restart) and returns the number of calls that got a CheckInfo. Only calls
-// with a non-zero Etime get one: 0/0 pairs mean "no timing observed" and stay
-// nil, matching the no-anchor fallback. Calls that already carry a CheckInfo
-// are left untouched, and a shape mismatch (different prog layout) is ignored
-// safely.
+// with a non-zero Etime get one: 0/0/0 triples mean "no timing observed" and
+// stay nil, matching the no-anchor fallback. Calls that already carry a
+// CheckInfo are left untouched, and a shape mismatch (different prog layout)
+// is ignored safely.
 func ApplyProgTimings(ps []*Prog, timings [][]uint64) int {
 	restored := 0
 	for i, p := range ps {
@@ -5617,18 +5620,18 @@ func ApplyProgTimings(ps []*Prog, timings [][]uint64) int {
 			continue
 		}
 		t := timings[i]
-		if len(t) != 2*len(p.Calls) {
+		if len(t) != 3*len(p.Calls) {
 			continue
 		}
 		for j, call := range p.Calls {
 			if call == nil || call.CheckInfo != nil {
 				continue
 			}
-			stime, etime := t[2*j], t[2*j+1]
+			stime, etime, retv := t[3*j], t[3*j+1], t[3*j+2]
 			if etime == 0 {
 				continue
 			}
-			call.CheckInfo = &FileMetadata{Stime: stime, Etime: etime}
+			call.CheckInfo = &FileMetadata{Stime: stime, Etime: etime, Retv: int64(retv)}
 			restored++
 		}
 	}
