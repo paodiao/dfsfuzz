@@ -175,7 +175,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | ID | 状态 | 问题 |
 |---|---|---|
 | P2-T1 | fixed | LOOKUP nodeid fallback 父路径（P1-C2 已修；R `loc.path` 已是 child path，缺失/out-of-root/截断时 drop） |
-| P2-T2 | confirmed | LOOKUP 的 path 截断已在 tracer drop；`BuildVertices` 对非 LOOKUP/其它事件仍不检查 `Truncated`（待修：入口检查 `Truncated&3`，path/path2 截断 drop，bit2 xattr 不丢整条） |
+| P2-T2 | fixed | `BuildVertices` 入口检查 `Truncated&3`，path/path2 截断直接 drop；bit2 只截断 xattr name，不丢整条；新增 `DagDiag.PathTruncated` 与测试 |
 | P2-T3 | latent | symlink empty/unresolvable payload 退化成 target-role；`target==""` 时 target 变 linkpath |
 | P2-T4 | deferred | 非 LOOKUP 事件不 fallback `ev.Path`，也没有 path mismatch 诊断 |
 | P2-T5 | deferred | FUSE interrupt 重复 final event（同 unique 二次 S） |
@@ -214,7 +214,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-B4 | test-only | `insertCallFromDCT` 死路径/过期 base（见 P1-B9） |
 | P2-B5 | latent | FailurePolicy rename same-parent（见 P1-B10） |
 | P2-B6 | latent | `NewLayeredChoiceStrategy` profile=nil（见 P1-B11） |
-| P2-B7 | confirmed | witness symlink 用全局 `callNameConstraint`，和 profile `TargetConstraint` 不一致（待修：witnessFor/pickWitness/pickSibling 接收 profile） |
+| P2-B7 | fixed | witness 选择改用 profile `TargetConstraint`；`witnessFor`/`pickWitness`/`pickSibling` 接收 profile，GlusterFS symlink/readlink 的 dir target 可被选中 |
 | P2-B8 | fixed | `IsFdRequiredCall("readlink")` 子串误判（P1-B12 已改精确匹配；`TestIsFdRequiredCallExactMatch` 覆盖） |
 | P2-B9 | latent | PathSet generic linkpath（见 P1-B13） |
 | P2-B10 | latent | cross-program fresh parent 不要求 mkdir 成功（见 P1-B14） |
@@ -243,7 +243,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-E5 | deferred | manager 不能覆盖 `MetadataDelayMs`/DAG flags |
 | P2-E6 | not-a-problem | restore 不保留 xattr/ACL/hardlink：初始文件树不设置这些属性，`rsync -a` 足够 |
 | P2-E7 | needs-runtime-verification | `write_dir_info` 依赖 `dirent.d_type`，DT_UNKNOWN 不递归；需看 GlusterFS FUSE 返回 |
-| P2-E8 | deployment | `glusterfs-config.sh` 不检查 volume/mount 失败 |
+| P2-E8 | fixed | `glusterfs-config.sh` 不检查 volume/mount 失败（P1-E5-a 已加 volume create/start 与 client mount 退出码检查） |
 | P2-E9 | design-debt | `DFSProfile.DualPathCausalEnabled` 注释仍写 "v1 leaves it false"，与 GlusterFS profile 的 true 不一致；更新注释即可，无运行时影响 |
 | P2-E10 | latent | `ProfileForName` 未知 `DFSName` 返回 nil，`ProfileOrDefault` 静默回退 HMDFS；`proc.go` 按字符串分支，拼错可能走非预期路径；启动时校验 `DFSName ∈ {hmdfs, glusterfs}` |
 
@@ -252,7 +252,8 @@ out-of-scope              不属于本轮 GlusterFS 适配
 - P2-B8/P2-B11 已由 P1-B12/B15 修复，改 `fixed`。
 - P2-B1 降 `latent`：`GetParentDir` 仍返回 `"."`，但生产生成点已走 `parentDirOrRoot`/`joinTestPath`，当前无生产 caller 触发。
 - P2-D3 降 `deferred`：是已知边界集合，不是单点 bug；先拆 D3a–e（mkdir/rmdir Success、rename Failure、xattr context、unlink/unlink Same）再逐项确认。
-- P2-T2/P2-B7 保持 `confirmed`，修法已明确，后续落代码。
+- P2-T2/P2-B7 修法已明确并已落地：T2 在 BuildVertices 入口 drop 截断 path/path2；B7 让 witness 选择走 profile TargetConstraint。
+- 回归测试：`TestBuildVerticesDropsTruncatedPaths`、`TestDirectedWitnessUsesProfileTargetConstraint`；`go test -c ./prog`、`go vet ./prog`、`go test -c ./syz-fuzzer` 通过；Linux 3-3 运行时待跑。
 
 ---
 
