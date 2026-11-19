@@ -807,10 +807,23 @@ func TestValidateCausalPlanRootChecks(t *testing.T) {
 	treeRootFresh := freshPlan("mkdir")
 	treeRootFresh.BaseA = "merge_view/freshRoot"
 	treeRootFresh.BaseA2 = "merge_view"
-	treeRootFresh.Cell.DepthB = DepthBucketOf(treeRootFresh.BaseA)
-	treeRootFresh.Cell.PersistB = pathInDir(treeRootFresh.BaseA, hmcfg.Persistence_dir)
-	if validateCausalPlan(hmcfg, lcs, treeRootFresh) {
-		t.Fatal("FreshA with merge_view root parent accepted")
+	treeRootFresh.BaseB = "merge_view/dirA"
+	treeRootFresh.Cell.Combo.Rel = PathSibling
+	treeRootFresh.Cell.DepthB = DepthBucketOf(treeRootFresh.BaseB)
+	treeRootFresh.Cell.PersistB = pathInDir(treeRootFresh.BaseB, hmcfg.Persistence_dir)
+	if !validateCausalPlan(hmcfg, lcs, treeRootFresh) {
+		t.Fatal("FreshA under merge_view root parent rejected")
+	}
+
+	fileParent := freshPlan("mkdir")
+	fileParent.BaseA = "merge_view/dirA/a/freshRoot"
+	fileParent.BaseA2 = "merge_view/dirA/a"
+	fileParent.BaseB = "merge_view/dirA"
+	fileParent.Cell.Combo.Rel = PathParent
+	fileParent.Cell.DepthB = DepthBucketOf(fileParent.BaseB)
+	fileParent.Cell.PersistB = pathInDir(fileParent.BaseB, hmcfg.Persistence_dir)
+	if validateCausalPlan(hmcfg, lcs, fileParent) {
+		t.Fatal("FreshA with a file parent accepted")
 	}
 }
 
@@ -924,14 +937,30 @@ func TestCausalRootC1FreshRenameFiltersSourceSubtree(t *testing.T) {
 	}
 }
 
-func TestPlanCausalC2RejectsTreeRootFreshParent(t *testing.T) {
+func TestPlanCausalC2AcceptsTreeRootFreshParent(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	ps := directedPlanBaseProgs(target)
 	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, "mkdir",
 		"merge_view/freshRoot", "merge_view", "", "", "", false,
 		causalRootFresh, newRand(target, rand.NewSource(25)))
+	if len(cells) == 0 {
+		t.Fatal("C2 rejected merge_view as fresh root parent")
+	}
+	for _, ck := range cells {
+		if p := byCell[ck]; p != nil && p.BaseA2 != "merge_view" {
+			t.Fatalf("C2 plan lost merge_view parent: %+v", p)
+		}
+	}
+}
+
+func TestPlanCausalC2RejectsFileFreshParent(t *testing.T) {
+	target, hmcfg, _, lcs := directedPlanFixture(t)
+	ps := directedPlanBaseProgs(target)
+	byCell, cells := planCausalC2Cells(ps, lcs, hmcfg, "mkdir",
+		"merge_view/dirA/a/freshRoot", "merge_view/dirA/a", "", "", "", false,
+		causalRootFresh, newRand(target, rand.NewSource(27)))
 	if len(cells) != 0 || len(byCell) != 0 {
-		t.Fatalf("C2 accepted merge_view as fresh root parent: cells=%d plans=%d", len(cells), len(byCell))
+		t.Fatalf("C2 accepted a file fresh parent: cells=%d plans=%d", len(cells), len(byCell))
 	}
 }
 
@@ -1058,12 +1087,13 @@ func TestCausalRootC1FreshParentEligibility(t *testing.T) {
 	ps[0].Calls = append([]*Call{anchor}, ps[0].Calls...)
 	plans := collectCausalRootPlans(ps[0], lcs, hmcfg, newRand(target, rand.NewSource(19)))
 	sawAllowed := false
+	sawTreeRoot := false
 	for _, p := range plans {
 		if p.RootKind != causalRootFresh {
 			continue
 		}
 		if p.RootParent == "merge_view" {
-			t.Fatalf("fresh root used the merge_view tree root as parent: %+v", p)
+			sawTreeRoot = true
 		}
 		if p.RootParent == "merge_view/dirA" {
 			sawAllowed = true
@@ -1071,5 +1101,8 @@ func TestCausalRootC1FreshParentEligibility(t *testing.T) {
 	}
 	if !sawAllowed {
 		t.Fatal("fresh root under an eligible directory was lost")
+	}
+	if !sawTreeRoot {
+		t.Fatal("fresh root under the merge_view tree root was lost")
 	}
 }

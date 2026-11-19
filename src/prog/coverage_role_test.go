@@ -179,6 +179,18 @@ func TestCausalRootPathsByPathFreshTopLevel(t *testing.T) {
 	if len(siblings) != 2 || siblings[0] != "dirA/a" || siblings[1] != "dirA/b" {
 		t.Fatalf("PathSibling = %v, want [dirA/a dirA/b]", siblings)
 	}
+
+	hmdfs := NewFileTree()
+	hmdfs.AddNode("merge_view/dirA", NodeTypeDir, "")
+	hmdfs.AddNode("merge_view/dirB", NodeTypeDir, "")
+	parent = causalRootPathsByPath(hmdfs, "merge_view/newTop", info, PathParent)
+	if len(parent) != 0 {
+		t.Fatalf("HMDFS PathParent = %v, want none", parent)
+	}
+	siblings = causalRootPathsByPath(hmdfs, "merge_view/newTop", info, PathSibling)
+	if len(siblings) != 2 || siblings[0] != "merge_view/dirA" || siblings[1] != "merge_view/dirB" {
+		t.Fatalf("HMDFS PathSibling = %v, want [merge_view/dirA merge_view/dirB]", siblings)
+	}
 }
 
 func TestCellRoleReadlinkSingle(t *testing.T) {

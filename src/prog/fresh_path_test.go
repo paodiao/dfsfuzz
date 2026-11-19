@@ -49,6 +49,9 @@ func TestFreshParentEligible(t *testing.T) {
 	if freshParentEligible(hmdfs, "") {
 		t.Fatal("HMDFS empty parent accepted")
 	}
+	if !freshParentEligible(hmdfs, "merge_view") {
+		t.Fatal("HMDFS tree root rejected")
+	}
 	hmdfs.AddNode("merge_view/dirA", NodeTypeDir, "")
 	if !freshParentEligible(hmdfs, "merge_view/dirA") {
 		t.Fatal("HMDFS directory parent rejected")
@@ -83,6 +86,31 @@ func TestCausalTopLevelFreshRoot(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no top-level fresh root plan (RootParent empty)")
+	}
+}
+
+func TestFindNodeHMDFSRootName(t *testing.T) {
+	ft := NewFileTree()
+	if ft.FindNode("merge_view") != ft.Root {
+		t.Fatal("bare merge_view did not resolve to the tree root")
+	}
+	if ft.FindNode("") != ft.Root {
+		t.Fatal("empty path did not resolve to the tree root")
+	}
+	if ft.FindNode("merge_view/") != ft.Root {
+		t.Fatal("merge_view/ did not resolve to the tree root")
+	}
+
+	ft.AddNode("merge_view/merge_view", NodeTypeFile, "")
+	child := ft.FindNode("merge_view/merge_view")
+	if child == nil || child == ft.Root {
+		t.Fatalf("top-level merge_view child = %+v, want a child node", child)
+	}
+	if child.FullPath != "merge_view/merge_view" {
+		t.Fatalf("top-level merge_view child path = %q", child.FullPath)
+	}
+	if ft.FindNode("merge_view") != ft.Root {
+		t.Fatal("bare merge_view shadowed by a top-level child")
 	}
 }
 
@@ -203,12 +231,27 @@ func TestPathSetTopLevelParent(t *testing.T) {
 	if pathSetParentValid(ps, pos, "dirA/a/x", hmcfg.FileTree) {
 		t.Fatal("file parent accepted")
 	}
+
+	hmdfs := NewFileTree()
+	hmdfs.AddNode("merge_view/dirA", NodeTypeDir, "")
+	if !pathSetParentValidAt(nil, GroupPosition{}, "merge_view", hmdfs) {
+		t.Fatal("HMDFS tree root parent rejected")
+	}
+	if !pathSetParentValidAt(nil, GroupPosition{}, "", hmdfs) {
+		t.Fatal("HMDFS root alias rejected")
+	}
+	if !pathSetParentValid(ps, pos, "merge_view/dirA", hmdfs) {
+		t.Fatal("HMDFS directory parent rejected")
+	}
 }
 
-func TestHMDFSTopLevelFreshRejected(t *testing.T) {
+func TestHMDFSTopLevelFreshParent(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	if freshParentEligible(lcs.FileTree, "") {
 		t.Fatal("HMDFS empty parent accepted")
+	}
+	if !freshParentEligible(lcs.FileTree, "merge_view") {
+		t.Fatal("HMDFS tree root rejected")
 	}
 	r := newRand(target, rand.NewSource(404))
 	r.hmcfg = hmcfg
@@ -216,6 +259,20 @@ func TestHMDFSTopLevelFreshRejected(t *testing.T) {
 		"mkdir", "merge_view/mut_dir_", "", AnchorPathUnknown, false, false,
 		"", "", "", false, causalRootFresh, r)
 	if len(cells) != 0 || len(byCell) != 0 {
-		t.Fatalf("HMDFS top-level fresh C2 plans = %d/%d, want none", len(cells), len(byCell))
+		t.Fatalf("HMDFS empty fresh parent produced plans: cells=%d plans=%d", len(cells), len(byCell))
+	}
+
+	r = newRand(target, rand.NewSource(406))
+	r.hmcfg = hmcfg
+	byCell, cells = planCausalC2CellsWithParent(nil, lcs, hmcfg,
+		"mkdir", "merge_view/mut_dir_", "merge_view", AnchorPathUnknown, false, false,
+		"", "", "", false, causalRootFresh, r)
+	if len(cells) == 0 {
+		t.Fatal("HMDFS merge_view fresh parent produced no plans")
+	}
+	for _, ck := range cells {
+		if p := byCell[ck]; p != nil && p.BaseA2 != "merge_view" {
+			t.Fatalf("HMDFS fresh plan lost merge_view parent: %+v", p)
+		}
 	}
 }
