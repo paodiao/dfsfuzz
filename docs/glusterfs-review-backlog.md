@@ -134,9 +134,10 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 - C1-B：`BuildVertices` 对 GlusterFS 的 offset call 用 `glusterfsOffsetSize(hmcfg, v.Path)`（baseline `FileTree` size，缺失 0），不再用 trace 的 request length / truncate 0；HMDFS 继续用 `ev.Size`。这和 planner 的 `directedNode.size` 同源，新文件默认 0。
 - C2：LOOKUP 的 R `loc.path` 已经是 parent+name 解析后的 child path，直接使用；C++ 在 path 缺失、out-of-root、path 截断时 drop 并计入 `drop_lookup`，不再用 `nodeid`（父目录）fallback。其它 parent-nodeid opcode 的 DAG 顶点路径来自调用参数，现有 fallback 行为不变；DAG 侧 GlusterFS LOOKUP 继续用 `ev.Path`。
+- C2 残留：`normalize_trace_path` 对 trace root 之外的普通路径不置 `out_of_root`（P2-T14）；非 LOOKUP parent-nodeid fallback 未 gate（P2-T15）。
 - D1：`ProgTimings`/`ApplyProgTimings` 改为每 call 三个值 `[Stime, Etime, Retv]`；`Retv` 以 int64 bit pattern 存储/恢复，失败 creator/anchor 不再变成功。
 - 回归测试：`TestGlusterfsOffsetSizeUsesBaselineTree`、`TestGlusterfsOffsetBucketUsesTreeSize`、`TestGlusterfsOffsetBucketNewFileZero`、`TestGlusterfsOffsetBucketTruncateUsesTreeSize`、`TestGlusterfsOffsetBucketUsesTreeSizeNotFsMd`、`TestProgTimingsRoundTrip`（含 failed Retv）；C2 用 `glusterfs-trace-test --self-test` 覆盖 LOOKUP path 可用性/drop。
-- 验证：`gofmt`、`GOOS=linux GOARCH=amd64 go test -c ./prog`、`go test -c ./syz-fuzzer`、`go vet ./prog ./syz-fuzzer` 通过；C2 的 trace self-test 运行时待 3-3，C1-B 的 bucket 分布待 3-3 coverage smoke。
+- 验证：`gofmt`、`GOOS=linux GOARCH=amd64 go test -c ./prog`、`go test -c ./syz-fuzzer`、`go vet ./prog ./syz-fuzzer`、`go build ./syz-manager ./pkg/rpctype` 通过；C2 的 trace self-test 运行时待 3-3，C1-B 的 bucket 分布待 3-3 coverage smoke。
 
 ### P1-E Profile / config / runtime
 
@@ -158,8 +159,8 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 | ID | 状态 | 问题 |
 |---|---|---|
-| P2-T1 | confirmed | LOOKUP nodeid fallback 父路径（见 P1-C2，保留细节） |
-| P2-T2 | confirmed | truncated path 未过滤；`BuildVertices` 不检查 `Truncated` |
+| P2-T1 | fixed | LOOKUP nodeid fallback 父路径（P1-C2 已修；R `loc.path` 已是 child path，缺失/out-of-root/截断时 drop） |
+| P2-T2 | confirmed | LOOKUP 的 path 截断已在 tracer drop；`BuildVertices` 对非 LOOKUP/其它事件仍不检查 `Truncated` |
 | P2-T3 | latent | symlink empty/unresolvable payload 退化成 target-role；`target==""` 时 target 变 linkpath |
 | P2-T4 | deferred | 非 LOOKUP 事件不 fallback `ev.Path`，也没有 path mismatch 诊断 |
 | P2-T5 | deferred | FUSE interrupt 重复 final event（同 unique 二次 S） |
@@ -171,6 +172,8 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-T11 | deferred | delete timeline 以 ino 0 为 key；当前 writepage 不产生，死代码 |
 | P2-T12 | deferred | output buffer overflow 直接 abort round（低概率） |
 | P2-T13 | latent | `RecordCoveragePairs`/`ComputeFeedback` 对 malformed `DAGPair`（A/B nil）没有防御；正常 `ExtractPairsFor` 不会产生 nil，但 IPC 异常时 `cellKeyOf`/`hashPair` 可能 panic；加 nil guard + drop 诊断 |
+| P2-T14 | latent | `normalize_trace_path` 只拒绝 mount root `/` 和 `.glusterfs`，trace root 之外的普通路径（如 `/foo`）会被归一化成 `foo`；C2 的 out-of-root drop 依赖该标记。fuzzer 若产生 `..`/绝对路径，外部路径仍可能进 DAG |
+| P2-T15 | latent | 非 LOOKUP 的 parent-nodeid opcode（MKDIR/CREATE/UNLINK/RMDIR/RENAME/LINK/SYMLINK）R path 缺失时仍走 nodeid fallback，trace 事件 path 可能变成 parent/source；当前 DAG 用调用参数，不产生假 pair |
 
 ### P2-Directed
 
@@ -180,7 +183,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-D2 | deferred | C1 tie 排序不确定（见 P1-A7） |
 | P2-D3 | confirmed | plannable/planner phantom：mkdir Success、rmdir Success、rename Failure、getxattr/setxattr 上下文、unlink/unlink Same 等（已知边界） |
 | P2-D4 | latent | symlink-to-dir 类型；baseline 不建 symlink 时不触发 |
-| P2-D5 | deferred | 同路径 size mutation 的 offset bucket 以 pre-root size 计算 |
+| P2-D5 | deferred | 同路径 size mutation 的 offset bucket 仍以 pre-root size 计算；C1-B 让 planner/观测同源，但程序内 size 变化仍偏；由 P1-C1b 跟踪 |
 | P2-D6 | latent | validator FreshB/profile 不一致（主要 HMDFS） |
 | P2-D7 | deferred | fresh linkpath 未做 batch-local 保留，随机碰撞可能把 Success 变 EEXIST |
 | P2-D8 | deferred | directed variants 不复用已有 fd（`directedVariantCallsSeq` 总是重新 open）；fd-survives-unlink 的 HB pair 当前不可构造 |

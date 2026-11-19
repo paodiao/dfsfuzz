@@ -1419,6 +1419,9 @@ restore finish barrier
 
 ```bash
 go test ./prog/... ./pkg/ipc/...
+
+make glusterfs-trace-test
+./glusterfs-trace-test --self-test   # 目标 VM / root 下运行
 ```
 
 覆盖：
