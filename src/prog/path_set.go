@@ -463,9 +463,27 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				}
 				var specs []pathSpec
 				if src != "" {
+					srcKind, srcRecreated := pathSetCreatorState(p, ft, ci, src, profile)
+					srcCurrentKind := 0
+					srcHasCreator := false
+					srcCreatorPos := GroupPosition{}
+					srcCreatorArg := 0
+					if srcKind == pathFresh {
+						srcCurrentKind = sourceType
+						if pos, arg, ok := freshPathCreatorBefore(p, ci, src, profile); ok {
+							srcHasCreator = true
+							srcCreatorPos = pos
+							srcCreatorArg = arg
+						}
+					}
 					specs = append(specs, pathSpec{
-						Path: src, Kind: pathExisting, Role: pathRoleRenameSrc,
+						Path: src, Kind: srcKind, Role: pathRoleRenameSrc,
 						ArgIdx: 0, TypeConstraint: sourceType,
+						CurrentKind:   srcCurrentKind,
+						CreatorPos:    srcCreatorPos,
+						CreatorArgIdx: srcCreatorArg,
+						HasCreator:    srcHasCreator,
+						Recreated:     srcRecreated,
 					})
 				}
 				if dst != "" {
@@ -495,6 +513,13 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 			path = normalizePathSetPath(ft, path)
 			if path == "" {
 				continue
+			}
+			if profile.TracksPathState() {
+				if links := freshLinkPathsBefore(p, ft, ci, profile); links[path].Kind != 0 {
+					// A program-local linkpath is not a FileTree node; migrating
+					// a generic consumer to it would break the link binding.
+					continue
+				}
 			}
 			kind := pathExisting
 			role := pathRoleDirect
@@ -925,8 +950,9 @@ func pathSetFreshParentCreated(ps []*Prog, ft *FileTree, pos GroupPosition, pare
 			continue
 		}
 		name := call.Meta.CallName
-		if strings.Contains(name, "mkdir") {
-			if normalizePathSetPath(ft, extractPathFromCall(call)) == parent {
+		if strings.Contains(name, "mkdir") &&
+			normalizePathSetPath(ft, extractPathFromCall(call)) == parent {
+			if call.CheckInfo == nil || callReturnedSuccess(call) {
 				return true
 			}
 		}
@@ -1035,6 +1061,19 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 		}
 		return node != nil && node.Type == NodeTypeFile
 	case pathRoleRenameSrc:
+		if spec.Kind == pathFresh {
+			if spec.CurrentKind == 0 ||
+				!pathKindMatchesConstraint(spec.CurrentKind, typeConstraint) {
+				return false
+			}
+			if node != nil && !spec.Recreated {
+				return false
+			}
+			if !spec.HasCreator {
+				return false
+			}
+			return parentValid(parentDirOrRoot(spec.Path))
+		}
 		return node != nil && nodeMatchesConstraint(node, typeConstraint)
 	case pathRoleRenameDst:
 		if spec.Kind == pathFresh {
@@ -1637,6 +1676,9 @@ func pathSetPlanParentValid(ps []*Prog, mapped []pathPlanMappedSpec, ft *FileTre
 	if node := ft.FindNode(parent); node != nil {
 		return nodeIsDir(node)
 	}
+	if ps == nil || !pathSetPlanPosValid(ps, consumer) {
+		return false
+	}
 	for _, ms := range mapped {
 		if ms.spec.Role != pathRoleMkdir || ms.spec.Kind != pathFresh || ms.spec.Path != parent {
 			continue
@@ -1645,8 +1687,11 @@ func pathSetPlanParentValid(ps []*Prog, mapped []pathPlanMappedSpec, ft *FileTre
 			continue
 		}
 		if ms.pos.ProgIdx == consumer.ProgIdx {
-			if ms.pos.CallIdx < consumer.CallIdx {
-				return true
+			if ms.pos.CallIdx < consumer.CallIdx && pathSetPlanPosValid(ps, ms.pos) {
+				mkdir := ps[ms.pos.ProgIdx].Calls[ms.pos.CallIdx]
+				if mkdir != nil && (mkdir.CheckInfo == nil || callReturnedSuccess(mkdir)) {
+					return true
+				}
 			}
 			continue
 		}
@@ -1656,6 +1701,9 @@ func pathSetPlanParentValid(ps []*Prog, mapped []pathPlanMappedSpec, ft *FileTre
 		mkdir := ps[ms.pos.ProgIdx].Calls[ms.pos.CallIdx]
 		consumerCall := ps[consumer.ProgIdx].Calls[consumer.CallIdx]
 		if mkdir == nil || consumerCall == nil || mkdir.CheckInfo == nil || consumerCall.CheckInfo == nil {
+			continue
+		}
+		if !callReturnedSuccess(mkdir) {
 			continue
 		}
 		mkdirE := int64(mkdir.CheckInfo.Etime) - tscoffFor(tscoffs, ms.pos.ProgIdx)
@@ -1722,7 +1770,8 @@ func validatePathSetPlan(ps []*Prog, set *pathSet, plan *pathPlan, ft *FileTree,
 		member := set.Members[i]
 		for j, orig := range member.Paths {
 			if orig.Kind != pathFresh ||
-				(orig.Role != pathRoleLinkTarget && orig.Role != pathRoleSymlinkTarget) {
+				(orig.Role != pathRoleLinkTarget && orig.Role != pathRoleSymlinkTarget &&
+					orig.Role != pathRoleRenameSrc) {
 				continue
 			}
 			if !orig.HasCreator || !pathSetPosBefore(orig.CreatorPos, member.Pos) {

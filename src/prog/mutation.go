@@ -3687,7 +3687,7 @@ func applyFailureShape(lcs *LayeredChoiceStrategy, rootCallName, basePath, baseP
 		atomic.AddUint64(&failShapeSkipCount, 1)
 	case "rename":
 		if dst := pickNonEmptyDir(lcs.FileTree, r, ""); dst != "" {
-			if src := pickRenameSrcDir(lcs.FileTree, r, dst); src != "" {
+			if src := pickRenameSrcDir(lcs.FileTree, r, dst, lcs.profileOrDefault()); src != "" {
 				atomic.AddUint64(&failShapeHitCount, 1)
 				return src, dst
 			}
@@ -3720,24 +3720,36 @@ func pickNonEmptyDir(ft *FileTree, r *randGen, exclude string) string {
 	return cands[r.Intn(len(cands))].FullPath
 }
 
-// pickRenameSrcDir returns a directory sibling of dstPath (same parent — the
-// hard hmdfs requirement: cross-parent renames return EPERM before the trace
-// point, so they would never produce an event), "" if none exists. The source
-// is a variant-side path, so a TmpDir sibling qualifies (nodeIsDir); the
-// non-TmpDir rule applies to the destination only (see pickNonEmptyDir).
-func pickRenameSrcDir(ft *FileTree, r *randGen, dstPath string) string {
+// pickRenameSrcDir returns a directory source for the rename ENOTEMPTY
+// failure shape. HMDFS requires a sibling of dstPath (cross-parent renames
+// return EPERM before the trace point). GlusterFS allows a cross-parent source;
+// dst itself, its subtree, and its ancestors are excluded because those shapes
+// fail with EINVAL before reaching the non-empty-destination check.
+func pickRenameSrcDir(ft *FileTree, r *randGen, dstPath string, profiles ...*DFSProfile) string {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
+	if ft == nil {
+		return ""
+	}
 	parent := parentDirOrRoot(dstPath)
-	if parent == "" && (ft == nil || ft.Prefix != "") {
+	glusterfs := profile.Name == "glusterfs"
+	if !glusterfs && parent == "" && ft.Prefix != "" {
 		return ""
 	}
 	ft.mu.RLock()
 	var cands []*FileNode
 	for _, dirs := range ft.DirsByCid {
 		for _, n := range dirs {
-			if !nodeIsDir(n) {
+			if !nodeIsDir(n) || n.FullPath == dstPath {
 				continue
 			}
-			if n.Parent == nil || n.Parent.FullPath != parent || n.FullPath == dstPath {
+			if glusterfs {
+				if pathUnderRoot(n.FullPath, dstPath) || pathUnderRoot(dstPath, n.FullPath) {
+					continue
+				}
+			} else if n.Parent == nil || n.Parent.FullPath != parent {
 				continue
 			}
 			cands = append(cands, n)
@@ -4639,70 +4651,81 @@ func freshPathAbsentBefore(p *Prog, end int, profiles ...*DFSProfile) map[string
 }
 
 // dctBaseCandidates returns the HMDFS legacy candidate set.
-func dctBaseCandidates(p *Prog, insertPos int) []string {
-	return dctBaseCandidatesFor(hmdfsProfile, p, insertPos)
+func dctBaseCandidates(p *Prog, ft *FileTree, insertPos int) []string {
+	return dctBaseCandidatesFor(hmdfsProfile, ft, p, insertPos)
 }
 
-// dctBaseCandidatesFor returns the p0 paths a new DCT root may use.
-// GlusterFS follows the documented rename/link/symlink visibility rules;
-// HMDFS keeps the historical src+dst candidate set.
-func dctBaseCandidatesFor(profile *DFSProfile, p *Prog, insertPos int) []string {
+// dctBaseCandidatesFor returns the p0 paths a new DCT root may use at
+// insertPos. It is test-only: the set is filtered by the path state at the
+// insertion slot (baseline nodes, in-program creations, and link bindings),
+// and paths deleted or moved away before the slot are excluded. The tracking
+// copy makes the filter strict for both profiles; production fresh-path
+// helpers keep their profile-specific legacy behavior.
+func dctBaseCandidatesFor(profile *DFSProfile, ft *FileTree, p *Prog, insertPos int) []string {
 	if p == nil {
 		return nil
 	}
 	if profile == nil {
 		profile = hmdfsProfile
 	}
+	if insertPos < 0 {
+		insertPos = 0
+	}
+	if insertPos > len(p.Calls) {
+		insertPos = len(p.Calls)
+	}
+	scanProfile := *profile
+	scanProfile.Plan.PathStateTracking = true
+	if ft != nil {
+		scanProfile.Tree.Prefix = ft.Prefix
+	}
+	freshKinds := freshPathKindsBefore(p, ft, insertPos, &scanProfile)
+	absent := freshPathAbsentBefore(p, insertPos, &scanProfile)
+	links := freshLinkPathsBefore(p, ft, insertPos, &scanProfile)
+
+	seen := make(map[string]bool)
 	var out []string
-	for i, call := range p.Calls {
+	add := func(path string) {
+		path = canonicalFreshPath(ft, path)
+		if path == "" || seen[path] || pathSetAbsentIn(absent, path) {
+			return
+		}
+		if ft != nil && ft.FindNode(path) != nil {
+			seen[path] = true
+			out = append(out, path)
+			return
+		}
+		if _, ok := freshKinds[path]; ok {
+			seen[path] = true
+			out = append(out, path)
+			return
+		}
+		if info, ok := links[path]; ok && info.Kind != 0 {
+			seen[path] = true
+			out = append(out, path)
+		}
+	}
+
+	for _, call := range p.Calls {
 		if call == nil || call.Meta == nil {
 			continue
 		}
-		before := i < insertPos
 		switch call.Meta.CallName {
 		case "rename":
 			src, dst := extractRenamePaths(call)
-			if profile.Name != "glusterfs" {
-				if src != "" {
-					out = append(out, src)
-				}
-				if dst != "" {
-					out = append(out, dst)
-				}
-				continue
-			}
-			if before && callAssumedSucceeded(call) && dst != "" {
-				out = append(out, dst)
-			} else if src != "" {
-				out = append(out, src)
-			}
+			add(src)
+			add(dst)
 		case "link":
-			target := extractPathFromCallByArgIdx(call, 0)
-			linkPath := extractPathFromCallByArgIdx(call, 1)
-			if target != "" {
-				out = append(out, target)
-			}
-			if before && callAssumedSucceeded(call) && linkPath != "" {
-				out = append(out, linkPath)
-			}
+			add(extractPathFromCallByArgIdx(call, 0))
+			add(extractPathFromCallByArgIdx(call, 1))
 		case "symlink":
 			linkPath := extractPathFromCallByArgIdx(call, 1)
-			target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(call, 0))
-			if target != "" {
-				out = append(out, target)
-			}
-			if before && callAssumedSucceeded(call) && linkPath != "" {
-				out = append(out, linkPath)
-			}
+			add(symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(call, 0)))
+			add(linkPath)
 		case "readlink":
-			linkPath := extractPathFromCallByArgIdx(call, 0)
-			if before && callAssumedSucceeded(call) && linkPath != "" {
-				out = append(out, linkPath)
-			}
+			add(extractPathFromCallByArgIdx(call, 0))
 		default:
-			if path := extractPathFromCall(call); path != "" {
-				out = append(out, path)
-			}
+			add(extractPathFromCall(call))
 		}
 	}
 	return out
@@ -4861,7 +4884,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 	insertPos := r.biasedRand(len(p0.Calls)+1, 5)
 	var pathCandidates []string
 	if !useFreshPath {
-		pathCandidates = dctBaseCandidatesFor(lcs.profileOrDefault(), p0, insertPos)
+		pathCandidates = dctBaseCandidatesFor(lcs.profileOrDefault(), lcs.FileTree, p0, insertPos)
 		if len(pathCandidates) > 0 {
 			basePath = pathCandidates[r.Intn(len(pathCandidates))]
 		}

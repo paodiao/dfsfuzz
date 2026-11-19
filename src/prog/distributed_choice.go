@@ -107,7 +107,7 @@ func IsFileOrDirCall(callName string) bool {
 
 func IsFdRequiredCall(callName string) bool {
 	for _, name := range FdRequiredCalls {
-		if strings.Contains(callName, name) {
+		if callName == name {
 			return true
 		}
 	}
@@ -2096,8 +2096,8 @@ func NewLayeredChoiceStrategy(hmcfg *Hmdfs_config, target *Target) *LayeredChoic
 
 	if target != nil {
 		choiceCalls := FsopsChoiceCalls
-		if hmcfg != nil && hmcfg.Profile != nil && len(hmcfg.Profile.Calls.ChoiceCalls) > 0 {
-			choiceCalls = hmcfg.Profile.Calls.ChoiceCalls
+		if len(profile.Calls.ChoiceCalls) > 0 {
+			choiceCalls = profile.Calls.ChoiceCalls
 		}
 		lcs.FsopsChoiceTable = buildSubChoiceTable(target, choiceCalls)
 	}
