@@ -54,6 +54,17 @@ type Proc struct {
 	lastDCTBoardLog   time.Time
 }
 
+// plannerTscOffsets returns the TSC offsets for the planner's program view.
+// GlusterFS mutates cps = ps[Serv_num:], so planner node indices are
+// client-relative and must not read the server offsets. DAG matching keeps the
+// full absolute slice (proc.tscoffs).
+func plannerTscOffsets(tscoffs []int64, servNum int) []int64 {
+	if servNum <= 0 || servNum >= len(tscoffs) {
+		return tscoffs
+	}
+	return tscoffs[servNum:]
+}
+
 func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	env, err := ipc.MakeEnv(fuzzer.config, pid, fuzzer.config.InitShmId)
 	if err != nil {
@@ -328,9 +339,10 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	var lcsFsops *prog.LayeredChoiceStrategy
 	if hc.DfsName == "hmdfs" || hc.DfsName == "glusterfs" {
 		lcsFsops = prog.NewLayeredChoiceStrategy(&hc, fuzzer.target)
-		lcsFsops.SetTscOffsets(procTsc)
+		plannerTsc := plannerTscOffsets(procTsc, hc.Serv_num)
+		lcsFsops.SetTscOffsets(plannerTsc)
 		prog.InitCoverageBoard(&hc)
-		appendDiagLog("tscoffs=%v", procTsc)
+		appendDiagLog("tscoffs=%v plannerTscoffs=%v", procTsc, plannerTsc)
 	}
 
 	proc := &Proc{
