@@ -97,8 +97,9 @@ out-of-scope              不属于本轮 GlusterFS 适配
 - B3：`GetPathsForRenameVariant` 改走 `pickRenameDstFor`；`pickRenameDstPolicy` 的 `parent` 用 `parentDirOrRoot`，并移除空 root 的 `targetParent` 回退（`""` 是合法 GlusterFS root）。
 - B4：`choosePathSetBase` 返回 `oldBase/newBase`；新增 `mapPathSetBasePath`、`pathSetBaseCandidateOK`、`pathPlanChangesPaths`；允许 ancestor newBase（上提一层），拒绝 descendant/no-op/root；`buildPathPlan` 用 `oldBase+suffix → newBase+suffix`。
 - B5：`classifyAnchorPath`/`findAnchorCreator`/`anchorSourceIsDir`/`collectSeedAnchors` 增加 profile 参数；GlusterFS 下拒绝 anchor 前已删除的路径，anchor 自身 creator 豁免，latest creator 优先；PathSet rename src 在 absent 时跳过 member。HMDFS `PathStateTracking=false`，保持 baseline-only 行为。
+- B5 hardening（review follow-up）：`findAnchorCreator` 的扫描方向按 `TracksPathState()` 分流（HMDFS first-wins，GlusterFS latest-wins）；`anchorCreatorKind` 跳过 `Retv<0` 的失败 creator（即使 `requireSuccess=false`）；hardlink anchor 要求 target 存在且为普通文件；`freshPathAbsentBefore`/`freshRenameEventsBefore`/`freshPathCreatorBefore` 改用 `profile.Tree.Prefix` 归一。
 - B6：`joinTestPath(".")` 归一为 root；mkdir sibling 生成点用 `parentDirOrRoot`；`pickRenameSrcDir` 支持 GlusterFS 顶层；`freshPathKindsBefore`/`freshLinkPathsBefore`/`freshPathAbsentBefore`/`freshRenameEventsBefore`/`freshPathCreatorBefore` 的 key 归一；`GetParentDir` 本身不改，避免影响 DAG SameParent。
-- 回归测试：`TestDepthBucketOfRelative`、`TestGlusterfsTopLevelBucketSelection`、`TestGlusterfsCoverageDepths`、`TestPathSetTargetLevelGlusterfsTopLevel`、`TestDerivedRootCallPathsDualNone`、`TestGetPathsForRenameVariantUsesProfilePolicy`、`TestMapPathSetBasePath`、`TestPathSetBaseCandidateOK`、`TestPathPlanChangesPaths`、`TestBuildPathPlanBroadMapping`、`TestClassifyAnchorPathRejectsDeletedPath`、`TestClassifyAnchorPathAcceptsCreatorAnchor`、`TestClassifyAnchorPathRecreatedType`、`TestBuildPathMembersSkipsDeletedRenameSource`、`TestJoinTestPathRoot`、`TestFreshPathKindsCanonical`、`TestFreshPathAbsentCanonical`。
+- 回归测试：`TestDepthBucketOfRelative`、`TestGlusterfsTopLevelBucketSelection`、`TestGlusterfsCoverageDepths`、`TestPathSetTargetLevelGlusterfsTopLevel`、`TestDerivedRootCallPathsDualNone`、`TestGetPathsForRenameVariantUsesProfilePolicy`、`TestMapPathSetBasePath`、`TestPathSetBaseCandidateOK`、`TestPathPlanChangesPaths`、`TestBuildPathPlanBroadMapping`、`TestClassifyAnchorPathRejectsDeletedPath`、`TestClassifyAnchorPathAcceptsCreatorAnchor`、`TestClassifyAnchorPathRecreatedType`、`TestBuildPathMembersSkipsDeletedRenameSource`、`TestJoinTestPathRoot`、`TestFreshPathKindsCanonical`、`TestFreshPathAbsentCanonical`、`TestFindAnchorCreatorLegacyFirstCreator`、`TestFindAnchorCreatorSkipsFailedLatestCreator`、`TestClassifyAnchorPathRejectsDeletedLinkTarget`、`TestClassifyAnchorPathRejectsDirLinkTarget`、`TestClassifyAnchorPathAcceptsFileLinkTarget`、`TestFreshPathAbsentPrefixedProfile`。
 - 验证：`gofmt`、`GOOS=linux GOARCH=amd64 go test -c ./prog`、`go test -c ./syz-fuzzer`、`go vet ./prog ./syz-fuzzer` 通过；Linux 3-3 运行时待跑。
 
 ### P1-C Tracer / parser
@@ -259,7 +260,10 @@ P1-B4:
 
 P1-B5:
   TestClassifyAnchorPathRejectsDeletedPath / TestClassifyAnchorPathAcceptsCreatorAnchor /
-  TestClassifyAnchorPathRecreatedType / TestBuildPathMembersSkipsDeletedRenameSource
+  TestClassifyAnchorPathRecreatedType / TestBuildPathMembersSkipsDeletedRenameSource /
+  TestFindAnchorCreatorLegacyFirstCreator / TestFindAnchorCreatorSkipsFailedLatestCreator /
+  TestClassifyAnchorPathRejectsDeletedLinkTarget / TestClassifyAnchorPathRejectsDirLinkTarget /
+  TestClassifyAnchorPathAcceptsFileLinkTarget / TestFreshPathAbsentPrefixedProfile
 
 P1-B6:
   TestJoinTestPathRoot / TestFreshPathKindsCanonical / TestFreshPathAbsentCanonical
