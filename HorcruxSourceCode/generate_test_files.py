@@ -72,6 +72,8 @@ def main():
     parser.add_argument('--num-large-files', type=int, default=1100, help='Number of files in the large directory for dcache persistence test')
     parser.add_argument('--num-empty-dirs', type=int, default=100, help='Number of empty directories to generate per node')
     parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducible generation')
+    parser.add_argument('--shared', action='store_true',
+                        help='Generate only the shared manifest and skip the large directory')
     args = parser.parse_args()
     
     if args.seed is not None:
@@ -82,6 +84,11 @@ def main():
     num_dirs = args.num_dirs
     max_depth = args.max_depth
     num_large_files = args.num_large_files
+    if args.shared:
+        if args.num_large_files > 0:
+            print("Warning: --shared disables the large-directory block")
+        node_ids = ["shared"]
+        num_large_files = 0
     num_empty_dirs = args.num_empty_dirs
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -92,8 +99,11 @@ def main():
     large_dir_info = {}
     empty_dirs_info = {}
     
-    large_dir_node_idx = random.randint(0, len(node_ids) - 1)
-    large_dir_node_id = node_ids[large_dir_node_idx]
+    if num_large_files > 0:
+        large_dir_node_idx = random.randint(0, len(node_ids) - 1)
+        large_dir_node_id = node_ids[large_dir_node_idx]
+    else:
+        large_dir_node_id = None
     
     for node_idx, node_id in enumerate(node_ids):
         print(f"Processing node: {node_id}")
