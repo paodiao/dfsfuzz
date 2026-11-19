@@ -329,24 +329,24 @@ func TestFeaturesOfOffsetLayout(t *testing.T) {
 }
 
 // TestProgTimingsRoundTrip covers the corpus timeline transfer added for
-// fuzzer restarts: ProgTimings extracts per-call [Stime, Etime] pairs (0/0 for
-// calls without CheckInfo) and ApplyProgTimings restores them on a fresh copy,
-// leaving missing calls nil, never overwriting an existing CheckInfo and
-// ignoring shape mismatches.
+// fuzzer restarts: ProgTimings extracts per-call [Stime, Etime, Retv] triples
+// (0/0/0 for calls without CheckInfo) and ApplyProgTimings restores them on a
+// fresh copy, leaving missing calls nil, never overwriting an existing
+// CheckInfo and ignoring shape mismatches.
 func TestProgTimingsRoundTrip(t *testing.T) {
 	target := smokeTarget(t)
-	mk := func(stime, etime uint64) *Call {
-		return &Call{CheckInfo: &FileMetadata{Stime: stime, Etime: etime}}
+	mk := func(stime, etime uint64, retv int64) *Call {
+		return &Call{CheckInfo: &FileMetadata{Stime: stime, Etime: etime, Retv: retv}}
 	}
 	ps := []*Prog{{
 		Target: target,
-		Calls:  []*Call{mk(100, 200), {}, mk(300, 400)},
+		Calls:  []*Call{mk(100, 200, 0), {}, mk(300, 400, 0)},
 	}}
 	timings := ProgTimings(ps)
-	if len(timings) != 1 || len(timings[0]) != 6 {
-		t.Fatalf("ProgTimings shape = %v, want 1x6", timings)
+	if len(timings) != 1 || len(timings[0]) != 9 {
+		t.Fatalf("ProgTimings shape = %v, want 1x9", timings)
 	}
-	want := []uint64{100, 200, 0, 0, 300, 400}
+	want := []uint64{100, 200, 0, 0, 0, 0, 300, 400, 0}
 	for i, v := range want {
 		if timings[0][i] != v {
 			t.Fatalf("timings[0][%d] = %d, want %d", i, timings[0][i], v)
@@ -357,19 +357,19 @@ func TestProgTimingsRoundTrip(t *testing.T) {
 	if n := ApplyProgTimings([]*Prog{fresh}, timings); n != 2 {
 		t.Fatalf("ApplyProgTimings restored %d calls, want 2", n)
 	}
-	if ci := fresh.Calls[0].CheckInfo; ci == nil || ci.Stime != 100 || ci.Etime != 200 {
+	if ci := fresh.Calls[0].CheckInfo; ci == nil || ci.Stime != 100 || ci.Etime != 200 || ci.Retv != 0 {
 		t.Fatalf("call0 CheckInfo not restored: %+v", ci)
 	}
 	if fresh.Calls[1].CheckInfo != nil {
-		t.Fatal("0/0 pair must leave CheckInfo nil")
+		t.Fatal("0/0/0 triple must leave CheckInfo nil")
 	}
-	if ci := fresh.Calls[2].CheckInfo; ci == nil || ci.Stime != 300 || ci.Etime != 400 {
+	if ci := fresh.Calls[2].CheckInfo; ci == nil || ci.Stime != 300 || ci.Etime != 400 || ci.Retv != 0 {
 		t.Fatalf("call2 CheckInfo not restored: %+v", ci)
 	}
 
 	// Existing CheckInfo is never overwritten: the prog matches the payload
 	// shape, so the per-call guard (not the shape guard) is what skips call 0.
-	keep := &Prog{Target: target, Calls: []*Call{mk(1, 2), {}, {}}}
+	keep := &Prog{Target: target, Calls: []*Call{mk(1, 2, 0), {}, {}}}
 	if n := ApplyProgTimings([]*Prog{keep}, timings); n != 1 {
 		t.Fatalf("existing CheckInfo restored count = %d, want 1", n)
 	}
@@ -393,5 +393,20 @@ func TestProgTimingsRoundTrip(t *testing.T) {
 	}
 	if long.Calls[0].CheckInfo != nil {
 		t.Fatal("long payload must not restore a misaligned CheckInfo")
+	}
+
+	// Failed calls keep their negative Retv across the transfer.
+	neg := int64(-17)
+	failPs := []*Prog{{Target: target, Calls: []*Call{mk(500, 600, neg)}}}
+	failTimings := ProgTimings(failPs)
+	if len(failTimings) != 1 || len(failTimings[0]) != 3 || failTimings[0][2] != uint64(neg) {
+		t.Fatalf("failed-call timings = %v, want [500 600 %d]", failTimings, uint64(neg))
+	}
+	restoredFail := &Prog{Target: target, Calls: []*Call{{}}}
+	if n := ApplyProgTimings([]*Prog{restoredFail}, failTimings); n != 1 {
+		t.Fatalf("failed-call restored count = %d, want 1", n)
+	}
+	if ci := restoredFail.Calls[0].CheckInfo; ci == nil || ci.Retv != neg {
+		t.Fatalf("failed-call Retv not restored: %+v", ci)
 	}
 }
