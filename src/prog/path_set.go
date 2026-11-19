@@ -1108,19 +1108,40 @@ func alignFreshLinkTargets(set *pathSet, updates []pathUpdate) {
 	}
 }
 
+// pathSetRootPath returns the namespace root's canonical path ("" for
+// GlusterFS, "merge_view" for HMDFS).
+func pathSetRootPath(ft *FileTree) string {
+	if ft == nil || ft.Root == nil {
+		return ""
+	}
+	return ft.Root.FullPath
+}
+
+// pathSetFallbackCandidates returns call-path candidates for a fallback.
+// Parent paths are only useful as call paths when they are not the namespace
+// root: root is a valid parent, but never a call path.
+func pathSetFallbackCandidates(ft *FileTree, desired, base string) []string {
+	root := pathSetRootPath(ft)
+	seen := make(map[string]bool, 4)
+	var out []string
+	add := func(p string) {
+		if p == "" || p == root || seen[p] {
+			return
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	add(desired)
+	add(base)
+	add(parentDirOrRoot(desired))
+	add(parentDirOrRoot(base))
+	return out
+}
+
 func pathSetFallbackPathWithParent(ps []*Prog, pos GroupPosition, desired, base string, spec pathSpec,
 	constraint int, ft *FileTree, r *randGen, parentValid func(string) bool) string {
-	candidates := []string{desired, base}
-	if p := parentDirOrRoot(desired); p != "" {
-		candidates = append(candidates, p)
-	}
-	if p := parentDirOrRoot(base); p != "" {
-		candidates = append(candidates, p)
-	}
+	candidates := pathSetFallbackCandidates(ft, desired, base)
 	for _, cand := range candidates {
-		if cand == "" {
-			continue
-		}
 		next := spec
 		next.Path = cand
 		if pathSetSpecValidWithParent(ps, pos, next, constraint, ft, parentValid) {
@@ -1128,9 +1149,10 @@ func pathSetFallbackPathWithParent(ps []*Prog, pos GroupPosition, desired, base 
 		}
 	}
 	if ft != nil {
+		root := pathSetRootPath(ft)
 		for _, rel := range []PathRelation{PathSame, PathParent, PathChild, PathSibling} {
 			cand := ft.GetPathByRelation(base, "", rel, r.Rand, false, constraint)
-			if cand == "" {
+			if cand == "" || cand == root {
 				continue
 			}
 			next := spec
@@ -1229,6 +1251,7 @@ func pathSetDirectedCandidates(ps []*Prog, set *pathSet, target *pathTarget, ft 
 		return out
 	}
 	var out []pathRelocationCandidate
+	root := pathSetRootPath(ft)
 	seen := make(map[string]bool)
 	add := func(parent string, selectedDir bool) {
 		if parent == "" || seen[parent] {
@@ -1236,11 +1259,12 @@ func pathSetDirectedCandidates(ps []*Prog, set *pathSet, target *pathTarget, ft 
 		}
 		seen[parent] = true
 		anchorNew := mapPathSetPath(ft.Prefix, anchorSpec.Path, "", parent, roots)
-		if anchorNew != "" {
-			out = append(out, pathRelocationCandidate{
-				NewParent: parent, AnchorNew: anchorNew, SelectedDir: selectedDir,
-			})
+		if anchorNew == "" || anchorNew == root {
+			return
 		}
+		out = append(out, pathRelocationCandidate{
+			NewParent: parent, AnchorNew: anchorNew, SelectedDir: selectedDir,
+		})
 	}
 	for _, bucket := range pathSetForestParentBuckets(target.DepthBucket) {
 		attempts := 3
@@ -1314,10 +1338,11 @@ func pathSetTargetMemberPaths(ps []*Prog, set *pathSet, target *pathTarget,
 		return nil
 	}
 	constraint := member.Constraint
+	root := pathSetRootPath(ft)
 	seen := make(map[string]bool)
 	var out []string
 	add := func(path string) {
-		if path == "" || seen[path] {
+		if path == "" || path == root || seen[path] {
 			return
 		}
 		next := spec
