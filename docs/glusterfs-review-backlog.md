@@ -175,7 +175,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | ID | 状态 | 问题 |
 |---|---|---|
 | P2-T1 | fixed | LOOKUP nodeid fallback 父路径（P1-C2 已修；R `loc.path` 已是 child path，缺失/out-of-root/截断时 drop） |
-| P2-T2 | confirmed | LOOKUP 的 path 截断已在 tracer drop；`BuildVertices` 对非 LOOKUP/其它事件仍不检查 `Truncated` |
+| P2-T2 | confirmed | LOOKUP 的 path 截断已在 tracer drop；`BuildVertices` 对非 LOOKUP/其它事件仍不检查 `Truncated`（待修：入口检查 `Truncated&3`，path/path2 截断 drop，bit2 xattr 不丢整条） |
 | P2-T3 | latent | symlink empty/unresolvable payload 退化成 target-role；`target==""` 时 target 变 linkpath |
 | P2-T4 | deferred | 非 LOOKUP 事件不 fallback `ev.Path`，也没有 path mismatch 诊断 |
 | P2-T5 | deferred | FUSE interrupt 重复 final event（同 unique 二次 S） |
@@ -196,7 +196,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 |---|---|---|
 | P2-D1 | deferred | C1 E-overwrite 未保留 batch 路径（见 P1-A6） |
 | P2-D2 | deferred | C1 tie 排序不确定（见 P1-A7） |
-| P2-D3 | confirmed | plannable/planner phantom：mkdir Success、rmdir Success、rename Failure、getxattr/setxattr 上下文、unlink/unlink Same 等（已知边界） |
+| P2-D3 | deferred | plannable/planner phantom：mkdir Success、rmdir Success、rename Failure、getxattr/setxattr 上下文、unlink/unlink Same 等（已知边界集合；需拆 D3a–e 后再逐项确认） |
 | P2-D4 | latent | symlink-to-dir 类型；baseline 不建 symlink 时不触发 |
 | P2-D5 | deferred | 同路径 size mutation 的 offset bucket 仍以 pre-root size 计算；C1-B 让 planner/观测同源，但程序内 size 变化仍偏；由 P1-C1b 跟踪 |
 | P2-D6 | latent | validator FreshB/profile 不一致（主要 HMDFS） |
@@ -208,17 +208,17 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 | ID | 状态 | 问题 |
 |---|---|---|
-| P2-B1 | confirmed | `GetParentDir` 生成 `"./..."`（见 P1-B6） |
+| P2-B1 | latent | `GetParentDir` 生成 `"./..."`（P1-B6 已修生产生成点；`GetParentDir` 本身保留，当前无生产 caller 触发） |
 | P2-B2 | deferred | PathSet rename dst=src no-op（见 P1-B7） |
 | P2-B3 | deferred | derived readlink CC（见 P1-B8） |
 | P2-B4 | test-only | `insertCallFromDCT` 死路径/过期 base（见 P1-B9） |
 | P2-B5 | latent | FailurePolicy rename same-parent（见 P1-B10） |
 | P2-B6 | latent | `NewLayeredChoiceStrategy` profile=nil（见 P1-B11） |
-| P2-B7 | confirmed | witness symlink 用 file-only 约束；`callNameConstraint` 与 `TargetConstraint` 不一致 |
-| P2-B8 | confirmed | `IsFdRequiredCall("readlink")` 子串误判（见 P1-B12） |
+| P2-B7 | confirmed | witness symlink 用全局 `callNameConstraint`，和 profile `TargetConstraint` 不一致（待修：witnessFor/pickWitness/pickSibling 接收 profile） |
+| P2-B8 | fixed | `IsFdRequiredCall("readlink")` 子串误判（P1-B12 已改精确匹配；`TestIsFdRequiredCallExactMatch` 覆盖） |
 | P2-B9 | latent | PathSet generic linkpath（见 P1-B13） |
 | P2-B10 | latent | cross-program fresh parent 不要求 mkdir 成功（见 P1-B14） |
-| P2-B11 | confirmed | PathSet rename source fresh（见 P1-B15） |
+| P2-B11 | fixed | PathSet rename source fresh（P1-B15 已加 creator binding；`TestBuildPathMembersFreshRenameSource` / `TestValidatePathSetPlanFreshRenameSource` 覆盖） |
 
 ### P2-Fuzzer / manager
 
@@ -246,6 +246,13 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-E8 | deployment | `glusterfs-config.sh` 不检查 volume/mount 失败 |
 | P2-E9 | design-debt | `DFSProfile.DualPathCausalEnabled` 注释仍写 "v1 leaves it false"，与 GlusterFS profile 的 true 不一致；更新注释即可，无运行时影响 |
 | P2-E10 | latent | `ProfileForName` 未知 `DFSName` 返回 nil，`ProfileOrDefault` 静默回退 HMDFS；`proc.go` 按字符串分支，拼错可能走非预期路径；启动时校验 `DFSName ∈ {hmdfs, glusterfs}` |
+
+2026-11-19 P2 confirmed 复核：
+
+- P2-B8/P2-B11 已由 P1-B12/B15 修复，改 `fixed`。
+- P2-B1 降 `latent`：`GetParentDir` 仍返回 `"."`，但生产生成点已走 `parentDirOrRoot`/`joinTestPath`，当前无生产 caller 触发。
+- P2-D3 降 `deferred`：是已知边界集合，不是单点 bug；先拆 D3a–e（mkdir/rmdir Success、rename Failure、xattr context、unlink/unlink Same）再逐项确认。
+- P2-T2/P2-B7 保持 `confirmed`，修法已明确，后续落代码。
 
 ---
 
