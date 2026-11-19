@@ -91,6 +91,11 @@ func anchorCreatorKind(p *Prog, ft *FileTree, call *Call, path string, idx int,
 	if p == nil || call == nil || call.Meta == nil || path == "" {
 		return AnchorPathUnknown, false, -1, false
 	}
+	if call.CheckInfo != nil && call.CheckInfo.Retv < 0 {
+		// A failed syscall never creates a path, even when the caller does
+		// not require success (seed anchors may run without CheckInfo).
+		return AnchorPathUnknown, false, -1, false
+	}
 	if requireSuccess && !callReturnedSuccess(call) {
 		return AnchorPathUnknown, false, -1, false
 	}
@@ -121,11 +126,32 @@ func anchorCreatorKind(p *Prog, ft *FileTree, call *Call, path string, idx int,
 		}
 		return AnchorPathFreshRenameDst, isDir, idx, true
 	case "link":
-		if canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 1)) == path {
-			// v1 link targets are regular files; the new dentry is a file
-			// alias and follows the target type.
-			return AnchorPathFreshFile, false, idx, true
+		linkPath := canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 1))
+		if linkPath != path {
+			break
 		}
+		target := canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 0))
+		if target == "" {
+			return AnchorPathUnknown, false, -1, false
+		}
+		if profile != nil && profile.TracksPathState() &&
+			pathSetAbsentIn(freshPathAbsentBefore(p, idx, profile), target) {
+			return AnchorPathUnknown, false, -1, false
+		}
+		if node := ft.FindNode(target); node != nil {
+			if node.Type != NodeTypeFile {
+				return AnchorPathUnknown, false, -1, false
+			}
+		} else {
+			kind, isDir, _, ok := findAnchorCreator(p, ft, target, idx-1, requireSuccess, profile)
+			if !ok || isDir ||
+				(kind != AnchorPathFreshFile && kind != AnchorPathFreshRenameDst) {
+				return AnchorPathUnknown, false, -1, false
+			}
+		}
+		// v1 link targets are regular files; the new dentry is a file alias
+		// and follows the target type.
+		return AnchorPathFreshFile, false, idx, true
 	case "symlink":
 		linkPath := canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 1))
 		if linkPath != path {
@@ -157,12 +183,22 @@ func findAnchorCreator(p *Prog, ft *FileTree, path string, end int, requireSucce
 	if end >= len(p.Calls) {
 		end = len(p.Calls) - 1
 	}
-	// Latest creator wins: a successful deletion followed by a recreation
-	// must classify the current state, not the first historical creator.
-	for i := end; i >= 0; i-- {
-		if kind, isDir, idx, ok := anchorCreatorKind(p, ft, p.Calls[i], path, i,
-			requireSuccess, profile); ok {
-			return kind, isDir, idx, true
+	if profile.TracksPathState() {
+		// GlusterFS: a successful deletion followed by a recreation must
+		// classify the current state, so the latest creator wins.
+		for i := end; i >= 0; i-- {
+			if kind, isDir, idx, ok := anchorCreatorKind(p, ft, p.Calls[i], path, i,
+				requireSuccess, profile); ok {
+				return kind, isDir, idx, true
+			}
+		}
+	} else {
+		// HMDFS legacy: the first creator wins.
+		for i := 0; i <= end; i++ {
+			if kind, isDir, idx, ok := anchorCreatorKind(p, ft, p.Calls[i], path, i,
+				requireSuccess, profile); ok {
+				return kind, isDir, idx, true
+			}
 		}
 	}
 	return AnchorPathUnknown, false, -1, false

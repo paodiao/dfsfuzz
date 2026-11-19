@@ -272,19 +272,11 @@ func (d *pathDSU) union(a, b int) {
 // not inherit NormalizeMergeViewPath's merge_view/ prepend. FindNode already
 // applies the same prefix internally, so specs must use this canonical form.
 func normalizePathSetPath(ft *FileTree, path string) string {
-	if path == "" {
-		return ""
+	prefix := ""
+	if ft != nil {
+		prefix = ft.Prefix
 	}
-	path = strings.TrimPrefix(path, "./")
-	path = strings.TrimPrefix(path, "/")
-	if ft == nil || ft.Prefix == "" {
-		return path
-	}
-	prefix := strings.TrimSuffix(ft.Prefix, "/")
-	if path == prefix || strings.HasPrefix(path, prefix+"/") {
-		return path
-	}
-	return prefix + "/" + path
+	return normalizePathWithPrefix(prefix, path)
 }
 
 func pathSetNodeConstraint(ft *FileTree, path string) int {

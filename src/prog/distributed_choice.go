@@ -2515,6 +2515,26 @@ func NormalizePath(prefix, path string) string {
 	return path
 }
 
+// normalizePathWithPrefix aligns a call-argument path with a namespace root
+// prefix. It is the FileTree-free form of normalizePathSetPath: an empty
+// prefix only trims "./" and a leading "/", while a non-empty prefix is added
+// when the path is bare. It keeps the prefix when the path is already rooted.
+func normalizePathWithPrefix(prefix, path string) string {
+	if path == "" {
+		return ""
+	}
+	path = strings.TrimPrefix(path, "./")
+	path = strings.TrimPrefix(path, "/")
+	prefix = strings.TrimSuffix(prefix, "/")
+	if prefix == "" {
+		return path
+	}
+	if path == prefix || strings.HasPrefix(path, prefix+"/") {
+		return path
+	}
+	return prefix + "/" + path
+}
+
 func IsUnderRoot(prefix, path string) bool {
 	if prefix == "" {
 		return true

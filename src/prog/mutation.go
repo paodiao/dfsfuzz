@@ -4310,6 +4310,17 @@ func canonicalFreshPath(ft *FileTree, path string) string {
 	return normalizePathSetPath(ft, path)
 }
 
+// canonicalFreshPathForProfile is canonicalFreshPath for helpers that do not
+// carry a FileTree. It uses the profile's declared namespace prefix so a bare
+// in-program path aligns with the tree path used by classifyAnchorPath.
+func canonicalFreshPathForProfile(profile *DFSProfile, path string) string {
+	prefix := ""
+	if profile != nil {
+		prefix = profile.Tree.Prefix
+	}
+	return normalizePathWithPrefix(prefix, path)
+}
+
 func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfile) map[string]int {
 	profile := hmdfsProfile
 	if len(profiles) > 0 && profiles[0] != nil {
@@ -4500,8 +4511,8 @@ func freshRenameEventsBefore(p *Prog, end int, profile *DFSProfile) []freshRenam
 			continue
 		}
 		src, dst := extractRenamePaths(c)
-		src = canonicalFreshPath(nil, src)
-		dst = canonicalFreshPath(nil, dst)
+		src = canonicalFreshPathForProfile(profile, src)
+		dst = canonicalFreshPathForProfile(profile, dst)
 		if src != "" && dst != "" && src != dst {
 			out = append(out, freshRenameEvent{idx: i, src: src, dst: dst})
 		}
@@ -4538,7 +4549,7 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 	if p == nil || path == "" || end <= 0 {
 		return GroupPosition{}, 0, false
 	}
-	path = canonicalFreshPath(nil, path)
+	path = canonicalFreshPathForProfile(profile, path)
 	if end > len(p.Calls) {
 		end = len(p.Calls)
 	}
@@ -4553,25 +4564,25 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 		}
 		switch c.Meta.CallName {
 		case "mkdir", "creat":
-			if renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCall(c)), events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPathForProfile(profile, extractPathFromCall(c)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
 			}
 		case "open":
 			if openPathCreatesFile(p.Target, c) &&
-				renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCall(c)), events, i) == path {
+				renamePathThroughEvents(canonicalFreshPathForProfile(profile, extractPathFromCall(c)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
 			}
 		case "rename":
 			_, dst := extractRenamePaths(c)
-			if renamePathThroughEvents(canonicalFreshPath(nil, dst), events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPathForProfile(profile, dst), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		case "link":
-			if renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCallByArgIdx(c, 1)), events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPathForProfile(profile, extractPathFromCallByArgIdx(c, 1)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		case "symlink":
-			if renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCallByArgIdx(c, 1)), events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPathForProfile(profile, extractPathFromCallByArgIdx(c, 1)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		}
@@ -4602,24 +4613,24 @@ func freshPathAbsentBefore(p *Prog, end int, profiles ...*DFSProfile) map[string
 		}
 		switch c.Meta.CallName {
 		case "unlink", "rmdir":
-			if path := canonicalFreshPath(nil, extractPathFromCall(c)); path != "" {
+			if path := canonicalFreshPathForProfile(profile, extractPathFromCall(c)); path != "" {
 				m[path] = true
 			}
 		case "rename":
 			src, dst := extractRenamePaths(c)
-			renameAbsentPrefix(m, canonicalFreshPath(nil, src), canonicalFreshPath(nil, dst))
+			renameAbsentPrefix(m, canonicalFreshPathForProfile(profile, src), canonicalFreshPathForProfile(profile, dst))
 		case "mkdir", "creat":
-			if path := canonicalFreshPath(nil, extractPathFromCall(c)); path != "" {
+			if path := canonicalFreshPathForProfile(profile, extractPathFromCall(c)); path != "" {
 				delete(m, path)
 			}
 		case "open":
 			if openPathCreatesFile(p.Target, c) {
-				if path := canonicalFreshPath(nil, extractPathFromCall(c)); path != "" {
+				if path := canonicalFreshPathForProfile(profile, extractPathFromCall(c)); path != "" {
 					delete(m, path)
 				}
 			}
 		case "link", "symlink":
-			if path := canonicalFreshPath(nil, extractPathFromCallByArgIdx(c, 1)); path != "" {
+			if path := canonicalFreshPathForProfile(profile, extractPathFromCallByArgIdx(c, 1)); path != "" {
 				delete(m, path)
 			}
 		}
