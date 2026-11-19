@@ -52,12 +52,14 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 2026-11-19 修复记录：P1-A2/A3/A4/A6 已落地。
 
-- 新增 `path_effect.go`：`unlink` 文件 → Remove，`rmdir` 空目录 → Remove，`rename` → Move(source,dest)；C1 anchor 用 `callSucceeded` 严格判定，失败 anchor 直接跳过。
+- 新增 `path_effect.go`：`unlink` 文件 → Remove，`rmdir` 空目录 → Remove，`rename` → Move(source,dest)；C1 anchor 用 `callReturnedSuccess`（`Retv>=0`）判定，destructive effect 仍用 `callSucceeded`（`Retv==0`），失败 anchor 直接跳过。
 - C1 root candidate、C1 anchor 后的 C2 variant（CC+HB）都按 anchor effect 过滤；C2 root 的 HB variant 按 root effect 过滤，CC 保留 race。
-- rename root 的 CC A 侧改用 source，HB 仍用 dest；dual profile 才启用，HMDFS 保持原路径。
+- rename root 的 CC A 侧改用 source，HB 仍用 dest；A2 的 dual 分支只在 `DualPathCausalEnabled` 下启用。C1 root 的 path effect 是共享修复，HMDFS 也会过滤 unlink/rmdir anchor 后的 root。
 - E-overwrite destination 现在把 root 的 source/dest/parent 和全部 plan 路径纳入 reserved set，并在 picker/insert 两处用 `batchRootReservationsOK` 兜底。
 - directed variant 不复用 root 的 fd（`directedVariantCallsSeq` 始终重新 open），所以 fd variants 不豁免删除路径；只有 `creat` 在精确 source path 上、RetB=Success 时豁免。
-- 回归测试：`TestPathEffect*`、`TestCausalRootRelPathsForDualRenameTemporal`、`TestCausalRenameRootC2TemporalRelations`、`TestCausalUnlinkAnchorFiltersRemovedPath`、`TestCausalRmdirAnchorFiltersRemovedPath`、`TestCausalRenameAnchorFiltersSourceSubtree`、`TestCausalFailedAnchorRejected`、`TestPickCausalRootBatchFiltersAnchorRemovedPath`、`TestBatchRootReservationsOK`。
+- P1-B5a：`findAnchorCreator` 改用 `callReturnedSuccess`，成功 `open(O_CREAT)` 返回 fd>=0 时仍被识别为 creator；失败 `open`（`Retv<0`）仍拒绝。
+- `pathEffect` 在构造和 `allows` 边界 normalize `./`/前导 `/`，避免 p0 anchor 的 `./dirA/a` 与 tree `dirA/a` 字符串不一致导致漏过滤；P1-B6 的生成点（`GetParentDir`/`joinTestPath`）仍在 backlog。
+- 回归测试：`TestPathEffect*`（含 `TestPathEffectNormalizesDotPaths`）、`TestCausalRootRelPathsForDualRenameTemporal`、`TestCausalRenameRootC2TemporalRelations`（不绑定 stat/Same）、`TestCausalUnlinkAnchorFiltersRemovedPath`、`TestCausalRmdirAnchorFiltersRemovedPath`、`TestCausalRenameAnchorFiltersSourceSubtree`、`TestCausalFailedAnchorRejected`、`TestCausalWriteAnchorAccepted`、`TestFindAnchorCreatorAcceptsOpenCreate`、`TestPickCausalRootBatchFiltersAnchorRemovedPath`、`TestBatchRootReservationsOK`。
 - 验证：`GOOS=linux GOARCH=amd64 go test -c ./prog`、`GOOS=linux GOARCH=amd64 go vet ./prog ./syz-fuzzer` 通过；Linux 3-3 运行时待跑。
 
 ### P1-B DCT / seed / PathSet
@@ -69,6 +71,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P1-B3 | confirmed | rename variant 绕过 profile RenamePolicy；`GetPathsForRenameVariant` → `pickRenameDst` → `pickRenameDstPolicy(hmdfsProfile,...)`，GlusterFS 永远 same-parent | `distributed_choice.go:2239-2248,2280-2282`；`mutation.go:5129,5372`；`rand.go:2897` | 改成 `lcs.pickRenameDstFor(src, rel, r)`；HMDFS 保持 wrapper |
 | P1-B4 | confirmed | PathSet broad relocation 用 newBase 当 oldBase 映射；`choosePathSetBase` 丢掉 oldBase，`mapPathSetPath` 得到 `newBase+path` 或 no-op | `path_set.go:811-841,1494-1502,872-875` | 返回 `oldBase/newBase`，用 `oldBase+suffix→newBase+suffix`；拒绝 ancestor newBase，要求至少一个路径变化 |
 | P1-B5 | confirmed | anchor/rename source 不跟踪 in-program unlink/rmdir/rename；FileTree 只保留 baseline，derived root 落在已删除路径；fresh rename source 永远 `pathExisting` | `anchor_path.go:31-38,53-104`；`seed_derivation.go:115-192`；`mutation.go:4570-4612`；`path_set.go:466-470,1009-1010` | anchor/creator 查询加 `freshPathAbsentBefore`/`freshRenameEventsBefore`；rename src 用 `pathSetCreatorState`；至少拒绝 anchor 自身成功删除的路径 |
+| P1-B5a | fixed | `findAnchorCreator` 的 `requireSuccess` 用 `callSucceeded`（`Retv==0`），成功 `open(O_CREAT)` 返回 fd>0 会被当成失败跳过；`classifyAnchorPath` 看不到这个 fresh anchor | `anchor_path.go:58,122-124` | 改用 `callReturnedSuccess`（`Retv>=0`）；补 `TestFindAnchorCreatorAcceptsOpenCreate` |
 | P1-B6 | confirmed | `GetParentDir` 对顶层路径产生 `"./..."`；`joinTestPath(".", name)`/`freshChildPath(".",...)` 生成 `"./mut_dir_x"`，DAG/coverage/freshKinds 字符串不一致 | `distributed_choice.go:2318,2375-2380`；`mutation.go:5121,5365`；`rand.go:2889`；`seed_derivation.go:291-292` | 统一 `parentDirOrRoot`/canonical join；normalize freshKinds/freshLinks 键 |
 | P1-B7 | deferred | PathSet 可生成 `rename(src, src)` no-op | `path_set.go:1107-1140,1011-1021` | `pathRoleRenameDst` 拒绝 dst==src；fallback 排除 source |
 | P1-B8 | deferred | derived readlink variant 允许 CC；root symlink 是 modifier，50% CC，readlink 在 root 前执行 → ENOENT | `mutation.go:5314,5322-5340,5350-5355`；`distributed_choice.go:1975-1983` | readlink variant 强制 `TemporalHB`/`rootEnd` |
@@ -139,6 +142,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-D6 | latent | validator FreshB/profile 不一致（主要 HMDFS） |
 | P2-D7 | deferred | fresh linkpath 未做 batch-local 保留，随机碰撞可能把 Success 变 EEXIST |
 | P2-D8 | deferred | directed variants 不复用已有 fd（`directedVariantCallsSeq` 总是重新 open）；fd-survives-unlink 的 HB pair 当前不可构造 |
+| P2-D9 | latent | `pathEffect` 仍是字符串比较；HMDFS bare path / future `NormalizePath` source 与 tree `merge_view/` prefix 不一致时会漏过滤。当前 p0/tree 同 profile prefix，生产不触发 |
 
 ### P2-DCT / PathSet
 
