@@ -266,6 +266,40 @@ func TestPathSetRejectsRootCallPath(t *testing.T) {
 	}
 }
 
+func TestPathSetFallbackCandidatesSkipRoot(t *testing.T) {
+	has := func(list []string, want string) bool {
+		for _, s := range list {
+			if s == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	hmdfs := NewFileTree()
+	cands := pathSetFallbackCandidates(hmdfs, "merge_view/dirA", "merge_view/dirB")
+	if has(cands, "merge_view") || has(cands, "") {
+		t.Fatalf("HMDFS root survived in fallback candidates: %v", cands)
+	}
+	if !has(cands, "merge_view/dirA") || !has(cands, "merge_view/dirB") {
+		t.Fatalf("HMDFS fallback candidates lost paths: %v", cands)
+	}
+
+	glusterfs := NewFileTreeWithPrefix("")
+	cands = pathSetFallbackCandidates(glusterfs, "dirA", "dirB")
+	if has(cands, "") {
+		t.Fatalf("GlusterFS root survived in fallback candidates: %v", cands)
+	}
+	if !has(cands, "dirA") || !has(cands, "dirB") {
+		t.Fatalf("GlusterFS fallback candidates lost paths: %v", cands)
+	}
+
+	cands = pathSetFallbackCandidates(hmdfs, "merge_view", "merge_view")
+	if len(cands) != 0 {
+		t.Fatalf("root fallback candidates = %v, want none", cands)
+	}
+}
+
 func TestHMDFSTopLevelFreshParent(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	if freshParentEligible(lcs.FileTree, "") {
