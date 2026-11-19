@@ -194,6 +194,18 @@ static bool normalize_trace_path(const std::string &raw, std::string &out)
 	return true;
 }
 
+/* lookup_event_path_ok reports whether a LOOKUP's R path can be emitted.
+ * fuse_resolve_parent_simple sets loc.name and loc_touchup builds loc.path as
+ * parent + name, so the path is used as-is. LOOKUP's nodeid is the parent, so
+ * a missing/out-of-root/truncated path must be dropped rather than resolved
+ * through the nodeid map. */
+static bool lookup_event_path_ok(const std::string &path, bool out_of_root,
+				 uint32_t truncated)
+{
+	/* truncated bit0 is the path field; LOOKUP does not use path2. */
+	return !path.empty() && !out_of_root && (truncated & 1u) == 0;
+}
+
 static std::string raw_string(const char *buf, uint32_t len, uint32_t max)
 {
 	if (len > max)
@@ -225,6 +237,7 @@ static uint64_t g_missing_d;
 static uint64_t g_missing_r;
 static uint64_t g_missing_s;
 static uint64_t g_drop_xattr;
+static uint64_t g_drop_lookup;
 static uint64_t g_out_of_root;
 static uint64_t g_path2_out_of_root;
 static uint64_t g_unmapped_opcode;
@@ -373,8 +386,17 @@ static void process_merged_events(void)
 			if (p.opcode != GF_OP_RELEASE)
 				g_missing_r++;
 		}
-		/* Missing or out-of-root event path: prefer the nodeid map. */
-		if (p.path.empty() || p.out_of_root) {
+		if (p.opcode == GF_OP_LOOKUP) {
+			/* LOOKUP's nodeid is the parent, not the child. loc.path
+			 * already holds the resolved child path; drop instead of
+			 * using the nodeid fallback. */
+			if (!lookup_event_path_ok(p.path, p.out_of_root, p.truncated)) {
+				g_drop_lookup++;
+				g_pending.erase(it);
+				continue;
+			}
+		} else if (p.path.empty() || p.out_of_root) {
+			/* Missing or out-of-root event path: prefer the nodeid map. */
 			auto nip = g_nodeid_path.find(p.nodeid);
 			if (nip != g_nodeid_path.end()) {
 				p.path = nip->second;
@@ -421,11 +443,12 @@ static void process_merged_events(void)
 
 	fprintf(stderr,
 		"glusterfs_trace: merged=%zu final=%zu missing_d=%llu missing_r=%llu "
-		"missing_s=%llu drop_xattr=%llu out_root=%llu path2_out_root=%llu "
-		"unmapped=%llu dropped=%llu\n",
+		"missing_s=%llu drop_xattr=%llu drop_lookup=%llu out_root=%llu "
+		"path2_out_root=%llu unmapped=%llu dropped=%llu\n",
 		merged.size(), g_final_events.size(),
 		(unsigned long long)g_missing_d, (unsigned long long)g_missing_r,
 		(unsigned long long)g_missing_s, (unsigned long long)g_drop_xattr,
+		(unsigned long long)g_drop_lookup,
 		(unsigned long long)g_out_of_root,
 		(unsigned long long)g_path2_out_of_root,
 		(unsigned long long)g_unmapped_opcode,
@@ -760,6 +783,7 @@ void stop_collect_glusterfs_trace(void)
 	g_missing_r = 0;
 	g_missing_s = 0;
 	g_drop_xattr = 0;
+	g_drop_lookup = 0;
 	g_out_of_root = 0;
 	g_path2_out_of_root = 0;
 	g_unmapped_opcode = 0;
