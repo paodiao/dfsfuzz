@@ -615,7 +615,7 @@ func directedAShapeForPlan(plan *directedPlan, byPath map[string]directedAShape,
 // witnessFor returns the A base path that puts B in relation rel to A for the
 // given root call, or ok=false when no A-eligible witness exists or the root's
 // type constraint does not fit.
-func (bn *directedBNode) witnessFor(rel PathRelation, root string, r *rand.Rand) (string, bool) {
+func (bn *directedBNode) witnessFor(profile *DFSProfile, rel PathRelation, root string, r *rand.Rand) (string, bool) {
 	switch rel {
 	case PathSame:
 		// A = B must itself be a valid root base: TmpDir B has no Same witness.
@@ -634,16 +634,16 @@ func (bn *directedBNode) witnessFor(rel PathRelation, root string, r *rand.Rand)
 			}
 			a = bn.srcPath
 		}
-		if bn.isTmpDir || !nodeFitsConstraint(bn.directedNode, root) {
+		if bn.isTmpDir || !nodeFitsConstraintFor(profile, bn.directedNode, root) {
 			return "", false
 		}
 		return a, true
 	case PathChild:
-		return pickWitness(&bn.anc, root, r)
+		return pickWitness(profile, &bn.anc, root, r)
 	case PathParent:
-		return pickWitness(&bn.sub, root, r)
+		return pickWitness(profile, &bn.sub, root, r)
 	case PathSibling:
-		return bn.pickSibling(root, r)
+		return bn.pickSibling(profile, root, r)
 	}
 	return "", false
 }
@@ -652,7 +652,7 @@ func (bn *directedBNode) witnessFor(rel PathRelation, root string, r *rand.Rand)
 // "minus self" list: the parent's per-type lists are shared read-only from the
 // view and up to two slots (the skipped ones, in ascending order) are excluded
 // by index mapping. -1 = slot absent.
-func (bn *directedBNode) pickSibling(root string, r *rand.Rand) (string, bool) {
+func (bn *directedBNode) pickSibling(profile *DFSProfile, root string, r *rand.Rand) (string, bool) {
 	pick := func(list []string, i1, i2 int) (string, bool) {
 		n, e := len(list), 0
 		if i1 >= 0 {
@@ -673,7 +673,7 @@ func (bn *directedBNode) pickSibling(root string, r *rand.Rand) (string, bool) {
 		}
 		return list[k], true
 	}
-	switch callNameConstraint(root) {
+	switch profiledTargetConstraint(profile, root) {
 	case relTargetFile:
 		return pick(bn.sibFile, bn.sibFileIdx, bn.sibFileIdx2)
 	case relTargetDir:
@@ -737,8 +737,8 @@ func firstCand(c *witnessCands) string {
 // constraint. The candidate lists are deterministic; the choice is not, so
 // repeated plans for the same cell exercise different concrete paths while a
 // fixed RNG seed stays reproducible.
-func pickWitness(c *witnessCands, root string, r *rand.Rand) (string, bool) {
-	switch callNameConstraint(root) {
+func pickWitness(profile *DFSProfile, c *witnessCands, root string, r *rand.Rand) (string, bool) {
+	switch profiledTargetConstraint(profile, root) {
 	case relTargetFile:
 		if len(c.file) == 0 {
 			return "", false
@@ -768,6 +768,17 @@ func pickWitness(c *witnessCands, root string, r *rand.Rand) (string, bool) {
 // nodeFitsConstraint checks a node against the call's type constraint.
 func nodeFitsConstraint(n directedNode, call string) bool {
 	return nodeFitsConstraintFor(hmdfsProfile, n, call)
+}
+
+// profiledTargetConstraint is the profile-aware counterpart of the legacy
+// callNameConstraint. Witness selection must use the active profile: GlusterFS
+// symlink/readlink targets may be directories even though the HMDFS global
+// file-only table says otherwise.
+func profiledTargetConstraint(profile *DFSProfile, call string) int {
+	if profile == nil {
+		profile = hmdfsProfile
+	}
+	return profile.TargetConstraint(call)
 }
 
 func nodeFitsConstraintFor(profile *DFSProfile, n directedNode, call string) bool {
@@ -2018,7 +2029,7 @@ func planDirectedCellsScan(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_
 						if _, ok := planByCell[cell.toKey()]; ok {
 							continue
 						}
-						aPath, ok := bn.witnessFor(rel, root, r.Rand)
+						aPath, ok := bn.witnessFor(profile, rel, root, r.Rand)
 						if !ok {
 							continue
 						}
