@@ -408,7 +408,7 @@ func (r *randGen) expandWithDCT(ps []*Prog, sCalls *SpecialCalls, hmcfg *Hmdfs_c
 		return
 	}
 	if lcs == nil || lcs.FileTree == nil ||
-		len(collectSeedAnchors(ps[0], lcs.FileTree, false)) == 0 {
+		len(collectSeedAnchors(ps[0], lcs.FileTree, false, lcs.profileOrDefault())) == 0 {
 		return
 	}
 	target := 7 + r.Intn(4) // 7-10

@@ -112,13 +112,18 @@ func seedAnchorPaths(p *Prog, pos GroupPosition, call *Call) []string {
 	return []string{pathOfCall([]*Prog{p}, pos)}
 }
 
-func collectSeedAnchors(p *Prog, ft *FileTree, requireSuccess bool) []seedAnchor {
+func collectSeedAnchors(p *Prog, ft *FileTree, requireSuccess bool, profiles ...*DFSProfile) []seedAnchor {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
 	if p == nil || ft == nil {
 		return nil
 	}
 	seen := make(map[string]bool)
 	var anchors []seedAnchor
 	add := func(pos GroupPosition, path string, role seedAnchorRole) {
+		path = canonicalFreshPath(ft, path)
 		if path == "" {
 			return
 		}
@@ -130,7 +135,7 @@ func collectSeedAnchors(p *Prog, ft *FileTree, requireSuccess bool) []seedAnchor
 		if seen[key] {
 			return
 		}
-		info, ok := classifyAnchorPath(p, ft, pos, path, requireSuccess)
+		info, ok := classifyAnchorPath(p, ft, pos, path, requireSuccess, profile)
 		if !ok || info.Kind == AnchorPathUnknown {
 			return
 		}
@@ -153,13 +158,13 @@ func collectSeedAnchors(p *Prog, ft *FileTree, requireSuccess bool) []seedAnchor
 		switch call.Meta.CallName {
 		case "link":
 			anchor.Dual = DualLink
-			anchor.Target = extractPathFromCallByArgIdx(call, 0)
-			anchor.LinkPath = extractPathFromCallByArgIdx(call, 1)
+			anchor.Target = canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 0))
+			anchor.LinkPath = canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 1))
 		case "symlink":
 			anchor.Dual = DualSymlink
-			anchor.LinkPath = extractPathFromCallByArgIdx(call, 1)
-			anchor.Target = symlinkCanonicalTarget(anchor.LinkPath,
-				extractPathFromCallByArgIdx(call, 0))
+			anchor.LinkPath = canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 1))
+			anchor.Target = canonicalFreshPath(ft, symlinkCanonicalTarget(anchor.LinkPath,
+				extractPathFromCallByArgIdx(call, 0)))
 			anchor.FollowIsDir = info.IsDir
 		case "readlink":
 			anchor.Dual = DualReadlink
@@ -398,7 +403,7 @@ func sampleSeedDerivation(p *Prog, ft *FileTree, table *CausalDerivationTable, r
 	if table == nil {
 		table = newCausalDerivationTableFor(r.profile())
 	}
-	anchors := collectSeedAnchors(p, ft, requireSuccess)
+	anchors := collectSeedAnchors(p, ft, requireSuccess, r.profile())
 	if len(anchors) == 0 {
 		return seedRootDerivation{}, false
 	}

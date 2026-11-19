@@ -457,6 +457,13 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 				src, dst := extractRenamePaths(call)
 				src = normalizePathSetPath(ft, src)
 				dst = normalizePathSetPath(ft, dst)
+				if src != "" && profile.TracksPathState() {
+					if absent := freshPathAbsentBefore(p, ci, profile); pathSetAbsentIn(absent, src) {
+						// The source was removed before this rename; the call
+						// cannot execute, so it is not a valid PathSet member.
+						continue
+					}
+				}
 				sourceType := pathSetNodeConstraint(ft, src)
 				freshKinds := freshPathKindsBefore(p, ft, ci, profile)
 				if k, ok := freshKinds[src]; ok {
@@ -808,14 +815,28 @@ func pathSetBaseKind(set *pathSet, ft *FileTree, anchorConstraint int) int {
 	return anchorConstraint
 }
 
-func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (string, []string, bool) {
+// pathSetBaseCandidateOK reports whether newBase is a usable broad-relocation
+// destination for oldBase. The namespace root and the current base are not
+// relocations; a descendant would nest the moved subtree inside itself. An
+// ancestor is allowed: it flattens one level and remains a real change.
+func pathSetBaseCandidateOK(ft *FileTree, oldBase, newBase string) bool {
+	if oldBase == "" || newBase == "" || newBase == oldBase {
+		return false
+	}
+	if ft != nil && newBase == ft.Root.FullPath {
+		return false
+	}
+	return !pathUnderRoot(newBase, oldBase)
+}
+
+func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (string, string, []string, bool) {
 	roots := pathSetRoots(set)
 	if len(roots) == 0 {
-		return "", nil, false
+		return "", "", nil, false
 	}
 	anchor, ok := pathSetFindMember(set, set.Anchor)
 	if !ok {
-		return "", nil, false
+		return "", "", nil, false
 	}
 	anchorConstraint := anchor.Constraint
 	if len(roots) == 1 {
@@ -827,18 +848,18 @@ func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (stri
 		}
 		oldBase := pathSetCommonPrefix(paths)
 		if oldBase == "" {
-			return "", nil, false
+			return "", "", nil, false
 		}
 		baseKind := pathSetBaseKind(set, ft, anchorConstraint)
 		for attempt := 0; attempt < 8; attempt++ {
 			newBase := pickNewBasePath(ft, baseKind, -1, r.Rand, "", oldBase)
-			if newBase == "" || newBase == oldBase || newBase == ft.Root.FullPath ||
-				pathUnderRoot(newBase, oldBase) || !pathSatisfiesType(ft, newBase, baseKind) {
+			if !pathSetBaseCandidateOK(ft, oldBase, newBase) ||
+				!pathSatisfiesType(ft, newBase, baseKind) {
 				continue
 			}
-			return newBase, nil, true
+			return oldBase, newBase, nil, true
 		}
-		return "", nil, false
+		return "", "", nil, false
 	}
 	for attempt := 0; attempt < 8; attempt++ {
 		newParent := pickNewBasePath(ft, relTargetDir, -1, r.Rand, "", "")
@@ -854,7 +875,7 @@ func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (stri
 			}
 		}
 		if !bad {
-			return "", []string{newParent}, true
+			return "", "", []string{newParent}, true
 		}
 	}
 	// No parent outside the selected roots: use an existing selected directory
@@ -863,10 +884,10 @@ func choosePathSetBase(set *pathSet, ps []*Prog, ft *FileTree, r *randGen) (stri
 	for _, root := range roots {
 		rootPath := pathSetTopPath(ft.Prefix, root)
 		if node := ft.FindNode(rootPath); node != nil && nodeIsDir(node) {
-			return "", []string{rootPath}, true
+			return "", "", []string{rootPath}, true
 		}
 	}
-	return "", nil, false
+	return "", "", nil, false
 }
 
 func mapPathSetPath(prefix, path, base string, parent string, roots []string) string {
@@ -884,6 +905,17 @@ func mapPathSetPath(prefix, path, base string, parent string, roots []string) st
 	rootPath := pathSetTopPath(prefix, top)
 	rest := strings.TrimPrefix(path, rootPath)
 	return parent + "/" + top + rest
+}
+
+// mapPathSetBasePath relocates path from the old common prefix to the new one:
+// oldBase/suffix -> newBase/suffix. The path must be under oldBase; callers
+// choose oldBase as pathSetCommonPrefix of the set.
+func mapPathSetBasePath(path, oldBase, newBase string) string {
+	if path == "" || oldBase == "" || newBase == "" || oldBase == newBase ||
+		!pathUnderRoot(path, oldBase) {
+		return ""
+	}
+	return newBase + strings.TrimPrefix(path, oldBase)
 }
 
 func pathSetFreshParentCreated(ps []*Prog, ft *FileTree, pos GroupPosition, parent string) bool {
@@ -1520,15 +1552,20 @@ func mutatePathSetDirected(ps []*Prog, lcs *LayeredChoiceStrategy, r *randGen) b
 	return true
 }
 
-func buildPathPlan(ps []*Prog, set *pathSet, base, parent string, roots []string, ft *FileTree, r *randGen) (*pathPlan, bool) {
-	plan := &pathPlan{Base: base}
+func buildPathPlan(ps []*Prog, set *pathSet, oldBase, newBase, parent string, roots []string, ft *FileTree, r *randGen) (*pathPlan, bool) {
+	plan := &pathPlan{Base: newBase}
 	if parent != "" {
 		plan.Base = parent
 	}
 	for _, m := range set.Members {
 		update := pathUpdate{Pos: m.Pos}
 		for _, spec := range m.Paths {
-			desired := mapPathSetPath(ft.Prefix, spec.Path, base, parent, roots)
+			var desired string
+			if parent == "" {
+				desired = mapPathSetBasePath(spec.Path, oldBase, newBase)
+			} else {
+				desired = mapPathSetPath(ft.Prefix, spec.Path, "", parent, roots)
+			}
 			if desired == "" {
 				return nil, false
 			}
@@ -1722,6 +1759,25 @@ func validatePathSetPlan(ps []*Prog, set *pathSet, plan *pathPlan, ft *FileTree,
 	return quality, true
 }
 
+// pathPlanChangesPaths reports whether at least one mapped path differs from
+// its original. A no-op plan must not be applied as a successful relocation.
+func pathPlanChangesPaths(set *pathSet, plan *pathPlan) bool {
+	if set == nil || plan == nil || len(plan.Updates) != len(set.Members) {
+		return false
+	}
+	for i := range set.Members {
+		if len(plan.Updates[i].Specs) != len(set.Members[i].Paths) {
+			return false
+		}
+		for j, spec := range set.Members[i].Paths {
+			if plan.Updates[i].Specs[j].Path != spec.Path {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func relocatePathSet(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *randGen) bool {
 	if set == nil || lcs == nil || lcs.FileTree == nil {
 		return false
@@ -1730,7 +1786,7 @@ func relocatePathSet(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *ra
 	var bestPlan *pathPlan
 	bestSoft := true
 	for attempt := 0; attempt < 4; attempt++ {
-		base, parents, ok := choosePathSetBase(set, ps, lcs.FileTree, r)
+		oldBase, newBase, parents, ok := choosePathSetBase(set, ps, lcs.FileTree, r)
 		if !ok {
 			break
 		}
@@ -1738,8 +1794,8 @@ func relocatePathSet(ps []*Prog, lcs *LayeredChoiceStrategy, set *pathSet, r *ra
 		if len(parents) > 0 {
 			parent = parents[0]
 		}
-		plan, ok := buildPathPlan(ps, set, base, parent, roots, lcs.FileTree, r)
-		if !ok || !pathSetConnected(set, plan) {
+		plan, ok := buildPathPlan(ps, set, oldBase, newBase, parent, roots, lcs.FileTree, r)
+		if !ok || !pathPlanChangesPaths(set, plan) || !pathSetConnected(set, plan) {
 			continue
 		}
 		quality, ok := validatePathSetPlan(ps, set, plan, lcs.FileTree, lcs.tscoffs)

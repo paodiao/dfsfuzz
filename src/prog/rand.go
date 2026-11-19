@@ -2886,7 +2886,7 @@ func (r *randGen) generateFromDistributedChoiceTable(s *state, sCalls *SpecialCa
 			case PathChild:
 				concurrentPath = r.freshChildPath(basePath, "mkdir")
 			case PathSibling:
-				concurrentPath = r.freshChildPath(GetParentDir(basePath), "mkdir")
+				concurrentPath = r.freshChildPath(parentDirOrRoot(basePath), "mkdir")
 			case PathNoRel:
 				if dir := lcs.FileTree.getRandomUnrelatedPath(basePath, r.Rand, relTargetDir); dir != "" {
 					concurrentPath = r.freshChildPath(dir, "mkdir")

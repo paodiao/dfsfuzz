@@ -3726,8 +3726,8 @@ func pickNonEmptyDir(ft *FileTree, r *randGen, exclude string) string {
 // is a variant-side path, so a TmpDir sibling qualifies (nodeIsDir); the
 // non-TmpDir rule applies to the destination only (see pickNonEmptyDir).
 func pickRenameSrcDir(ft *FileTree, r *randGen, dstPath string) string {
-	parent := GetParentDir(dstPath)
-	if parent == "" {
+	parent := parentDirOrRoot(dstPath)
+	if parent == "" && (ft == nil || ft.Prefix != "") {
 		return ""
 	}
 	ft.mu.RLock()
@@ -4301,6 +4301,15 @@ func callAssumedSucceeded(call *Call) bool {
 	return call.CheckInfo.Retv == 0
 }
 
+// canonicalFreshPath aligns in-program path hints with the FileTree namespace.
+// ft may be nil; the canonical form then only trims "./" and a leading "/".
+func canonicalFreshPath(ft *FileTree, path string) string {
+	if path == "" {
+		return ""
+	}
+	return normalizePathSetPath(ft, path)
+}
+
 func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfile) map[string]int {
 	profile := hmdfsProfile
 	if len(profiles) > 0 && profiles[0] != nil {
@@ -4314,6 +4323,7 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 	}
 	m := make(map[string]int)
 	set := func(path string, kind int) {
+		path = canonicalFreshPath(ft, path)
 		if path == "" {
 			return
 		}
@@ -4324,6 +4334,7 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 		m[path] = kind
 	}
 	kindOf := func(path string) (int, bool) {
+		path = canonicalFreshPath(ft, path)
 		if k, ok := m[path]; ok {
 			return k, true
 		}
@@ -4365,10 +4376,12 @@ func freshPathKindsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 			}
 		case "unlink", "rmdir":
 			if profile.TracksPathState() {
-				delete(m, extractPathFromCall(c))
+				delete(m, canonicalFreshPath(ft, extractPathFromCall(c)))
 			}
 		case "rename":
 			src, dst := extractRenamePaths(c)
+			src = canonicalFreshPath(ft, src)
+			dst = canonicalFreshPath(ft, dst)
 			if profile.TracksPathState() {
 				renameFreshKindPrefix(m, src, dst, kindOf)
 			} else if k, ok := kindOf(src); ok {
@@ -4487,6 +4500,8 @@ func freshRenameEventsBefore(p *Prog, end int, profile *DFSProfile) []freshRenam
 			continue
 		}
 		src, dst := extractRenamePaths(c)
+		src = canonicalFreshPath(nil, src)
+		dst = canonicalFreshPath(nil, dst)
 		if src != "" && dst != "" && src != dst {
 			out = append(out, freshRenameEvent{idx: i, src: src, dst: dst})
 		}
@@ -4523,6 +4538,7 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 	if p == nil || path == "" || end <= 0 {
 		return GroupPosition{}, 0, false
 	}
+	path = canonicalFreshPath(nil, path)
 	if end > len(p.Calls) {
 		end = len(p.Calls)
 	}
@@ -4537,25 +4553,25 @@ func freshPathCreatorBefore(p *Prog, end int, path string, profiles ...*DFSProfi
 		}
 		switch c.Meta.CallName {
 		case "mkdir", "creat":
-			if renamePathThroughEvents(extractPathFromCall(c), events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCall(c)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
 			}
 		case "open":
 			if openPathCreatesFile(p.Target, c) &&
-				renamePathThroughEvents(extractPathFromCall(c), events, i) == path {
+				renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCall(c)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 0, true
 			}
 		case "rename":
 			_, dst := extractRenamePaths(c)
-			if renamePathThroughEvents(dst, events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPath(nil, dst), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		case "link":
-			if renamePathThroughEvents(extractPathFromCallByArgIdx(c, 1), events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCallByArgIdx(c, 1)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		case "symlink":
-			if renamePathThroughEvents(extractPathFromCallByArgIdx(c, 1), events, i) == path {
+			if renamePathThroughEvents(canonicalFreshPath(nil, extractPathFromCallByArgIdx(c, 1)), events, i) == path {
 				return GroupPosition{ProgIdx: 0, CallIdx: i}, 1, true
 			}
 		}
@@ -4586,24 +4602,24 @@ func freshPathAbsentBefore(p *Prog, end int, profiles ...*DFSProfile) map[string
 		}
 		switch c.Meta.CallName {
 		case "unlink", "rmdir":
-			if path := extractPathFromCall(c); path != "" {
+			if path := canonicalFreshPath(nil, extractPathFromCall(c)); path != "" {
 				m[path] = true
 			}
 		case "rename":
 			src, dst := extractRenamePaths(c)
-			renameAbsentPrefix(m, src, dst)
+			renameAbsentPrefix(m, canonicalFreshPath(nil, src), canonicalFreshPath(nil, dst))
 		case "mkdir", "creat":
-			if path := extractPathFromCall(c); path != "" {
+			if path := canonicalFreshPath(nil, extractPathFromCall(c)); path != "" {
 				delete(m, path)
 			}
 		case "open":
 			if openPathCreatesFile(p.Target, c) {
-				if path := extractPathFromCall(c); path != "" {
+				if path := canonicalFreshPath(nil, extractPathFromCall(c)); path != "" {
 					delete(m, path)
 				}
 			}
 		case "link", "symlink":
-			if path := extractPathFromCallByArgIdx(c, 1); path != "" {
+			if path := canonicalFreshPath(nil, extractPathFromCallByArgIdx(c, 1)); path != "" {
 				delete(m, path)
 			}
 		}
@@ -4738,6 +4754,7 @@ func freshLinkPathsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 	}
 	m := make(map[string]linkPathInfo)
 	followKind := func(path string) (bool, bool) {
+		path = canonicalFreshPath(ft, path)
 		if info, ok := m[path]; ok {
 			return info.FollowIsDir, true
 		}
@@ -4758,15 +4775,15 @@ func freshLinkPathsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 		}
 		switch c.Meta.CallName {
 		case "link":
-			linkPath := extractPathFromCallByArgIdx(c, 1)
+			linkPath := canonicalFreshPath(ft, extractPathFromCallByArgIdx(c, 1))
 			if linkPath != "" {
 				m[linkPath] = linkPathInfo{
-					Kind: linkPathHardlink, Target: extractPathFromCallByArgIdx(c, 0), CreatorIdx: i,
+					Kind: linkPathHardlink, Target: canonicalFreshPath(ft, extractPathFromCallByArgIdx(c, 0)), CreatorIdx: i,
 				}
 			}
 		case "symlink":
-			linkPath := extractPathFromCallByArgIdx(c, 1)
-			target := symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(c, 0))
+			linkPath := canonicalFreshPath(ft, extractPathFromCallByArgIdx(c, 1))
+			target := canonicalFreshPath(ft, symlinkCanonicalTarget(linkPath, extractPathFromCallByArgIdx(c, 0)))
 			if linkPath != "" {
 				isDir, _ := followKind(target)
 				m[linkPath] = linkPathInfo{
@@ -4776,13 +4793,15 @@ func freshLinkPathsBefore(p *Prog, ft *FileTree, end int, profiles ...*DFSProfil
 		case "unlink", "rmdir":
 			// Removal invalidates a local binding.
 			for _, path := range dctCallPaths(c) {
-				delete(m, path)
+				delete(m, canonicalFreshPath(ft, path))
 			}
 		case "rename":
 			// Rename moves a source binding to dst and overwrites any
 			// binding that previously occupied dst. Both cases matter for
 			// nested-link rejection.
 			src, dst := extractRenamePaths(c)
+			src = canonicalFreshPath(ft, src)
+			dst = canonicalFreshPath(ft, dst)
 			if profile.TracksPathState() {
 				renameLinkPathPrefix(m, src, dst)
 				continue
@@ -5118,7 +5137,7 @@ func insertCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hmdf
 			case PathChild:
 				concurrentPath = r.freshChildPath(observedPath, "mkdir")
 			case PathSibling:
-				concurrentPath = r.freshChildPath(GetParentDir(observedPath), "mkdir")
+				concurrentPath = r.freshChildPath(parentDirOrRoot(observedPath), "mkdir")
 			case PathNoRel:
 				if dir := lcs.FileTree.getRandomUnrelatedPath(observedPath, r.Rand, relTargetDir); dir != "" {
 					concurrentPath = r.freshChildPath(dir, "mkdir")
@@ -5200,6 +5219,21 @@ func progHaveFd(p *Prog) bool {
 	return false
 }
 
+// derivedRootCallPaths projects a derived root onto the two path arguments
+// passed to generateCallByName. Only dual-path roots (rename, link, symlink,
+// readlink) carry a meaningful second path; for a single-path root path2 is
+// empty so calls that interpret it as a payload (setxattr/getxattr use it as
+// the xattr name) fall back to their random/default value instead of receiving
+// the target path.
+func derivedRootCallPaths(rp RootPaths) (string, string) {
+	path := rp.Source()
+	path2 := rp.Dest()
+	if rp.Kind == DualNone {
+		path2 = ""
+	}
+	return path, path2
+}
+
 // TimeAlignedInsertPos returns the insertion position j in p whose execution
 // boundary time (the end of the previous call; 0 for j == 0) is closest to
 // refTime. Times are in the global TSC domain (raw TSC minus the VM's TSC
@@ -5218,8 +5252,7 @@ func insertDerivedCallFromDCT(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcf
 	}
 	rootCallName := derivation.RootCall
 	rp := derivation.RootPaths()
-	basePath := rp.Source()
-	basePath2 := rp.Dest()
+	basePath, basePath2 := derivedRootCallPaths(rp)
 	if basePath == "" {
 		return false
 	}

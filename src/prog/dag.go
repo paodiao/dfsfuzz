@@ -1801,20 +1801,12 @@ func offsetBucketOf(v *DAGVertex) uint64 {
 	return offsetBucketMid
 }
 
-// DepthBucketOf maps a path to its depth bucket (0/1/2-4/5+ '/' counts).
-// Bucket 0 is unreachable for merge_view paths (the prefix always contains
-// a '/'); bucket 1 = merge_view/file; bucket 2 = 2-4; bucket 3 = 5+.
+// DepthBucketOf maps a path to its depth bucket relative to the namespace
+// root. HMDFS carries the merge_view root alias; empty-root DFSs (GlusterFS)
+// need no adjustment. merge_view is reserved as the HMDFS root alias; the
+// tree-aware FileTree.DepthBucketOf is the collision-free variant.
 func DepthBucketOf(path string) uint64 {
-	switch n := strings.Count(path, "/"); {
-	case n == 0:
-		return 0
-	case n == 1:
-		return 1
-	case n <= 4:
-		return 2
-	default:
-		return 3
-	}
+	return DepthBucketOfWithPrefix(path, MergeViewPrefix)
 }
 
 // DepthBucketOfWithPrefix maps a path relative to prefix to the same bucket

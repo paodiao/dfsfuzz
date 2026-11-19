@@ -268,9 +268,14 @@ func defaultTestDir(c *Hmdfs_config) string {
 }
 
 // joinTestPath joins a root-relative directory and a leaf without producing a
-// leading slash for the empty GlusterFS root.
+// leading slash for the empty GlusterFS root. filepath.Dir returns "." for a
+// top-level path; treat that as the namespace root so call paths never acquire
+// a "./" prefix.
 func joinTestPath(dir, name string) string {
 	dir = strings.TrimSuffix(dir, "/")
+	if dir == "." {
+		dir = ""
+	}
 	if dir == "" {
 		return name
 	}
@@ -2251,7 +2256,7 @@ func (lcs *LayeredChoiceStrategy) GetPathsForRenameVariant(basePath string, base
 		// 保持——空路径 rename 恒 ENOENT 且退化会改变路径关系。
 		return "", ""
 	}
-	return srcPath, lcs.pickRenameDst(srcPath, r)
+	return srcPath, lcs.pickRenameDstFor(srcPath, pathRelation, r)
 }
 
 // renameExistingDstProb is the probability that a DCT-generated rename picks
@@ -2322,7 +2327,7 @@ func pickRenameDstPolicy(profile *DFSProfile, ft *FileTree, src string, rel Path
 		return freshRenameDst(src, r)
 	}
 	srcIsDir := srcNode.Type != NodeTypeFile
-	parent := GetParentDir(src)
+	parent := parentDirOrRoot(src)
 	targetParent := parent
 	switch rel {
 	case PathParent:
@@ -2350,9 +2355,8 @@ func pickRenameDstPolicy(profile *DFSProfile, ft *FileTree, src string, rel Path
 			targetParent = p
 		}
 	}
-	if targetParent == "" {
-		targetParent = parent
-	}
+	// targetParent may legitimately be the empty namespace root (GlusterFS),
+	// so an empty value must not be treated as an "unset" sentinel.
 	// Existing same-class destination in the target parent.
 	if r.Float64() < renameExistingDstProb {
 		parentNode := ft.FindNode(targetParent)

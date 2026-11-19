@@ -966,7 +966,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 		if !validateCausalAnchor(p0, &anchor, lcs) {
 			continue
 		}
-		info, ok := classifyAnchorPath(p0, ft, pos, path, true)
+		info, ok := classifyAnchorPath(p0, ft, pos, path, true, lcs.profileOrDefault())
 		if !ok || info.Kind == AnchorPathUnknown {
 			continue
 		}

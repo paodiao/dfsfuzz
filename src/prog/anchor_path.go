@@ -23,10 +23,51 @@ type anchorPathInfo struct {
 	CreatorIdx  int
 }
 
-func classifyAnchorPath(p *Prog, ft *FileTree, pos GroupPosition, path string, requireSuccess bool) (anchorPathInfo, bool) {
+func classifyAnchorPath(p *Prog, ft *FileTree, pos GroupPosition, path string, requireSuccess bool, profiles ...*DFSProfile) (anchorPathInfo, bool) {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
 	if p == nil || ft == nil || path == "" || pos.ProgIdx != 0 ||
 		pos.CallIdx < 0 || pos.CallIdx >= len(p.Calls) {
 		return anchorPathInfo{}, false
+	}
+	path = canonicalFreshPath(ft, path)
+	if path == "" {
+		return anchorPathInfo{}, false
+	}
+	if profile.TracksPathState() {
+		if absent := freshPathAbsentBefore(p, pos.CallIdx, profile); pathSetAbsentIn(absent, path) {
+			// The path is absent when the anchor starts. Only the anchor's
+			// own creator effect may make it valid.
+			kind, isDir, idx, ok := anchorCreatorKind(p, ft, p.Calls[pos.CallIdx],
+				path, pos.CallIdx, requireSuccess, profile)
+			if !ok || idx != pos.CallIdx {
+				return anchorPathInfo{}, false
+			}
+			return anchorPathInfo{Kind: kind, IsDir: isDir, FollowIsDir: isDir, CreatorIdx: idx}, true
+		}
+		if node := ft.FindNode(path); node != nil {
+			// The baseline node exists. A successful in-program deletion
+			// followed by a recreation changes its type; the latest creator
+			// wins when the path was absent immediately before it.
+			if kind, isDir, idx, ok := findAnchorCreator(p, ft, path, pos.CallIdx, requireSuccess, profile); ok {
+				if pathSetAbsentIn(freshPathAbsentBefore(p, idx, profile), path) {
+					return anchorPathInfo{Kind: kind, IsDir: isDir, FollowIsDir: isDir, CreatorIdx: idx}, true
+				}
+			}
+			return anchorPathInfo{
+				Kind:        AnchorPathExisting,
+				IsDir:       node.Type != NodeTypeFile,
+				FollowIsDir: node.Type != NodeTypeFile,
+				CreatorIdx:  -1,
+			}, true
+		}
+		kind, isDir, idx, ok := findAnchorCreator(p, ft, path, pos.CallIdx, requireSuccess, profile)
+		if !ok {
+			return anchorPathInfo{}, false
+		}
+		return anchorPathInfo{Kind: kind, IsDir: isDir, FollowIsDir: isDir, CreatorIdx: idx}, true
 	}
 	if node := ft.FindNode(path); node != nil {
 		return anchorPathInfo{
@@ -36,83 +77,120 @@ func classifyAnchorPath(p *Prog, ft *FileTree, pos GroupPosition, path string, r
 			CreatorIdx:  -1,
 		}, true
 	}
-	kind, isDir, idx, ok := findAnchorCreator(p, ft, path, pos.CallIdx, requireSuccess)
+	kind, isDir, idx, ok := findAnchorCreator(p, ft, path, pos.CallIdx, requireSuccess, profile)
 	if !ok {
 		return anchorPathInfo{}, false
 	}
 	return anchorPathInfo{Kind: kind, IsDir: isDir, FollowIsDir: isDir, CreatorIdx: idx}, true
 }
 
-func findAnchorCreator(p *Prog, ft *FileTree, path string, end int, requireSuccess bool) (AnchorPathKind, bool, int, bool) {
+// anchorCreatorKind classifies one call as the creator of path. It is shared
+// by the forward/backward scan and by the anchor's own-effect check.
+func anchorCreatorKind(p *Prog, ft *FileTree, call *Call, path string, idx int,
+	requireSuccess bool, profile *DFSProfile) (AnchorPathKind, bool, int, bool) {
+	if p == nil || call == nil || call.Meta == nil || path == "" {
+		return AnchorPathUnknown, false, -1, false
+	}
+	if requireSuccess && !callReturnedSuccess(call) {
+		return AnchorPathUnknown, false, -1, false
+	}
+	switch call.Meta.CallName {
+	case "mkdir":
+		if canonicalFreshPath(ft, extractPathFromCall(call)) == path {
+			return AnchorPathFreshDir, true, idx, true
+		}
+	case "creat":
+		if canonicalFreshPath(ft, extractPathFromCall(call)) == path {
+			return AnchorPathFreshFile, false, idx, true
+		}
+	case "open":
+		if !openPathCreatesFile(p.Target, call) {
+			return AnchorPathUnknown, false, -1, false
+		}
+		if canonicalFreshPath(ft, extractPathFromCall(call)) == path {
+			return AnchorPathFreshFile, false, idx, true
+		}
+	case "rename":
+		src, dst := extractRenamePaths(call)
+		if canonicalFreshPath(ft, dst) != path {
+			return AnchorPathUnknown, false, -1, false
+		}
+		isDir, ok := anchorSourceIsDir(p, ft, canonicalFreshPath(ft, src), idx, requireSuccess, profile)
+		if !ok {
+			return AnchorPathUnknown, false, -1, false
+		}
+		return AnchorPathFreshRenameDst, isDir, idx, true
+	case "link":
+		if canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 1)) == path {
+			// v1 link targets are regular files; the new dentry is a file
+			// alias and follows the target type.
+			return AnchorPathFreshFile, false, idx, true
+		}
+	case "symlink":
+		linkPath := canonicalFreshPath(ft, extractPathFromCallByArgIdx(call, 1))
+		if linkPath != path {
+			return AnchorPathUnknown, false, -1, false
+		}
+		target := canonicalFreshPath(ft, symlinkCanonicalTarget(linkPath,
+			extractPathFromCallByArgIdx(call, 0)))
+		isDir, ok := anchorSourceIsDir(p, ft, target, idx, requireSuccess, profile)
+		if !ok {
+			return AnchorPathUnknown, false, -1, false
+		}
+		return AnchorPathFreshSymlink, isDir, idx, true
+	}
+	return AnchorPathUnknown, false, -1, false
+}
+
+func findAnchorCreator(p *Prog, ft *FileTree, path string, end int, requireSuccess bool, profiles ...*DFSProfile) (AnchorPathKind, bool, int, bool) {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
 	if p == nil || path == "" || end < 0 {
+		return AnchorPathUnknown, false, -1, false
+	}
+	path = canonicalFreshPath(ft, path)
+	if path == "" {
 		return AnchorPathUnknown, false, -1, false
 	}
 	if end >= len(p.Calls) {
 		end = len(p.Calls) - 1
 	}
-	for i := 0; i <= end; i++ {
-		call := p.Calls[i]
-		if call == nil || call.Meta == nil {
-			continue
-		}
-		if requireSuccess && !callReturnedSuccess(call) {
-			continue
-		}
-		switch call.Meta.CallName {
-		case "mkdir":
-			if extractPathFromCall(call) == path {
-				return AnchorPathFreshDir, true, i, true
-			}
-		case "creat":
-			if extractPathFromCall(call) == path {
-				return AnchorPathFreshFile, false, i, true
-			}
-		case "open":
-			if !openPathCreatesFile(p.Target, call) {
-				continue
-			}
-			if extractPathFromCall(call) == path {
-				return AnchorPathFreshFile, false, i, true
-			}
-		case "rename":
-			src, dst := extractRenamePaths(call)
-			if dst != path {
-				continue
-			}
-			isDir, ok := anchorSourceIsDir(p, ft, src, i, requireSuccess)
-			if !ok {
-				return AnchorPathUnknown, false, -1, false
-			}
-			return AnchorPathFreshRenameDst, isDir, i, true
-		case "link":
-			if extractPathFromCallByArgIdx(call, 1) == path {
-				// v1 link targets are regular files; the new dentry is a file
-				// alias and follows the target type.
-				return AnchorPathFreshFile, false, i, true
-			}
-		case "symlink":
-			if extractPathFromCallByArgIdx(call, 1) != path {
-				continue
-			}
-			target := symlinkCanonicalTarget(path, extractPathFromCallByArgIdx(call, 0))
-			isDir, ok := anchorSourceIsDir(p, ft, target, i, requireSuccess)
-			if !ok {
-				return AnchorPathUnknown, false, -1, false
-			}
-			return AnchorPathFreshSymlink, isDir, i, true
+	// Latest creator wins: a successful deletion followed by a recreation
+	// must classify the current state, not the first historical creator.
+	for i := end; i >= 0; i-- {
+		if kind, isDir, idx, ok := anchorCreatorKind(p, ft, p.Calls[i], path, i,
+			requireSuccess, profile); ok {
+			return kind, isDir, idx, true
 		}
 	}
 	return AnchorPathUnknown, false, -1, false
 }
 
-func anchorSourceIsDir(p *Prog, ft *FileTree, path string, before int, requireSuccess bool) (bool, bool) {
+func anchorSourceIsDir(p *Prog, ft *FileTree, path string, before int, requireSuccess bool, profiles ...*DFSProfile) (bool, bool) {
+	profile := hmdfsProfile
+	if len(profiles) > 0 && profiles[0] != nil {
+		profile = profiles[0]
+	}
+	if p == nil || path == "" {
+		return false, false
+	}
+	path = canonicalFreshPath(ft, path)
 	if path == "" {
 		return false, false
+	}
+	if profile.TracksPathState() && pathSetAbsentIn(freshPathAbsentBefore(p, before, profile), path) {
+		return false, false
+	}
+	kind, isDir, idx, ok := findAnchorCreator(p, ft, path, before-1, requireSuccess, profile)
+	if ok && profile.TracksPathState() &&
+		pathSetAbsentIn(freshPathAbsentBefore(p, idx, profile), path) {
+		return isDir, true
 	}
 	if node := ft.FindNode(path); node != nil {
 		return node.Type != NodeTypeFile, true
 	}
-	kind, isDir, _, ok := findAnchorCreator(p, ft, path, before-1, requireSuccess)
 	if !ok || !kind.IsFresh() {
 		return false, false
 	}
