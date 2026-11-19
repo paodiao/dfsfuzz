@@ -983,11 +983,15 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 	if ft == nil || spec.Path == "" {
 		return false
 	}
+	node := ft.FindNode(spec.Path)
+	if node == ft.Root {
+		// The namespace root is a valid parent, but never a call path.
+		return false
+	}
 	typeConstraint := constraint
 	if spec.TypeConstraint != relTargetAny {
 		typeConstraint = spec.TypeConstraint
 	}
-	node := ft.FindNode(spec.Path)
 	switch spec.Role {
 	case pathRoleMkdir:
 		if spec.Kind == pathFresh {
