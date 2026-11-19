@@ -43,12 +43,22 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | ID | 状态 | 问题 | 位置 | 处理方向 |
 |---|---|---|---|---|
 | P1-A1 | confirmed | client-only mutation 用了 server TSC offset。`MutateFsopsWithDCT(cps)` 的 `ps[0]` 是第一个 client，但 `lcs.tscoffFor(0..2)` 取的是 VM 0..2（server） | `proc.go:327-331,857-862`；`distributed_choice.go:2225-2232`；`directed_plan.go:2926,2982,2986`；`causal_root.go:779,1498` | 给 planner 传 `tscoffs[ServNum:]`，或让 LCS 带 client base index；DAG 侧仍用绝对 `proc.tscoffs`。加 `ServNum>0` + 不同 offsets 的测试 |
-| P1-A2 | confirmed | C2 rename root 的 CC relation 用 destination 算；rename CC 的 A 侧实际是 source。`B=src` 计划 Sibling、观测 Same；`B=dst` 计划 Same、观测 Sibling；source 子树 Child 漏掉 | `causal_root.go:297-317,492,653-658,709-712`；`dag.go:753-768` | 按 temporal 分别取 `rootSource`/`rootDest`；CC 用 source，HB 用 dest；destructive gate 也按 temporal rel |
-| P1-A3 | confirmed | rename root 后仍给 source 上的 variant 预测 Success。`destructiveSame` 只对 `Rel=Same` 生效，而 rename root 的 dest/source 是 Sibling | `causal_root.go:499-504,581-715` | 对 `causalRootRename` 排除 `bn.path == rootSource` 及 source 子树（HB）；加 `SourceMoved` 类似的 per-temporal gate |
-| P1-A4 | confirmed | unlink/rmdir 作为 C1 anchor 时 root 路径已删除。C1 root 插在 anchor 后，root 失败；C1 不进 pending，无法被 cell-suppress | `causal_root.go:756-784,1342-1351`；`anchor_path.go:31-38`；`causal_root.go:1476-1515` | C1 anchor 要求 `callSucceeded`；对 unlink/rmdir anchor 过滤 anchor path/subtree；考虑 C1 选择失败计数 |
+| P1-A2 | fixed | C2 rename root 的 CC relation 用 destination 算；rename CC 的 A 侧实际是 source。`B=src` 计划 Sibling、观测 Same；`B=dst` 计划 Same、观测 Sibling；source 子树 Child 漏掉 | `causal_root.go:297-317,492,653-658,709-712`；`dag.go:753-768` | 按 temporal 分别取 `rootSource`/`rootDest`；CC 用 source，HB 用 dest；destructive gate 也按 temporal rel |
+| P1-A3 | fixed | rename root 后仍给 source 上的 variant 预测 Success。`destructiveSame` 只对 `Rel=Same` 生效，而 rename root 的 dest/source 是 Sibling | `causal_root.go:499-504,581-715` | 对 `causalRootRename` 排除 `bn.path == rootSource` 及 source 子树（HB）；加 `SourceMoved` 类似的 per-temporal gate |
+| P1-A4 | fixed | unlink/rmdir 作为 C1 anchor 时 root 路径已删除。C1 root 插在 anchor 后，root 失败；C1 不进 pending，无法被 cell-suppress | `causal_root.go:756-784,1342-1351`；`anchor_path.go:31-38`；`causal_root.go:1476-1515` | C1 anchor 要求 `callSucceeded`；对 unlink/rmdir anchor 过滤 anchor path/subtree；考虑 C1 选择失败计数 |
 | P1-A5 | confirmed | GlusterFS 顶层 fresh path 在 C1/C2/PathSet 中不完整：`GetParentDir` 得到 `"."`，`directedFreshName` 空 parent 生成 `"/mut_dir_x"`，validator 要求 `GetParentDir(BaseA)==BaseA2` | `causal_root.go:1311-1336,986-990,1104-1106`；`directed_plan.go:1027-1050,2776-2786`；`path_set.go:924-926,1574-1611` | 统一 `parentDirOrRoot`/`joinTestPath`；允许空 parent 并让 validator 用同一 helper |
-| P1-A6 | confirmed | C1 E-overwrite 采样没有 batch 路径保留；E variant 可能落到 root rename destination，预测 Success 实际 ENOTEMPTY | `causal_root.go:229-239` | 复用 normal 的 reserved set，并把 `batch.BaseA2`/`RootDest` 纳入 authority |
+| P1-A6 | fixed | C1 E-overwrite 采样没有 batch 路径保留；E variant 可能落到 root rename destination，预测 Success 实际 ENOTEMPTY | `causal_root.go:229-239` | 复用 normal 的 reserved set，并把 `batch.BaseA2`/`RootDest` 纳入 authority |
 | P1-A7 | deferred | C1 plan 排序对 tie 不确定；link/symlink target/linkpath 同路径 tie 时顺序取决于 map 迭代 | `causal_root.go:1172-1202` | 用 `Cell.toKey()` 或补全 `Role/DepthB/Temporal/RetB` 排序 |
+
+2026-11-19 修复记录：P1-A2/A3/A4/A6 已落地。
+
+- 新增 `path_effect.go`：`unlink` 文件 → Remove，`rmdir` 空目录 → Remove，`rename` → Move(source,dest)；C1 anchor 用 `callSucceeded` 严格判定，失败 anchor 直接跳过。
+- C1 root candidate、C1 anchor 后的 C2 variant（CC+HB）都按 anchor effect 过滤；C2 root 的 HB variant 按 root effect 过滤，CC 保留 race。
+- rename root 的 CC A 侧改用 source，HB 仍用 dest；dual profile 才启用，HMDFS 保持原路径。
+- E-overwrite destination 现在把 root 的 source/dest/parent 和全部 plan 路径纳入 reserved set，并在 picker/insert 两处用 `batchRootReservationsOK` 兜底。
+- directed variant 不复用 root 的 fd（`directedVariantCallsSeq` 始终重新 open），所以 fd variants 不豁免删除路径；只有 `creat` 在精确 source path 上、RetB=Success 时豁免。
+- 回归测试：`TestPathEffect*`、`TestCausalRootRelPathsForDualRenameTemporal`、`TestCausalRenameRootC2TemporalRelations`、`TestCausalUnlinkAnchorFiltersRemovedPath`、`TestCausalRmdirAnchorFiltersRemovedPath`、`TestCausalRenameAnchorFiltersSourceSubtree`、`TestCausalFailedAnchorRejected`、`TestPickCausalRootBatchFiltersAnchorRemovedPath`、`TestBatchRootReservationsOK`。
+- 验证：`GOOS=linux GOARCH=amd64 go test -c ./prog`、`GOOS=linux GOARCH=amd64 go vet ./prog ./syz-fuzzer` 通过；Linux 3-3 运行时待跑。
 
 ### P1-B DCT / seed / PathSet
 
@@ -128,6 +138,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-D5 | deferred | 同路径 size mutation 的 offset bucket 以 pre-root size 计算 |
 | P2-D6 | latent | validator FreshB/profile 不一致（主要 HMDFS） |
 | P2-D7 | deferred | fresh linkpath 未做 batch-local 保留，随机碰撞可能把 Success 变 EEXIST |
+| P2-D8 | deferred | directed variants 不复用已有 fd（`directedVariantCallsSeq` 总是重新 open）；fd-survives-unlink 的 HB pair 当前不可构造 |
 
 ### P2-DCT / PathSet
 
