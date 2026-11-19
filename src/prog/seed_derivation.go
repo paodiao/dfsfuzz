@@ -305,12 +305,8 @@ func deriveSeedRootPath(ft *FileTree, anchor seedAnchor, rootCall string, rel Pa
 			} else if !freshParentEligible(ft, parent) {
 				return seedRootDerivation{}, false
 			}
-		} else {
-			node := ft.FindNode(parent)
-			if node == nil || node.Type == NodeTypeFile || node.Type == NodeTypeTmpDir ||
-				!aEligible(node, ft.Root) {
-				return seedRootDerivation{}, false
-			}
+		} else if !freshParentEligible(ft, parent) {
+			return seedRootDerivation{}, false
 		}
 		path := r.freshChildPath(parent, rootCall)
 		if path == "" || ft.FindNode(path) != nil {

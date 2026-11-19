@@ -352,8 +352,15 @@ func (ft *FileTree) normalizePath(path string) string {
 		return normalizeRelativePath(path)
 	}
 	if ft.Prefix != "" {
+		rootName := strings.TrimSuffix(ft.Prefix, "/")
+		// The root's FullPath is not a child of itself. Map the bare root name
+		// to the root before prefix stripping; a real top-level entry named
+		// "merge_view" is addressed as "merge_view/merge_view" and still works.
+		if path == rootName || path == "./"+rootName {
+			return ""
+		}
 		path = strings.TrimPrefix(path, ft.Prefix)
-		path = strings.TrimPrefix(path, strings.TrimSuffix(ft.Prefix, "/")+"/")
+		path = strings.TrimPrefix(path, rootName+"/")
 	}
 	return normalizeRelativePath(path)
 }
