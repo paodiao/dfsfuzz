@@ -814,36 +814,41 @@ func TestValidateCausalPlanRootChecks(t *testing.T) {
 	}
 }
 
-func TestCausalRenameRootPathAllowed(t *testing.T) {
+func TestCausalPathEffectRenameRootPaths(t *testing.T) {
+	ft := NewFileTree()
 	plain := causalAnchor{Path: "merge_view/dirA/a", Source: "merge_view/dirA/a"}
-	if !causalRenameRootPathAllowed(plain, "merge_view/dirA/a") {
-		t.Fatal("non-rename anchor root path was filtered")
+	plainEffect := plannedPathEffect(ft, "stat", plain.Path, plain.Source, plain.Dest)
+	if !plainEffect.allows("merge_view/dirA/a") {
+		t.Fatal("non-destructive anchor root path was filtered")
 	}
 	rename := causalAnchor{Path: "merge_view/dirA/dst", Source: "merge_view/dirA/src",
 		SourceMoved: true}
+	renameEffect := plannedPathEffect(ft, "rename", rename.Path, rename.Source, rename.Dest)
 	for _, rootPath := range []string{
 		"merge_view/dirA/src",
 		"merge_view/dirA/src/kid",
 	} {
-		if causalRenameRootPathAllowed(rename, rootPath) {
+		if renameEffect.allows(rootPath) {
 			t.Fatalf("rename source subtree root %q accepted", rootPath)
 		}
 	}
 	for _, rootPath := range []string{
 		"merge_view/dirA",
 		"merge_view/dirA/sibling",
+		"merge_view/dirA/dst",
 	} {
-		if !causalRenameRootPathAllowed(rename, rootPath) {
+		if !renameEffect.allows(rootPath) {
 			t.Fatalf("safe rename root %q rejected", rootPath)
 		}
 	}
 	symlink := causalAnchor{Path: "merge_view/dirA/l1", Source: "merge_view/dirA",
 		Dest: "merge_view/dirA/l1"}
+	symlinkEffect := plannedPathEffect(ft, "symlink", symlink.Path, symlink.Source, symlink.Dest)
 	for _, rootPath := range []string{
 		"merge_view/dirA",
 		"merge_view/dirA/child",
 	} {
-		if !causalRenameRootPathAllowed(symlink, rootPath) {
+		if !symlinkEffect.allows(rootPath) {
 			t.Fatalf("symlink target subtree root %q rejected", rootPath)
 		}
 	}

@@ -1385,6 +1385,39 @@ func batchBaseBAuthorityOK(plans []directedPlan) bool {
 	return true
 }
 
+// batchRootReservationsOK verifies that an E overwrite destination does not
+// collide with the batch root's own paths. The root is not part of Plans, so
+// batchBaseBAuthorityOK cannot see it: a C1 rename root writes batch.BaseA2,
+// and a rename variant landing there would be ENOTEMPTY (or overwrite the
+// root's result) while the cell predicts Success.
+func batchRootReservationsOK(batch *directedBatch) bool {
+	if batch == nil {
+		return false
+	}
+	reserved := make(map[string]bool, 4)
+	add := func(p string) {
+		if p != "" {
+			reserved[p] = true
+		}
+	}
+	add(batch.BaseA)
+	add(batch.BaseA2)
+	add(batch.RootSource)
+	add(batch.RootDest)
+	seen := make(map[string]bool, len(batch.Plans))
+	for i := range batch.Plans {
+		p := &batch.Plans[i]
+		if !p.RenameReplace {
+			continue
+		}
+		if reserved[p.BaseB] || seen[p.BaseB] {
+			return false
+		}
+		seen[p.BaseB] = true
+	}
+	return true
+}
+
 // PickDirectedBatch enumerates constructible plans for uncovered target cells,
 // samples one cell uniformly, and returns a batch of up to len(ps)-1 plans
 // sharing that cell's root call and root base path (sampled without
@@ -1403,6 +1436,7 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 	if lcs == nil || lcs.FileTree == nil || hmcfg == nil || r == nil || len(ps) < 2 {
 		return nil, directedPlanCfgErr
 	}
+	profile := lcs.profileOrDefault()
 	if !CoverageBoardReady() {
 		return nil, directedPlanCfgErr
 	}
@@ -1528,6 +1562,15 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 			usedDst[q.BaseB2] = true
 		}
 	}
+	if profile.DualPathCausalEnabled() {
+		// The root's own linkpath is not in Plans. Reserve it so an E
+		// overwrite cannot land on the path the root just materialized. The
+		// fresh rename destination is generated below, after the batch root
+		// is fixed, and is reserved there.
+		if seed.RootLinkPath != "" {
+			usedDst[seed.RootLinkPath] = true
+		}
+	}
 	batch := &directedBatch{Root: seed.Cell.Combo.Root, BaseA: seed.BaseA, BaseA2: seed.BaseA2}
 	if seed.Cell.Combo.Root == "link" || seed.Cell.Combo.Root == "symlink" {
 		// Normal dual root: BaseA is the existing target; RootLinkPath is the
@@ -1549,6 +1592,9 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 		// "._renamed_*" level before appending, so batch materialization
 		// cannot accumulate suffixes round over round.
 		batch.BaseA2 = freshRenameDst(seed.BaseA, r.Rand)
+	}
+	if profile.DualPathCausalEnabled() && batch.BaseA2 != "" {
+		usedDst[batch.BaseA2] = true
 	}
 	for i, ci := range group {
 		p := *planByCell[cells[ci]]
@@ -1611,6 +1657,9 @@ func pickDirectedBatchNormal(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdf
 		batch.Plans[i].NodeX = i + 1
 	}
 	if !batchBaseBAuthorityOK(batch.Plans) {
+		return nil, directedPlanCfgErr
+	}
+	if profile.DualPathCausalEnabled() && !batchRootReservationsOK(batch) {
 		return nil, directedPlanCfgErr
 	}
 	return batch, directedPlanFound
@@ -2881,6 +2930,9 @@ func insertDirectedBatch(ps []*Prog, r *randGen, sCalls *SpecialCalls, hmcfg *Hm
 	// postconditions. A violation is a future assembler bug, degrading it to
 	// insertFail keeps the cell ledger clean.
 	if !batchBaseBAuthorityOK(batch.Plans) {
+		return false
+	}
+	if lcs.profileOrDefault().DualPathCausalEnabled() && !batchRootReservationsOK(batch) {
 		return false
 	}
 	for i := range batch.Plans {

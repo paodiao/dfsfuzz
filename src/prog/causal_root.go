@@ -22,6 +22,10 @@ type causalAnchor struct {
 	InsertPos   int
 	RefTime     int64
 	Relation    PathRelation
+	// Effect is the anchor's post-state path effect. It is computed once from
+	// the prior CheckInfo and then shared by C1 root enumeration and C2
+	// variant admission.
+	Effect pathEffect
 }
 
 // causalAnchorRole is one A-side role of a C1 anchor. Link/symlink anchors have
@@ -143,6 +147,7 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 	if !CoverageBoardReady() || len(hmcfg.Cids) != len(ps) {
 		return nil, false
 	}
+	profile := lcs.profileOrDefault()
 	plans := collectCausalRootPlans(ps[0], lcs, hmcfg, r)
 	if len(plans) == 0 {
 		return nil, false
@@ -169,6 +174,12 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 				continue
 			}
 			if p := rolePlans[ck]; p != nil {
+				// The C1 anchor precedes every C2 form, so its post-state
+				// effect filters concurrent and HB variants alike.
+				if profile.DualPathCausalEnabled() &&
+					!c2PlanAllowedAfterEffect(p, c1.Anchor.Effect) {
+					continue
+				}
 				planByCell[ck] = p
 				cells = append(cells, ck)
 			}
@@ -222,6 +233,29 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 	if !foundSeed {
 		group[0] = seed
 	}
+	// The C1 root's own source/destination is not part of Plans, so reserve it
+	// explicitly: an E overwrite landing on the root destination would be
+	// ENOTEMPTY (or overwrite the root result) while the cell predicts Success.
+	var usedDst map[string]bool
+	if profile.DualPathCausalEnabled() {
+		usedDst = make(map[string]bool, 2*len(group)+4)
+		for _, p := range []string{c1.RootPath, c1.RootSource, c1.RootDest, c1.RootParent} {
+			if p != "" {
+				usedDst[p] = true
+			}
+		}
+		for _, p := range group {
+			if p.BaseA != "" {
+				usedDst[p.BaseA] = true
+			}
+			if p.BaseB != "" {
+				usedDst[p.BaseB] = true
+			}
+			if p.BaseB2 != "" {
+				usedDst[p.BaseB2] = true
+			}
+		}
+	}
 	for _, p := range group {
 		if p.FreshB {
 			p.BaseB = directedFreshName(p.Cell.Combo.Variant, p.BaseB2, r.Rand)
@@ -229,11 +263,14 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 		if p.FreshRenameDst {
 			p.BaseB = freshRenameDst(p.BaseB2, r.Rand)
 			if p.Cell.RetB == RetSuccess && r.Rand.Intn(2) == 0 {
-				if dst := pickRenameReplaceDst(lcs.FileTree, p.BaseB2, nil,
+				if dst := pickRenameReplaceDst(lcs.FileTree, p.BaseB2, usedDst,
 					hmcfg.Persistence_dir, p.Cell.PersistB, r.Rand); dst != "" {
 					p.BaseB = dst
 					p.RenameReplace = true
 					p.FreshRenameDst = false
+					if usedDst != nil {
+						usedDst[dst] = true
+					}
 				}
 			}
 		}
@@ -288,12 +325,17 @@ func pickCausalRootBatch(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_co
 	if !batchBaseBAuthorityOK(batch.Plans) {
 		return nil, false
 	}
+	if profile.DualPathCausalEnabled() && !batchRootReservationsOK(batch) {
+		return nil, false
+	}
 	return batch, true
 }
 
 // causalRootRelPaths returns the root's pre/post paths for C2 relation
 // classification. A rename root is the HB A side and uses its destination
 // (post-state) for every relation; all other roots have one effective path.
+// Concurrent rename plans must use causalRootRelPathsFor instead: their A side
+// is the entry-state source.
 func causalRootRelPaths(rootKind causalRootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath string) (string, string) {
 	if rootKind == causalRootRename {
 		// HB A uses the rename's post-state destination. Source/Dest remain
@@ -314,6 +356,19 @@ func causalRootRelPaths(rootKind causalRootKind, rootCall, rootPath, rootSource,
 		return relationPath, relationPath
 	}
 	return rootPath, rootPath
+}
+
+// causalRootRelPathsFor returns the A-side pre/post paths for one temporal
+// form. A dual-path profile's concurrent rename A side is the source (both
+// operations see the entry state); its HB A side is the destination
+// (post-state). Non-dual profiles keep the historical destination-for-both
+// behavior so HMDFS planning is unchanged.
+func causalRootRelPathsFor(profile *DFSProfile, temporal TemporalRel, rootKind causalRootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath string) (string, string) {
+	if rootKind == causalRootRename && temporal == TemporalConcurrent &&
+		profile.DualPathCausalEnabled() {
+		return rootSource, rootSource
+	}
+	return causalRootRelPaths(rootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath)
 }
 
 // causalVariantRelPaths returns a variant's pre/post paths. A rename variant
@@ -489,18 +544,26 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		planA, planA2 = rootSource, rootDest
 		freshA2 = true
 	}
-	rootPre, rootPost := causalRootRelPaths(rootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath)
+	dualRenameRoot := rootKind == causalRootRename && profile.DualPathCausalEnabled()
+	rootPre, rootPost := causalRootRelPathsFor(profile, TemporalHB, rootKind, rootCall, rootPath, rootSource, rootDest, rootRelationPath)
+	rootEffect := causalRootPathEffect(ft, rootKind, rootCall, rootPath, rootSource, rootDest)
 	// A link/symlink root is observable at the program-local linkpath only in
 	// the HB form: pair extraction enumerates the linkpath role for a
 	// link/symlink A vertex only when it is HB. A CC linkpath-role plan could
 	// never be observed, so it must not enter the pending ledger.
 	linkPathRole := (rootCall == "link" || rootCall == "symlink") &&
 		rootRelationPath != "" && rootRelationPath != rootPath
-	destructiveSame := func(varPre string, rel PathRelation) bool {
+	destructiveSameFor := func(rootPre string, rootDestructive bool, varPre string, rel PathRelation) bool {
 		if rel != PathSame {
 			return false
 		}
-		return rootCall == "unlink" || (rootKind == causalRootRename && rootPre != "" && rootPre == varPre)
+		return rootCall == "unlink" ||
+			(rootDestructive && rootKind == causalRootRename && rootPre != "" && rootPre == varPre)
+	}
+	destructiveSame := func(varPre string, rel PathRelation) bool {
+		// Legacy profiles keep the historical destination-for-both rename
+		// relation, including its destructive-Same treatment.
+		return destructiveSameFor(rootPre, true, varPre, rel)
 	}
 	liveCombos, filterCombos := causalC2ComboLive(profile, rootCall)
 	addC2 := func(cell directedCell, baseB, baseB2 string, off, blen uint64, freshRenameDst, freshB, freshSame bool) {
@@ -519,6 +582,12 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 				return
 			}
 			cell.Role = linkPathCellRole(rootCall)
+		}
+		// The root is the temporally earlier side only in the HB form; a
+		// concurrent variant races the root and keeps its pre-state path.
+		if profile.DualPathCausalEnabled() && cell.Temporal == TemporalHB &&
+			!c2VariantAllowedAfterEffect(rootEffect, cell, baseB, baseB2, freshB, freshSame) {
+			return
 		}
 		ck := cell.toKey()
 		if filterCombos && !liveCombos[cell.Combo] {
@@ -557,6 +626,75 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		}
 		cells = append(cells, ck)
 	}
+	// c2Forms returns the temporal forms a variant can realize. Legacy
+	// profiles keep one relation for both forms (and therefore one RNG draw
+	// per kind). A dual rename root splits them: the concurrent A side is the
+	// source, the HB A side is the destination.
+	type causalC2Form struct {
+		temporal    TemporalRel
+		rel         PathRelation
+		rootPre     string
+		destructive bool
+	}
+	c2Forms := func(varPre, varPost string) []causalC2Form {
+		if !dualRenameRoot {
+			rel, ok := causalPairRelation(rootPre, rootPost, varPre, varPost)
+			if !ok {
+				return nil
+			}
+			forms := []causalC2Form{{temporal: TemporalConcurrent, rel: rel, rootPre: rootPre, destructive: true}}
+			if isModifierCall(rootCall) {
+				forms = append(forms, causalC2Form{temporal: TemporalHB, rel: rel, rootPre: rootPre, destructive: true})
+			}
+			return forms
+		}
+		var forms []causalC2Form
+		if rel, ok := causalPairRelation(rootSource, rootSource, varPre, varPost); ok {
+			// CC A is the entry-state source: a Same B is the path the root
+			// moves away.
+			forms = append(forms, causalC2Form{temporal: TemporalConcurrent, rel: rel, rootPre: rootSource, destructive: true})
+		}
+		if isModifierCall(rootCall) {
+			if rel, ok := causalPairRelation(rootDest, rootDest, varPre, varPost); ok {
+				// HB A is the post-state destination: the root created it, so
+				// a Same B is not destructive.
+				forms = append(forms, causalC2Form{temporal: TemporalHB, rel: rel, rootPre: rootDest})
+			}
+		}
+		return forms
+	}
+	addDualVariant := func(cell directedCell, variant, varPre, varPost, baseB, baseB2 string, freshRenameDst, freshB, freshSame bool, bn *directedBNode, destructiveGates bool) {
+		for _, form := range c2Forms(varPre, varPost) {
+			dest := destructiveSameFor(form.rootPre, form.destructive, varPre, form.rel)
+			kinds, ok := variantKindsFor(variant, rootCall, form.rel, dest, bn.isDir, profile)
+			if !ok {
+				continue
+			}
+			for _, kind := range kinds {
+				if !variantKindAllowed(variant, kind.retB, bn, rootCall, form.rel) {
+					continue
+				}
+				if destructiveGates {
+					if dest && form.temporal == TemporalConcurrent && destructiveCCExclusive(variant, kind.retB) {
+						continue
+					}
+					if dest && form.temporal == TemporalHB && destructiveHBDoomed(variant, kind.retB) {
+						continue
+					}
+				}
+				off, blen, ok := realizeDirectedParams(variant, kind.bucket, bn.directedNode, r)
+				if !ok {
+					continue
+				}
+				c := cell
+				c.Combo.Rel = form.rel
+				c.RetB = kind.retB
+				c.OffB = kind.bucket
+				c.Temporal = form.temporal
+				addC2(c, baseB, baseB2, off, blen, freshRenameDst, freshB, freshSame)
+			}
+		}
+	}
 	if rootKind == causalRootFresh {
 		for _, fp := range freshSameFormsFor(profile) {
 			if fp.root != rootCall {
@@ -581,11 +719,21 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 	for i := range view.bNodes {
 		bn := &view.bNodes[i]
 		if bn.freshB {
+			variant := bn.freshBCall
+			if dualRenameRoot {
+				cell := directedCell{
+					Combo:    comboKey{Root: rootCall, Variant: variant},
+					PersistB: bn.persist,
+					DepthB:   bn.depth,
+					TypeB:    bn.isDir,
+				}
+				addDualVariant(cell, variant, bn.path, bn.path, "", bn.freshParent, false, true, false, bn, false)
+				continue
+			}
 			rel, ok := causalPairRelation(rootPre, rootPost, bn.path, bn.path)
 			if !ok {
 				continue
 			}
-			variant := bn.freshBCall
 			kinds, ok := variantKindsFor(variant, rootCall, rel, destructiveSame(bn.path, rel), bn.isDir, profile)
 			if !ok {
 				continue
@@ -618,6 +766,20 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 		if bn.srcPath != "" {
 			variant := "rename"
 			varPre, varPost := causalVariantRelPaths(variant, bn.path, bn.srcPath)
+			if dualRenameRoot {
+				baseB := bn.path
+				if bn.renameFresh {
+					baseB = ""
+				}
+				cell := directedCell{
+					Combo:    comboKey{Root: rootCall, Variant: variant},
+					PersistB: bn.cellPersist(hmcfg.Persistence_dir),
+					DepthB:   bn.cellDepth(),
+					TypeB:    bn.isDir,
+				}
+				addDualVariant(cell, variant, varPre, varPost, baseB, bn.srcPath, bn.renameFresh, false, false, bn, true)
+				continue
+			}
 			rel, ok := causalPairRelation(rootPre, rootPost, varPre, varPost)
 			if !ok {
 				continue
@@ -660,6 +822,28 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 			continue
 		}
 		varPre, varPost := causalVariantRelPaths("", bn.path, "")
+		if dualRenameRoot {
+			for _, variant := range variantCalls {
+				if variant == "rename" || variant == "readlink" {
+					continue
+				}
+				if (variant == "link" || variant == "symlink") &&
+					!profile.DualPathCausalEnabled() {
+					continue
+				}
+				if !nodeFitsConstraintFor(profile, bn.directedNode, variant) {
+					continue
+				}
+				cell := directedCell{
+					Combo:    comboKey{Root: rootCall, Variant: variant},
+					PersistB: bn.persist,
+					DepthB:   bn.depth,
+					TypeB:    bn.isDir,
+				}
+				addDualVariant(cell, variant, varPre, varPost, bn.path, "", false, false, false, bn, true)
+			}
+			continue
+		}
 		rel, ok := causalPairRelation(rootPre, rootPost, varPre, varPost)
 		if !ok {
 			continue
@@ -766,7 +950,9 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 			continue
 		}
 		ciInfo := call.CheckInfo
-		if ciInfo == nil {
+		if ciInfo == nil || !callSucceeded(call) {
+			// A C1 cell predicts RetA=Success; a failed anchor can never
+			// produce it and would only charge a guaranteed miss.
 			continue
 		}
 		anchor := causalAnchor{
@@ -779,6 +965,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 			RefTime:     int64(ciInfo.Etime) - lcs.tscoffFor(0),
 			Relation:    PathNoRel,
 		}
+		anchor.Effect = anchorPathEffect(ft, call, anchor)
 		if !validateCausalAnchor(p0, &anchor, lcs) {
 			continue
 		}
@@ -811,7 +998,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 					return
 				}
 				rootPath := directedFreshPlaceholder(rootCall, parent)
-				if !causalRenameRootPathAllowed(anchor, rootPath) {
+				if !anchor.Effect.allows(rootPath) {
 					return
 				}
 				actualRel, ok := causalPairRelation(anchorPre, anchorPost, "", rootPath)
@@ -860,7 +1047,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 				for _, rel := range rels {
 					paths := pathsByRel[rel]
 					for _, rootPath := range paths {
-						if !causalRenameRootPathAllowed(anchor, rootPath) {
+						if !anchor.Effect.allows(rootPath) {
 							continue
 						}
 						rootNode := ft.FindNode(rootPath)
@@ -873,7 +1060,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 						if rootCall == "link" || rootCall == "symlink" {
 							linkPath := r.freshLinkPath(rootPath, rootCall)
 							if linkPath == "" || ft.FindNode(linkPath) != nil ||
-								!causalRenameRootPathAllowed(anchor, linkPath) {
+								!anchor.Effect.allows(linkPath) {
 								continue
 							}
 							// C1: link/symlink is the B side. The pair extractor
@@ -989,7 +1176,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 								continue
 							}
 							rootPath := directedFreshPlaceholder(rootCall, parent)
-							if !causalRenameRootPathAllowed(anchor, rootPath) {
+							if !anchor.Effect.allows(rootPath) {
 								continue
 							}
 							actualRel, ok := causalPairRelation(anchorPre, anchorPost, "", rootPath)
@@ -1038,7 +1225,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 					}
 					if rootCall == "rename" {
 						for _, rootPath := range paths {
-							if !causalRenameRootPathAllowed(anchor, rootPath) {
+							if !anchor.Effect.allows(rootPath) {
 								continue
 							}
 							rootNode := ft.FindNode(rootPath)
@@ -1050,7 +1237,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 								continue // root E requires an empty directory
 							}
 							source := causalRenameSource(ft, rootPath)
-							if source == "" || !causalRenameRootPathAllowed(anchor, source) {
+							if source == "" || !anchor.Effect.allows(source) {
 								continue
 							}
 							sourceNode := ft.FindNode(source)
@@ -1108,11 +1295,11 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 									continue
 								}
 								source := causalRenameSourceUnder(ft, parent)
-								if source == "" || !causalRenameRootPathAllowed(anchor, source) {
+								if source == "" || !anchor.Effect.allows(source) {
 									continue
 								}
 								dest := freshRenameDst(source, r.Rand)
-								if ft.FindNode(dest) != nil || !causalRenameRootPathAllowed(anchor, dest) {
+								if ft.FindNode(dest) != nil || !anchor.Effect.allows(dest) {
 									continue
 								}
 								// C1 root rename is the B side: relation/cell use
@@ -1339,17 +1526,6 @@ func causalRootPathsByPath(ft *FileTree, path string, info anchorPathInfo, rel P
 	default:
 		return nil
 	}
-}
-
-// causalRenameRootPathAllowed rejects root paths that live in a successful
-// rename anchor's source subtree. The root is inserted after the anchor, so
-// the source path and its descendants have moved by then. Source parent and
-// sibling paths remain valid and must still pass the normal node constraints.
-func causalRenameRootPathAllowed(a causalAnchor, rootPath string) bool {
-	if !a.SourceMoved || a.Source == "" || a.Source == a.Path {
-		return true
-	}
-	return !pathUnderRoot(rootPath, a.Source)
 }
 
 func causalRootCallsSeq(r *randGen, sCalls *SpecialCalls, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_config, p *Prog, batch *directedBatch) []*Call {
