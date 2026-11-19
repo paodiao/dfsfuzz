@@ -115,6 +115,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-T10 | deferred | `InoByFunc` capture-failure alarm 对 GlusterFS 永久为真（诊断） |
 | P2-T11 | deferred | delete timeline 以 ino 0 为 key；当前 writepage 不产生，死代码 |
 | P2-T12 | deferred | output buffer overflow 直接 abort round（低概率） |
+| P2-T13 | latent | `RecordCoveragePairs`/`ComputeFeedback` 对 malformed `DAGPair`（A/B nil）没有防御；正常 `ExtractPairsFor` 不会产生 nil，但 IPC 异常时 `cellKeyOf`/`hashPair` 可能 panic；加 nil guard + drop 诊断 |
 
 ### P2-Directed
 
@@ -160,7 +161,7 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 | ID | 状态 | 问题 |
 |---|---|---|
-| P2-E1 | latent | `ClientView`/`RootProg` 短 batch 把 server 当 client；配置/批次校验会先拒绝 |
+| P2-E1 | latent | `ClientView`/`RootProg` 短 batch 把 server 当 client；`Serv_num >= len(ps)` 时 `RootProg` 回退 `ps[0]`；配置/批次校验会先拒绝 |
 | P2-E2 | latent | HMDFS prefix 在缺 Profile/FileTree 时泄漏到 GlusterFS |
 | P2-E3 | design-debt | profile 大量字段 dead：Feature/Checker/Gen/Trace/Paths.MaxClientNum/Plan.DCT* |
 | P2-E4 | deferred | 启动/config panic 风险：`ipcconfig.Default` err 前赋值、`argv[15]`、`InitIp` 索引、`tscoffs[idx]` |
@@ -168,6 +169,8 @@ out-of-scope              不属于本轮 GlusterFS 适配
 | P2-E6 | not-a-problem | restore 不保留 xattr/ACL/hardlink：初始文件树不设置这些属性，`rsync -a` 足够 |
 | P2-E7 | needs-runtime-verification | `write_dir_info` 依赖 `dirent.d_type`，DT_UNKNOWN 不递归；需看 GlusterFS FUSE 返回 |
 | P2-E8 | deployment | `glusterfs-config.sh` 不检查 volume/mount 失败 |
+| P2-E9 | design-debt | `DFSProfile.DualPathCausalEnabled` 注释仍写 "v1 leaves it false"，与 GlusterFS profile 的 true 不一致；更新注释即可，无运行时影响 |
+| P2-E10 | latent | `ProfileForName` 未知 `DFSName` 返回 nil，`ProfileOrDefault` 静默回退 HMDFS；`proc.go` 按字符串分支，拼错可能走非预期路径；启动时校验 `DFSName ∈ {hmdfs, glusterfs}` |
 
 ---
 
@@ -181,6 +184,9 @@ out-of-scope              不属于本轮 GlusterFS 适配
 - **output overflow**：低概率，先观察。
 - **insertCallFromDCT 相关**：当前只有测试调用，生产走 `insertDerivedCallFromDCT`；不阻塞。
 - **NewLayeredChoiceStrategy profile=nil**：生产 `newProc` 会设置 Profile；latent。
+- **`DualPathCausalEnabled` 过期注释**：只影响可读性，不是运行时 bug；更新注释即可。
+- **未知 `DFSName`**：配置校验问题，正常 config 不会触发；后续启动校验。
+- **malformed `DAGPair` nil**：防御性问题，正常 DAG pipeline 的 pair 都非 nil；加 nil guard 即可。
 - **ClientView 短 batch**：配置/批次校验会先拒绝；防御性。
 - **profile dead fields**：设计债，不是当前运行时 bug。
 - **启动 panic**：配置错误路径，正常配置不触发；后续做启动校验。
