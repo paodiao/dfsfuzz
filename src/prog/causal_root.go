@@ -950,9 +950,10 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 			continue
 		}
 		ciInfo := call.CheckInfo
-		if ciInfo == nil || !callSucceeded(call) {
-			// A C1 cell predicts RetA=Success; a failed anchor can never
-			// produce it and would only charge a guaranteed miss.
+		if ciInfo == nil || !callReturnedSuccess(call) {
+			// A C1 cell predicts RetA=Success; a negative Retv (failed
+			// anchor) can never produce it. Retv is the raw syscall return:
+			// write/pwrite64 report a positive byte count on success.
 			continue
 		}
 		anchor := causalAnchor{

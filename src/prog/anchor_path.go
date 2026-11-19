@@ -55,7 +55,7 @@ func findAnchorCreator(p *Prog, ft *FileTree, path string, end int, requireSucce
 		if call == nil || call.Meta == nil {
 			continue
 		}
-		if requireSuccess && !callSucceeded(call) {
+		if requireSuccess && !callReturnedSuccess(call) {
 			continue
 		}
 		switch call.Meta.CallName {
@@ -121,6 +121,15 @@ func anchorSourceIsDir(p *Prog, ft *FileTree, path string, before int, requireSu
 
 func callSucceeded(call *Call) bool {
 	return call != nil && call.CheckInfo != nil && call.CheckInfo.Retv == 0
+}
+
+// callReturnedSuccess reports a successful syscall by its raw return value:
+// negative errno on failure, zero or a positive fd/byte count on success.
+// callSucceeded's Retv==0 is only valid for calls whose success return is
+// exactly zero; anchor admission and open creators must accept fd>=0 and
+// write byte counts >0.
+func callReturnedSuccess(call *Call) bool {
+	return call != nil && call.CheckInfo != nil && call.CheckInfo.Retv >= 0
 }
 
 func openPathCreatesFile(target *Target, call *Call) bool {

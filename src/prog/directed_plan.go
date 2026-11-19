@@ -982,10 +982,13 @@ func variantKindsFor(variant, root string, rel PathRelation, freshA2, isDir bool
 }
 
 // fdHBVariants are the fd-based variants whose HB Success stays plannable
-// under a destructive Same root: their embedded open may win the race before
-// the removal takes effect, and the open fd keeps the inode alive after the
-// name is gone (POSIX unlink only removes the name), so the following op can
-// start after the root ends -> HB Success. Shared by the gate and its test.
+// under a destructive Same root in the legacy model: their embedded open may
+// win the race before the removal takes effect, and the open fd keeps the
+// inode alive after the name is gone (POSIX unlink only removes the name), so
+// the following op can start after the root ends -> HB Success. Dual-path
+// profiles additionally apply the root path effect: directed variants reopen
+// their path in another proc, so an fd variant on the removed/moved source is
+// filtered even though this gate keeps it. Shared by the gate and its test.
 var fdHBVariants = map[string]bool{
 	"read": true, "write": true, "pread64": true, "pwrite64": true,
 	"fsync": true, "fdatasync": true,
@@ -997,7 +1000,7 @@ var fdHBVariants = map[string]bool{
 // a second remover/mover (unlink/rmdir/rename) can never both Success with
 // the root, and the non-ENOENT failures (ENOTEMPTY/EEXIST) are impossible too.
 // Only creat (recreate), the fd variants (fdHBVariants) and the ENOENT forms
-// remain.
+// remain; dual-path profiles still apply the root path effect afterwards.
 func destructiveHBDoomed(variant string, retB RetBucket) bool {
 	if retB == RetENOENT {
 		return false

@@ -29,7 +29,7 @@ func (e pathEffect) allows(path string) bool {
 	if path == "" || !e.active() {
 		return true
 	}
-	return !pathUnderRoot(path, e.src)
+	return !pathUnderRoot(normalizeRelativePath(path), e.src)
 }
 
 // plannedPathEffect returns the effect of a call that is assumed to succeed.
@@ -46,6 +46,9 @@ func plannedPathEffect(ft *FileTree, call, path, source, dest string) pathEffect
 	if ft == nil || call == "" {
 		return pathEffect{}
 	}
+	path = normalizeRelativePath(path)
+	source = normalizeRelativePath(source)
+	dest = normalizeRelativePath(dest)
 	switch call {
 	case "unlink":
 		if path == "" {
@@ -79,9 +82,9 @@ func plannedPathEffect(ft *FileTree, call, path, source, dest string) pathEffect
 }
 
 // anchorPathEffect returns the effect of an already executed C1 anchor. A
-// failed or unchecked call has no effect: this is the strict counterpart of
-// callAssumedSucceeded, which intentionally treats a missing CheckInfo as
-// success for fresh-path creators.
+// failed or unchecked call has no effect. The anchor itself is admitted by
+// callReturnedSuccess; destructive effects still require the strict zero
+// return because unlink/rmdir/rename never return a positive value.
 func anchorPathEffect(ft *FileTree, call *Call, a causalAnchor) pathEffect {
 	if call == nil || call.Meta == nil || !callSucceeded(call) {
 		return pathEffect{}
@@ -118,7 +121,7 @@ func c2VariantAllowedAfterEffect(e pathEffect, cell directedCell, baseB, baseB2 
 	if !e.active() {
 		return true
 	}
-	path := c2VariantEffectPath(cell, baseB, baseB2, freshB, freshSame)
+	path := normalizeRelativePath(c2VariantEffectPath(cell, baseB, baseB2, freshB, freshSame))
 	if e.allows(path) {
 		return true
 	}
