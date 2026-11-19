@@ -456,6 +456,13 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 						continue
 					}
 				}
+				if src != "" {
+					if links := freshLinkPathsBefore(p, ft, ci, profile); links[src].Kind != 0 {
+						// A linkpath is a program-local binding, not a FileTree
+						// node; PathSet v1 linkpath migration is deferred.
+						continue
+					}
+				}
 				sourceType := pathSetNodeConstraint(ft, src)
 				freshKinds := freshPathKindsBefore(p, ft, ci, profile)
 				if k, ok := freshKinds[src]; ok {
@@ -519,6 +526,16 @@ func buildPathMembers(ps []*Prog, ft *FileTree, profiles ...*DFSProfile) []pathM
 					// A program-local linkpath is not a FileTree node; migrating
 					// a generic consumer to it would break the link binding.
 					continue
+				}
+				isCreator := strings.Contains(name, "mkdir") || strings.Contains(name, "creat") ||
+					(strings.Contains(name, "open") && openPathCreatesFile(p.Target, call))
+				if !isCreator && ft != nil {
+					if kind, _ := pathSetCreatorState(p, ft, ci, path, profile); kind == pathFresh && ft.FindNode(path) != nil {
+						// A baseline node removed before this call: a stale-path
+						// plan would ENOENT. Fresh paths keep the existing
+						// direct-role behavior; creator binding is P1-B16.
+						continue
+					}
 				}
 			}
 			kind := pathExisting
