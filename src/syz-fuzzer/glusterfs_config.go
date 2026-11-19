@@ -6,40 +6,17 @@ import (
 	"strconv"
 	"strings"
 
+	"monarch/pkg/glusterfsconfig"
 	"monarch/prog"
 )
-
-// GlusterFS v1 fixes the client count at 3. The shared HMDFS seed/legacy
-// generators are budget-tested only for 2-3 slots; with ClientNum=1 several
-// concurrency generators still emit 2+ programs, and the batch normalizer
-// would have to silently drop their planned operations.
-const glusterfsV1ClientCount = 3
 
 // loadGlusterfsConfig initializes the client-only GlusterFS view. All clients
 // share one manifest/namespace; Cids is repeated only for length-compatible
 // APIs and never identifies a client.
 func loadGlusterfsConfig(hc *prog.Hmdfs_config, setupParams string, fuzzingVMs, servNum int, initDir string) error {
-	parts := strings.Fields(setupParams)
-	if len(parts) < 2 {
-		return fmt.Errorf("bad glusterfs params format: %v", setupParams)
-	}
-	serverCnt, err := strconv.Atoi(parts[0])
+	serverCnt, clientCnt, err := glusterfsconfig.ValidateV1(setupParams, servNum, fuzzingVMs)
 	if err != nil {
-		return fmt.Errorf("parse glusterfs server count: %w", err)
-	}
-	clientCnt, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return fmt.Errorf("parse glusterfs client count: %w", err)
-	}
-	if serverCnt != servNum {
-		return fmt.Errorf("glusterfs server count %d does not match config %d", serverCnt, servNum)
-	}
-	if clientCnt != glusterfsV1ClientCount {
-		return fmt.Errorf("glusterfs v1 requires exactly %d clients (got %d)",
-			glusterfsV1ClientCount, clientCnt)
-	}
-	if serverCnt+clientCnt != fuzzingVMs {
-		return fmt.Errorf("glusterfs server+client %d != fuzzing_vms %d", serverCnt+clientCnt, fuzzingVMs)
+		return err
 	}
 
 	hc.Serv_num = serverCnt

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"monarch/pkg/config"
+	"monarch/pkg/glusterfsconfig"
 	"monarch/pkg/osutil"
 	"monarch/prog"
 	_ "monarch/sys" // most mgrconfig users want targets too
@@ -34,7 +35,7 @@ type Derived struct {
 	ExecprogBin        string
 	ExecutorBin        string
 	HostFuzzerCheckBin string
-	DFSConfigBins	   string
+	DFSConfigBins      string
 
 	Syscalls []int
 	Timeouts targets.Timeouts
@@ -178,6 +179,11 @@ func Complete(cfg *Config) error {
 	}
 	if cfg.ServNum > cfg.FuzzingVMs {
 		return fmt.Errorf("server_num %v exceeds fuzzing_vms %v", cfg.ServNum, cfg.FuzzingVMs)
+	}
+	if cfg.DFSName == "glusterfs" {
+		if _, _, err := glusterfsconfig.ValidateV1(cfg.DfsSetupParams, cfg.ServNum, cfg.FuzzingVMs); err != nil {
+			return err
+		}
 	}
 
 	var err error
