@@ -93,7 +93,7 @@ type DAGVertex struct {
 	ProgIdx   int
 	IsDir     bool
 	Off       uint64 // entry position: write/read entry ki_pos (O_APPEND=EOF); truncate ia_size; else 0
-	Size      uint64 // entry-time file size for write/read/truncate (entry kprobe); else 0
+	Size      uint64 // entry-time file size for HMDFS; baseline FileTree size for GlusterFS offset calls (0 if absent)
 }
 
 // pairPathType overrides the type bit of a role-selected pair path. The zero
@@ -516,6 +516,15 @@ func BuildVertices(events []HmdfsTraceEvent, ps []*Prog,
 		}
 		v.Off = ev.Off
 		v.Size = ev.Size
+		if glusterfs && isOffsetFunc(v.FuncID) && isOffsetCall(v.CallName) {
+			// GlusterFS FUSE events carry the request length in ev.Size, not
+			// the file size. Use the baseline FileTree size, the same source
+			// the planner's directedNode.size uses; a path absent from the
+			// tree (fresh, renamed, deleted) defaults to 0. Post-execution
+			// fsMd sizes are deliberately not used: they would give new files
+			// their final size and break observation/plan agreement.
+			v.Size = glusterfsOffsetSize(hmcfg, v.Path)
+		}
 		if int(v.FuncID) < len(diag.PerFuncVertices) {
 			diag.PerFuncVertices[v.FuncID]++
 		}
@@ -1799,6 +1808,21 @@ func offsetBucketOf(v *DAGVertex) uint64 {
 		return offsetBucketTail
 	}
 	return offsetBucketMid
+}
+
+// glusterfsOffsetSize returns the baseline FileTree size for a GlusterFS
+// offset call. The planner's directedNode.size comes from the same tree, so
+// observations and plans agree; a path absent from the tree (fresh, renamed,
+// deleted) defaults to 0. Post-execution fsMd sizes are deliberately not used:
+// they would give new files their final size and break that agreement.
+func glusterfsOffsetSize(hmcfg *Hmdfs_config, path string) uint64 {
+	if hmcfg == nil || hmcfg.FileTree == nil || path == "" {
+		return 0
+	}
+	if n := hmcfg.FileTree.FindNode(path); n != nil {
+		return n.Size
+	}
+	return 0
 }
 
 // DepthBucketOf maps a path to its depth bucket relative to the namespace
