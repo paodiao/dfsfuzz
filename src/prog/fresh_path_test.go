@@ -331,3 +331,46 @@ func TestHMDFSTopLevelFreshParent(t *testing.T) {
 		}
 	}
 }
+
+func TestJoinTestPathRoot(t *testing.T) {
+	cases := []struct{ dir, name, want string }{
+		{".", "mut_dir_x", "mut_dir_x"},
+		{"", "mut_dir_x", "mut_dir_x"},
+		{"dirA", "mut_dir_x", "dirA/mut_dir_x"},
+		{"merge_view", "mut_dir_x", "merge_view/mut_dir_x"},
+	}
+	for _, tc := range cases {
+		if got := joinTestPath(tc.dir, tc.name); got != tc.want {
+			t.Fatalf("joinTestPath(%q,%q) = %q, want %q", tc.dir, tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestFreshPathKindsCanonical(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	ft := glusterfsPlanTree()
+	creat := mkCreat(target, "./dirA/new")
+	creat.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{creat}}
+	kinds := freshPathKindsBefore(p, ft, 1, glusterfsProfile)
+	if kinds["dirA/new"] != relTargetFile {
+		t.Fatalf("fresh kinds = %v, want canonical dirA/new", kinds)
+	}
+	if _, ok := kinds["./dirA/new"]; ok {
+		t.Fatalf("fresh kinds kept the ./ key: %v", kinds)
+	}
+}
+
+func TestFreshPathAbsentCanonical(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	unlink := mkUnlinkCall(t, target, "./dirA/a")
+	unlink.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{unlink}}
+	absent := freshPathAbsentBefore(p, 1, glusterfsProfile)
+	if !absent["dirA/a"] {
+		t.Fatalf("absent = %v, want canonical dirA/a", absent)
+	}
+	if absent["./dirA/a"] {
+		t.Fatalf("absent kept the ./ key: %v", absent)
+	}
+}

@@ -269,3 +269,109 @@ func TestMapPathSetPath(t *testing.T) {
 		t.Fatalf("forest map = %q", got)
 	}
 }
+
+func TestMapPathSetBasePath(t *testing.T) {
+	cases := []struct {
+		path, oldBase, newBase, want string
+	}{
+		{"dirA/a", "dirA", "dirB", "dirB/a"},
+		{"dirA", "dirA", "dirB", "dirB"},
+		{"dirA/sub/a", "dirA/sub", "dirA", "dirA/a"},
+		{"dirA/a", "dirA", "dirA", ""},
+		{"dirA/a", "dirA", "", ""},
+		{"dirB/a", "dirA", "dirB", ""},
+	}
+	for _, tc := range cases {
+		if got := mapPathSetBasePath(tc.path, tc.oldBase, tc.newBase); got != tc.want {
+			t.Fatalf("mapPathSetBasePath(%q,%q,%q) = %q, want %q",
+				tc.path, tc.oldBase, tc.newBase, got, tc.want)
+		}
+	}
+}
+
+func TestPathSetBaseCandidateOK(t *testing.T) {
+	ft := NewFileTreeWithPrefix("")
+	ft.AddNode("dirA", NodeTypeDir, "c1")
+	ft.AddNode("dirA/sub", NodeTypeDir, "c1")
+
+	if !pathSetBaseCandidateOK(ft, "dirA", "dirB") {
+		t.Fatal("unrelated newBase rejected")
+	}
+	if !pathSetBaseCandidateOK(ft, "dirA/sub", "dirA") {
+		t.Fatal("ancestor newBase rejected")
+	}
+	if pathSetBaseCandidateOK(ft, "dirA", "dirA") {
+		t.Fatal("no-op newBase accepted")
+	}
+	if pathSetBaseCandidateOK(ft, "dirA", "dirA/sub") {
+		t.Fatal("descendant newBase accepted")
+	}
+	if pathSetBaseCandidateOK(ft, "dirA", ft.Root.FullPath) {
+		t.Fatal("namespace root accepted as a newBase")
+	}
+}
+
+func TestPathPlanChangesPaths(t *testing.T) {
+	set := &pathSet{Members: []pathMember{{
+		Pos:   GroupPosition{ProgIdx: 0, CallIdx: 0},
+		Paths: []pathSpec{{Path: "dirA/a"}},
+	}}}
+	plan := &pathPlan{Updates: []pathUpdate{{
+		Pos:   GroupPosition{ProgIdx: 0, CallIdx: 0},
+		Specs: []pathSpec{{Path: "dirA/a"}},
+	}}}
+	if pathPlanChangesPaths(set, plan) {
+		t.Fatal("no-op plan reported as a change")
+	}
+	plan.Updates[0].Specs[0].Path = "dirB/a"
+	if !pathPlanChangesPaths(set, plan) {
+		t.Fatal("changed plan reported as a no-op")
+	}
+}
+
+func TestBuildPathPlanBroadMapping(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	ft := NewFileTreeWithPrefix("")
+	ft.AddNode("dirA", NodeTypeDir, "c1")
+	ft.AddNode("dirA/a", NodeTypeDir, "c1")
+	ft.AddNode("dirA/b", NodeTypeDir, "c1")
+	ft.AddNode("dirB", NodeTypeDir, "c1")
+	ft.AddNode("dirB/a", NodeTypeDir, "c1")
+	ft.AddNode("dirB/b", NodeTypeDir, "c1")
+	p := &Prog{Target: target, Calls: []*Call{
+		mkMkdir(target, "dirA/a"),
+		mkMkdir(target, "dirA/b"),
+	}}
+	set := &pathSet{
+		Anchor: GroupPosition{ProgIdx: 0, CallIdx: 0},
+		Members: []pathMember{
+			{Pos: GroupPosition{ProgIdx: 0, CallIdx: 0}, Constraint: relTargetDir,
+				Paths: []pathSpec{{Path: "dirA/a", Kind: pathExisting, Role: pathRoleMkdir,
+					ArgIdx: 0, TypeConstraint: relTargetDir}}},
+			{Pos: GroupPosition{ProgIdx: 0, CallIdx: 1}, Constraint: relTargetDir,
+				Paths: []pathSpec{{Path: "dirA/b", Kind: pathExisting, Role: pathRoleMkdir,
+					ArgIdx: 0, TypeConstraint: relTargetDir}}},
+		},
+	}
+	plan, ok := buildPathPlan([]*Prog{p}, set, "dirA", "dirB", "", nil, ft,
+		newRand(target, rand.NewSource(5)))
+	if !ok {
+		t.Fatal("buildPathPlan failed")
+	}
+	if got := plan.Updates[0].Specs[0].Path; got != "dirB/a" {
+		t.Fatalf("mapped path = %q, want dirB/a", got)
+	}
+	if got := plan.Updates[1].Specs[0].Path; got != "dirB/b" {
+		t.Fatalf("mapped path = %q, want dirB/b", got)
+	}
+	if !pathPlanChangesPaths(set, plan) {
+		t.Fatal("broad mapping reported as a no-op")
+	}
+}
+
+func TestPathSetTargetLevelGlusterfsTopLevel(t *testing.T) {
+	target := &pathTarget{Rel: PathSibling, DepthBucket: 1}
+	if got := pathSetTargetLevel(target, "dirA", "dirB"); got != 0 {
+		t.Fatalf("top-level GlusterFS target level = %d, want 0", got)
+	}
+}

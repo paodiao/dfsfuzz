@@ -34,6 +34,41 @@ func TestGlusterfsRenamePolicyCrossParent(t *testing.T) {
 	}
 }
 
+func TestGetPathsForRenameVariantUsesProfilePolicy(t *testing.T) {
+	ft := glusterfsPlanTree()
+	lcs := &LayeredChoiceStrategy{FileTree: ft, Profile: glusterfsProfile}
+	r := rand.New(rand.NewSource(63))
+	cross := false
+	for i := 0; i < 40; i++ {
+		src, dst := lcs.GetPathsForRenameVariant("dirA/a", "", PathNoRel, r, false)
+		if src == "" || dst == "" || dst == src {
+			t.Fatalf("bad GlusterFS rename variant %q -> %q", src, dst)
+		}
+		if parentDirOrRoot(dst) != parentDirOrRoot(src) {
+			cross = true
+		}
+	}
+	if !cross {
+		t.Fatal("GlusterFS rename variant never produced a cross-parent destination")
+	}
+
+	hmft := NewFileTree()
+	hmft.AddNode("merge_view/dirA", NodeTypeDir, "c1")
+	hmft.AddNode("merge_view/dirA/a", NodeTypeFile, "c1")
+	hmft.AddNode("merge_view/dirB", NodeTypeDir, "c1")
+	hmft.AddNode("merge_view/dirB/b", NodeTypeFile, "c1")
+	hm := &LayeredChoiceStrategy{FileTree: hmft, Profile: hmdfsProfile}
+	for i := 0; i < 20; i++ {
+		src, dst := hm.GetPathsForRenameVariant("merge_view/dirA/a", "", PathNoRel, r, false)
+		if src == "" || dst == "" || dst == src {
+			t.Fatalf("bad HMDFS rename variant %q -> %q", src, dst)
+		}
+		if parentDirOrRoot(dst) != parentDirOrRoot(src) {
+			t.Fatalf("HMDFS rename dst %q must stay same-parent with %q", dst, src)
+		}
+	}
+}
+
 func TestPathSetPrefixIsProfileAware(t *testing.T) {
 	if got := pathSetTopPath("", "dirA"); got != "dirA" {
 		t.Fatalf("empty-prefix top path = %q", got)

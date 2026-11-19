@@ -135,6 +135,26 @@ func TestGlusterfsCausalDerivationRoots(t *testing.T) {
 	}
 }
 
+func TestDerivedRootCallPathsDualNone(t *testing.T) {
+	none := RootPaths{Kind: DualNone, PrePath: "dirA/a", PostPath: "dirA/a"}
+	path, path2 := derivedRootCallPaths(none)
+	if path != "dirA/a" || path2 != "" {
+		t.Fatalf("DualNone paths = %q/%q, want dirA/a and empty", path, path2)
+	}
+
+	rename := RootPaths{Kind: DualRename, PrePath: "dirA/a", PostPath: "dirA/b"}
+	path, path2 = derivedRootCallPaths(rename)
+	if path != "dirA/a" || path2 != "dirA/b" {
+		t.Fatalf("DualRename paths = %q/%q, want dirA/a and dirA/b", path, path2)
+	}
+
+	link := RootPaths{Kind: DualLink, TargetPath: "dirA/a", LinkPath: "dirA/l"}
+	path, path2 = derivedRootCallPaths(link)
+	if path != "dirA/a" || path2 != "dirA/l" {
+		t.Fatalf("DualLink paths = %q/%q, want dirA/a and dirA/l", path, path2)
+	}
+}
+
 func TestDctBaseCandidatesLinkRoles(t *testing.T) {
 	target := hmdfsSmokeTarget(t)
 	if _, ok := target.SyscallMap["link"]; !ok {
