@@ -112,3 +112,160 @@ func TestBuildPathMembersSkipsDeletedRenameSource(t *testing.T) {
 		}
 	}
 }
+
+func TestFindAnchorCreatorLegacyFirstCreator(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["creat"]; !ok {
+		t.Skip("target has no creat")
+	}
+	ft := glusterfsPlanTree()
+	first := mkCreat(target, "dirA/fresh")
+	first.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	second := mkCreat(target, "dirA/fresh")
+	second.CheckInfo = &FileMetadata{Stime: 120, Etime: 130, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{first, second}}
+
+	// HMDFS legacy (no profile): the first creator wins.
+	kind, isDir, idx, ok := findAnchorCreator(p, ft, "dirA/fresh", 1, true)
+	if !ok || kind != AnchorPathFreshFile || isDir || idx != 0 {
+		t.Fatalf("HMDFS creator = kind %v isDir %v idx %d ok %v, want FreshFile idx 0",
+			kind, isDir, idx, ok)
+	}
+	// GlusterFS: the latest creator wins.
+	kind, isDir, idx, ok = findAnchorCreator(p, ft, "dirA/fresh", 1, true, glusterfsProfile)
+	if !ok || kind != AnchorPathFreshFile || isDir || idx != 1 {
+		t.Fatalf("GlusterFS creator = kind %v isDir %v idx %d ok %v, want FreshFile idx 1",
+			kind, isDir, idx, ok)
+	}
+}
+
+func TestFindAnchorCreatorSkipsFailedLatestCreator(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["mkdir"]; !ok {
+		t.Skip("target has no mkdir")
+	}
+	if _, ok := target.SyscallMap["creat"]; !ok {
+		t.Skip("target has no creat")
+	}
+	ft := glusterfsPlanTree()
+	creat := mkCreat(target, "dirA/fresh")
+	creat.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	mkdir := mkMkdir(target, "dirA/fresh")
+	mkdir.CheckInfo = &FileMetadata{Stime: 120, Etime: 130, Retv: -1}
+	p := &Prog{Target: target, Calls: []*Call{creat, mkdir}}
+
+	for _, tc := range []struct {
+		name    string
+		profile *DFSProfile
+	}{
+		{"hmdfs", nil},
+		{"glusterfs", glusterfsProfile},
+	} {
+		var profiles []*DFSProfile
+		if tc.profile != nil {
+			profiles = append(profiles, tc.profile)
+		}
+		kind, isDir, idx, ok := findAnchorCreator(p, ft, "dirA/fresh", 1, false, profiles...)
+		if !ok || kind != AnchorPathFreshFile || isDir || idx != 0 {
+			t.Fatalf("%s creator = kind %v isDir %v idx %d ok %v, want FreshFile idx 0",
+				tc.name, kind, isDir, idx, ok)
+		}
+	}
+}
+
+func TestClassifyAnchorPathRejectsDeletedLinkTarget(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["unlink"]; !ok {
+		t.Skip("target has no unlink")
+	}
+	ft := glusterfsPlanTree()
+	unlink := mkUnlinkCall(t, target, "dirA/a")
+	unlink.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	link := mkLinkCall(t, target, "dirA/a", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 120, Etime: 130, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{unlink, link}}
+
+	if _, ok := classifyAnchorPath(p, ft, GroupPosition{ProgIdx: 0, CallIdx: 1},
+		"dirA/l1", true, glusterfsProfile); ok {
+		t.Fatal("linkpath anchor with a deleted target was accepted")
+	}
+}
+
+func TestClassifyAnchorPathRejectsDirLinkTarget(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["mkdir"]; !ok {
+		t.Skip("target has no mkdir")
+	}
+	ft := glusterfsPlanTree()
+	mkdir := mkMkdir(target, "dirA/newdir")
+	mkdir.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	link := mkLinkCall(t, target, "dirA/newdir", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 120, Etime: 130, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{mkdir, link}}
+
+	if _, ok := classifyAnchorPath(p, ft, GroupPosition{ProgIdx: 0, CallIdx: 1},
+		"dirA/l1", true, glusterfsProfile); ok {
+		t.Fatal("linkpath anchor with a directory target was accepted")
+	}
+}
+
+func TestClassifyAnchorPathAcceptsFileLinkTarget(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["creat"]; !ok {
+		t.Skip("target has no creat")
+	}
+	ft := glusterfsPlanTree()
+	creat := mkCreat(target, "dirA/target")
+	creat.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	link := mkLinkCall(t, target, "dirA/target", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 120, Etime: 130, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{creat, link}}
+
+	info, ok := classifyAnchorPath(p, ft, GroupPosition{ProgIdx: 0, CallIdx: 1},
+		"dirA/l1", true, glusterfsProfile)
+	if !ok || info.Kind != AnchorPathFreshFile || info.IsDir {
+		t.Fatalf("linkpath anchor with a fresh file target = %+v, ok=%v", info, ok)
+	}
+}
+
+func TestFreshPathAbsentPrefixedProfile(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["unlink"]; !ok {
+		t.Skip("target has no unlink")
+	}
+	future := *glusterfsProfile
+	future.Name = "futuredfs"
+	future.Plan.PathStateTracking = true
+	future.Tree.Prefix = MergeViewPrefix
+
+	ft := NewFileTree()
+	ft.AddNode("merge_view/dirA", NodeTypeDir, "c1")
+	ft.AddNode("merge_view/dirA/a", NodeTypeFile, "c1")
+
+	unlink := mkUnlinkCall(t, target, "dirA/a")
+	unlink.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	open := mkOpen(target, "dirA/a")
+	open.CheckInfo = &FileMetadata{Stime: 120, Etime: 130}
+	p := &Prog{Target: target, Calls: []*Call{unlink, open}}
+
+	absent := freshPathAbsentBefore(p, 1, &future)
+	if !absent["merge_view/dirA/a"] {
+		t.Fatalf("absent = %v, want prefixed merge_view/dirA/a", absent)
+	}
+	if absent["dirA/a"] {
+		t.Fatalf("absent kept the bare key: %v", absent)
+	}
+	if _, ok := classifyAnchorPath(p, ft, GroupPosition{ProgIdx: 0, CallIdx: 1},
+		"dirA/a", true, &future); ok {
+		t.Fatal("prefixed tracked profile accepted an anchor deleted earlier")
+	}
+}
