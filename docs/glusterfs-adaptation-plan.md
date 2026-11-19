@@ -641,7 +641,7 @@ GlusterFS 版本变化，offset 必须随文档更新。
 | READ 15 / WRITE 16 / FSYNC 20 / READDIR 28/44 | nodeid→path 或 fd→path | 空 | fd 操作 |
 | RELEASE 18 | nodeid→path 或 fd→path | 空 | 文件 close 有 D/S、无 R；保留 |
 | RELEASEDIR 29 | — | — | 过滤，不产生事件 |
-| LOOKUP 1 | `loc.path`（parent+name 的精确分量） | 空 | 不做 nodeid 目标映射；DAG LOOKUP 顶点用该 Path |
+| LOOKUP 1 | `loc.path`（已解析的 parent+name child path） | 空 | 直接使用；nodeid 是父目录，不做 fallback；path 缺失/out-of-root 时 drop |
 | MKDIR 9 / CREATE 35 / UNLINK 10 / RMDIR 11 | 调用参数路径 | 空 | 不做 nodeid 目标映射 |
 
 `nodeid -> path` 只对目标 inode 型 opcode 建立；LOOKUP/MKDIR/CREATE/UNLINK/RMDIR/RENAME

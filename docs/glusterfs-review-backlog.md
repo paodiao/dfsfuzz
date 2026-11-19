@@ -120,14 +120,23 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 | ID | 状态 | 问题 | 位置 | 处理方向 |
 |---|---|---|---|---|
-| P1-C1 | confirmed | offset bucket 用 request length / 0，而不是 entry file size。truncate `size=0`，Mid/Tail 永不出现；directed pread/pwrite 计划 Mid/Tail 但请求长度 1，观测总是 Beyond | `glusterfs_trace.bpf.c:284-296`；`dag.go:95-96,1786-1802`；`directed_plan.go:1083-1088`；`coverage_board.go:1979-1984` | wire 加 entry file size，或 GlusterFS profile-aware bucket；同步收窄 producible/planner |
-| P1-C2 | confirmed | LOOKUP nodeid fallback 用 parent path 代替 child；R path 丢失/out-of-root 时产生假 Same/Parent pair | `glusterfs_trace.cc:376-384`；`dag.go:468-473` | fallback 只用于 target-inode opcode；LOOKUP 用 parent+name 重建，否则 drop |
+| P1-C1 | fixed | offset bucket 用 request length / 0，而不是 entry file size。truncate `size=0`，Mid/Tail 永不出现；directed pread/pwrite 计划 Mid/Tail 但请求长度 1，观测总是 Beyond | `glusterfs_trace.bpf.c:284-296`；`dag.go:95-96,1786-1802`；`directed_plan.go:1083-1088`；`coverage_board.go:1979-1984` | B approximation：DAG 对 GlusterFS offset call 用 baseline `FileTree` size（缺失 0），和 planner 的 `directedNode.size` 同源；HMDFS 仍用 trace entry size。完全 faithful 的 entry size map 见 P1-C1b |
+| P1-C1b | deferred | GlusterFS trace 的 read/write request 没有 entry file size；B 用 baseline size 近似，程序内先改过的文件、rename 新路径、删除路径仍可能偏 | `glusterfs_trace.cc`；`glusterfs_trace.bpf.c`；`dag.go` | 后续从 LOOKUP/GETATTR reply 的 `fuse_attr.size` 维护 `nodeid -> size`，R event 填 entry_size |
+| P1-C2 | fixed | LOOKUP nodeid fallback 用 parent path 代替 child；R path 丢失/out-of-root 时产生假 Same/Parent pair | `glusterfs_trace.cc:376-384`；`dag.go:468-473` | LOOKUP 的 R `loc.path` 已是解析后的 child path，直接使用；path 缺失/out-of-root/path 截断时 drop，禁止 `nodeid` fallback。其它 parent-nodeid opcode 的 DAG 顶点路径来自调用参数，fallback 行为不变 |
 
 ### P1-D Fuzzer / feedback
 
 | ID | 状态 | 问题 | 位置 | 处理方向 |
 |---|---|---|---|---|
-| P1-D1 | confirmed | `ApplyProgTimings` 恢复 `CheckInfo` 时 `Retv=0`；fuzzer restart 后 failed creator/anchor 被 `callSucceeded` 当成功 | `mutation.go:5520-5568`；`anchor_path.go:58,122-124`；`fuzzer.go:716-732` | Timings 带 `Retv`/success flag；或只恢复成功调用 |
+| P1-D1 | fixed | `ApplyProgTimings` 恢复 `CheckInfo` 时 `Retv=0`；fuzzer restart 后 failed creator/anchor 被 `callSucceeded` 当成功 | `mutation.go:5520-5568`；`anchor_path.go:58,122-124`；`fuzzer.go:716-732` | `ProgTimings`/`ApplyProgTimings` 改为 `[Stime, Etime, Retv]` 三元组；失败调用保留负 Retv；旧 corpus 不兼容（已确认不需要） |
+
+2026-11-19 修复记录：P1-C1（B approximation）/C2/D1 已落地。
+
+- C1-B：`BuildVertices` 对 GlusterFS 的 offset call 用 `glusterfsOffsetSize(hmcfg, v.Path)`（baseline `FileTree` size，缺失 0），不再用 trace 的 request length / truncate 0；HMDFS 继续用 `ev.Size`。这和 planner 的 `directedNode.size` 同源，新文件默认 0。
+- C2：LOOKUP 的 R `loc.path` 已经是 parent+name 解析后的 child path，直接使用；C++ 在 path 缺失、out-of-root、path 截断时 drop 并计入 `drop_lookup`，不再用 `nodeid`（父目录）fallback。其它 parent-nodeid opcode 的 DAG 顶点路径来自调用参数，现有 fallback 行为不变；DAG 侧 GlusterFS LOOKUP 继续用 `ev.Path`。
+- D1：`ProgTimings`/`ApplyProgTimings` 改为每 call 三个值 `[Stime, Etime, Retv]`；`Retv` 以 int64 bit pattern 存储/恢复，失败 creator/anchor 不再变成功。
+- 回归测试：`TestGlusterfsOffsetSizeUsesBaselineTree`、`TestGlusterfsOffsetBucketUsesTreeSize`、`TestGlusterfsOffsetBucketNewFileZero`、`TestGlusterfsOffsetBucketTruncateUsesTreeSize`、`TestGlusterfsOffsetBucketUsesTreeSizeNotFsMd`、`TestProgTimingsRoundTrip`（含 failed Retv）；C2 用 `glusterfs-trace-test --self-test` 覆盖 LOOKUP path 可用性/drop。
+- 验证：`gofmt`、`GOOS=linux GOARCH=amd64 go test -c ./prog`、`go test -c ./syz-fuzzer`、`go vet ./prog ./syz-fuzzer` 通过；C2 的 trace self-test 运行时待 3-3，C1-B 的 bucket 分布待 3-3 coverage smoke。
 
 ### P1-E Profile / config / runtime
 
@@ -308,10 +317,15 @@ P1-B15:
   TestBuildPathMembersSkipsLinkPathRenameSource
 
 P1-C1:
-  truncate/pread/pwrite bucket 与观测一致
+  TestGlusterfsOffsetSizeUsesBaselineTree / TestGlusterfsOffsetBucketUsesTreeSize /
+  TestGlusterfsOffsetBucketNewFileZero / TestGlusterfsOffsetBucketTruncateUsesTreeSize /
+  TestGlusterfsOffsetBucketUsesTreeSizeNotFsMd
+
+P1-C2:
+  glusterfs-trace-test --self-test（LOOKUP loc.path 可用性 / drop）
 
 P1-D1:
-  Timings 带 Retv，failed creator 不被当成功
+  TestProgTimingsRoundTrip（含 failed Retv）
 
 P1-E1/E2/E5:
   3-3 config/mount/restore smoke

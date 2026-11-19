@@ -767,6 +767,19 @@ CREATE 35
 - `LOOKUP/MKDIR/CREATE/UNLINK/RMDIR/RENAME` 的 `nodeid` 是父目录。
 - 用它们把父目录映射到目标路径会造成错误映射。
 
+LOOKUP 路径：
+
+```text
+R event path = state->loc.path = 已解析的 parent + name child path
+```
+
+- `fuse_lookup` 把 name 放进 `resolve.bname`；`fuse_resolve_parent_simple`
+  设置 `loc.name`，`loc_touchup` 用 parent + name 生成 `loc.path`；
+- R event 的 `path` 已经是 child path，直接使用，不做二次拼接；
+- `nodeid` 是父目录，不能走 `nodeid -> path` fallback；path 缺失、
+  out-of-root、path 截断时丢弃该 LOOKUP 事件并计入 `drop_lookup`；
+- 用 parent path 顶替会产生假的 Same/Parent pair。
+
 补路径：
 
 ```text
@@ -1411,6 +1424,9 @@ go test ./prog/... ./pkg/ipc/...
 覆盖：
 
 - GlusterFS event parser 正常/截断/不足数据。
+- GlusterFS LOOKUP path：R `loc.path` 已是 child path，直接使用；缺失/
+  out-of-root/path 截断时 drop；禁止 nodeid fallback；非 LOOKUP 的
+  nodeid fallback 不变。
 - HMDFS parser 不受影响。
 - 新增事件：LINK/Path2、SYMLINK target、READLINK linkpath、xattr key。
 - 空前缀 FileTree：Root/Join/Parent/DepthBucket。
