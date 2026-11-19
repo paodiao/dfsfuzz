@@ -245,6 +245,27 @@ func TestPathSetTopLevelParent(t *testing.T) {
 	}
 }
 
+func TestPathSetRejectsRootCallPath(t *testing.T) {
+	ft := NewFileTree()
+	parentValid := func(string) bool { return true }
+
+	rootSpec := pathSpec{Path: "merge_view", Kind: pathExisting, Role: pathRoleMkdir}
+	if pathSetSpecValidWithParent(nil, GroupPosition{}, rootSpec, relTargetDir, ft, parentValid) {
+		t.Fatal("HMDFS root accepted as a call path")
+	}
+
+	slashRoot := pathSpec{Path: "merge_view/", Kind: pathExisting, Role: pathRoleMkdir}
+	if pathSetSpecValidWithParent(nil, GroupPosition{}, slashRoot, relTargetDir, ft, parentValid) {
+		t.Fatal("HMDFS merge_view/ accepted as a call path")
+	}
+
+	ft.AddNode("merge_view/merge_view", NodeTypeDir, "")
+	child := pathSpec{Path: "merge_view/merge_view", Kind: pathExisting, Role: pathRoleMkdir}
+	if !pathSetSpecValidWithParent(nil, GroupPosition{}, child, relTargetDir, ft, parentValid) {
+		t.Fatal("top-level merge_view child rejected as a call path")
+	}
+}
+
 func TestHMDFSTopLevelFreshParent(t *testing.T) {
 	target, hmcfg, _, lcs := directedPlanFixture(t)
 	if freshParentEligible(lcs.FileTree, "") {
