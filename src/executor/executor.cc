@@ -110,6 +110,17 @@ static NORETURN PRINTF(2, 3) void failmsg(const char *err, const char *msg,
 static NORETURN PRINTF(1, 2) void exitf(const char *msg, ...);
 static NORETURN void doexit(int status);
 
+// GlusterFS config/node-up scripts report volume/mount failures via exit code.
+// HMDFS keeps its historical best-effort behavior.
+static void check_glusterfs_cmd(const char *dfs, int status, const char *what,
+                                const char *cmd)
+{
+  if (strcmp(dfs, "glusterfs") != 0 || status == 0)
+    return;
+  int code = WIFEXITED(status) ? WEXITSTATUS(status) : status;
+  failmsg(what, "exit=%d cmd=%s", code, cmd);
+}
+
 // Print debug output that is visible when running syz-manager/execprog with
 // -debug flag. Debug output is supposed to be relatively high-level (syscalls
 // executed, return values, timing, etc) and is intended mostly for end users.
@@ -715,8 +726,10 @@ int main(int argc, char **argv) {
       (is_dfs_client && !strcmp(dfs_name, "glusterfs")) ? "eifuzz_root"
                                                         : nullptr;
   if (dfs_rt && dfs_rt->trace_enabled_for(is_dfs_client != 0) &&
-      dfs_rt->init_trace)
-    dfs_rt->init_trace(is_dfs_client != 0, trace_root);
+      dfs_rt->init_trace) {
+    if (!dfs_rt->init_trace(is_dfs_client != 0, trace_root))
+      failmsg("dfs trace init failed", "dfs=%s", dfs_name);
+  }
 
   snprintf(mnt_dir, 100, "/root/%s-client", dfs_name);
   if(!strcmp(dfs_name, "hmdfs")) {
@@ -1485,23 +1498,35 @@ void reconfigure_dfs() {
     fprintf(stderr, "------ executor %lld reconfigure DFS\n", executor_index);
 #endif
     char cmdbuf[4096]; // hmdfs cids (64 hex chars per node) can be long
-    // Quote dfs_setup_params: it contains spaces and ';' (cids separator)
-    // which bash would otherwise split into extra args / commands.
-    snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-node-up.sh %s \"%s\" %lld", dfs_name, init_ip,
-             dfs_setup_params, executor_index);
+    // HMDFS params contain cids with spaces and ';' (separator), so they must
+    // stay quoted. GlusterFS/NFS scripts take the params as separate argv
+    // fields (start_ip srv_cnt client_cnt mode [cur_idx]).
+    if (!strcmp(dfs_name, "hmdfs")) {
+      snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-node-up.sh %s \"%s\" %lld", dfs_name,
+               init_ip, dfs_setup_params, executor_index);
+    } else {
+      snprintf(cmdbuf, sizeof(cmdbuf), "/root/%s-node-up.sh %s %s %lld", dfs_name,
+               init_ip, dfs_setup_params, executor_index);
+    }
     if (cmdbuf[0] != 0) {
 #if MDEBUG
       fprintf(stderr, "----------executor %lld executing cmd: %s",
               executor_index, cmdbuf);
 #endif
       FILE *cmd = popen(cmdbuf, "r");
+      if (cmd == NULL) {
+        if (!strcmp(dfs_name, "glusterfs"))
+          fail("glusterfs node-up popen failed");
+      } else {
 #if MDEBUG
-      char result[1000] = {0x0};
-      while (fgets(result, sizeof(result), cmd) != NULL)
-        fprintf(stderr, "---- executor %lld config DFS: %s\n", executor_index,
-                result);
+        char result[1000] = {0x0};
+        while (fgets(result, sizeof(result), cmd) != NULL)
+          fprintf(stderr, "---- executor %lld config DFS: %s\n", executor_index,
+                  result);
 #endif
-      pclose(cmd);
+        check_glusterfs_cmd(dfs_name, pclose(cmd), "glusterfs node-up failed",
+                            cmdbuf);
+      }
     }
 
     // Agent (hmdfs) was started in the background by the script; wait for it
@@ -1707,14 +1732,18 @@ void receive_handshake() {
                dfs_name, init_ip, dfs_setup_params);
     }
     FILE *cmd = popen(cmdbuf, "r");
-    if (cmd != NULL) {
+    if (cmd == NULL) {
+      if (!strcmp(dfs_name, "glusterfs"))
+        fail("glusterfs config popen failed");
+    } else {
 #if MDEBUG
       char result[1000] = {0x0};
       while (fgets(result, sizeof(result), cmd) != NULL)
         fprintf(stderr, "---- executor %lld config DFS: %s\n", executor_index,
                 result);
 #endif
-      pclose(cmd);
+      check_glusterfs_cmd(dfs_name, pclose(cmd), "glusterfs config failed",
+                          cmdbuf);
     }
   }
 

@@ -19,8 +19,9 @@ struct DfsRuntimeOps {
 	/* true: this role emits trace output. GlusterFS server returns true
 	 * too: it writes the count=0 header even though it does not attach. */
 	bool (*trace_enabled_for)(bool is_client);
-	/* trace_root is non-null only for GlusterFS client ("eifuzz_root"). */
-	void (*init_trace)(bool is_client, const char *trace_root);
+	/* trace_root is non-null only for GlusterFS client ("eifuzz_root").
+	 * Returns false when the role needs tracing but initialization failed. */
+	bool (*init_trace)(bool is_client, const char *trace_root);
 	void (*start_trace)();
 	void (*stop_trace)();
 

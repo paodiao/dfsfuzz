@@ -29,11 +29,12 @@ static bool hmdfs_trace_enabled(bool is_client)
 	return true;
 }
 
-static void hmdfs_init_trace(bool is_client, const char *trace_root)
+static bool hmdfs_init_trace(bool is_client, const char *trace_root)
 {
 	(void)is_client;
 	(void)trace_root;
 	init_hmdfs_trace();
+	return true;
 }
 
 static void hmdfs_start_trace(void)
@@ -55,9 +56,10 @@ static bool glusterfs_trace_enabled(bool is_client)
 	return true;
 }
 
-static void glusterfs_init_trace(bool is_client, const char *trace_root)
+static bool glusterfs_init_trace(bool is_client, const char *trace_root)
 {
-	init_glusterfs_trace(GLUSTERFS_FUSE_SO, trace_root, is_client ? 1 : 0);
+	return init_glusterfs_trace(GLUSTERFS_FUSE_SO, trace_root,
+				    is_client ? 1 : 0) != 0;
 }
 
 static void glusterfs_start_trace(void)

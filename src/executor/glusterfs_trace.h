@@ -136,8 +136,9 @@ _Static_assert(sizeof(struct glusterfs_trace_event) == GLUSTERFS_TRACE_EVENT_SIZ
                "glusterfs_trace_event wire size must be 1228");
 #endif
 
-/* attach=0 means "server executor": emit only the empty trace header. */
-void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attach);
+/* attach=0 means "server executor": emit only the empty trace header.
+ * Returns 0 when a client attach cannot be initialized. */
+int init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attach);
 void start_glusterfs_trace(void);
 void stop_collect_glusterfs_trace(void);
 

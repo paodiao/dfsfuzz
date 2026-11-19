@@ -421,8 +421,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	init_glusterfs_trace(fuse_so.c_str(), trace_root.c_str(), 1);
-	if (!skel || !ctl_rb || !path_rb) {
+	if (!init_glusterfs_trace(fuse_so.c_str(), trace_root.c_str(), 1) ||
+	    !skel || !ctl_rb || !path_rb) {
 		fprintf(stderr,
 			"glusterfs-trace-test: attach/load failed; see "
 			"glusterfs_trace diagnostics above\n");

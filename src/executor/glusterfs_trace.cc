@@ -690,7 +690,7 @@ static void destroy_attach(void)
 }
 
 /* ── Public API ───────────────────────────────────────────────── */
-void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attach)
+int init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attach)
 {
 	const char *so = fuse_so ? fuse_so : "";
 	g_trace_root = trace_root ? trace_root : "";
@@ -698,12 +698,12 @@ void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attac
 	if (!attach) {
 		fprintf(stderr,
 			"glusterfs_trace: server executor, no uprobe attach\n");
-		return;
+		return 1;
 	}
 	if (g_trace_root.empty()) {
 		fprintf(stderr,
 			"glusterfs_trace: client attach without trace_root; disabled\n");
-		return;
+		return 0;
 	}
 
 	struct symbol_offset syms[] = {
@@ -713,7 +713,7 @@ void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attac
 	};
 	if (!find_symbol_offsets(so, syms, sizeof(syms) / sizeof(syms[0]))) {
 		fprintf(stderr, "glusterfs_trace: symbol resolution failed\n");
-		return;
+		return 0;
 	}
 	for (const auto &s : syms) {
 		fprintf(stderr,
@@ -725,7 +725,7 @@ void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attac
 	skel = glusterfs_trace_bpf__open_and_load();
 	if (!skel) {
 		fprintf(stderr, "glusterfs_trace: BPF load failed\n");
-		return;
+		return 0;
 	}
 	ctl_rb = ring_buffer__new(bpf_map__fd(skel->maps.gf_ctl_events),
 				  handle_ctl, nullptr, nullptr);
@@ -734,7 +734,7 @@ void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attac
 	if (!ctl_rb || !path_rb) {
 		fprintf(stderr, "glusterfs_trace: ring buffer creation failed\n");
 		destroy_attach();
-		return;
+		return 0;
 	}
 
 	link_dispatch = attach_one(skel->progs.gf_dispatch, false, so,
@@ -748,9 +748,10 @@ void init_glusterfs_trace(const char *fuse_so, const char *trace_root, int attac
 	if (!link_dispatch || !link_resume || !link_send_entry || !link_send_ret) {
 		fprintf(stderr, "glusterfs_trace: attach failed; tracing disabled\n");
 		destroy_attach();
-		return;
+		return 0;
 	}
 	fprintf(stderr, "glusterfs_trace: 3 uprobes + 1 uretprobe attached\n");
+	return 1;
 }
 
 void start_glusterfs_trace(void)

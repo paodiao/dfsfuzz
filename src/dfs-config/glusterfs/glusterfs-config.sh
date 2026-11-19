@@ -42,9 +42,13 @@ sleep 2s
 gluster peer status
 echo gluster volume create test-volume $mode $srvs force
 #disperse 3 redundancy 1
-LD_PRELOAD=/root/dfs-fuzzing/libucov.so gluster volume create test-volume $mode $srvs force
+if ! gluster volume info test-volume >/dev/null 2>&1; then
+    LD_PRELOAD=/root/dfs-fuzzing/libucov.so gluster volume create test-volume $mode $srvs force || exit 1
+fi
 #gluster volume create test-volume $srvs force
-LD_PRELOAD=/root/dfs-fuzzing/libucov.so gluster volume start test-volume force
+if ! gluster volume status test-volume >/dev/null 2>&1; then
+    LD_PRELOAD=/root/dfs-fuzzing/libucov.so gluster volume start test-volume force || exit 1
+fi
 gluster volume set test-volume network.ping-timeout 1
 gluster volume set test-volume performance.open-behind off
 gluster volume set test-volume performance.quick-read off
@@ -66,12 +70,19 @@ gluster volume set test-volume performance.cache-invalidation on
 
 #client
 i=0
+pids=""
 while [ $i -lt $client_cnt ]
 do
     #export ASAN_OPTIONS=detect_leaks=0
-    sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$cur_ip mount -t glusterfs -o attribute-timeout=0,entry-timeout=0 $start_ip:/test-volume glusterfs-client &
+    sshpass -p "123456" ssh -o StrictHostKeyChecking=no root@$cur_ip "umount -f /root/glusterfs-client 2>/dev/null || true; mount -t glusterfs -o attribute-timeout=0,entry-timeout=0 $start_ip:/test-volume /root/glusterfs-client" &
+    pids="$pids $!"
     cur_ip=$(nextip $cur_ip)
     i=$(( i + 1 ))
 done
+for pid in $pids; do
+    if ! wait "$pid"; then
+        echo "glusterfs client mount failed" >&2
+        exit 1
+    fi
+done
 echo "mount finished"
-wait
