@@ -1650,17 +1650,17 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, ps []*prog.Prog, stat Stat) ([]
 		hbPairs, ccPairs := prog.ExtractPairsFor(proc.hmcfg.ProfileOrDefault(), vertices, dagDiag)
 		allPairs := append(hbPairs, ccPairs...)
 		pairBits, schedBit := prog.ComputeFeedback(hbPairs, ccPairs, &proc.hmcfg, dagDiag)
-		log.Logf(0, "hmdfs dag: vertices=%d ps0Len=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d mfDistIn=%v mfDistOut=%v tol=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
+		log.Logf(0, "hmdfs dag: vertices=%d ps0Len=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d pathTrunc=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d mfDistIn=%v mfDistOut=%v tol=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
 			len(vertices), rootCallCount, len(hbPairs), len(ccPairs), len(pairBits),
-			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
+			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PathTruncated, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
 			dagDiag.MatchFailFunc, dagDiag.MatchFailRetOK, dagDiag.MatchFailNoFunc, dagDiag.MatchFailNoCI, dagDiag.MatchFailTime,
 			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly, dagDiag.MFGap, dagDiag.MFShift,
 			dagDiag.MatchDistIn, dagDiag.MatchDistOut, prog.MfTolTicks(),
 			dagDiag.TotalPairs, dagDiag.OverlapPairs, dagDiag.HBForwardPairs, dagDiag.HBReversePairs,
 			dagDiag.FilteredNoMod, dagDiag.FilteredPathRel, dagDiag.PairBitsUnique)
-		appendDiagLog("hmdfs dag: vertices=%d ps0Len=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d mfDistIn=%v mfDistOut=%v tol=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
+		appendDiagLog("hmdfs dag: vertices=%d ps0Len=%d hbPairs=%d ccPairs=%d pairBits=%d | events=%d matchFail=%d progIdxBad=%d pathDrop=%d pathTrunc=%d perNode=%v perFunc=%v | mfFunc=%v mfRetOK=%v mfNoFunc=%d mfNoCI=%d mfTime=%d mfByNode=%v mfLate=%d mfEarly=%d mfGap=%d mfShift=%d mfDistIn=%v mfDistOut=%v tol=%d | pairs=%d overlap=%d hbFwd=%d hbRev=%d filtNoMod=%d filtPathRel=%d bitsUnique=%d",
 			len(vertices), rootCallCount, len(hbPairs), len(ccPairs), len(pairBits),
-			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
+			dagDiag.Events, dagDiag.MatchFailed, dagDiag.ProgIdxBad, dagDiag.PathEmpty, dagDiag.PathTruncated, dagDiag.PerNodeVertices, dagDiag.PerFuncVertices,
 			dagDiag.MatchFailFunc, dagDiag.MatchFailRetOK, dagDiag.MatchFailNoFunc, dagDiag.MatchFailNoCI, dagDiag.MatchFailTime,
 			dagDiag.MatchFailByNode, dagDiag.MFTimeLate, dagDiag.MFTimeEarly, dagDiag.MFGap, dagDiag.MFShift,
 			dagDiag.MatchDistIn, dagDiag.MatchDistOut, prog.MfTolTicks(),
