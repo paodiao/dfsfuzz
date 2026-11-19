@@ -708,7 +708,7 @@ func TestDirectedPlanWitnessDiversity(t *testing.T) {
 	seen := map[string]bool{}
 	for seed := int64(0); seed < 20; seed++ {
 		r := newRand(target, rand.NewSource(seed))
-		p, ok := dirA.witnessFor(PathParent, "open", r.Rand)
+		p, ok := dirA.witnessFor(hmdfsProfile, PathParent, "open", r.Rand)
 		if !ok {
 			t.Fatal("dirA must have a Parent witness")
 		}
@@ -958,7 +958,7 @@ func TestDirectedPlanSiblingExcludesB(t *testing.T) {
 	seen := map[string]bool{}
 	for seed := int64(0); seed < 20; seed++ {
 		r := newRand(target, rand.NewSource(seed))
-		p, ok := nodeY.witnessFor(PathSibling, "open", r.Rand)
+		p, ok := nodeY.witnessFor(hmdfsProfile, PathSibling, "open", r.Rand)
 		if !ok {
 			t.Fatal("dirW/y must have a Sibling witness")
 		}
@@ -1410,7 +1410,7 @@ func TestRenameVariantParentWitnessUsesSource(t *testing.T) {
 	if bn == nil {
 		t.Fatal("synthesized srcDir->dstDir rename node missing")
 	}
-	got, ok := bn.witnessFor(PathParent, "stat", newRand(target, rand.NewSource(1)).Rand)
+	got, ok := bn.witnessFor(hmdfsProfile, PathParent, "stat", newRand(target, rand.NewSource(1)).Rand)
 	if !ok || got != "merge_view/dirW/srcDir/kid" {
 		t.Fatalf("rename Parent witness = %q (ok=%v), want source child", got, ok)
 	}
