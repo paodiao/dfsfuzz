@@ -291,3 +291,71 @@ func TestFreshPathAbsentPrefixedProfile(t *testing.T) {
 		t.Fatal("prefixed tracked profile accepted an anchor deleted earlier")
 	}
 }
+
+func TestBuildPathMembersSkipsLinkPathRenameSource(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["rename"]; !ok {
+		t.Skip("target has no rename")
+	}
+	ft := glusterfsPlanTree()
+	link := mkLinkCall(t, target, "dirA/a", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	rn := mkRenameCall(t, target, "dirA/l1", "dirA/l2", 120, 130)
+	rn.CheckInfo.Retv = 0
+	p := &Prog{Target: target, Calls: []*Call{link, rn}}
+
+	for _, m := range buildPathMembers([]*Prog{p}, ft, glusterfsProfile) {
+		if m.Pos.CallIdx == 1 {
+			t.Fatalf("linkpath rename source produced a member: %+v", m)
+		}
+	}
+}
+
+func TestBuildPathMembersSkipsDeletedGenericPath(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	for _, name := range []string{"unlink", "stat"} {
+		if _, ok := target.SyscallMap[name]; !ok {
+			t.Skipf("target has no %s", name)
+		}
+	}
+	ft := glusterfsPlanTree()
+	unlink := mkUnlinkCall(t, target, "dirA/a")
+	unlink.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	stat := mkPathCall(t, target, "stat", "dirA/a", 120, 130)
+	stat.CheckInfo.Retv = 0
+	p := &Prog{Target: target, Calls: []*Call{unlink, stat}}
+
+	for _, m := range buildPathMembers([]*Prog{p}, ft, glusterfsProfile) {
+		if m.Pos.CallIdx == 1 {
+			t.Fatalf("deleted generic path produced a member: %+v", m)
+		}
+	}
+}
+
+func TestBuildPathMembersKeepsFreshGenericPath(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	for _, name := range []string{"creat", "stat"} {
+		if _, ok := target.SyscallMap[name]; !ok {
+			t.Skipf("target has no %s", name)
+		}
+	}
+	ft := glusterfsPlanTree()
+	creat := mkCreat(target, "dirA/new")
+	creat.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	stat := mkPathCall(t, target, "stat", "dirA/new", 120, 130)
+	stat.CheckInfo.Retv = 0
+	p := &Prog{Target: target, Calls: []*Call{creat, stat}}
+
+	found := false
+	for _, m := range buildPathMembers([]*Prog{p}, ft, glusterfsProfile) {
+		if m.Pos.CallIdx == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("fresh generic member missing; direct-role creator binding is P1-B16")
+	}
+}
