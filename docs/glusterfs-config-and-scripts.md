@@ -43,6 +43,9 @@
 [ ] /root/.ssh/authorized_keys      focal.id_rsa.pub
 [ ] ssh -i focal.id_rsa root@VM     可登录
 [ ] eifuzz_root                     不预置，由首轮 restore 创建
+[ ] enable_c2san=false             C2SAN 未完工，不启用
+[ ] enable_syscalls                使用 §1 的 22 个，不要复用原版 Monarch 列表
+[ ] 通过 manager 运行              不要直接 syz-fuzzer -procs>1
 [ ] 不要直接复用 fuzz-config/all-config/glusterfs 下的原版矩阵配置
 [ ] 复用 VM 时确认 test-volume 是 replica 3；旧 mode 先 gluster volume stop/delete test-volume
 ```
