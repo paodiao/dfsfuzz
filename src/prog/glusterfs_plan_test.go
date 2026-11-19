@@ -430,25 +430,63 @@ func TestDctBaseCandidatesRenameProfile(t *testing.T) {
 		t.Skip("target has no rename")
 	}
 	src, dst := "dirA/a", "dirA/moved"
+	ft := glusterfsPlanTree()
 	okCall := mkRenameCall(t, target, src, dst, 100, 200)
 	okCall.CheckInfo.Retv = 0
 	p := &Prog{Target: target, Calls: []*Call{okCall}}
 
-	if got := dctBaseCandidatesFor(glusterfsProfile, p, 1); len(got) != 1 || got[0] != dst {
+	if got := dctBaseCandidatesFor(glusterfsProfile, ft, p, 1); len(got) != 1 || got[0] != dst {
 		t.Fatalf("glusterfs rename-before candidates = %v, want [%s]", got, dst)
 	}
-	if got := dctBaseCandidatesFor(glusterfsProfile, p, 0); len(got) != 1 || got[0] != src {
+	if got := dctBaseCandidatesFor(glusterfsProfile, ft, p, 0); len(got) != 1 || got[0] != src {
 		t.Fatalf("glusterfs rename-after candidates = %v, want [%s]", got, src)
 	}
-	if got := dctBaseCandidatesFor(hmdfsProfile, p, 1); len(got) != 2 {
-		t.Fatalf("hmdfs rename candidates = %v, want src+dst", got)
+	if got := dctBaseCandidatesFor(hmdfsProfile, ft, p, 1); len(got) != 1 || got[0] != dst {
+		t.Fatalf("hmdfs rename candidates = %v, want [%s]", got, dst)
 	}
 
 	failCall := mkRenameCall(t, target, src, dst, 100, 200)
 	failCall.CheckInfo.Retv = -17
 	p = &Prog{Target: target, Calls: []*Call{failCall}}
-	if got := dctBaseCandidatesFor(glusterfsProfile, p, 1); len(got) != 1 || got[0] != src {
+	if got := dctBaseCandidatesFor(glusterfsProfile, ft, p, 1); len(got) != 1 || got[0] != src {
 		t.Fatalf("failed rename candidates = %v, want [%s]", got, src)
+	}
+}
+
+func TestDctBaseCandidatesExistenceFilter(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	for _, name := range []string{"stat", "creat", "unlink"} {
+		if _, ok := target.SyscallMap[name]; !ok {
+			t.Skipf("target has no %s", name)
+		}
+	}
+	ft := glusterfsPlanTree()
+	stat := mkPathCall(t, target, "stat", "dirA/a", 100, 110)
+	stat.CheckInfo.Retv = 0
+	creat := mkCreat(target, "dirA/new")
+	creat.CheckInfo = &FileMetadata{Stime: 120, Etime: 130, Retv: 0}
+	unlink := mkUnlinkCall(t, target, "dirA/a")
+	unlink.CheckInfo = &FileMetadata{Stime: 140, Etime: 150, Retv: 0}
+	p := &Prog{Target: target, Calls: []*Call{stat, creat, unlink}}
+
+	has := func(list []string, want string) bool {
+		for _, s := range list {
+			if s == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// At slot 1 only the baseline dirA/a exists; dirA/new is created later.
+	got := dctBaseCandidatesFor(glusterfsProfile, ft, p, 1)
+	if !has(got, "dirA/a") || has(got, "dirA/new") {
+		t.Fatalf("slot 1 candidates = %v, want dirA/a without dirA/new", got)
+	}
+	// At slot 3 dirA/a was deleted and dirA/new was created.
+	got = dctBaseCandidatesFor(glusterfsProfile, ft, p, 3)
+	if has(got, "dirA/a") || !has(got, "dirA/new") {
+		t.Fatalf("slot 3 candidates = %v, want dirA/new without dirA/a", got)
 	}
 }
 

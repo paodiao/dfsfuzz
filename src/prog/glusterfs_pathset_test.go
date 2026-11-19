@@ -34,6 +34,39 @@ func TestGlusterfsRenamePolicyCrossParent(t *testing.T) {
 	}
 }
 
+func TestPickRenameSrcDirProfilePolicy(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	ft := NewFileTreeWithPrefix("")
+	ft.AddNode("dirA", NodeTypeDir, "c1")
+	ft.AddNode("dirA/nonempty", NodeTypeDir, "c1")
+	ft.AddNode("dirA/nonempty/child", NodeTypeFile, "c1")
+	ft.AddNode("dirA/sib", NodeTypeDir, "c1")
+	ft.AddNode("dirB", NodeTypeDir, "c1")
+	ft.AddNode("dirB/src", NodeTypeDir, "c1")
+	r := newRand(target, rand.NewSource(71))
+
+	cross := false
+	for i := 0; i < 40; i++ {
+		src := pickRenameSrcDir(ft, r, "dirA/nonempty", glusterfsProfile)
+		if src == "" {
+			t.Fatal("GlusterFS rename source missing")
+		}
+		if parentDirOrRoot(src) != parentDirOrRoot("dirA/nonempty") {
+			cross = true
+		}
+	}
+	if !cross {
+		t.Fatal("GlusterFS rename source never crossed parents")
+	}
+
+	for i := 0; i < 20; i++ {
+		src := pickRenameSrcDir(ft, r, "dirA/nonempty")
+		if src == "" || parentDirOrRoot(src) != parentDirOrRoot("dirA/nonempty") {
+			t.Fatalf("HMDFS rename source %q must stay same-parent", src)
+		}
+	}
+}
+
 func TestGetPathsForRenameVariantUsesProfilePolicy(t *testing.T) {
 	ft := glusterfsPlanTree()
 	lcs := &LayeredChoiceStrategy{FileTree: ft, Profile: glusterfsProfile}

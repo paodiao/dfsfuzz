@@ -173,7 +173,7 @@ func TestDctBaseCandidatesLinkRoles(t *testing.T) {
 
 	// insertPos=2: link and symlink are before the insertion point, readlink
 	// is not. Only the executed link/symlink create usable linkpaths.
-	got := dctBaseCandidates(p, 2)
+	got := dctBaseCandidates(p, smokeFileTree(), 2)
 	want := map[string]bool{
 		"merge_view/dirA/a":  true,
 		"merge_view/dirA/l1": true,
@@ -195,7 +195,7 @@ func TestDctBaseCandidatesLinkRoles(t *testing.T) {
 	}
 
 	// insertPos=0: no call has executed, so linkpaths must not be candidates.
-	got = dctBaseCandidates(p, 0)
+	got = dctBaseCandidates(p, smokeFileTree(), 0)
 	for _, path := range got {
 		if strings.Contains(path, "/l1") || strings.Contains(path, "/l2") {
 			t.Fatalf("unexecuted linkpath became a base candidate: %q", path)

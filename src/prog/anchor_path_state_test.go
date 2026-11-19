@@ -91,6 +91,28 @@ func TestClassifyAnchorPathRecreatedType(t *testing.T) {
 // TestBuildPathMembersSkipsDeletedRenameSource pins the PathSet-side B5 guard:
 // a rename whose source was removed earlier cannot execute and must not become
 // a PathSet member.
+func TestBuildPathMembersSkipsLinkPath(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["link"]; !ok {
+		t.Skip("target has no link")
+	}
+	if _, ok := target.SyscallMap["stat"]; !ok {
+		t.Skip("target has no stat")
+	}
+	ft := glusterfsPlanTree()
+	link := mkLinkCall(t, target, "dirA/a", "dirA/l1")
+	link.CheckInfo = &FileMetadata{Stime: 100, Etime: 110, Retv: 0}
+	stat := mkPathCall(t, target, "stat", "dirA/l1", 120, 130)
+	stat.CheckInfo.Retv = 0
+	p := &Prog{Target: target, Calls: []*Call{link, stat}}
+
+	for _, m := range buildPathMembers([]*Prog{p}, ft, glusterfsProfile) {
+		if m.Pos.CallIdx == 1 {
+			t.Fatalf("linkpath produced a generic member: %+v", m)
+		}
+	}
+}
+
 func TestBuildPathMembersSkipsDeletedRenameSource(t *testing.T) {
 	target := hmdfsSmokeTarget(t)
 	if _, ok := target.SyscallMap["rename"]; !ok {

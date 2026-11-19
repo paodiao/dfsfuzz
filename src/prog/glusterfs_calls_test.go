@@ -110,6 +110,21 @@ func TestGenerateSpecialCallByName(t *testing.T) {
 	}
 }
 
+func TestIsFdRequiredCallExactMatch(t *testing.T) {
+	if !IsFdRequiredCall("read") {
+		t.Fatal("read must be fd-required")
+	}
+	if !IsFdRequiredCall("pread64") {
+		t.Fatal("pread64 must be fd-required")
+	}
+	if IsFdRequiredCall("readlink") {
+		t.Fatal("readlink must not be fd-required")
+	}
+	if IsFdRequiredCall("open") {
+		t.Fatal("open must not be fd-required")
+	}
+}
+
 func TestSymlinkCanonicalTargetAndPayload(t *testing.T) {
 	cases := []struct {
 		linkPath string
@@ -217,6 +232,30 @@ func mkReadlinkCall(t *testing.T, target *Target, linkPath string) *Call {
 // TestGlusterfsDagLinkSymlinkPaths pins the GlusterFS v1 vertex path roles:
 // link uses Path=new/OldPath=source, symlink uses Path=linkpath and
 // OldPath=canonical target.
+func TestLayeredChoiceStrategyProfileNilGlusterfsChoice(t *testing.T) {
+	target := hmdfsSmokeTarget(t)
+	if _, ok := target.SyscallMap["setxattr"]; !ok {
+		t.Skip("target has no setxattr")
+	}
+	hmcfg := &Hmdfs_config{
+		DfsName: "glusterfs", Node_num: 3, Cids: hmdfsSmokeCids(),
+		FileTree: glusterfsPlanTree(),
+	}
+	lcs := NewLayeredChoiceStrategy(hmcfg, target)
+	if lcs.Profile == nil || lcs.Profile.Name != "glusterfs" {
+		t.Fatalf("profile = %v, want glusterfs", lcs.Profile)
+	}
+	if lcs.FsopsChoiceTable == nil {
+		t.Fatal("choice table missing")
+	}
+	for _, call := range lcs.FsopsChoiceTable.calls {
+		if call.Name == "setxattr" {
+			return
+		}
+	}
+	t.Fatal("GlusterFS choice table missing setxattr")
+}
+
 func TestGlusterfsDagLinkSymlinkPaths(t *testing.T) {
 	target := hmdfsSmokeTarget(t)
 	if _, ok := target.SyscallMap["link"]; !ok {
