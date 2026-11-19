@@ -163,6 +163,24 @@ func TestCausalLinkAnchorRoleEnumeration(t *testing.T) {
 	}
 }
 
+// TestCausalRootPathsByPathFreshTopLevel pins the GlusterFS empty-prefix
+// termination case: filepath.Dir("dirA") is ".", which is not the tree root.
+// The helper must stop at the namespace root instead of looping on ".".
+func TestCausalRootPathsByPathFreshTopLevel(t *testing.T) {
+	hmcfg := glusterfsCoverageConfig(t, true)
+	ft := hmcfg.FileTree
+	info := anchorPathInfo{Kind: AnchorPathFreshFile}
+
+	parent := causalRootPathsByPath(ft, "dirA/l1", info, PathParent)
+	if len(parent) != 1 || parent[0] != "dirA" {
+		t.Fatalf("PathParent = %v, want [dirA]", parent)
+	}
+	siblings := causalRootPathsByPath(ft, "dirA/l1", info, PathSibling)
+	if len(siblings) != 2 || siblings[0] != "dirA/a" || siblings[1] != "dirA/b" {
+		t.Fatalf("PathSibling = %v, want [dirA/a dirA/b]", siblings)
+	}
+}
+
 func TestCellRoleReadlinkSingle(t *testing.T) {
 	glusterfsCoverageConfig(t, true)
 	cell := glusterfsCoverageCell("symlink", "readlink", PathSame, TemporalHB,
