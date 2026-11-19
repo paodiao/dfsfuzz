@@ -143,13 +143,22 @@ out-of-scope              不属于本轮 GlusterFS 适配
 
 | ID | 状态 | 问题 | 位置 | 处理方向 |
 |---|---|---|---|---|
-| P1-E1 | confirmed | `glusterfs-node-up.sh` 参数契约不匹配；`$cur_idx` 空，else 分支在 server 上也 mount client FS | `executor.cc:1490`；`glusterfs-node-up.sh:2-8` | 脚本内 `set -- $2` 解析 params，或 executor 传 5 个参数；加 role 检查/mount 选项/错误处理 |
-| P1-E2 | confirmed | server 数量/replica mode 不校验；`serverCnt=2` 或 `"3 3"`（mode 空）被接受，实际 distributed volume | `glusterfs_config.go:34-43`；`glusterfs-config.sh:43-47` | 要求 `serverCnt==3` + replica 3 mode；mgrconfig 启动前校验 |
+| P1-E1 | fixed | `glusterfs-node-up.sh` 参数契约不匹配；`$cur_idx` 空，else 分支在 server 上也 mount client FS | `executor.cc:1490`；`glusterfs-node-up.sh:2-8` | executor 按 DFS 分支：HMDFS 保留 params quote，GlusterFS/NFS 恢复原版 unquoted 5 参数；脚本参数契约不变 |
+| P1-E2 | fixed | server 数量/replica mode 不校验；`serverCnt=2` 或 `"3 3"`（mode 空）被接受，实际 distributed volume | `glusterfs_config.go:34-43`；`glusterfs-config.sh:43-47` | 固定 3 server + 3 client + 6 VMs，params canonical `3 3 'replica 3'`；`mgrconfig` 启动前校验 + `loadGlusterfsConfig` 防御；volume create/start 检查退出码 |
 | P1-E3 | needs-runtime-verification | C2SAN 与 client-only empty server batch 不兼容；若 config 关闭 C2SAN 则暂不触发 | `proc.go:1424-1436,1478-1487`；`mutation.go:1566-1577`；`dfs_profile.go:215` | 按 profile/DFSName gate；GlusterFS 启用时启动报错 |
-| P1-E4 | confirmed | trace init 失败静默；fuse.so/BPF/ring/uprobe 失败只打印，executor 继续，DAG/directed 全空 | `glusterfs_trace.cc:670-731`；`dfs_runtime.cc:58-61`；`executor.cc:717-719` | init 返回 status，client 失败即 fail |
-| P1-E5 | confirmed | restore 不验证 client root 真的是 GlusterFS mount；mount 失败时 `rm -rf`/rsync 在本地目录执行 | `dfs_runtime.cc:97-129`；`executor.cc:3720-3725`；`glusterfs-config.sh:69-76` | statfs magic 校验；mount 脚本失败即退出 |
+| P1-E4 | fixed | trace init 失败静默；fuse.so/BPF/ring/uprobe 失败只打印，executor 继续，DAG/directed 全空 | `glusterfs_trace.cc:670-731`；`dfs_runtime.cc:58-61`；`executor.cc:717-719` | `DfsRuntimeOps::init_trace` 返回 bool；GlusterFS init 失败返回 0；executor fail-fast；HMDFS wrapper 保持 true |
+| P1-E5 | fixed | restore 不验证 client root 真的是 GlusterFS mount；mount 失败时 `rm -rf`/rsync 在本地目录执行 | `dfs_runtime.cc:97-129`；`executor.cc:3720-3725`；`glusterfs-config.sh:69-76` | E5-a：config/node-up 检查 mount/volume 退出码，client mount 逐个 wait，executor 检查 popen/pclose；不加每轮 statfs，startup 后 mount 消失仍按原版风险接受 |
 | P1-E6 | needs-runtime-verification | profile calls 未与 enabled syscalls 校验；缺 call 时 DCT/planner 仍可能选中，首次执行 panic | `distributed_choice.go:1581-1604`；`coverage_board.go:380-398`；`fuzzer.go:804-819`；`proc.go:1493-1495` | 启动时 profile lists ∩ EnabledCalls，缺 call 清晰报错 |
 | P1-E7 | needs-runtime-verification | 多 proc 默认 6，若未设 procs=1 会共享同一 shm | `mgrconfig/load.go:89`；`proc.go:58`；`ipc.go:248-262` | 每 Proc 独立 shm，或 GlusterFS 强制 procs=1 并校验 |
+
+2026-11-19 修复记录：P1-E1/E2/E4/E5 已落地。
+
+- E1：executor 的 node-up 调用按 DFS 分支；HMDFS 保留 params quote，GlusterFS/NFS 恢复原版 unquoted 5 参数契约；`glusterfs-node-up.sh` 的 5 参数接口不变。
+- E2：新增 `pkg/glusterfsconfig` canonical 校验；`mgrconfig.Complete` 和 `loadGlusterfsConfig` 都要求 3 server / 3 client / 6 VMs / `3 3 'replica 3'`；config 脚本 volume create/start 检查退出码并做幂等保护。
+- E4：`DfsRuntimeOps::init_trace` 返回 bool；`init_glusterfs_trace` 失败返回 0；executor fail-fast；HMDFS wrapper 保持 true。
+- E5：config/node-up 脚本检查 mount/volume 退出码；client mount 逐个 wait；executor 检查 popen/pclose。正常 restore 不加 statfs；startup 后 mount 消失仍按原版风险接受。
+- 回归测试：`TestValidateV1`、`TestLoadGlusterfsConfigRequiresThreeClients`；C++ `make executor` / `make glusterfs-trace-test` 待 3-3；mount 失败和 trace init 失败需 3-3 注入验证。
+- 验证：`go test ./pkg/glusterfsconfig`、`GOOS=linux GOARCH=amd64 go test -c ./syz-fuzzer`、`go build ./pkg/mgrconfig`、`go build -o <tmp>/syz-manager ./syz-manager`、`go vet ./pkg/glusterfsconfig ./syz-fuzzer` 通过；`go test -c ./pkg/mgrconfig` 仍受既有 `vm/gce` 类型错误影响。
 
 ---
 
@@ -331,7 +340,10 @@ P1-D1:
   TestProgTimingsRoundTrip（含 failed Retv）
 
 P1-E1/E2/E5:
-  3-3 config/mount/restore smoke
+  3-3 config/mount/restore smoke（正常 + client mount 失败）
+
+P1-E4:
+  移走 fuse.so，executor 应在 trace init 阶段 fail
 
 最终:
   go test ./prog -count=1

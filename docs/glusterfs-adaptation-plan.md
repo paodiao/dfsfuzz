@@ -2233,10 +2233,10 @@ GlusterFS client 非空（`eifuzz_root`），HMDFS/server 传 `nullptr`。
   - `start_hmdfs_trace` → `rt->start_trace()`
   - `stop_collect_hmdfs_trace` → `rt->stop_trace()`
 - B2 只填 trace 字段；D 阶段已补 restore/cwd/metadata；config/node-up/down
-  仍未实现。
+  仍走现有命令路径（E1/E5 已修正参数和错误传播），未新增 runtime command builder。
 - `restore_initial_file_tree` →
   `rt->restore_initial(is_restarting, is_client, is_reset_client)`
-- cwd/metadata 已走 runtime；config/node-up/down 仍为 `nullptr`，继续走现有命令路径。
+- cwd/metadata 已走 runtime；config/node-up/down 仍走现有命令路径。
 
 ### 10.2 GlusterFS hooks
 
@@ -2468,8 +2468,8 @@ cwd `/root` 和挂载点存在。`eifuzz_root` 不在镜像中预置；volume �
   `start_ip srv_cnt client_cnt mode cur_idx`；
   server 重启 glusterd；client umount/remount 带 timeout 选项。
 - `glusterfs-node-down.sh`：client umount；server 仅 failure 场景。
-- 当前 executor 传入的 `node-up` 参数格式是 HMDFS 格式，会错位；
-  由 runtime command builder 按 profile 生成。
+- 当前 executor 对 HMDFS 保留 quoted params，对 GlusterFS/NFS 恢复原版
+  unquoted params；`glusterfs-node-up.sh` 仍按 5 参数契约接收。
 - prefill/restore：
   - `rm -rf eifuzz_root`
   - `timeout 60s rsync -a --numeric-ids --delete /home/baseline/glusterfs/ eifuzz_root/`

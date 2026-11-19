@@ -374,15 +374,16 @@ $4 mode
 - 在每个 client 上挂载：
 
 ```bash
+umount -f /root/glusterfs-client 2>/dev/null || true
 mount -t glusterfs \
   -o attribute-timeout=0,entry-timeout=0 \
   $start_ip:/test-volume /root/glusterfs-client
 ```
 
-当前脚本的 `mount ... glusterfs-client` 使用相对挂载点，v1 直接复用它，
-不改脚本。前提是 executor config 阶段 cwd=`/root`，且镜像已预建
-`/root/glusterfs-client`。如果以后启动方式改变，再把脚本改成绝对路径。
-挂载完成后增加 client mount barrier；不能只依赖 `popen` 返回。
+- volume create/start 前用 `volume info/status` 做幂等判断，失败 `exit 1`；
+- client mount 后台任务收集 PID，逐个 `wait`，任一失败 `exit 1`；
+- executor 对 config 脚本的 `popen/pclose` 检查退出码；HMDFS 保持原行为。
+- 挂载完成后增加 client mount barrier；不能只依赖 `popen` 返回。
 
 脚本复用还需：
 
@@ -420,17 +421,17 @@ mount -t glusterfs \
   $start_ip:/test-volume /root/glusterfs-client
 ```
 
-当前 executor 的 `node-up` 调用是 HMDFS 参数格式：
+当前 executor 的 `node-up` 调用按 DFS 分支：
 
 ```text
-node-up.sh start_ip "<dfs_setup_params>" cur_idx
+HMDFS:       node-up.sh start_ip "<dfs_setup_params>" cur_idx
+GlusterFS:   node-up.sh start_ip srv_cnt client_cnt "mode" cur_idx
 ```
 
-对 GlusterFS 会错位。必须由 `DfsRuntimeOps::node_up_command` 按 profile 生成：
-
-```text
-node-up.sh start_ip srv_cnt client_cnt "mode" cur_idx
-```
+GlusterFS/NFS 使用原版 unquoted 参数，shell 会把 canonical
+`3 3 'replica 3'` 拆成脚本需要的 5 个参数。`glusterfs-node-up.sh`
+server 分支检查 glusterd 退出码，client 分支先 `umount -f` 再 `mount`，
+mount 失败 `exit 1`；executor 检查 `pclose` 退出码。
 
 ### 5.3 glusterfs-node-down.sh
 
