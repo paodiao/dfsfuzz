@@ -2825,8 +2825,12 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 		}
 		return true
 	case plan.FreshA:
-		parent := ft.FindNode(plan.BaseA2)
-		if parent == nil || parent.Type == NodeTypeFile || parent.Type == NodeTypeTmpDir {
+		if plan.RootParentIsAnchor {
+			if !plan.RootParentKind.IsFresh() || !plan.RootParentIsDir ||
+				!freshParentNodeEligible(ft, plan.BaseA2) {
+				return false
+			}
+		} else if !freshParentEligible(ft, plan.BaseA2) {
 			return false
 		}
 		if plan.Cell.Combo.Root != "mkdir" && plan.Cell.Combo.Root != "creat" {
