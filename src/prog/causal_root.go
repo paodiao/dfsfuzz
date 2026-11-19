@@ -1308,7 +1308,9 @@ func causalRootPathsByPath(ft *FileTree, path string, info anchorPathInfo, rel P
 	switch rel {
 	case PathParent:
 		var out []string
-		for p := GetParentDir(path); p != ""; p = GetParentDir(p) {
+		// parentDirOrRoot maps GlusterFS's empty namespace root and "."
+		// to "", avoiding the filepath.Dir(".") == "." cycle.
+		for p := parentDirOrRoot(path); p != ""; p = parentDirOrRoot(p) {
 			n := ft.FindNode(p)
 			if n == nil {
 				continue
@@ -1321,7 +1323,7 @@ func causalRootPathsByPath(ft *FileTree, path string, info anchorPathInfo, rel P
 		sort.Strings(out)
 		return out
 	case PathSibling:
-		parent := ft.FindNode(GetParentDir(path))
+		parent := ft.FindNode(parentDirOrRoot(path))
 		if parent == nil {
 			return nil
 		}
