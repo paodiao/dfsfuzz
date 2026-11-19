@@ -1030,11 +1030,11 @@ func destructiveCCExclusive(variant string, retB RetBucket) bool {
 func directedFreshName(call, parent string, r *rand.Rand) string {
 	switch call {
 	case "mkdir":
-		return parent + "/mut_dir_" + randomSuffix(r)
+		return joinTestPath(parent, "mut_dir_"+randomSuffix(r))
 	case "creat":
-		return parent + "/._creat_" + randomSuffix(r) + ".txt"
+		return joinTestPath(parent, "._creat_"+randomSuffix(r)+".txt")
 	}
-	return parent + "/fresh_" + randomSuffix(r)
+	return joinTestPath(parent, "fresh_"+randomSuffix(r))
 }
 
 // directedFreshPlaceholder returns a prefix of directedFreshName(call, parent)
@@ -1045,11 +1045,11 @@ func directedFreshName(call, parent string, r *rand.Rand) string {
 func directedFreshPlaceholder(call, parent string) string {
 	switch call {
 	case "mkdir":
-		return parent + "/mut_dir_"
+		return joinTestPath(parent, "mut_dir_")
 	case "creat":
-		return parent + "/._creat_"
+		return joinTestPath(parent, "._creat_")
 	}
-	return parent + "/fresh_"
+	return joinTestPath(parent, "fresh_")
 }
 
 // renamePlaceholder returns the prefix placeholder of a fresh rename
@@ -2087,9 +2087,9 @@ func planDirectedCellsScan(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_
 					}
 					parent := bn.path
 					if rel == PathSibling {
-						parent = GetParentDir(bn.path)
+						parent = parentDirOrRoot(bn.path)
 					}
-					if parent == "" {
+					if !freshParentEligible(lcs.FileTree, parent) {
 						continue
 					}
 					for _, kind := range kinds {
@@ -2813,7 +2813,7 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 		if plan.BaseA == "" || plan.BaseA != plan.BaseB || ft.FindNode(plan.BaseA) != nil {
 			return false
 		}
-		if GetParentDir(plan.BaseA) != plan.BaseA2 || plan.Cell.Combo.Rel != PathSame {
+		if parentDirOrRoot(plan.BaseA) != plan.BaseA2 || plan.Cell.Combo.Rel != PathSame {
 			return false
 		}
 		if !freshSameFormAllowedFor(hmcfg.ProfileOrDefault(), plan.Cell.Combo.Root,
@@ -2833,7 +2833,7 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 			return false
 		}
 		if plan.BaseA == "" || ft.FindNode(plan.BaseA) != nil ||
-			GetParentDir(plan.BaseA) != plan.BaseA2 {
+			parentDirOrRoot(plan.BaseA) != plan.BaseA2 {
 			return false
 		}
 		b := ft.FindNode(plan.BaseB)
@@ -2894,7 +2894,7 @@ func validateFreshPlanLive(ft *FileTree, hmcfg *Hmdfs_config, plan *directedPlan
 			return false
 		}
 		if plan.BaseB == "" || ft.FindNode(plan.BaseB) != nil ||
-			GetParentDir(plan.BaseB) != plan.BaseB2 {
+			parentDirOrRoot(plan.BaseB) != plan.BaseB2 {
 			return false
 		}
 		wantDir := plan.Cell.Combo.Variant == "mkdir"

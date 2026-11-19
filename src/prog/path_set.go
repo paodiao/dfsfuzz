@@ -922,7 +922,7 @@ func pathSetParentValidAt(ps []*Prog, pos GroupPosition, parent string, ft *File
 }
 
 func pathSetParentValid(ps []*Prog, pos GroupPosition, path string, ft *FileTree) bool {
-	return pathSetParentValidAt(ps, pos, GetParentDir(path), ft)
+	return pathSetParentValidAt(ps, pos, parentDirOrRoot(path), ft)
 }
 
 func pathSetProvisionalParentValid(ft *FileTree, parent string) bool {
@@ -994,7 +994,7 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 			if node != nil {
 				return spec.Recreated && spec.CurrentKind == relTargetDir
 			}
-			return parentValid(GetParentDir(spec.Path))
+			return parentValid(parentDirOrRoot(spec.Path))
 		}
 		return node != nil && nodeIsDir(node)
 	case pathRoleCreat:
@@ -1003,7 +1003,7 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 				!(spec.Recreated && spec.CurrentKind == relTargetFile) {
 				return false
 			}
-			return parentValid(GetParentDir(spec.Path))
+			return parentValid(parentDirOrRoot(spec.Path))
 		}
 		return node != nil && node.Type == NodeTypeFile
 	case pathRoleRenameSrc:
@@ -1016,7 +1016,7 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 				}
 				return nodeMatchesConstraint(node, typeConstraint)
 			}
-			return parentValid(GetParentDir(spec.Path))
+			return parentValid(parentDirOrRoot(spec.Path))
 		}
 		return node != nil && nodeMatchesConstraint(node, typeConstraint)
 	case pathRoleLinkTarget, pathRoleSymlinkTarget:
@@ -1029,7 +1029,7 @@ func pathSetSpecValidWithParent(ps []*Prog, pos GroupPosition, spec pathSpec, co
 				// creator binding proves the creator maps to this path.
 				return spec.HasCreator && spec.CurrentKind != 0
 			}
-			return parentValid(GetParentDir(spec.Path))
+			return parentValid(parentDirOrRoot(spec.Path))
 		}
 		return node != nil && nodeMatchesConstraint(node, typeConstraint)
 	default:
@@ -1107,10 +1107,10 @@ func alignFreshLinkTargets(set *pathSet, updates []pathUpdate) {
 func pathSetFallbackPathWithParent(ps []*Prog, pos GroupPosition, desired, base string, spec pathSpec,
 	constraint int, ft *FileTree, r *randGen, parentValid func(string) bool) string {
 	candidates := []string{desired, base}
-	if p := GetParentDir(desired); p != "" {
+	if p := parentDirOrRoot(desired); p != "" {
 		candidates = append(candidates, p)
 	}
-	if p := GetParentDir(base); p != "" {
+	if p := parentDirOrRoot(base); p != "" {
 		candidates = append(candidates, p)
 	}
 	for _, cand := range candidates {

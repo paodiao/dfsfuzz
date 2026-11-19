@@ -461,12 +461,8 @@ func planCausalC2CellsWithParent(ps []*Prog, lcs *LayeredChoiceStrategy, hmcfg *
 				!freshParentNodeEligible(ft, rootParent) {
 				return planByCell, cells
 			}
-		} else {
-			parent := ft.FindNode(rootParent)
-			if parent == nil || parent.Type == NodeTypeFile || parent.Type == NodeTypeTmpDir ||
-				!aEligible(parent, ft.Root) {
-				return planByCell, cells
-			}
+		} else if !freshParentEligible(ft, rootParent) {
+			return planByCell, cells
 		}
 		isDir := rootCall == "mkdir"
 		dn = directedNode{
@@ -985,13 +981,8 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 			anchorNodes := role.Nodes
 			pathsByRel := causalPathsByRel(ft, role, info, rels)
 			addFreshPlan := func(rootCall string, rel PathRelation, parent string, parentKind AnchorPathKind, parentIsDir, parentIsAnchor bool) {
-				if parent == "" {
-					return
-				}
 				if !parentIsAnchor {
-					parentNode := ft.FindNode(parent)
-					if parentNode == nil || parentNode.Type == NodeTypeFile ||
-						!aEligible(parentNode, ft.Root) {
+					if !freshParentEligible(ft, parent) {
 						return
 					}
 				} else if !parentKind.IsFresh() || !parentIsDir ||
@@ -1162,18 +1153,14 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 							parent := ""
 							switch rel {
 							case PathChild:
-								if anchorNode.Type != NodeTypeFile {
-									parent = anchorNode.FullPath
+								if anchorNode.Type == NodeTypeFile {
+									continue
 								}
+								parent = anchorNode.FullPath
 							case PathSibling:
-								parent = GetParentDir(anchorNode.FullPath)
+								parent = parentDirOrRoot(anchorNode.FullPath)
 							}
-							if parent == "" {
-								continue
-							}
-							parentNode := ft.FindNode(parent)
-							if parentNode == nil || parentNode.Type == NodeTypeFile ||
-								!aEligible(parentNode, ft.Root) {
+							if !freshParentEligible(ft, parent) {
 								continue
 							}
 							rootPath := directedFreshPlaceholder(rootCall, parent)
@@ -1220,7 +1207,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 							case PathChild:
 								addFreshPlan(rootCall, rel, path, info.Kind, info.IsDir, true)
 							case PathSibling:
-								addFreshPlan(rootCall, rel, GetParentDir(path), AnchorPathExisting, true, false)
+								addFreshPlan(rootCall, rel, parentDirOrRoot(path), AnchorPathExisting, true, false)
 							}
 						}
 					}
@@ -1275,7 +1262,7 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 								RootCall:          rootCall,
 								RootPath:          rootPath,
 								RootKind:          causalRootRename,
-								RootParent:        GetParentDir(rootPath),
+								RootParent:        parentDirOrRoot(rootPath),
 								RootSource:        source,
 								RootDest:          rootPath,
 								RootRenameReplace: true,
@@ -1287,12 +1274,15 @@ func collectCausalRootPlans(p0 *Prog, lcs *LayeredChoiceStrategy, hmcfg *Hmdfs_c
 						if rel == PathChild || rel == PathSibling {
 							for _, anchorNode := range anchorNodes {
 								parent := ""
-								if rel == PathChild && anchorNode.Type != NodeTypeFile {
+								if rel == PathChild {
+									if anchorNode.Type == NodeTypeFile {
+										continue
+									}
 									parent = anchorNode.FullPath
-								} else if rel == PathSibling {
-									parent = GetParentDir(anchorNode.FullPath)
+								} else {
+									parent = parentDirOrRoot(anchorNode.FullPath)
 								}
-								if parent == "" {
+								if !freshParentEligible(ft, parent) {
 									continue
 								}
 								source := causalRenameSourceUnder(ft, parent)
@@ -1822,15 +1812,11 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 				!freshParentNodeEligible(ft, plan.BaseA2) {
 				return false
 			}
-		} else {
-			parent := ft.FindNode(plan.BaseA2)
-			if parent == nil || parent.Type == NodeTypeFile || parent.Type == NodeTypeTmpDir ||
-				!aEligible(parent, ft.Root) {
-				return false
-			}
+		} else if !freshParentEligible(ft, plan.BaseA2) {
+			return false
 		}
 		if plan.BaseA == "" || ft.FindNode(plan.BaseA) != nil ||
-			GetParentDir(plan.BaseA) != plan.BaseA2 {
+			parentDirOrRoot(plan.BaseA) != plan.BaseA2 {
 			return false
 		}
 	default:
@@ -1872,7 +1858,7 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 	// Variant side.
 	if plan.FreshSame {
 		if plan.BaseA == "" || plan.BaseA != plan.BaseB ||
-			plan.BaseA2 == "" || GetParentDir(plan.BaseA) != plan.BaseA2 {
+			parentDirOrRoot(plan.BaseA) != plan.BaseA2 {
 			return false
 		}
 		if !freshSameFormAllowedFor(profile, plan.Cell.Combo.Root, plan.Cell.Combo.Variant,
@@ -1919,7 +1905,7 @@ func validateCausalPlan(hmcfg *Hmdfs_config, lcs *LayeredChoiceStrategy, plan *d
 		parent := ft.FindNode(plan.BaseB2)
 		if parent == nil || parent.Type == NodeTypeFile || parent.Type == NodeTypeTmpDir ||
 			plan.BaseB == "" || ft.FindNode(plan.BaseB) != nil ||
-			GetParentDir(plan.BaseB) != plan.BaseB2 ||
+			parentDirOrRoot(plan.BaseB) != plan.BaseB2 ||
 			(plan.Cell.Combo.Variant != "mkdir" && plan.Cell.Combo.Variant != "creat") ||
 			plan.Cell.RetB != RetSuccess || plan.Cell.OffB != offsetBucketNA {
 			return false

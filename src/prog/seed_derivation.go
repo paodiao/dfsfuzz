@@ -289,15 +289,20 @@ func deriveSeedRootPath(ft *FileTree, anchor seedAnchor, rootCall string, rel Pa
 				parent = anchor.Path
 			}
 		case PathSibling:
-			parent = GetParentDir(anchor.Path)
+			parent = parentDirOrRoot(anchor.Path)
 		case PathNoRel:
 			parent = ft.getRandomUnrelatedPath(anchor.Path, r.Rand, relTargetDir)
 		}
 		if parent == "" {
-			return seedRootDerivation{}, false
-		}
-		if parent == anchor.Path {
-			if !freshParentNodeEligible(ft, parent) {
+			if !freshParentEligible(ft, parent) {
+				return seedRootDerivation{}, false
+			}
+		} else if parent == anchor.Path {
+			if anchor.PathKind.IsFresh() {
+				if !freshParentNodeEligible(ft, parent) {
+					return seedRootDerivation{}, false
+				}
+			} else if !freshParentEligible(ft, parent) {
 				return seedRootDerivation{}, false
 			}
 		} else {

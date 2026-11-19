@@ -180,6 +180,22 @@ func freshParentNodeEligible(ft *FileTree, path string) bool {
 	return node != nil && node.Type != NodeTypeFile && node.Type != NodeTypeTmpDir
 }
 
+// freshParentEligible reports whether parent can host a fresh child. Empty
+// parent is the namespace root only for profiles with an empty tree prefix
+// (GlusterFS); HMDFS must stay under merge_view/. Unlike
+// freshParentNodeEligible, this checks the parent node itself, not the
+// parent of a fresh path.
+func freshParentEligible(ft *FileTree, parent string) bool {
+	if ft == nil {
+		return false
+	}
+	if parent == "" {
+		return ft.Prefix == "" && ft.Root != nil
+	}
+	node := ft.FindNode(parent)
+	return node != nil && node.Type != NodeTypeFile && node.Type != NodeTypeTmpDir
+}
+
 // freshPathParentEligible is reserved for future nested fresh-parent support.
 // C1 and seed derivation intentionally use freshParentNodeEligible to enforce
 // the first-version one-layer fresh rule. Do not use this helper as a
