@@ -13,8 +13,9 @@ func TestLoadGlusterfsConfigRequiresThreeClients(t *testing.T) {
 		servNum int
 		vms     int
 	}{
-		{"3 3", 3, 6},
 		{"3 3 'replica 3'", 3, 6},
+		{"3 3 \"replica 3\"", 3, 6},
+		{" 3   3   'replica 3' ", 3, 6},
 	}
 	for _, tc := range okCases {
 		hc := &prog.Hmdfs_config{}
@@ -42,12 +43,12 @@ func TestLoadGlusterfsConfigRequiresThreeClients(t *testing.T) {
 		vms     int
 		wantErr string
 	}{
-		{"3 0", 3, 3, "exactly 3 clients"},
-		{"3 1", 3, 4, "exactly 3 clients"},
-		{"3 2", 3, 5, "exactly 3 clients"},
-		{"3 4", 3, 7, "exactly 3 clients"},
-		{"2 3", 3, 5, "does not match"},
-		{"3 3", 3, 5, "fuzzing_vms"},
+		{"3 3", 3, 6, "bad glusterfs params format"},
+		{"3 3 replica 3", 3, 6, "bad glusterfs params format"},
+		{"3 2 'replica 3'", 3, 6, "bad glusterfs params format"},
+		{"3 3 'replica 2'", 3, 6, "bad glusterfs params format"},
+		{"3 3 'replica 3'", 2, 6, "requires server_num"},
+		{"3 3 'replica 3'", 3, 5, "requires fuzzing_vms"},
 	}
 	for _, tc := range rejectCases {
 		hc := &prog.Hmdfs_config{}
