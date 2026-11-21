@@ -701,11 +701,13 @@ func (inst *instance) boot(index int) error {
 			return err
 		}
 		inst.ip = fmt.Sprintf("%s.%s.%s.%d", bytes[0], bytes[1], bytes[2], lastByte+index)
-		// hmdfs uses the full ip= format with an explicit eth0 (relying on
-		// net.ifnames=0 in the vm cmdline) and DHCP disabled, matching the
-		// hand-written qemu command used to set up a dfs instance.
+		// hmdfs and glusterfs use the full ip= format with an explicit eth0
+		// (relying on net.ifnames=0 in the vm cmdline) and DHCP disabled.
+		// A bare ip= leaves the device unspecified, and the 5.15 kernels
+		// register extra virtual netdevs (hwsim0, gretap0, erspan0) that
+		// ipconfig may pick instead of eth0, falling back to DHCP/RARP.
 		ipArg := "ip=" + inst.ip
-		if inst.cfg.DFSName == "hmdfs" {
+		if inst.cfg.DFSName == "hmdfs" || inst.cfg.DFSName == "glusterfs" {
 			ipArg = "ip=" + inst.ip + ":::::eth0:off"
 		}
 		cmdline = append(cmdline, inst.cfg.Cmdline, ipArg, "quiet", "nokaslr") //Guest ip start from 192.160.0.2
