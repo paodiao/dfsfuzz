@@ -3057,6 +3057,29 @@ func (r *randGen) pathPtrArg(s *state, typ Type, path string) Arg {
 	return r.allocAddr(s, ptrType, DirIn, data.Size(), data)
 }
 
+// xattrNamePtrArg builds the name argument of getxattr/setxattr. The argument
+// is a ptr[in, xattr_name], and xattr_name is a varlen union, so pathPtrArg
+// would build a DataArg carrying the union type; walking that arg later
+// (mutation/validation) asserts *UnionArg and panics. Build the known option
+// (field 0: string[xattr_names]) explicitly instead.
+func (r *randGen) xattrNamePtrArg(s *state, typ Type, name string) Arg {
+	ptrType, ok := typ.(*PtrType)
+	if !ok {
+		return nil
+	}
+	unionType, ok := ptrType.Elem.(*UnionType)
+	if !ok {
+		return r.pathPtrArg(s, typ, name)
+	}
+	if len(unionType.Fields) == 0 {
+		return nil
+	}
+	known := unionType.Fields[0]
+	data := MakeDataArg(known.Type, DirIn, []byte(name+"\x00"))
+	union := MakeUnionArg(unionType, DirIn, data, 0)
+	return r.allocAddr(s, ptrType, DirIn, union.Size(), union)
+}
+
 func (r *randGen) randomXattrName() string {
 	return "user." + r.randomString(6)
 }
@@ -3153,7 +3176,7 @@ func (r *randGen) generateGetxattrCallWithPath(s *state, sCalls *SpecialCalls, p
 		return nil
 	}
 	pathArg := r.pathPtrArg(s, meta.Args[0].Type, path)
-	nameArg := r.pathPtrArg(s, meta.Args[1].Type, name)
+	nameArg := r.xattrNamePtrArg(s, meta.Args[1].Type, name)
 	bufPtrType, ok := meta.Args[2].Type.(*PtrType)
 	if !ok {
 		return nil
@@ -3191,7 +3214,7 @@ func (r *randGen) generateSetxattrCallFull(s *state, sCalls *SpecialCalls, path,
 		return nil
 	}
 	pathArg := r.pathPtrArg(s, meta.Args[0].Type, path)
-	nameArg := r.pathPtrArg(s, meta.Args[1].Type, name)
+	nameArg := r.xattrNamePtrArg(s, meta.Args[1].Type, name)
 	valPtrType, ok := meta.Args[2].Type.(*PtrType)
 	if !ok {
 		return nil
